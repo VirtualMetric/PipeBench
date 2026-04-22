@@ -203,8 +203,8 @@
 
         #details th {
             vertical-align: bottom;
-            /* Subject names shouldn't wrap — expand the column to fit on a
-               single line. */
+            /* Long subject names (e.g. "bindplane-agent") expand the column
+               to fit on a single line — no wrapping, no truncation. */
             white-space: nowrap;
             padding: 0 0.5rem 0.25rem 0.5rem;
             text-align: center;
@@ -324,7 +324,7 @@ const TEST_TYPES = {};
 <div class="header stick-left">
     <span class="nowrap themes"><span id="toggle-dark">🌚</span><span id="toggle-light">🌞</span></span>
     <h1>PipeBench — Data Pipeline Benchmark</h1>
-    <a href="https://github.com/VirtualMetric/PipeBench">Methodology</a> | <a href="https://github.com/VirtualMetric/PipeBench">Reproduce</a> | <a href="https://github.com/VirtualMetric/PipeBench">Add a System</a> | <a href="https://github.com/VirtualMetric/PipeBench">Report Mistake</a> | See also: <a href="https://benchmark.clickhouse.com/">ClickBench</a>, <a href="https://github.com/ClickHouse/JSONBench">JSONBench</a>
+    <a href="https://github.com/VirtualMetric/virtualmetric-bench">Methodology</a> | <a href="https://github.com/VirtualMetric/virtualmetric-bench">Reproduce</a> | <a href="https://github.com/VirtualMetric/virtualmetric-bench">Add a System</a> | <a href="https://github.com/VirtualMetric/virtualmetric-bench">Report Mistake</a> | See also: <a href="https://benchmark.clickhouse.com/">ClickBench</a>, <a href="https://github.com/ClickHouse/JSONBench">JSONBench</a>
 </div>
 
 <table class="selectors-container stick-left">
@@ -536,9 +536,13 @@ function buildHardwarePills() {
             [...hardwares.querySelectorAll('a')].forEach(x => {
                 x.className = x.dataset.hw === hw ? 'selector selector-active' : 'selector';
             });
-            rebuildData();
-            render();
-            updateHistory();
+            // Lazy-load this hardware tier's per-case data on first select,
+            // then rebuild. Re-selecting a tier is a no-op fast path.
+            ensureHardwareLoaded(hw).then(() => {
+                rebuildData();
+                render();
+                updateHistory();
+            });
         });
         hardwares.appendChild(a);
     });
@@ -697,7 +701,7 @@ function renderSummary(filtered_data) {
 
         let link = document.createElement('a');
         link.appendChild(document.createTextNode(`${elem.system}`));
-        link.href = "https://github.com/VirtualMetric/PipeBench";
+        link.href = "https://github.com/VirtualMetric/virtualmetric-bench";
         td_name.appendChild(link);
 
         if (elem.comment) { td_name.appendChild(addNote(elem.comment)); }
@@ -933,37 +937,63 @@ if (window.location.hash) {
 
 const DATA_ROOT = 'data/';
 const t0 = performance.now();
+let indexData = null;        // the raw master index (has by_hardware)
+const loadedHardwares = new Set();   // hardware tiers whose case files are in pipeData.results
+
+// ensureHardwareLoaded fetches the per-case JSON files for one hardware tier
+// on first use and appends entries to pipeData.results. Subsequent calls for
+// the same tier resolve immediately. The filter in rebuildData() keys on
+// r.hardware === selectors.hardware, so un-fetched tiers simply show empty.
+function ensureHardwareLoaded(hw) {
+    if (!hw || loadedHardwares.has(hw)) return Promise.resolve();
+    const cases = (indexData && indexData.by_hardware && indexData.by_hardware[hw]) || [];
+    if (cases.length === 0) {
+        loadedHardwares.add(hw);
+        return Promise.resolve();
+    }
+    const tStart = performance.now();
+    return Promise.all(
+        cases.map(c =>
+            fetch(DATA_ROOT + c.file)
+                .then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status + ' on ' + c.file)))
+                .catch(err => { console.warn('[pipebench]', err.message); return null; })
+        )
+    ).then(caseDatas => {
+        for (const cd of caseDatas) {
+            if (cd && Array.isArray(cd.results)) pipeData.results.push(...cd.results);
+        }
+        loadedHardwares.add(hw);
+        console.log('[pipebench] loaded', hw, 'in', (performance.now() - tStart).toFixed(0) + 'ms',
+                    '(' + cases.length + ' case files)');
+    });
+}
 
 fetch(DATA_ROOT + 'index.json')
     .then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status + ' on index.json')))
     .then(index => {
+        indexData = index;
         const tIndex = performance.now();
-        return Promise.all(
-            (index.cases || []).map(c =>
-                fetch(DATA_ROOT + c.file)
-                    .then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status + ' on ' + c.file)))
-            )
-        ).then(caseDatas => {
-            const tAll = performance.now();
-            const results = [];
-            for (const cd of caseDatas) {
-                if (cd && Array.isArray(cd.results)) results.push(...cd.results);
-            }
-            pipeData = {
-                generated_at: index.generated_at,
-                subjects: index.subjects || [],
-                tests: index.tests || [],
-                hardwares: index.hardwares || [],
-                results: results,
-            };
-            console.log('[pipebench] index:', (tIndex - t0).toFixed(0) + 'ms',
-                        '+', (index.cases || []).length, 'case files:', (tAll - tIndex).toFixed(0) + 'ms',
-                        '| total:', (tAll - t0).toFixed(0) + 'ms');
 
-            pipeData.hardwares.sort((a, b) => a === 'custom' ? -1 : b === 'custom' ? 1 : a.localeCompare(b));
-            if (!selectors.hardware || !pipeData.hardwares.includes(selectors.hardware)) {
-                selectors.hardware = pipeData.hardwares[0] || null;
-            }
+        pipeData = {
+            generated_at: index.generated_at,
+            subjects: index.subjects || [],
+            tests: index.tests || [],
+            hardwares: index.hardwares || [],
+            results: [],
+        };
+        pipeData.hardwares.sort((a, b) => a === 'custom' ? -1 : b === 'custom' ? 1 : a.localeCompare(b));
+
+        if (!selectors.hardware || !pipeData.hardwares.includes(selectors.hardware)) {
+            selectors.hardware = pipeData.hardwares[0] || null;
+        }
+
+        // Only load the selected tier's case files on first paint.
+        // Other tiers load lazily when the user clicks their pill.
+        return ensureHardwareLoaded(selectors.hardware).then(() => {
+            const tAll = performance.now();
+            console.log('[pipebench] index:', (tIndex - t0).toFixed(0) + 'ms',
+                        '| initial tier:', selectors.hardware,
+                        '| total:', (tAll - t0).toFixed(0) + 'ms');
             buildHardwarePills();
             buildSystemPills();
             rebuildData();
