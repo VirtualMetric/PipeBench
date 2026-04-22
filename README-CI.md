@@ -1,4 +1,4 @@
-# VirtualMetric Bench — GitHub Actions CI Guide
+# PipeBench — GitHub Actions CI Guide
 
 Run automated benchmarks in CI/CD pipelines using GitHub Actions. Every push and pull request builds the harness, builds the container images, and runs a smoke test to verify nothing is broken.
 

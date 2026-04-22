@@ -11,9 +11,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/VirtualMetric/virtualmetric-bench/internal/config"
-	"github.com/VirtualMetric/virtualmetric-bench/internal/results"
-	"github.com/VirtualMetric/virtualmetric-bench/internal/runner"
+	"github.com/VirtualMetric/PipeBench/internal/config"
+	"github.com/VirtualMetric/PipeBench/internal/results"
+	"github.com/VirtualMetric/PipeBench/internal/runner"
 )
 
 // Set via ldflags at build time.
@@ -168,9 +168,9 @@ func testCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&noCleanup, "no-cleanup", false, "leave containers running after test (for debugging)")
 	cmd.Flags().IntVar(&receiverHostPort, "receiver-port", 19001, "host port for receiver metrics endpoint")
 	cmd.Flags().DurationVar(&timeout, "timeout", 10*time.Minute, "maximum time to wait for test completion")
-	cmd.Flags().StringVar(&generatorImage, "generator-image", "virtualmetric/bench-generator:latest", "generator container image")
-	cmd.Flags().StringVar(&receiverImage, "receiver-image", "virtualmetric/bench-receiver:latest", "receiver container image")
-	cmd.Flags().StringVar(&collectorImage, "collector-image", "virtualmetric/bench-collector:latest", "collector container image")
+	cmd.Flags().StringVar(&generatorImage, "generator-image", "vmetric/bench-generator:latest", "generator container image")
+	cmd.Flags().StringVar(&receiverImage, "receiver-image", "vmetric/bench-receiver:latest", "receiver container image")
+	cmd.Flags().StringVar(&collectorImage, "collector-image", "vmetric/bench-collector:latest", "collector container image")
 	cmd.Flags().StringVar(&platform, "platform", "docker", "platform: docker or kubernetes")
 	cmd.Flags().StringVar(&cpuLimit, "cpu-limit", "", "CPU cores for subject container (e.g. \"1\", \"4\", \"0.5\")")
 	cmd.Flags().StringVar(&memLimit, "mem-limit", "", "memory limit for subject container (e.g. \"1g\", \"4g\", \"512m\")")

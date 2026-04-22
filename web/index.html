@@ -324,7 +324,7 @@ const TEST_TYPES = {};
 <div class="header stick-left">
     <span class="nowrap themes"><span id="toggle-dark">🌚</span><span id="toggle-light">🌞</span></span>
     <h1>PipeBench — Data Pipeline Benchmark</h1>
-    <a href="https://github.com/VirtualMetric/virtualmetric-bench">Methodology</a> | <a href="https://github.com/VirtualMetric/virtualmetric-bench">Reproduce</a> | <a href="https://github.com/VirtualMetric/virtualmetric-bench">Add a System</a> | <a href="https://github.com/VirtualMetric/virtualmetric-bench">Report Mistake</a> | See also: <a href="https://benchmark.clickhouse.com/">ClickBench</a>, <a href="https://github.com/ClickHouse/JSONBench">JSONBench</a>
+    <a href="https://github.com/VirtualMetric/PipeBench">Methodology</a> | <a href="https://github.com/VirtualMetric/PipeBench">Reproduce</a> | <a href="https://github.com/VirtualMetric/PipeBench">Add a System</a> | <a href="https://github.com/VirtualMetric/PipeBench">Report Mistake</a> | See also: <a href="https://benchmark.clickhouse.com/">ClickBench</a>, <a href="https://github.com/ClickHouse/JSONBench">JSONBench</a>
 </div>
 
 <table class="selectors-container stick-left">
@@ -697,7 +697,7 @@ function renderSummary(filtered_data) {
 
         let link = document.createElement('a');
         link.appendChild(document.createTextNode(`${elem.system}`));
-        link.href = "https://github.com/VirtualMetric/virtualmetric-bench";
+        link.href = "https://github.com/VirtualMetric/PipeBench";
         td_name.appendChild(link);
 
         if (elem.comment) { td_name.appendChild(addNote(elem.comment)); }

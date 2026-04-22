@@ -1,4 +1,4 @@
-module github.com/VirtualMetric/virtualmetric-bench
+module github.com/VirtualMetric/PipeBench
 
 go 1.25.0
 

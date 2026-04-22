@@ -129,8 +129,8 @@ go version
 ```bash
 sudo apt install -y git make
 
-git clone https://github.com/VirtualMetric/virtualmetric-bench.git
-cd virtualmetric-bench
+git clone https://github.com/VirtualMetric/PipeBench.git
+cd PipeBench
 
 make build
 make build-containers
@@ -146,17 +146,17 @@ k3s can use locally built images if you import them:
 
 ```bash
 # k3s uses containerd, so import directly:
-docker save virtualmetric/bench-generator:latest | sudo k3s ctr images import -
-docker save virtualmetric/bench-receiver:latest  | sudo k3s ctr images import -
-docker save virtualmetric/bench-collector:latest  | sudo k3s ctr images import -
+docker save vmetric/bench-generator:latest | sudo k3s ctr images import -
+docker save vmetric/bench-receiver:latest  | sudo k3s ctr images import -
+docker save vmetric/bench-collector:latest  | sudo k3s ctr images import -
 ```
 
 #### If using kind
 
 ```bash
-kind load docker-image virtualmetric/bench-generator:latest --name bench
-kind load docker-image virtualmetric/bench-receiver:latest  --name bench
-kind load docker-image virtualmetric/bench-collector:latest  --name bench
+kind load docker-image vmetric/bench-generator:latest --name bench
+kind load docker-image vmetric/bench-receiver:latest  --name bench
+kind load docker-image vmetric/bench-collector:latest  --name bench
 ```
 
 #### If using a remote cluster
@@ -165,9 +165,9 @@ Push to a registry your cluster can reach (Docker Hub, ECR, GCR, ACR, etc.):
 
 ```bash
 # Example for Docker Hub (replace with your username):
-docker tag virtualmetric/bench-generator:latest yourusername/bench-generator:latest
-docker tag virtualmetric/bench-receiver:latest  yourusername/bench-receiver:latest
-docker tag virtualmetric/bench-collector:latest  yourusername/bench-collector:latest
+docker tag vmetric/bench-generator:latest yourusername/bench-generator:latest
+docker tag vmetric/bench-receiver:latest  yourusername/bench-receiver:latest
+docker tag vmetric/bench-collector:latest  yourusername/bench-collector:latest
 
 docker push yourusername/bench-generator:latest
 docker push yourusername/bench-receiver:latest

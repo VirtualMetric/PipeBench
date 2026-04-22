@@ -83,11 +83,11 @@ You should see something like `go version go1.22.5 linux/amd64`.
 ```bash
 sudo apt install -y git make
 
-git clone https://github.com/VirtualMetric/virtualmetric-bench.git
-cd virtualmetric-bench
+git clone https://github.com/VirtualMetric/PipeBench.git
+cd PipeBench
 ```
 
-From this point on, all commands are run from inside the `virtualmetric-bench` folder.
+From this point on, all commands are run from inside the `PipeBench` folder.
 
 ### Step 6: Build everything
 
@@ -399,7 +399,7 @@ These verify data integrity — no lost, duplicated, or reordered events. The ge
 ## Project structure (for the curious)
 
 ```
-virtualmetric-bench/
+PipeBench/
   cmd/harness/           CLI binary (the tool you run)
   internal/              Go packages for config, orchestration, metrics, results
   containers/

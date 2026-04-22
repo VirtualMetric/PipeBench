@@ -82,7 +82,7 @@ The original harness required AWS (EC2, S3, Athena, DynamoDB), Terraform 0.12, A
 ## 2. Repository Structure
 
 ```
-virtualmetric-bench/
+PipeBench/
 ├── cmd/
 │   └── harness/
 │       └── main.go                  # CLI entrypoint (cobra)
@@ -459,7 +459,7 @@ services:
     restart: "no"
 
   generator:
-    image: "virtualmetric/bench-generator:latest"
+    image: "vmetric/bench-generator:latest"
     container_name: "bench-generator"
     networks: [bench]
     depends_on:
@@ -475,7 +475,7 @@ services:
     restart: "no"
 
   receiver:
-    image: "virtualmetric/bench-receiver:latest"
+    image: "vmetric/bench-receiver:latest"
     container_name: "bench-receiver"
     networks: [bench]
     ports:
@@ -486,7 +486,7 @@ services:
     restart: "no"
 
   collector:
-    image: "virtualmetric/bench-collector:latest"
+    image: "vmetric/bench-collector:latest"
     container_name: "bench-collector"
     networks: [bench]
     volumes:
@@ -878,9 +878,9 @@ build:
 	go build -o bin/harness ./cmd/harness
 
 build-containers:
-	docker build -t virtualmetric/bench-generator:latest -f containers/generator/Dockerfile .
-	docker build -t virtualmetric/bench-receiver:latest  -f containers/receiver/Dockerfile  .
-	docker build -t virtualmetric/bench-collector:latest -f containers/collector/Dockerfile .
+	docker build -t vmetric/bench-generator:latest -f containers/generator/Dockerfile .
+	docker build -t vmetric/bench-receiver:latest  -f containers/receiver/Dockerfile  .
+	docker build -t vmetric/bench-collector:latest -f containers/collector/Dockerfile .
 
 test-local: build build-containers
 	./bin/harness test -t tcp_to_tcp_performance -s vector

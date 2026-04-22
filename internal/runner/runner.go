@@ -13,9 +13,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/VirtualMetric/virtualmetric-bench/internal/config"
-	"github.com/VirtualMetric/virtualmetric-bench/internal/orchestrator"
-	"github.com/VirtualMetric/virtualmetric-bench/internal/results"
+	"github.com/VirtualMetric/PipeBench/internal/config"
+	"github.com/VirtualMetric/PipeBench/internal/orchestrator"
+	"github.com/VirtualMetric/PipeBench/internal/results"
 )
 
 // Options configure a test run.
@@ -44,13 +44,13 @@ type Options struct {
 
 func (o *Options) applyDefaults() {
 	if o.GeneratorImage == "" {
-		o.GeneratorImage = "virtualmetric/bench-generator:latest"
+		o.GeneratorImage = "vmetric/bench-generator:latest"
 	}
 	if o.ReceiverImage == "" {
-		o.ReceiverImage = "virtualmetric/bench-receiver:latest"
+		o.ReceiverImage = "vmetric/bench-receiver:latest"
 	}
 	if o.CollectorImage == "" {
-		o.CollectorImage = "virtualmetric/bench-collector:latest"
+		o.CollectorImage = "vmetric/bench-collector:latest"
 	}
 	if o.ConfigName == "" {
 		o.ConfigName = "default"

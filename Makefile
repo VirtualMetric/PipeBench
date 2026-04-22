@@ -14,9 +14,9 @@ LDFLAGS  := -s -w \
   -X main.buildDate=$(BUILDDATE)
 
 # Container image tags
-GENERATOR_IMAGE := virtualmetric/bench-generator:latest
-RECEIVER_IMAGE  := virtualmetric/bench-receiver:latest
-COLLECTOR_IMAGE := virtualmetric/bench-collector:latest
+GENERATOR_IMAGE := vmetric/bench-generator:latest
+RECEIVER_IMAGE  := vmetric/bench-receiver:latest
+COLLECTOR_IMAGE := vmetric/bench-collector:latest
 
 # Default test / subject for test-local
 TEST    ?= tcp_to_tcp_performance

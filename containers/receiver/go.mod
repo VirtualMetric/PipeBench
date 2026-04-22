@@ -1,3 +1,3 @@
-module github.com/VirtualMetric/bench-receiver
+module github.com/VirtualMetric/PipeBench/containers/receiver
 
 go 1.25.6

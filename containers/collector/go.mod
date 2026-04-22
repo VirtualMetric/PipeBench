@@ -1,4 +1,4 @@
-module github.com/VirtualMetric/bench-collector
+module github.com/VirtualMetric/PipeBench/containers/collector
 
 go 1.25.6
 
