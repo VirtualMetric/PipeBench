@@ -18,6 +18,11 @@ GENERATOR_IMAGE := vmetric/bench-generator:latest
 RECEIVER_IMAGE  := vmetric/bench-receiver:latest
 COLLECTOR_IMAGE := vmetric/bench-collector:latest
 
+# Set ATTEST=1 to emit SBOM + max-mode provenance (used when publishing to Docker Hub).
+# Requires the docker-container buildx driver; the default docker driver on GitHub
+# Actions runners does not support attestations.
+ATTEST_FLAGS := $(if $(ATTEST),--sbom=true --provenance=mode=max,)
+
 # Default test / subject for test-local
 TEST    ?= tcp_to_tcp_performance
 SUBJECT ?= vector
@@ -35,7 +40,7 @@ build-generator:
 		-f containers/generator/Dockerfile \
 		-t $(GENERATOR_IMAGE) \
 		--platform linux/amd64 \
-		--sbom=true --provenance=mode=max \
+		$(ATTEST_FLAGS) \
 		--build-arg BUILDKIT_INLINE_CACHE=1 \
 		.
 
@@ -44,7 +49,7 @@ build-receiver:
 		-f containers/receiver/Dockerfile \
 		-t $(RECEIVER_IMAGE) \
 		--platform linux/amd64 \
-		--sbom=true --provenance=mode=max \
+		$(ATTEST_FLAGS) \
 		--build-arg BUILDKIT_INLINE_CACHE=1 \
 		.
 
@@ -53,7 +58,7 @@ build-collector:
 		-f containers/collector/Dockerfile \
 		-t $(COLLECTOR_IMAGE) \
 		--platform linux/amd64 \
-		--sbom=true --provenance=mode=max \
+		$(ATTEST_FLAGS) \
 		--build-arg BUILDKIT_INLINE_CACHE=1 \
 		.
 
