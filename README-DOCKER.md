@@ -100,6 +100,8 @@ make build-containers
 
 The first run will take a few minutes because Docker needs to download the Go base image. Subsequent builds are fast.
 
+> **Skip the container builds?** Prebuilt images are published to Docker Hub — `vmetric/bench-generator`, `vmetric/bench-receiver`, `vmetric/bench-collector` (both `:latest` and a pinned `:sha-<shortsha>` tag per release). If you only plan to run the harness (not modify the helpers), you can skip `make build-containers` and Docker will pull them on first use. Build locally when you want to change the generator/receiver/collector source.
+
 ### Step 7: Run your first test
 
 Run the TCP-to-TCP performance test against Vector:

@@ -140,6 +140,8 @@ make build-containers
 
 Your Kubernetes cluster needs to pull the helper images. How you do this depends on your setup.
 
+> **Prebuilt images available.** If your cluster has internet access, you can skip this step entirely and use the published images: `vmetric/bench-generator:latest`, `vmetric/bench-receiver:latest`, `vmetric/bench-collector:latest` (also pinned as `:sha-<shortsha>` per release). Kubernetes will pull them automatically on first run. The steps below are only needed for offline clusters or when you've modified the helper sources locally.
+
 #### If using k3s (local single-node)
 
 k3s can use locally built images if you import them:
