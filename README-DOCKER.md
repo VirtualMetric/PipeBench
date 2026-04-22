@@ -1,6 +1,6 @@
 # PipeBench — Docker Guide
 
-A containerized benchmarking and correctness testing framework for data pipeline tools. Compare **Vector**, **Fluent Bit**, **Fluentd**, **Logstash**, **Filebeat**, **Cribl Stream**, **Telegraf**, **Splunk HF**, **NXLog**, **AxoSyslog**, **Tenzir**, **OpenTelemetry Collector**, **Grafana Alloy**, and **BindPlane Agent** side by side — no cloud account required.
+A containerized benchmarking and correctness testing framework for data pipeline tools. Compare **VirtualMetric DataStream**, **Vector**, **Fluent Bit**, **Fluentd**, **Logstash**, and **AxoSyslog** side by side — no cloud account required.
 
 > This guide covers running tests locally with Docker. For Kubernetes deployments, see [README-KUBERNETES.md](README-KUBERNETES.md).
 
@@ -336,7 +336,7 @@ sudo systemctl enable docker
 
 ### Generator times out connecting
 
-The subject container may be slow to start (especially Logstash/Filebeat which are Java-based). The generator retries for 30 seconds. If it still fails, try running the test again — Docker may have been pulling the image on the first attempt.
+The subject container may be slow to start (especially Logstash, which is Java-based). The generator retries for 30 seconds. If it still fails, try running the test again — Docker may have been pulling the image on the first attempt.
 
 ### "image not found" errors
 

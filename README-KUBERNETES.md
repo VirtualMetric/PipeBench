@@ -1,6 +1,6 @@
 # PipeBench — Kubernetes Guide
 
-Run data pipeline benchmarks on any Kubernetes cluster. Compare **Vector**, **Fluent Bit**, **Fluentd**, **Logstash**, **Filebeat**, **Cribl Stream**, **Telegraf**, **Splunk HF**, **NXLog**, **AxoSyslog**, **Tenzir**, **OpenTelemetry Collector**, **Grafana Alloy**, **BindPlane Agent**, and more with fair resource isolation using Guaranteed QoS pods.
+Run data pipeline benchmarks on any Kubernetes cluster. Compare **VirtualMetric DataStream**, **Vector**, **Fluent Bit**, **Fluentd**, **Logstash**, and **AxoSyslog** with fair resource isolation using Guaranteed QoS pods.
 
 > This guide covers Kubernetes deployments. For local Docker testing, see [README-DOCKER.md](README-DOCKER.md).
 

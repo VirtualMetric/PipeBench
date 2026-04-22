@@ -284,8 +284,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 
 	// Compute derived stats — use the generator's actual send duration for
 	// throughput, not total elapsed time. This ensures tools with slow startup
-	// (Cribl, Logstash, OTel Collector) are measured fairly on actual processing
-	// time, not boot time.
+	// (e.g. Logstash) are measured fairly on actual processing time, not boot time.
 	sendDuration := elapsed
 	if genStats.DurationMs > 0 {
 		sendDuration = float64(genStats.DurationMs) / 1000.0

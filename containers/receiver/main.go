@@ -322,8 +322,9 @@ func main() {
 	go serveMetrics(cfg.MetricsPort, cnt, val, cfg)
 
 	// Always start HTTP data ingestion endpoint alongside the primary mode.
-	// This allows subjects that output over HTTP/ES (e.g. Filebeat) to send
-	// data to :9002 while TCP subjects send to the primary listen port.
+	// This allows subjects that output over HTTP or the Elasticsearch bulk
+	// API to send data to :9002 while TCP subjects send to the primary listen
+	// port.
 	httpDataPort := getEnv("RECEIVER_HTTP_DATA_PORT", "9002")
 	go func() {
 		if err := startHTTPDataEndpoint(httpDataPort, cnt, val, cfg); err != nil {
@@ -569,7 +570,7 @@ func startHTTPDataEndpoint(port string, cnt *counters, val *validator, cfg confi
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost && r.Method != http.MethodPut {
-			// Filebeat/ES health check: GET / expects cluster info JSON
+			// Elasticsearch health check: GET / expects cluster info JSON
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("X-Elastic-Product", "Elasticsearch")
 			fmt.Fprintf(w, `{"name":"bench-receiver","cluster_name":"bench","version":{"number":"8.13.0","build_type":"docker"},"tagline":"You Know, for Search"}`)
@@ -617,15 +618,15 @@ func startHTTPDataEndpoint(port string, cnt *counters, val *validator, cfg confi
 		w.WriteHeader(http.StatusOK)
 		if isBulk && docCount > 0 {
 			// Build a proper ES bulk response with one item per document.
-			// Filebeat checks each item for success/failure and will retry
-			// the entire batch if items are missing.
-			// Filebeat uses "create" action (not "index"), so we must match.
-			// We parse the action lines to determine the correct action type.
+			// Strict ES clients check each item for success/failure and retry
+			// the entire batch if items are missing. We also mirror the action
+			// ("create" vs "index") from each request action line, since some
+			// clients only accept responses that match what they sent.
 			var buf strings.Builder
 			buf.WriteString(`{"took":0,"errors":false,"items":[`)
 			itemIdx := 0
 			for i := 0; i < len(lines)-1; i += 2 {
-				action := "create" // default for Filebeat
+				action := "create"
 				// Try to detect action from the action line
 				actionLine := lines[i]
 				if strings.Contains(actionLine, `"index"`) {

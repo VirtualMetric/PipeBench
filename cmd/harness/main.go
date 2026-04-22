@@ -51,7 +51,7 @@ func main() {
 		Use:   "harness",
 		Short: "PipeBench — containerized data pipeline benchmarking",
 		Long: `harness runs performance and correctness tests against data pipeline tools
-(Vector, Fluent Bit, Fluentd, Logstash, Filebeat, Telegraf) using Docker containers.
+(VirtualMetric DataStream, Vector, Fluent Bit, Fluentd, Logstash, AxoSyslog) using Docker containers.
 
 No cloud account, Terraform, Ansible, or SSH required.`,
 	}

@@ -60,12 +60,12 @@ The original harness required AWS (EC2, S3, Athena, DynamoDB), Terraform 0.12, A
 
 | Subject | Image | Phase |
 |---|---|---|
+| VirtualMetric DataStream | `vmetric/director:<version>` | Phase 1 |
 | Vector | `timberio/vector:<version>` | Phase 1 |
 | Fluent Bit | `fluent/fluent-bit:<version>` | Phase 2 |
 | Fluentd | `fluent/fluentd:<version>` | Phase 2 |
 | Logstash | `docker.elastic.co/logstash/logstash:<version>` | Phase 2 |
-| Filebeat | `docker.elastic.co/beats/filebeat:<version>` | Phase 2 |
-| Telegraf | `telegraf:<version>` | Phase 3 |
+| AxoSyslog | `ghcr.io/axoflow/axosyslog:<version>` | Phase 3 |
 
 ### Why the Original Is Broken
 
@@ -116,11 +116,12 @@ PipeBench/
 │   ├── tcp_to_tcp_performance/
 │   │   ├── case.yaml
 │   │   └── configs/
+│   │       ├── vmetric.yml
 │   │       ├── vector.toml
 │   │       ├── fluent-bit.conf
 │   │       ├── fluentd.conf
 │   │       ├── logstash.conf
-│   │       └── filebeat.yml
+│   │       └── axosyslog.conf
 │   ├── tcp_to_tcp_5min_performance/
 │   ├── tcp_to_tcp_persistent_performance/
 │   ├── file_to_tcp_performance/
@@ -226,17 +227,17 @@ var Registry = map[string]Subject{
         Version:    "8.13.0",
         ConfigPath: "/usr/share/logstash/pipeline/logstash.conf",
     },
-    "filebeat": {
-        Name:       "filebeat",
-        Image:      "docker.elastic.co/beats/filebeat",
-        Version:    "8.13.0",
-        ConfigPath: "/usr/share/filebeat/filebeat.yml",
+    "axosyslog": {
+        Name:       "axosyslog",
+        Image:      "ghcr.io/axoflow/axosyslog",
+        Version:    "4.24.0",
+        ConfigPath: "/etc/syslog-ng/syslog-ng.conf",
     },
-    "telegraf": {
-        Name:       "telegraf",
-        Image:      "telegraf",
+    "vmetric": {
+        Name:       "vmetric",
+        Image:      "vmetric/director",
         Version:    "latest",
-        ConfigPath: "/etc/telegraf/telegraf.conf",
+        ConfigPath: "/config.yml",
     },
 }
 ```
@@ -363,11 +364,12 @@ receiver:
 
 # Which subjects to run this test against
 subjects:
+  - vmetric
   - vector
   - fluent-bit
   - fluentd
   - logstash
-  - filebeat
+  - axosyslog
 
 # Named configurations to test (each subject must have a config file per config name)
 # Config files: cases/<name>/configs/<config_name>/<subject>.<ext>
@@ -396,11 +398,12 @@ cases/tcp_to_tcp_performance/
   case.yaml
   configs/
     default/
+      vmetric.yml
       vector.toml
       fluent-bit.conf
       fluentd.conf
       logstash.conf
-      filebeat.yml
+      axosyslog.conf
     with_regex/
       vector.toml
       fluent-bit.conf
@@ -694,7 +697,7 @@ Deliverables:
 **Goal:** `harness compare -t tcp_to_tcp` prints a comparison table across all subjects.
 
 Deliverables:
-- [ ] Add Fluent Bit, Fluentd, Logstash, Filebeat, Telegraf to subject registry
+- [ ] Add Fluent Bit, Fluentd, Logstash, AxoSyslog to subject registry
 - [ ] Subject configs for all performance test cases
 - [ ] `internal/results/compare.go` — load results and render tabular comparison
 - [ ] `harness compare` command
@@ -703,7 +706,7 @@ Deliverables:
 - [ ] All 8 performance test case directories with all subject configs
 - [ ] `harness clean` command
 
-### Phase 3 — Correctness Tests + Telegraf
+### Phase 3 — Correctness Tests + AxoSyslog
 
 **Goal:** `harness test -t file_rotate_create -s vector` passes/fails with explanation.
 
@@ -712,7 +715,7 @@ Deliverables:
 - [ ] Correctness result type (pass/fail + details)
 - [ ] All 7 correctness test case directories
 - [ ] Correctness report in `harness compare` output
-- [ ] Telegraf subject configs
+- [ ] AxoSyslog subject configs
 - [ ] `harness test --all-subjects` shorthand
 
 ### Phase 4 — Kubernetes Support
