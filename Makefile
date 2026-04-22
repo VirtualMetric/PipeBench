@@ -34,6 +34,8 @@ build-generator:
 	docker build \
 		-f containers/generator/Dockerfile \
 		-t $(GENERATOR_IMAGE) \
+		--platform linux/amd64 \
+		--sbom=true --provenance=mode=max \
 		--build-arg BUILDKIT_INLINE_CACHE=1 \
 		.
 
@@ -41,6 +43,8 @@ build-receiver:
 	docker build \
 		-f containers/receiver/Dockerfile \
 		-t $(RECEIVER_IMAGE) \
+		--platform linux/amd64 \
+		--sbom=true --provenance=mode=max \
 		--build-arg BUILDKIT_INLINE_CACHE=1 \
 		.
 
@@ -48,6 +52,8 @@ build-collector:
 	docker build \
 		-f containers/collector/Dockerfile \
 		-t $(COLLECTOR_IMAGE) \
+		--platform linux/amd64 \
+		--sbom=true --provenance=mode=max \
 		--build-arg BUILDKIT_INLINE_CACHE=1 \
 		.
 
