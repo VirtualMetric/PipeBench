@@ -1,0 +1,37 @@
+name: wrapped_json_correctness
+type: correctness
+description: "Verifies JSON-in-string fields are parsed and re-emitted correctly"
+
+duration: 60s
+warmup: 10s
+
+generator:
+  mode: tcp
+  target: "subject:9000"
+  rate: 500
+  line_size: 256
+  format: json
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+subjects:
+  - vmetric
+  - vector
+  - fluent-bit
+  - fluentd
+  - logstash
+  - nxlog
+  - axosyslog
+  - tenzir
+  - cribl-stream
+
+correctness:
+  validate_order: false
+  validate_dedup: false
+  expected_loss_pct: 0.0
+
+configurations:
+  default:
+    description: "Parse wrapped JSON, forward over TCP"

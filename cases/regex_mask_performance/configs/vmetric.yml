@@ -1,0 +1,29 @@
+devices:
+  - id: 1
+    name: tcp-bench
+    type: tcp
+    properties:
+      address: "0.0.0.0"
+      port: 9000
+targets:
+  - name: tcp-target-bench
+    type: tcp
+    properties:
+      address: "receiver"
+      port: 9001
+routes:
+  - name: tcp-to-tcp-bench
+    devices:
+      - name: tcp-bench
+    pipelines:
+      - name: regex-mask
+    targets:
+      - name: tcp-target-bench
+pipelines:
+  - name: regex-mask
+    processors:
+      - gsub:
+          field: message
+          pattern: "CONN=[0-9]+"
+          replacement: "CONN=***"
+          ignore_missing: true

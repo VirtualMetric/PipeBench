@@ -1,0 +1,16 @@
+[sources.in]
+type = "socket"
+mode = "tcp"
+address = "0.0.0.0:9000"
+
+[sinks.out]
+type = "http"
+inputs = ["in"]
+uri = "http://receiver:9001/"
+method = "post"
+encoding.codec = "text"
+
+[sinks.out.buffer]
+type = "disk"
+max_size = 2147483648
+when_full = "block"

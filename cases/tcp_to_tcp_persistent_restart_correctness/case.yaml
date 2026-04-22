@@ -1,0 +1,39 @@
+name: tcp_to_tcp_persistent_restart_correctness
+type: persistence_restart_correctness
+description: "Verifies durable persistence across a subject restart: send logs, stop subject, start receiver, restart subject, verify all logs arrive"
+
+duration: 10s
+warmup: 10s
+
+generator:
+  mode: tcp
+  target: "subject:9000"
+  rate: 25000
+  total_lines: 25000
+  line_size: 256
+  format: raw
+  connections: 4
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+subjects:
+  - vmetric
+  - vector
+  - fluent-bit
+  - fluentd
+  - logstash
+  - nxlog
+  - axosyslog
+  - tenzir
+  - cribl-stream
+
+correctness:
+  validate_order: false
+  validate_dedup: true
+  expected_loss_pct: 0.0
+
+configurations:
+  default:
+    description: "Send logs, shutdown subject, start receiver, restart subject, verify delivery"

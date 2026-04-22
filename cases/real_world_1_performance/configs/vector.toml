@@ -1,0 +1,23 @@
+[sources.in]
+type = "socket"
+mode = "tcp"
+address = "0.0.0.0:9000"
+
+[transforms.parse]
+type = "remap"
+inputs = ["in"]
+source = '''
+. = parse_syslog!(.message)
+'''
+
+[transforms.filter]
+type = "filter"
+inputs = ["parse"]
+condition = '.severity != "debug"'
+
+[sinks.out]
+type = "socket"
+mode = "tcp"
+inputs = ["filter"]
+address = "receiver:9001"
+encoding.codec = "json"

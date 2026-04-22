@@ -1,0 +1,34 @@
+name: regex_mask_performance
+type: performance
+description: "Measures throughput of a TCP-in to TCP-out pipeline with a regex mask applied to every record (e.g. CONN=<digits> → CONN=***)."
+
+# Total test duration (after warmup)
+duration: 60s
+# Wait for the subject to be ready before the generator starts sending
+warmup: 10s
+
+generator:
+  mode: tcp
+  target: "subject:9000"
+  rate: 0
+  line_size: 256
+  format: raw
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+subjects:
+  - vmetric
+  - vector
+  - fluent-bit
+  - fluentd
+  - logstash
+  - nxlog
+  - axosyslog
+  - tenzir
+  - cribl-stream
+
+configurations:
+  default:
+    description: "Regex replace CONN=<digits> → CONN=*** on every record before forwarding"

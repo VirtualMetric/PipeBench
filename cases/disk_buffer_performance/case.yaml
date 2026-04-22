@@ -1,0 +1,33 @@
+name: disk_buffer_performance
+type: performance
+description: "Measures throughput with disk-based buffering enabled"
+
+duration: 60s
+warmup: 10s
+
+generator:
+  mode: tcp
+  target: "subject:9000"
+  rate: 0
+  line_size: 256
+  format: raw
+  connections: 8
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+subjects:
+  - vmetric
+  - vector
+  - fluent-bit
+  - fluentd
+  - logstash
+  - nxlog
+  - axosyslog
+  - tenzir
+  - cribl-stream
+
+configurations:
+  default:
+    description: "TCP in, disk buffer, TCP out"

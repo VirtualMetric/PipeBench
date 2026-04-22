@@ -1,0 +1,203 @@
+{
+  "generated_at": "2026-04-22T07:28:53.6964128Z",
+  "subjects": [
+    "axosyslog",
+    "bindplane-agent",
+    "cribl-stream",
+    "filebeat",
+    "fluent-bit",
+    "fluentd",
+    "grafana-alloy",
+    "logstash",
+    "nxlog",
+    "otel-collector",
+    "telegraf",
+    "tenzir",
+    "vector",
+    "vmetric"
+  ],
+  "hardwares": [
+    "custom"
+  ],
+  "tests": [
+    "disk_buffer_performance",
+    "disk_buffer_persistence_correctness",
+    "file_rotate_create_correctness",
+    "file_rotate_truncate_correctness",
+    "file_to_tcp_performance",
+    "file_truncate_correctness",
+    "lua_base_performance",
+    "real_world_1_performance",
+    "regex_mask_performance",
+    "regex_parsing_performance",
+    "sighup_correctness",
+    "tcp_to_blackhole_performance",
+    "tcp_to_blackhole_persistent_performance",
+    "tcp_to_http_5min_performance",
+    "tcp_to_http_performance",
+    "tcp_to_http_persistent_correctness",
+    "tcp_to_tcp_5min_performance",
+    "tcp_to_tcp_performance",
+    "tcp_to_tcp_persistent_correctness",
+    "tcp_to_tcp_persistent_performance",
+    "tcp_to_tcp_persistent_restart_correctness",
+    "wrapped_json_correctness"
+  ],
+  "cases": [
+    {
+      "test": "disk_buffer_performance",
+      "file": "disk_buffer_performance.json",
+      "type": "performance",
+      "description": "Measures throughput with disk-based buffering enabled",
+      "count": 0
+    },
+    {
+      "test": "disk_buffer_persistence_correctness",
+      "file": "disk_buffer_persistence_correctness.json",
+      "type": "correctness",
+      "description": "Verifies events survive subject restart when disk buffering is enabled",
+      "count": 0
+    },
+    {
+      "test": "file_rotate_create_correctness",
+      "file": "file_rotate_create_correctness.json",
+      "type": "correctness",
+      "description": "Verifies no data loss when log files are rotated by creating a new file",
+      "count": 0
+    },
+    {
+      "test": "file_rotate_truncate_correctness",
+      "file": "file_rotate_truncate_correctness.json",
+      "type": "correctness",
+      "description": "Verifies no data loss when log files are rotated by truncation",
+      "count": 0
+    },
+    {
+      "test": "file_to_tcp_performance",
+      "file": "file_to_tcp_performance.json",
+      "type": "performance",
+      "description": "Measures throughput of tailing a file and forwarding over TCP",
+      "count": 0
+    },
+    {
+      "test": "file_truncate_correctness",
+      "file": "file_truncate_correctness.json",
+      "type": "correctness",
+      "description": "Verifies no data loss when a log file is directly truncated",
+      "count": 0
+    },
+    {
+      "test": "lua_base_performance",
+      "file": "lua_base_performance.json",
+      "type": "performance",
+      "description": "Measures throughput with a Lua/scripting transform (baseline overhead)",
+      "count": 1
+    },
+    {
+      "test": "real_world_1_performance",
+      "file": "real_world_1_performance.json",
+      "type": "performance",
+      "description": "Simulates a real-world pipeline with parsing, filtering, and routing",
+      "count": 2
+    },
+    {
+      "test": "regex_mask_performance",
+      "file": "regex_mask_performance.json",
+      "type": "performance",
+      "description": "Measures throughput of a TCP-in to TCP-out pipeline with a regex mask applied to every record (e.g. CONN=\u003cdigits\u003e → CONN=***).",
+      "count": 3
+    },
+    {
+      "test": "regex_parsing_performance",
+      "file": "regex_parsing_performance.json",
+      "type": "performance",
+      "description": "Measures throughput with a regex parsing transform in the pipeline",
+      "count": 0
+    },
+    {
+      "test": "sighup_correctness",
+      "file": "sighup_correctness.json",
+      "type": "correctness",
+      "description": "Verifies no data loss during config reload via SIGHUP",
+      "count": 0
+    },
+    {
+      "test": "tcp_to_blackhole_performance",
+      "file": "tcp_to_blackhole_performance.json",
+      "type": "performance",
+      "description": "Measures baseline overhead of receiving TCP with no output (blackhole sink)",
+      "count": 11
+    },
+    {
+      "test": "tcp_to_blackhole_persistent_performance",
+      "file": "tcp_to_blackhole_persistent_performance.json",
+      "count": 5
+    },
+    {
+      "test": "tcp_to_http_5min_performance",
+      "file": "tcp_to_http_5min_performance.json",
+      "type": "performance",
+      "description": "Measures sustained throughput of TCP-in to HTTP-out pipeline (5 minutes)",
+      "count": 0
+    },
+    {
+      "test": "tcp_to_http_performance",
+      "file": "tcp_to_http_performance.json",
+      "type": "performance",
+      "description": "Measures throughput of TCP-in to HTTP-out pipeline",
+      "count": 11
+    },
+    {
+      "test": "tcp_to_http_persistent_correctness",
+      "file": "tcp_to_http_persistent_correctness.json",
+      "type": "persistence_correctness",
+      "description": "Verifies that logs sent while the HTTP receiver is down are persisted and delivered once the receiver starts",
+      "count": 1,
+      "has_pass": true
+    },
+    {
+      "test": "tcp_to_tcp_5min_performance",
+      "file": "tcp_to_tcp_5min_performance.json",
+      "type": "performance",
+      "description": "Measures sustained throughput of a TCP-in to TCP-out pipeline with no transforms (5 minutes)",
+      "count": 5
+    },
+    {
+      "test": "tcp_to_tcp_performance",
+      "file": "tcp_to_tcp_performance.json",
+      "type": "performance",
+      "description": "Measures throughput of a TCP-in to TCP-out pipeline with no transforms",
+      "count": 14
+    },
+    {
+      "test": "tcp_to_tcp_persistent_correctness",
+      "file": "tcp_to_tcp_persistent_correctness.json",
+      "type": "persistence_correctness",
+      "description": "Verifies that logs sent while the receiver is down are persisted and delivered once the receiver starts",
+      "count": 4,
+      "has_pass": true
+    },
+    {
+      "test": "tcp_to_tcp_persistent_performance",
+      "file": "tcp_to_tcp_persistent_performance.json",
+      "type": "performance",
+      "description": "Measures throughput of a TCP-in to TCP-out pipeline with disk persistence enabled",
+      "count": 7
+    },
+    {
+      "test": "tcp_to_tcp_persistent_restart_correctness",
+      "file": "tcp_to_tcp_persistent_restart_correctness.json",
+      "type": "persistence_restart_correctness",
+      "description": "Verifies durable persistence across a subject restart: send logs, stop subject, start receiver, restart subject, verify all logs arrive",
+      "count": 3,
+      "has_pass": true
+    },
+    {
+      "test": "wrapped_json_correctness",
+      "file": "wrapped_json_correctness.json",
+      "type": "correctness",
+      "description": "Verifies JSON-in-string fields are parsed and re-emitted correctly",
+      "count": 0
+    }
+  ]
+}

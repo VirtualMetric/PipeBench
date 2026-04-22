@@ -1,0 +1,38 @@
+name: tcp_to_http_persistent_correctness
+type: persistence_correctness
+description: "Verifies that logs sent while the HTTP receiver is down are persisted and delivered once the receiver starts"
+
+duration: 10s
+warmup: 10s
+
+generator:
+  mode: tcp
+  target: "subject:9000"
+  rate: 100000
+  line_size: 256
+  format: raw
+  connections: 4
+
+receiver:
+  mode: http
+  listen: ":9001"
+
+subjects:
+  - vmetric
+  - vector
+  - fluent-bit
+  - fluentd
+  - logstash
+  - nxlog
+  - axosyslog
+  - tenzir
+  - cribl-stream
+
+correctness:
+  validate_order: false
+  validate_dedup: false
+  expected_loss_pct: 0.0
+
+configurations:
+  default:
+    description: "Send logs with HTTP receiver down, start receiver, verify all logs arrive"

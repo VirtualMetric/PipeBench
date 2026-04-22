@@ -1,0 +1,19 @@
+devices:
+  - id: 1
+    name: tcp-bench
+    type: tcp
+    properties:
+      address: "0.0.0.0"
+      port: 9000
+targets:
+  - name: tcp-target-bench
+    type: tcp
+    properties:
+      address: "receiver"
+      port: 9001
+routes:
+  - name: tcp-to-tcp-bench
+    devices:
+      - name: tcp-bench
+    targets:
+      - name: tcp-target-bench

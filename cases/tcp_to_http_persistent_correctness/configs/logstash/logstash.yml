@@ -1,0 +1,5 @@
+path.config: /usr/share/logstash/config/logstash.conf
+queue.type: persisted
+queue.max_bytes: 2gb
+path.queue: /usr/share/logstash/data/queue
+pipeline.batch.size: 1000

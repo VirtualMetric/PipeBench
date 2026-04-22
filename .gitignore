@@ -1,0 +1,9 @@
+bin/
+/results/
+/tmp/
+*.csv
+*.log
+*.exe
+
+# vmetric director binary — built locally via build.sh, too large for GitHub
+containers/vmetric/director

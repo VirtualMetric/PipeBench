@@ -1,0 +1,62 @@
+{
+  "test": "regex_mask_performance",
+  "results": [
+    {
+      "test": "regex_mask_performance",
+      "subject": "logstash",
+      "hardware": "custom",
+      "version": "8.13.0",
+      "config": "default",
+      "timestamp": "2026-04-21T15:27:16.8960611+02:00",
+      "duration_secs": 60.075,
+      "lines_in": 12695114,
+      "lines_out": 12688554,
+      "bytes_out": 3755774166,
+      "loss_pct": 0.05167342333436409,
+      "lines_per_sec": 211211.88514357051,
+      "avg_cpu_pct": 165.6516142123292,
+      "max_cpu_pct": 551.8605374417772,
+      "avg_mem_mb": 1268.996951219512,
+      "max_mem_mb": 1393.12890625,
+      "io_avg_bytes_per_sec": 189219431.36585367
+    },
+    {
+      "test": "regex_mask_performance",
+      "subject": "vector",
+      "hardware": "custom",
+      "version": "0.54.0-alpine",
+      "config": "default",
+      "timestamp": "2026-04-21T22:51:51.7522301+02:00",
+      "duration_secs": 64.104,
+      "lines_in": 65803247,
+      "lines_out": 65778019,
+      "bytes_out": 16904950883,
+      "loss_pct": 0.038338533659287855,
+      "lines_per_sec": 1026114.1114439036,
+      "avg_cpu_pct": 382.797319095778,
+      "max_cpu_pct": 500.2660919956537,
+      "avg_mem_mb": 422.7597128378378,
+      "max_mem_mb": 496.703125,
+      "io_avg_bytes_per_sec": 923192756.4864864
+    },
+    {
+      "test": "regex_mask_performance",
+      "subject": "vmetric",
+      "hardware": "custom",
+      "version": "latest",
+      "config": "default",
+      "timestamp": "2026-04-22T09:08:35.2876507+02:00",
+      "duration_secs": 66.693,
+      "lines_in": 130820020,
+      "lines_out": 130816394,
+      "bytes_out": 41454254460,
+      "loss_pct": 0.002771747015484216,
+      "lines_per_sec": 1961471.128904083,
+      "avg_cpu_pct": 1034.0923940093658,
+      "max_cpu_pct": 1988.295909090909,
+      "avg_mem_mb": 458.58929869186045,
+      "max_mem_mb": 877.20703125,
+      "io_avg_bytes_per_sec": 1748782100.4186046
+    }
+  ]
+}

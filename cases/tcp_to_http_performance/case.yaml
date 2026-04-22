@@ -1,0 +1,35 @@
+name: tcp_to_http_performance
+type: performance
+description: "Measures throughput of TCP-in to HTTP-out pipeline"
+
+duration: 60s
+warmup: 10s
+
+generator:
+  mode: tcp
+  target: "subject:9000"
+  rate: 0
+  line_size: 256
+  format: raw
+  connections: 4
+
+receiver:
+  mode: http
+  listen: ":9001"
+
+subjects:
+  - vector
+  - fluent-bit
+  - fluentd
+  - logstash
+  - filebeat
+  - cribl-stream
+  - telegraf
+  - nxlog
+  - axosyslog
+  - tenzir
+  - vmetric
+
+configurations:
+  default:
+    description: "Receive TCP, POST to HTTP endpoint"

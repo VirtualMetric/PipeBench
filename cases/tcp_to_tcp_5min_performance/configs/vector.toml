@@ -1,0 +1,21 @@
+# Vector configuration for tcp_to_tcp_performance
+# Receives raw log lines over TCP on port 9000, forwards them to the receiver on port 9001.
+
+[sources.in]
+type = "socket"
+mode = "tcp"
+address = "0.0.0.0:9000"
+decoding.codec = "bytes"
+framing.method = "newline_delimited"
+
+[sinks.out]
+type = "socket"
+mode = "tcp"
+inputs = ["in"]
+address = "receiver:9001"
+
+[sinks.out.encoding]
+codec = "text"
+
+[sinks.out.framing]
+method = "newline_delimited"

@@ -1,0 +1,9 @@
+[sources.in]
+type = "socket"
+mode = "tcp"
+address = "0.0.0.0:9000"
+
+[sinks.out]
+type = "blackhole"
+inputs = ["in"]
+print_interval_secs = 0

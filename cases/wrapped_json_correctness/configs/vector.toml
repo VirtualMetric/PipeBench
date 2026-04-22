@@ -1,0 +1,18 @@
+[sources.in]
+type = "socket"
+mode = "tcp"
+address = "0.0.0.0:9000"
+
+[transforms.parse_json]
+type = "remap"
+inputs = ["in"]
+source = '''
+. = parse_json!(string!(.message))
+'''
+
+[sinks.out]
+type = "socket"
+mode = "tcp"
+inputs = ["parse_json"]
+address = "receiver:9001"
+encoding.codec = "json"

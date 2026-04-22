@@ -1,0 +1,11 @@
+[sources.in]
+type = "file"
+include = ["/data/input.log"]
+read_from = "beginning"
+
+[sinks.out]
+type = "socket"
+mode = "tcp"
+inputs = ["in"]
+address = "receiver:9001"
+encoding.codec = "text"

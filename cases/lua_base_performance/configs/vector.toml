@@ -1,0 +1,19 @@
+[sources.in]
+type = "socket"
+mode = "tcp"
+address = "0.0.0.0:9000"
+
+# VRL passthrough — measures scripting engine overhead
+[transforms.script]
+type = "remap"
+inputs = ["in"]
+source = '''
+.processed = true
+'''
+
+[sinks.out]
+type = "socket"
+mode = "tcp"
+inputs = ["script"]
+address = "receiver:9001"
+encoding.codec = "text"

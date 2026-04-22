@@ -1,0 +1,33 @@
+devices:
+  - id: 1
+    name: tcp-bench
+    type: tcp
+    properties:
+      address: "0.0.0.0"
+      port: 9000
+targets:
+  - name: tcp-target-bench
+    type: tcp
+    properties:
+      address: "receiver"
+      port: 9001
+routes:
+  - name: tcp-to-tcp-bench
+    devices:
+      - name: tcp-bench
+    pipelines:
+      - name: real-world
+    targets:
+      - name: tcp-target-bench
+# Real-world shape: parse syslog → drop debug → forward.
+# Mirrors the Vector remap+filter pipeline in configs/vector.toml.
+pipelines:
+  - name: real-world
+    processors:
+      - syslog:
+          field: message
+          ignore_missing: true
+          ignore_failure: true
+      - drop:
+          if: 'log?.syslog?.severity?.name == "Debug"'
+          ignore_failure: true

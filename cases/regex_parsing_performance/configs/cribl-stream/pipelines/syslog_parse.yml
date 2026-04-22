@@ -1,0 +1,14 @@
+id: syslog_parse
+conf:
+  output: default
+  groups: {}
+  asyncFuncTimeout: 1000
+  functions:
+    - id: parser
+      filter: "true"
+      disabled: false
+      conf:
+        mode: extract
+        type: regex
+        srcField: _raw
+        regex: "/<(?<priority>\\d+)>(?<timestamp>\\S+) (?<host>\\S+) (?<program>\\S+?)(?:\\[(?<pid>\\d+)\\])?: (?<msg>.*)/"

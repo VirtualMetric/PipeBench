@@ -1,0 +1,37 @@
+name: disk_buffer_persistence_correctness
+type: correctness
+description: "Verifies events survive subject restart when disk buffering is enabled"
+
+duration: 60s
+warmup: 10s
+
+generator:
+  mode: tcp
+  target: "subject:9000"
+  rate: 1000
+  line_size: 256
+  format: raw
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+subjects:
+  - vmetric
+  - vector
+  - fluent-bit
+  - fluentd
+  - logstash
+  - nxlog
+  - axosyslog
+  - tenzir
+  - cribl-stream
+
+correctness:
+  validate_order: false
+  validate_dedup: true
+  expected_loss_pct: 0.0
+
+configurations:
+  default:
+    description: "Disk buffer enabled, subject will be restarted mid-test"

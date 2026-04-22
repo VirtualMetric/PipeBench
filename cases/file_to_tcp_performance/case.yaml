@@ -1,0 +1,33 @@
+name: file_to_tcp_performance
+type: performance
+description: "Measures throughput of tailing a file and forwarding over TCP"
+
+duration: 60s
+warmup: 10s
+
+generator:
+  mode: file
+  target: "/data/input.log"
+  rate: 0
+  line_size: 256
+  format: raw
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+subjects:
+  - vector
+  - fluent-bit
+  - fluentd
+  - logstash
+  - filebeat
+  - telegraf
+  - nxlog
+  - axosyslog
+  - tenzir
+  - cribl-stream
+
+configurations:
+  default:
+    description: "Tail a file, forward over TCP"

@@ -1,0 +1,10 @@
+tenzir:
+  pipelines:
+    file-to-tcp:
+      name: File tail to TCP
+      restart-on-error: 5 seconds
+      definition: |
+        load_file "/data/input.log", follow=true
+        read_lines
+        write_lines
+        save_tcp "receiver:9001"

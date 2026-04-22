@@ -1,0 +1,37 @@
+name: file_rotate_truncate_correctness
+type: correctness
+description: "Verifies no data loss when log files are rotated by truncation"
+
+duration: 60s
+warmup: 10s
+
+generator:
+  mode: file
+  target: "/data/input.log"
+  rate: 500
+  line_size: 256
+  format: raw
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+subjects:
+  - vector
+  - fluent-bit
+  - fluentd
+  - filebeat
+  - logstash
+  - nxlog
+  - axosyslog
+  - tenzir
+  - cribl-stream
+
+correctness:
+  validate_order: true
+  validate_dedup: false
+  expected_loss_pct: 0.0
+
+configurations:
+  default:
+    description: "Tail file with truncation-based rotation"

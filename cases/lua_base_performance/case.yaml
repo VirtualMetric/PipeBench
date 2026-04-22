@@ -1,0 +1,32 @@
+name: lua_base_performance
+type: performance
+description: "Measures throughput with a Lua/scripting transform (baseline overhead)"
+
+duration: 60s
+warmup: 10s
+
+generator:
+  mode: tcp
+  target: "subject:9000"
+  rate: 0
+  line_size: 256
+  format: raw
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+subjects:
+  - vmetric
+  - vector
+  - fluent-bit
+  - fluentd
+  - logstash
+  - nxlog
+  - axosyslog
+  - tenzir
+  - cribl-stream
+
+configurations:
+  default:
+    description: "TCP in, Lua/VRL passthrough transform, TCP out"

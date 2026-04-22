@@ -1,0 +1,28 @@
+# Vector configuration for regex_mask_performance.
+# Every incoming line has CONN=<digits> rewritten to CONN=*** before forwarding.
+
+[sources.in]
+type = "socket"
+mode = "tcp"
+address = "0.0.0.0:9000"
+decoding.codec = "bytes"
+framing.method = "newline_delimited"
+
+[transforms.mask]
+type = "remap"
+inputs = ["in"]
+source = '''
+.message = replace(string!(.message), r'CONN=\d+', "CONN=***")
+'''
+
+[sinks.out]
+type = "socket"
+mode = "tcp"
+inputs = ["mask"]
+address = "receiver:9001"
+
+[sinks.out.encoding]
+codec = "text"
+
+[sinks.out.framing]
+method = "newline_delimited"

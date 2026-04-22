@@ -1,0 +1,983 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>PipeBench — Data Pipeline Benchmark</title>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="icon" type="image/png" href="favicon.png">
+    <link href="https://fonts.googleapis.com/css2?family=Inter&display=swap" rel="stylesheet">
+
+    <style>
+        :root {
+            --color: black;
+            --title-color: black;
+            --background-color: white;
+
+            --link-color: #08F;
+            --link-hover-color: #F40;
+
+            --selector-text-color: black;
+            --selector-active-text-color: black;
+            --selector-background-color: #EEE;
+            --selector-active-background-color: #FFCB80;
+            --selector-hover-text-color: black;
+            --selector-hover-background-color: #FDB;
+
+            --summary-every-other-row-color: #F8F8F8;
+            --highlight-color: #EEE;
+
+            --bar-color1: oklch(calc(0.9 - 0.6) 0.1 calc(90 - 60));
+            --bar-color2: oklch(calc(0.9 - 0.4) 0.1 calc(90 - 40));
+            --bar-color3: oklch(calc(0.9 - 0.1) 0.1 calc(90 - 20));
+            --bar-color4: oklch(0.9 0.1 90);
+
+            --bar-color: #FFCB80;
+            --fake-bar-color: #CCC;
+
+            --tooltip-text-color: white;
+            --tooltip-background-color: black;
+
+            --nothing-selected-color: #CCC;
+            --shadow-color: grey;
+        }
+
+        [data-theme="dark"] {
+            --color: #CCC;
+            --title-color: white;
+            --background-color: #04293A;
+
+            --link-color: #8CF;
+            --link-hover-color: #FFF;
+
+            --selector-text-color: white;
+            --selector-background-color: #444;
+            --selector-active-text-color: white;
+            --selector-active-background-color: #088;
+            --selector-hover-text-color: black;
+            --selector-hover-background-color: white;
+
+            --summary-every-other-row-color: #042e41;
+            --highlight-color: #064663;
+
+            --bar-color1: oklch(calc(0.4 + 0.6) 0.1 calc(250 - 180));
+            --bar-color2: oklch(calc(0.4 + 0.4) 0.1 calc(250 - 120));
+            --bar-color3: oklch(calc(0.4 + 0.2) 0.1 calc(250 - 60));
+            --bar-color4: oklch(0.4 0.1 250);
+
+            --bar-color: #088;
+            --fake-bar-color: #666;
+
+            --tooltip-text-color: white;
+            --tooltip-background-color: #444;
+
+            --nothing-selected-color: #666;
+            --shadow-color: black;
+        }
+
+        html, body {
+            color: var(--color);
+            background-color: var(--background-color);
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            overflow: auto;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            padding: 1% 3% 0 3%;
+        }
+
+        h1 {
+            color: var(--title-color);
+        }
+
+        table {
+             border-spacing: 1px;
+        }
+
+        .stick-left {
+            position: sticky;
+            left: 0px;
+        }
+
+        .selectors-container {
+            padding: 2rem 0 2rem 0;
+            user-select: none;
+        }
+
+        .selectors-container th {
+            text-align: left;
+            vertical-align: top;
+            white-space: nowrap;
+            padding-top: 0.5rem;
+            padding-right: 1rem;
+        }
+
+        .selector {
+            display: inline-block;
+            margin-left: 0.1rem;
+            padding: 0.2rem 0.5rem 0.2rem 0.5rem;
+            background: var(--selector-background-color);
+            color: var(--selector-text-color);
+            border: 0.2rem solid var(--background-color);
+            border-radius: 0.5rem;
+        }
+
+        .selector-active {
+            color: var(--selector-active-text-color);
+            background: var(--selector-active-background-color);
+        }
+
+        a, a:visited {
+            text-decoration: none;
+            color: var(--link-color);
+            cursor: pointer;
+        }
+
+        a:hover {
+            color: var(--link-hover-color);
+        }
+
+        .selector:hover {
+            color: var(--selector-hover-text-color) !important;
+            background: var(--selector-background-color);
+        }
+
+        .selector-active:hover {
+            background: var(--selector-hover-background-color);
+        }
+
+        #summary tr:nth-child(odd) {
+            background: var(--summary-every-other-row-color);
+        }
+
+        .summary-name {
+            white-space: nowrap;
+            text-align: right;
+            padding-right: 1rem;
+        }
+
+        .summary-bar-cell {
+            width: 100%;
+        }
+
+        .summary-bar {
+            height: 1rem;
+            width: 100%;
+        }
+
+        .summary-bar-fake {
+            height: 1rem;
+            background: var(--fake-bar-color);
+            border-radius: 0 0.2rem 0.2rem 0;
+        }
+
+        .summary-number {
+            font-family: monospace;
+            text-align: right;
+            padding-left: 1rem;
+            white-space: nowrap;
+        }
+
+        th {
+            padding-bottom: 0.5rem;
+        }
+
+        .th-entry-hilite {
+            background: var(--highlight-color);
+            font-weight: bold;
+        }
+
+        .summary-row:hover, .summary-row-hilite {
+            background: var(--highlight-color) !important;
+            font-weight: bold;
+        }
+
+        #details {
+            padding-bottom: 1rem;
+        }
+
+        #details th {
+            vertical-align: bottom;
+            /* Long subject names (e.g. "bindplane-agent") expand the column
+               to fit on a single line — no wrapping, no truncation. */
+            white-space: nowrap;
+            padding: 0 0.5rem 0.25rem 0.5rem;
+            text-align: center;
+        }
+
+        #details td {
+            white-space: pre;
+            font-family: monospace;
+            text-align: right;
+            padding: 0.1rem 0.5rem 0.1rem 0.5rem;
+        }
+
+        .shadow:hover {
+            box-shadow: 0 0 1rem var(--shadow-color);
+            position: relative;
+        }
+
+        #nothing-selected {
+            display: none;
+            font-size: 32pt;
+            font-weight: bold;
+            color: var(--nothing-selected-color);
+        }
+
+        .note {
+            position: relative;
+            display: inline-block;
+        }
+
+        .tooltip {
+            position: absolute;
+            bottom: calc(100% + 0.5rem);
+            visibility: hidden;
+            background-color: var(--tooltip-background-color);
+            color: var(--tooltip-text-color);
+            box-shadow: 0 0 1rem var(--shadow-color);
+            padding: 0.5rem 0.75rem;
+            border-radius: 0.5rem;
+            z-index: 1;
+            text-align: left;
+            white-space: normal;
+        }
+
+        .tooltip-result {
+            left: calc(50% - 0.25rem);
+            width: 20rem;
+            margin-left: -10rem;
+        }
+
+        .tooltip-query {
+            left: 0;
+            width: 40rem;
+            margin-left: -3rem;
+        }
+
+        .note:hover .tooltip {
+            visibility: visible;
+        }
+
+        .tooltip::after {
+            content: " ";
+            position: absolute;
+            top: 100%;
+            border-width: 0.5rem;
+            border-style: solid;
+            border-color: var(--tooltip-background-color) transparent transparent transparent;
+        }
+
+        .tooltip-result::after {
+            left: 50%;
+            margin-left: -1rem;
+        }
+
+        .tooltip-query::after {
+            left: 3rem;
+            margin-left: 0.5rem;
+        }
+
+        .nowrap {
+            text-wrap: none;
+        }
+
+        .themes {
+            float: right;
+            font-size: 200%;
+            cursor: pointer;
+        }
+
+        #toggle-dark, #toggle-light {
+            padding-right: 0.5rem;
+            cursor: pointer;
+        }
+
+        #toggle-dark:hover, #toggle-light:hover {
+            display: inline-block;
+            transform: translate(1px, 1px);
+            filter: brightness(125%);
+        }
+
+        #scale_hint {
+            font-weight: normal;
+            font-size: 80%;
+            filter: contrast(10%);
+        }
+    </style>
+    <script type="text/javascript">
+
+let queries = [];
+let data = [];
+let pipeData = null;
+const TEST_TYPES = {};
+
+    </script>
+</head>
+<body>
+
+<div class="header stick-left">
+    <span class="nowrap themes"><span id="toggle-dark">🌚</span><span id="toggle-light">🌞</span></span>
+    <h1>PipeBench — Data Pipeline Benchmark</h1>
+    <a href="https://github.com/VirtualMetric/virtualmetric-bench">Methodology</a> | <a href="https://github.com/VirtualMetric/virtualmetric-bench">Reproduce</a> | <a href="https://github.com/VirtualMetric/virtualmetric-bench">Add a System</a> | <a href="https://github.com/VirtualMetric/virtualmetric-bench">Report Mistake</a> | See also: <a href="https://benchmark.clickhouse.com/">ClickBench</a>, <a href="https://github.com/ClickHouse/JSONBench">JSONBench</a>
+</div>
+
+<table class="selectors-container stick-left">
+    <tr>
+        <th>System: </th>
+        <td id="selectors_system">
+            <a id="select-all-systems" class="selector selector-active">All</a>
+        </td>
+    </tr>
+    <tr>
+        <th>Hardware: </th>
+        <td id="selectors_hardware">
+        </td>
+    </tr>
+    <tr>
+        <th>Metric: </th>
+        <td id="selectors_run">
+            <a class="selector selector-active" id="selector-metric-eps">EPS</a>
+            <a class="selector" id="selector-metric-throughput">Throughput</a>
+            <a class="selector" id="selector-metric-correctness">Correctness</a>
+        </td>
+    </tr>
+</table>
+
+<table class="stick-left comparison">
+    <thead>
+        <tr>
+            <th class="summary-name">
+                System
+            </th>
+            <th colspan="2">
+                <span id="metric-title">Relative time (lower is better)</span>.<br/>
+                <span id="scale_hint"></span>
+            </th>
+        </tr>
+    </thead>
+    <tbody id="summary">
+    </tbody>
+</table>
+
+<div id="nothing-selected" class="stick-left">Nothing selected</div>
+
+<div class="stick-left comparison">
+    <h2>Detailed Comparison</h2>
+</div>
+
+<table id="details">
+    <thead>
+        <tr id="details_head">
+        </tr>
+    </thead>
+    <tbody id="details_body">
+    </tbody>
+</table>
+
+<script type="text/javascript">
+
+const constant_time_add = 0.01;
+const missing_result_penalty = 2;
+const missing_result_time = 3600;
+
+let selectors = {
+    "system": {},
+    "hardware": null,
+    "metric": "eps",
+    "queries": [],
+};
+
+let theme = 'light';
+
+function setTheme(new_theme) {
+    theme = new_theme;
+    document.documentElement.setAttribute('data-theme', theme);
+    window.localStorage.setItem('theme', theme);
+    render();
+}
+
+document.getElementById('toggle-light').addEventListener('click', e => setTheme('light'));
+document.getElementById('toggle-dark').addEventListener('click', e => setTheme('dark'));
+
+let new_theme = window.localStorage.getItem('theme');
+if (new_theme && new_theme != theme) {
+    setTheme(new_theme);
+}
+
+/// Generate selectors (PipeBench adapter)
+
+let systems = document.getElementById('selectors_system');
+let hardwares = document.getElementById('selectors_hardware');
+
+function toggle(e, elem, selectors_map) {
+    selectors_map[elem] = !selectors_map[elem];
+    if (selectors_map[elem]) {
+        e.target.classList.add('selector-active');
+    } else {
+        e.target.classList.remove('selector-active');
+    }
+    render();
+    updateHistory();
+}
+
+function switchTo(e, selector) {
+    [...e.target.parentElement.querySelectorAll('a')].map(elem => {
+        elem.className = elem == e.target ? 'selector selector-active' : 'selector'
+    });
+    if (selector) selectors[selector] = e.target.dataset.value;
+    render();
+    updateHistory();
+}
+
+function toggleAll(e, selectors_map) {
+    const new_value = Object.keys(selectors_map).filter(k => selectors_map[k]).length * 2 < Object.keys(selectors_map).length;
+    [...e.target.parentElement.querySelectorAll('a')].map(
+        elem => { elem.className = new_value ? 'selector selector-active' : 'selector' });
+
+    Object.keys(selectors_map).map(k => { selectors_map[k] = new_value });
+    render();
+    updateHistory();
+}
+
+// Classify a test into one of three metric buckets. EPS and Throughput share
+// the same "perf" tests; Correctness uses dedicated correctness tests.
+function classifyTest(name) {
+    return name.includes('correctness') ? 'correctness' : 'perf';
+}
+
+function metricBucket() {
+    return selectors.metric === 'correctness' ? 'correctness' : 'perf';
+}
+
+// Extract the per-test value used for ranking, or null if missing/invalid.
+// Returns a "timing" where lower = better (so JSONBench's ratio math works unchanged).
+function metricTiming(r) {
+    if (!r) return null;
+    if (selectors.metric === 'correctness') {
+        if (r.passed == null) return null;
+        return r.passed ? 1 : 1000;  // 1× vs 1000× so failures darken
+    }
+    if (selectors.metric === 'eps') {
+        if (!r.lines_per_sec || r.lines_per_sec <= 0) return null;
+        return 1e9 / r.lines_per_sec; // seconds per billion records
+    }
+    // throughput (MB/s): derive bytes/sec from bytes_out and duration
+    if (!r.bytes_out || !r.duration_secs) return null;
+    const bps = r.bytes_out / r.duration_secs;
+    if (bps <= 0) return null;
+    return 1e12 / bps; // picoseconds per byte — lower = faster
+}
+
+function rebuildData() {
+    if (!pipeData) return;
+    const bucket = metricBucket();
+    queries = pipeData.tests.filter(t => {
+        if (classifyTest(t) !== bucket) return false;
+        // Drop tests where no subject produced a usable value on this hardware
+        // (e.g. blackhole tests have lines_per_sec=0 for everyone, which poisons
+        // the geometric-mean baseline and makes sort fall back to alphabetical).
+        return pipeData.results.some(r =>
+            r.test === t &&
+            r.hardware === selectors.hardware &&
+            metricTiming(r) !== null);
+    });
+
+    const bySubject = new Map();
+    pipeData.results.forEach(r => {
+        if (r.hardware !== selectors.hardware) return;
+        if (classifyTest(r.test) !== bucket) return;
+        let row = bySubject.get(r.subject);
+        if (!row) {
+            row = {
+                system: r.subject,
+                version: r.version || 'latest',
+                os: 'n/a',
+                date: (r.timestamp || '').slice(0, 10),
+                machine: r.hardware,
+                retains_structure: 'yes',
+                tags: [],
+                dataset_size: 1,
+                num_loaded_documents: 1,
+                total_size: null,
+                _byTest: {}
+            };
+            bySubject.set(r.subject, row);
+        }
+        row._byTest[r.test] = r;
+    });
+
+    data = [];
+    bySubject.forEach(row => {
+        row.result = queries.map(t => {
+            const v = metricTiming(row._byTest[t]);
+            return v == null ? [null, null, null] : [v, v, v];
+        });
+        data.push(row);
+    });
+    selectors.queries = queries.map(() => true);
+}
+
+function buildHardwarePills() {
+    clearElement(hardwares);
+    pipeData.hardwares.forEach((hw, idx) => {
+        const a = document.createElement('a');
+        const active = hw === selectors.hardware;
+        a.className = 'selector' + (active ? ' selector-active' : '');
+        a.dataset.hw = hw;
+        a.appendChild(document.createTextNode(hw));
+        a.addEventListener('click', () => {
+            selectors.hardware = hw;
+            [...hardwares.querySelectorAll('a')].forEach(x => {
+                x.className = x.dataset.hw === hw ? 'selector selector-active' : 'selector';
+            });
+            rebuildData();
+            render();
+            updateHistory();
+        });
+        hardwares.appendChild(a);
+    });
+}
+
+function buildSystemPills() {
+    clearElement(systems);
+    const allBtn = document.createElement('a');
+    allBtn.id = 'select-all-systems';
+    allBtn.className = 'selector selector-active';
+    allBtn.appendChild(document.createTextNode('All'));
+    systems.appendChild(allBtn);
+
+    pipeData.subjects.forEach(s => {
+        const a = document.createElement('a');
+        a.className = 'selector selector-active';
+        a.dataset.name = s;
+        a.appendChild(document.createTextNode(s));
+        systems.appendChild(a);
+        selectors.system[s] = true;
+        a.addEventListener('click', e => toggle(e, s, selectors.system));
+        a.addEventListener('mouseover', () => {
+            [...document.querySelectorAll('.summary-row')].forEach(row => {
+                row.className = row.dataset.system == s ? 'summary-row summary-row-hilite' : 'summary-row';
+            });
+            [...document.querySelectorAll('.th-entry')].forEach(th => {
+                th.className = th.dataset.system == s ? 'th-entry th-entry-hilite' : 'th-entry';
+            });
+        });
+        a.addEventListener('mouseout', () => {
+            [...document.querySelectorAll('.summary-row')].forEach(row => { row.className = 'summary-row'; });
+            [...document.querySelectorAll('.th-entry')].forEach(th => { th.className = 'th-entry'; });
+        });
+    });
+    allBtn.addEventListener('click', e => toggleAll(e, selectors.system));
+}
+
+function makeMetricHandler(metric) {
+    return e => {
+        [...e.target.parentElement.querySelectorAll('a')].forEach(a => a.className = a === e.target ? 'selector selector-active' : 'selector');
+        selectors.metric = metric;
+        rebuildData();
+        render();
+        updateHistory();
+    };
+}
+document.getElementById('selector-metric-eps').addEventListener('click', makeMetricHandler('eps'));
+document.getElementById('selector-metric-throughput').addEventListener('click', makeMetricHandler('throughput'));
+document.getElementById('selector-metric-correctness').addEventListener('click', makeMetricHandler('correctness'));
+
+function updateSelectors() {
+    [...systems.childNodes].filter(elem => elem.tagName == 'A').forEach(elem => {
+        if (!elem.dataset.name) return;
+        elem.className = selectors.system[elem.dataset.name] ? 'selector selector-active' : 'selector';
+    });
+    [...hardwares.querySelectorAll('a')].forEach(elem => {
+        elem.className = elem.dataset.hw === selectors.hardware ? 'selector selector-active' : 'selector';
+    });
+    [...document.getElementById('selectors_run').querySelectorAll('a')].forEach(elem => {
+        elem.className = elem.id === 'selector-metric-' + selectors.metric ? 'selector selector-active' : 'selector';
+    });
+    [...document.querySelectorAll('.query-checkbox')].forEach((elem, i) => { elem.checked = selectors.queries[i]; });
+}
+
+function clearElement(elem)
+{
+    while (elem.firstChild) {
+        elem.removeChild(elem.lastChild);
+    }
+}
+
+function selectRun(timings) {
+    return selectors.metric == 'cold' ? timings[0] : (timings[1] !== null && timings[2] !== null ? Math.min(timings[1], timings[2]) : null)
+}
+
+function addNote(text) {
+    let note = document.createElement('sup');
+    note.className = 'note';
+    note.appendChild(document.createTextNode('†'));
+
+    let tooltip = document.createElement('span');
+    tooltip.className = 'tooltip tooltip-result';
+    tooltip.appendChild(document.createTextNode(text));
+
+    note.appendChild(tooltip);
+    return note;
+}
+
+function renderSummary(filtered_data) {
+    let table = document.getElementById('summary');
+    clearElement(table);
+
+    /// Generate summary
+
+    /// The algorithm: for each of the queries,
+    /// - if there is a result - take query duration, add 10 ms, and divide it to the corresponding value from the baseline,
+    /// - if there is no result - take the worse query duration across all query runs for this system and multiply by 2.
+    /// Take geometric mean across the queries.
+
+    let summary = {};
+
+    const num_queries = queries.length;
+
+    const baseline_data = [...queries.keys()].map(query_num =>
+        [...Array(3).keys()].map(run_num =>
+            Math.min(...filtered_data.filter(elem => !elem.fake && elem.result.length > 0).map(elem => elem.result[query_num][run_num]).filter(x => x != null))));
+
+    const min_load_time = Math.min(...filtered_data.map(elem => elem.load_time).filter(x => x));
+    const min_data_size = Math.min(...filtered_data.map(elem => elem.total_size).filter(x => x));
+
+    let summaries;
+    {
+        summaries = filtered_data.map(elem => {
+            let accumulator = 0;
+            let used_queries = 0;
+
+            const no_queries_selected = selectors.queries.filter(x => x).length == 0;
+
+            for (let i = 0; i < num_queries; ++i) {
+                if (no_queries_selected || selectors.queries[i]) {
+                    const fallback_timing = missing_result_penalty * Math.max(missing_result_time, ...filtered_data.filter(other => other.result.length > i).map(other => selectRun(other.result[i])));
+
+                    const curr_timing = elem.fake || elem.result.length <= i ? fallback_timing : selectRun(elem.result[i]) ?? fallback_timing;
+                    const baseline_timing = selectRun(baseline_data[i]);
+                    const ratio = (constant_time_add + curr_timing) / (constant_time_add + baseline_timing);
+                    accumulator += Math.log(ratio);
+                    ++used_queries;
+                }
+            }
+
+            return Math.exp(accumulator / used_queries);
+        });
+        const titles = {
+            eps:         'Events per second (×1 = fastest, lower = faster)',
+            throughput:  'Byte throughput (×1 = fastest, lower = faster)',
+            correctness: 'Correctness (passing = 1×, failing = 1000×)',
+        };
+        document.getElementById('metric-title').innerText = titles[selectors.metric];
+    }
+
+    const sorted_indices = [...summaries.keys()].sort((a, b) => summaries[a] - summaries[b]);
+    const max_ratio = summaries[sorted_indices[sorted_indices.length - 1]];
+
+    sorted_indices.map(idx => {
+        const elem = filtered_data[idx];
+
+        if (elem.fake) { return; }
+
+        let tr = document.createElement('tr');
+        tr.className = 'summary-row';
+
+        tr.dataset.system = elem.system;
+
+        let td_name = document.createElement('td');
+        td_name.className = 'summary-name';
+
+        let link = document.createElement('a');
+        link.appendChild(document.createTextNode(`${elem.system}`));
+        link.href = "https://github.com/VirtualMetric/virtualmetric-bench";
+        td_name.appendChild(link);
+
+        if (elem.comment) { td_name.appendChild(addNote(elem.comment)); }
+        td_name.appendChild(document.createTextNode(': '));
+
+        const ratio = summaries[idx];
+        const percentage = (summaries[idx] / max_ratio) * 100;
+
+        let td_number = document.createElement('td');
+        td_number.className = 'summary-number';
+
+        let text = `×${ratio.toFixed(2)}`;
+
+        td_number.appendChild(document.createTextNode(text));
+
+        let td_bar = document.createElement('td');
+        td_bar.className = 'summary-bar-cell';
+
+        let bar = document.createElement('div');
+
+        bar.className = elem.fake ? `summary-bar-fake` : `summary-bar`;
+        if (elem.fake) {
+            bar.style.width = `${percentage}%`;
+        } else {
+            bar.style.background = `linear-gradient(to right,
+                var(--bar-color1) 0%,
+                var(--bar-color1) ${Math.min(100, percentage)}%,
+                var(--bar-color2) ${Math.min(100, percentage)}%,
+                var(--bar-color2) ${Math.min(100, percentage * 10)}%,
+                var(--bar-color3) ${Math.min(100, percentage * 10)}%,
+                var(--bar-color3) ${Math.min(100, percentage * 100)}%,
+                var(--bar-color4) ${Math.min(100, percentage * 100)}%,
+                var(--bar-color4) ${Math.min(100, percentage * 1000)}%,
+                transparent ${Math.min(100, percentage * 1000)}%,
+                transparent 100%)`;
+        }
+
+        td_bar.appendChild(bar);
+
+        tr.appendChild(td_name);
+        tr.appendChild(td_bar);
+        tr.appendChild(td_number);
+        table.appendChild(tr);
+    });
+
+    return [sorted_indices, baseline_data];
+}
+
+function colorize(elem, ratio) {
+    let [r, g, b] = [0, 0, 0];
+
+    /// ratio less than 1 - green
+    /// ratio from 1 to 2 - green to yellow
+    /// ratio from 2 to 10 - yellow to red
+    /// ratio from 10 to 1000 to infinity - red to brown to black
+
+    /// Note: we are using RGB space without proper gamma correction. Read more: https://www.handprint.com/HP/WCL/color1.html
+
+    if (ratio !== null) {
+        if (ratio < 1) {
+            r = 232;
+            g = 255;
+            b = 232;
+        } else if (ratio <= 1) {
+            g = 255;
+        } else if (ratio <= 2) {
+            g = 255;
+            r = (ratio - 1) * 255;
+        } else if (ratio <= 10) {
+            g = (10 - ratio) / 8 * 255;
+            r = 255;
+        } else {
+            r = (1 - ((ratio - 10) / ((ratio - 10) + 1000))) * 255;
+        }
+    }
+
+    if (document.documentElement.getAttribute('data-theme') == 'dark') {
+        r /= 1.5;
+        g /= 1.5;
+        b /= 1.5;
+    }
+
+    elem.style.backgroundColor = `rgb(${r}, ${g}, ${b})`;
+    if (ratio === null || ratio > 10) {
+        /// This will look better on dark backgrounds
+        elem.style.color = 'white';
+    } else {
+        elem.style.color = 'black';
+    }
+
+    /// The best result is highlighted
+    if (ratio == 1) {
+        elem.style.fontWeight = 'bold';
+    }
+}
+
+function render() {
+    let details_head = document.getElementById('details_head');
+    let details_body = document.getElementById('details_body');
+
+    clearElement(details_head);
+    clearElement(details_body);
+
+    let filtered_data = data.filter(elem => selectors.system[elem.system]);
+
+    let nothing_selected_elem = document.getElementById('nothing-selected');
+    if (filtered_data.length == 0) {
+        nothing_selected_elem.style.display = 'block';
+        [...document.querySelectorAll('.comparison')].map(e => e.style.display = 'none');
+        return;
+    }
+    nothing_selected_elem.style.display = 'none';
+    [...document.querySelectorAll('.comparison')].map(e => e.style.display = 'block');
+
+    let [sorted_indices, baseline_data] = renderSummary(filtered_data);
+    sorted_indices = sorted_indices.filter(idx => !filtered_data[idx].fake);
+
+    /// Generate details
+
+    /// Global checkbox
+    {
+        let th_checkbox = document.createElement('th');
+        let checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.checked = true;
+        checkbox.addEventListener('change', e => {
+            [...document.querySelectorAll('.query-checkbox')].map(elem => { elem.checked = e.target.checked });
+            selectors.queries.map((_, i) => { selectors.queries[i] = e.target.checked });
+            renderSummary(filtered_data);
+            updateHistory();
+        });
+        th_checkbox.appendChild(checkbox);
+        details_head.appendChild(th_checkbox);
+        details_head.appendChild(document.createElement('th'));
+    }
+
+    /// Table header
+    sorted_indices.map(idx => {
+        const elem = filtered_data[idx];
+        let th = document.createElement('th');
+        th.appendChild(document.createTextNode(`${elem.system}`));
+        th.className = 'th-entry';
+        th.dataset.system = elem.system;
+        details_head.appendChild(th);
+    });
+
+    /// Per-test rows
+    const num_queries = queries.length;
+
+    for (let query_num = 0; query_num < num_queries; ++query_num) {
+        let tr = document.createElement('tr');
+        tr.className = 'shadow';
+
+        let td_checkbox = document.createElement('td');
+        let checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.className = 'query-checkbox';
+        checkbox.checked = selectors.queries[query_num];
+        checkbox.addEventListener('change', e => {
+            selectors.queries[query_num] = e.target.checked;
+            renderSummary(filtered_data);
+            updateHistory();
+        });
+        td_checkbox.appendChild(checkbox);
+        tr.appendChild(td_checkbox);
+
+        let td_query_num = document.createElement('td');
+        td_query_num.className = 'note';
+        td_query_num.appendChild(document.createTextNode(queries[query_num]));
+        tr.appendChild(td_query_num);
+
+        sorted_indices.map(idx => {
+            const curr_timing = filtered_data[idx].result.length > 0 ? selectRun(filtered_data[idx].result[query_num]) : null;
+            const baseline_timing = selectRun(baseline_data[query_num]);
+            const ratio = curr_timing !== null ? (constant_time_add + curr_timing) / (constant_time_add + baseline_timing) : null;
+
+            let td = document.createElement('td');
+            td.appendChild(document.createTextNode(formatCell(curr_timing, ratio)));
+
+            colorize(td, ratio);
+            tr.appendChild(td);
+        });
+
+        details_body.appendChild(tr);
+    }
+
+    /// The small hint below column heading
+    const hints = {
+        eps:         'Events per second in thousands; ratio compares each system against the fastest.',
+        throughput:  'Byte throughput in MB/s (bytes_out / duration); ratio compares each system against the fastest.',
+        correctness: 'Passing subjects get ratio 1×; failing subjects jump to 1000× and darken.',
+    };
+    document.getElementById("scale_hint").textContent = hints[selectors.metric];
+}
+
+// Format a timing cell for the currently selected metric. `curr_timing` is
+// always "lower = better" so JSONBench's ratio math works — this function
+// unwinds the transform to display a human-readable value.
+function formatCell(curr_timing, ratio) {
+    if (curr_timing === null) return '☠';
+    if (selectors.metric === 'correctness') {
+        return curr_timing > 1 ? `✗ (×${ratio.toFixed(2)})` : `✓`;
+    }
+    if (selectors.metric === 'eps') {
+        // curr_timing = 1e9 / lines_per_sec  →  eps = 1e9 / curr_timing.
+        // EPS is already events/sec, so K is a multiplier — no trailing "/s".
+        const eps = 1e9 / curr_timing;
+        return `${Math.round(eps / 1_000).toLocaleString()}K (×${ratio.toFixed(2)})`;
+    }
+    // throughput: curr_timing = 1e12 / bytes_per_sec  →  bytes/sec = 1e12 / curr_timing
+    const mbps = (1e12 / curr_timing) / 1_000_000;
+    return `${mbps.toFixed(1)} MB/s (×${ratio.toFixed(2)})`;
+}
+
+function updateHistory() {
+    history.pushState(selectors, '',
+        window.location.pathname + (window.location.search || '') + '#' + btoa(JSON.stringify(selectors)));
+}
+
+window.onpopstate = function(event) {
+    if (!event.state) { return; }
+    selectors = event.state;
+    rebuildData();
+    render();
+    updateSelectors();
+};
+
+if (window.location.hash) {
+    try {
+        selectors = Object.assign(selectors, JSON.parse(atob(window.location.hash.substring(1))));
+    } catch {}
+}
+
+const DATA_ROOT = 'data/';
+const t0 = performance.now();
+
+fetch(DATA_ROOT + 'index.json')
+    .then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status + ' on index.json')))
+    .then(index => {
+        const tIndex = performance.now();
+        return Promise.all(
+            (index.cases || []).map(c =>
+                fetch(DATA_ROOT + c.file)
+                    .then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status + ' on ' + c.file)))
+            )
+        ).then(caseDatas => {
+            const tAll = performance.now();
+            const results = [];
+            for (const cd of caseDatas) {
+                if (cd && Array.isArray(cd.results)) results.push(...cd.results);
+            }
+            pipeData = {
+                generated_at: index.generated_at,
+                subjects: index.subjects || [],
+                tests: index.tests || [],
+                hardwares: index.hardwares || [],
+                results: results,
+            };
+            console.log('[pipebench] index:', (tIndex - t0).toFixed(0) + 'ms',
+                        '+', (index.cases || []).length, 'case files:', (tAll - tIndex).toFixed(0) + 'ms',
+                        '| total:', (tAll - t0).toFixed(0) + 'ms');
+
+            pipeData.hardwares.sort((a, b) => a === 'custom' ? -1 : b === 'custom' ? 1 : a.localeCompare(b));
+            if (!selectors.hardware || !pipeData.hardwares.includes(selectors.hardware)) {
+                selectors.hardware = pipeData.hardwares[0] || null;
+            }
+            buildHardwarePills();
+            buildSystemPills();
+            rebuildData();
+            render();
+            updateSelectors();
+        });
+    })
+    .catch(err => {
+        document.body.innerHTML =
+            '<div style="padding:2rem;color:#c44;font-family:sans-serif">' +
+            '<h2>Failed to load benchmark data</h2><p>' + err.message + '</p>' +
+            '<p>Run <code>./bin/harness.exe report</code> to generate it, then reload.</p></div>';
+    });
+
+</script>
+</body>
+</html>

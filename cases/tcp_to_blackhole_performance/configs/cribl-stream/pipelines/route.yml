@@ -1,0 +1,12 @@
+id: default
+groups: {}
+comments: []
+routes:
+  - id: bench_route
+    name: bench_blackhole
+    final: true
+    disabled: false
+    pipeline: passthru
+    filter: "true"
+    output: devnull
+    description: "Route all data to devnull"

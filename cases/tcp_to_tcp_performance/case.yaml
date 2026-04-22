@@ -1,0 +1,42 @@
+name: tcp_to_tcp_performance
+type: performance
+description: "Measures throughput of a TCP-in to TCP-out pipeline with no transforms"
+
+# Total test duration (after warmup)
+duration: 60s
+# Wait for the subject to be ready before the generator starts sending
+warmup: 10s
+
+generator:
+  mode: tcp
+  # "subject" resolves to the subject container's hostname inside the bench network
+  target: "subject:9000"
+  rate: 0           # unlimited — push as fast as possible
+  line_size: 256    # bytes per log line
+  format: raw
+  connections: 4    # parallel TCP connections
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+subjects:
+  - vmetric
+  - vector
+  - fluent-bit
+  - fluentd
+  - logstash
+  - filebeat
+  - cribl-stream
+  - telegraf
+  - splunk-hf
+  - nxlog
+  - axosyslog
+  - tenzir
+  - otel-collector
+  - grafana-alloy
+  - bindplane-agent
+
+configurations:
+  default:
+    description: "No transforms — raw TCP passthrough"

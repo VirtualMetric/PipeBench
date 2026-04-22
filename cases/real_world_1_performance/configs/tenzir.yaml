@@ -1,0 +1,11 @@
+tenzir:
+  pipelines:
+    tcp-to-tcp-realworld:
+      name: TCP syslog parse + filter to TCP
+      restart-on-error: 5 seconds
+      definition: |
+        load_tcp "0.0.0.0:9000"
+        read_syslog
+        where severity != "debug"
+        write_json
+        save_tcp "receiver:9001"

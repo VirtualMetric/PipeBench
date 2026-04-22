@@ -1,0 +1,30 @@
+devices:
+  - id: 1
+    name: tcp-bench
+    type: tcp
+    properties:
+      address: "0.0.0.0"
+      port: 9000
+targets:
+  - name: tcp-target-bench
+    type: tcp
+    properties:
+      address: "receiver"
+      port: 9001
+routes:
+  - name: tcp-to-tcp-bench
+    devices:
+      - name: tcp-bench
+    pipelines:
+      - name: set-baseline
+    targets:
+      - name: tcp-target-bench
+# vmetric has no Lua processor. `set` is the cheapest per-record native
+# transform — it writes one literal field per record, giving a comparable
+# "minimum scripting-style overhead" baseline to what Lua/VRL do in others.
+pipelines:
+  - name: set-baseline
+    processors:
+      - set:
+          field: processed_by
+          value: "vmetric-pipeline"

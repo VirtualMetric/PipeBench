@@ -1,0 +1,32 @@
+name: real_world_1_performance
+type: performance
+description: "Simulates a real-world pipeline with parsing, filtering, and routing"
+
+duration: 60s
+warmup: 15s
+
+generator:
+  mode: tcp
+  target: "subject:9000"
+  rate: 0
+  line_size: 256
+  format: syslog
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+subjects:
+  - vmetric
+  - vector
+  - fluent-bit
+  - fluentd
+  - logstash
+  - nxlog
+  - axosyslog
+  - tenzir
+  - cribl-stream
+
+configurations:
+  default:
+    description: "Parse syslog, filter by level, route to output"

@@ -1,0 +1,20 @@
+# Vector configuration for tcp_to_tcp_performance — clean passthrough, no transforms.
+
+[sources.in]
+type = "socket"
+mode = "tcp"
+address = "0.0.0.0:9000"
+decoding.codec = "bytes"
+framing.method = "newline_delimited"
+
+[sinks.out]
+type = "socket"
+mode = "tcp"
+inputs = ["in"]
+address = "receiver:9001"
+
+[sinks.out.encoding]
+codec = "text"
+
+[sinks.out.framing]
+method = "newline_delimited"

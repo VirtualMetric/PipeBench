@@ -1,0 +1,28 @@
+PipeBench UI
+Copyright 2026 VirtualMetric
+
+---
+
+This UI is derived from JSONBench:
+  https://github.com/ClickHouse/JSONBench
+
+JSONBench is Copyright ClickHouse, Inc. and contributors, licensed under the
+Apache License, Version 2.0 (the "License"). See LICENSE for the full text.
+
+Modifications from the upstream JSONBench source:
+  - Page title and branding changed from JSONBench to PipeBench.
+  - Removed "Scale" and "Flattening" selectors (not applicable to pipeline
+    benchmarks).
+  - Metric radio buttons changed from {Cold Run, Hot Run, Storage Size,
+    Data Quality} to {Throughput, Correctness}.
+  - Embedded `data` array replaced with fetches to `data/index.json` and
+    per-case `data/<case>.json` files produced by `harness report`. The
+    UI fetches the index, then issues one parallel request per case, and
+    stitches the results into the same in-memory shape the original UI
+    consumed.
+  - Test selection is driven by the chosen metric (performance tests for
+    Throughput, correctness tests for Correctness).
+
+All other presentation logic — the summary geometric-mean ratio, cell
+colorize() thresholds, bar gradients, light/dark themes, link styles,
+URL hash selectors — is unchanged from the upstream source.

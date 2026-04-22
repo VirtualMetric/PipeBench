@@ -1,0 +1,18 @@
+[sources.in]
+type = "socket"
+mode = "tcp"
+address = "0.0.0.0:9000"
+
+[transforms.parse]
+type = "remap"
+inputs = ["in"]
+source = '''
+. = parse_syslog!(.message)
+'''
+
+[sinks.out]
+type = "socket"
+mode = "tcp"
+inputs = ["parse"]
+address = "receiver:9001"
+encoding.codec = "text"

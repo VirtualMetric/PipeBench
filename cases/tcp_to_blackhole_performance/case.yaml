@@ -1,0 +1,36 @@
+name: tcp_to_blackhole_performance
+type: performance
+description: "Measures baseline overhead of receiving TCP with no output (blackhole sink)"
+
+duration: 60s
+warmup: 10s
+
+generator:
+  mode: tcp
+  target: "subject:9000"
+  rate: 0
+  line_size: 256
+  format: raw
+  connections: 4
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+subjects:
+  - vmetric
+  - vector
+  - fluent-bit
+  - fluentd
+  - logstash
+  - telegraf
+  - cribl-stream
+  - tenzir
+  - axosyslog
+  - nxlog
+  - splunk-hf
+  - bindplane-agent
+
+configurations:
+  default:
+    description: "Receive TCP, discard all events (blackhole)"

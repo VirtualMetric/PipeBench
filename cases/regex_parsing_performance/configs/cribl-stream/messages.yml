@@ -1,0 +1,6 @@
+messages:
+  UNKNOWN_DESTINATION_tcp:
+    severity: warn
+    title: Unknown Destination type "tcp"
+    text: Skipping configuring Destination "bench_tcp_out" due to unrecognized type
+    time: 1775459533671

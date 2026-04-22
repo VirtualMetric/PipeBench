@@ -1,0 +1,33 @@
+name: regex_parsing_performance
+type: performance
+description: "Measures throughput with a regex parsing transform in the pipeline"
+
+duration: 60s
+warmup: 10s
+
+generator:
+  mode: tcp
+  target: "subject:9000"
+  rate: 0
+  line_size: 256
+  format: syslog
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+subjects:
+  - vmetric
+  - vector
+  - fluent-bit
+  - fluentd
+  - logstash
+  - telegraf
+  - nxlog
+  - axosyslog
+  - tenzir
+  - cribl-stream
+
+configurations:
+  default:
+    description: "TCP in, regex parse syslog, TCP out"

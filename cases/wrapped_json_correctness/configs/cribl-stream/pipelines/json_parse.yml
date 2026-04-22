@@ -1,0 +1,13 @@
+id: json_parse
+conf:
+  output: default
+  groups: {}
+  asyncFuncTimeout: 1000
+  functions:
+    - id: parser
+      filter: "true"
+      disabled: false
+      conf:
+        mode: extract
+        type: json
+        srcField: _raw
