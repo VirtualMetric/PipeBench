@@ -1,8 +1,0 @@
-tenzir:
-  pipelines:
-    tcp-to-tcp:
-      name: TCP to TCP
-      restart-on-error: 5 seconds
-      definition: |
-        load_tcp "0.0.0.0:9000"
-        save_tcp "receiver:9001"

@@ -1,6 +1,0 @@
-outputs:
-  default:
-    defaultId: devnull
-    type: default
-  devnull:
-    type: devnull

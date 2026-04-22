@@ -1,6 +1,6 @@
 # PipeBench — Data Pipeline Benchmark
 
-A containerized benchmarking and correctness testing framework for data pipeline tools. Compare **VirtualMetric Director**, **Vector**, **Fluent Bit**, **Fluentd**, **Logstash**, **Filebeat**, **Cribl Stream**, **Telegraf**, **Splunk HF**, **NXLog**, **AxoSyslog**, **Tenzir**, **OpenTelemetry Collector**, **Grafana Alloy**, and **BindPlane Agent** side by side — no cloud account, Terraform, or Ansible required.
+A containerized benchmarking and correctness testing framework for data pipeline tools. Compare **VirtualMetric DataStream**, **Vector**, **Fluent Bit**, **Fluentd**, **Logstash**, and **AxoSyslog** side by side — no cloud account, Terraform, or Ansible required.
 
 ## Choose your platform
 
@@ -60,21 +60,34 @@ After the test, results are saved locally as `summary.json` + `metrics.csv`.
 
 | Name | Image | Version |
 | --- | --- | --- |
-| VirtualMetric Director | `vmetric/director` | `latest` |
+| VirtualMetric DataStream | `vmetric/director` | `latest` |
 | Vector | `timberio/vector` | `0.54.0-alpine` |
 | Fluent Bit | `fluent/fluent-bit` | `3.2` |
 | Fluentd | `fluent/fluentd` | `v1.17-debian-1` |
 | Logstash | `docker.elastic.co/logstash/logstash` | `8.13.0` |
-| Filebeat | `docker.elastic.co/beats/filebeat` | `8.13.0` |
-| Cribl Stream | `cribl/cribl` | `4.17.0` |
-| Telegraf | `telegraf` | `1.30-alpine` |
-| Splunk HF | `splunk/splunk` | `latest` |
-| NXLog CE | `nxlog/nxlog-ce` | `latest` |
 | AxoSyslog | `ghcr.io/axoflow/axosyslog` | `4.24.0` |
-| Tenzir | `ghcr.io/tenzir/tenzir` | `v5.30.0` |
-| OpenTelemetry Collector | `otel/opentelemetry-collector-contrib` | `0.149.0` |
-| Grafana Alloy | `grafana/alloy` | `v1.15.0` |
-| BindPlane Agent | `observiq/bindplane-agent` | `latest` |
+
+## Why this list?
+
+PipeBench deliberately keeps the subject list short. Every tool here meets the same bar, which is what makes the numbers comparable.
+
+### What every subject must support
+
+- **Disk persistence on the forwarding path.** If the downstream dies, events survive a restart. This rules out tools that only buffer in memory.
+- **Basic pipeline primitives.** TCP/HTTP in and out, file tailing, regex parsing and masking, simple routing. Anything less and most cases can't even run.
+- **Realistic enterprise use.** Production-grade agents that organizations actually ship to fleets — not single-purpose shippers or experimental collectors.
+
+A tool that can't do these three things isn't in the same category, and benchmarking it here would be misleading.
+
+### Why some well-known tools aren't here
+
+- **Cribl Stream.** The free tier caps throughput, so any performance number would reflect the licence gate, not the engine. Including it would misrepresent the product.
+- **Splunk Heavy Forwarder.** Licensing and EULA constraints make publishing head-to-head results awkward at best. We'd rather leave it out than risk misrepresenting Splunk.
+- **Filebeat, Telegraf, NXLog, Tenzir, OpenTelemetry Collector, Grafana Alloy, BindPlane Agent.** All capable tools, but each fails at least one bar above (e.g. memory-only buffering, narrow scope, missing transforms) which would make cross-comparison apples-to-oranges.
+
+### Submitting your own results
+
+If you maintain a tool on this list — or want to make the case for adding one — **you can run PipeBench yourself and submit a pull request with the generated `results/` directory**. We'll publish vendor-submitted numbers clearly labelled as such. The harness is fully reproducible (Docker or Kubernetes, cases pinned in-repo), so submitted results are auditable against a re-run.
 
 ## Project structure
 

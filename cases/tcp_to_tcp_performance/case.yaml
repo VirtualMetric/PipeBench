@@ -26,16 +26,7 @@ subjects:
   - fluent-bit
   - fluentd
   - logstash
-  - filebeat
-  - cribl-stream
-  - telegraf
-  - splunk-hf
-  - nxlog
   - axosyslog
-  - tenzir
-  - otel-collector
-  - grafana-alloy
-  - bindplane-agent
 
 configurations:
   default:

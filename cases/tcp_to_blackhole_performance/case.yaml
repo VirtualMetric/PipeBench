@@ -23,13 +23,7 @@ subjects:
   - fluent-bit
   - fluentd
   - logstash
-  - telegraf
-  - cribl-stream
-  - tenzir
   - axosyslog
-  - nxlog
-  - splunk-hf
-  - bindplane-agent
 
 configurations:
   default:

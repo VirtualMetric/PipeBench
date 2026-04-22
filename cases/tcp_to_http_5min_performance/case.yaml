@@ -22,12 +22,7 @@ subjects:
   - fluent-bit
   - fluentd
   - logstash
-  - filebeat
-  - cribl-stream
-  - telegraf
-  - nxlog
   - axosyslog
-  - tenzir
   - vmetric
 
 configurations:
