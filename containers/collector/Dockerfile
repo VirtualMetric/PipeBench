@@ -1,11 +1,11 @@
-FROM golang:1.25-alpine@sha256:5caaf1cca9dc351e13deafbc3879fd4754801acba8653fa9540cea125d01a71f AS builder
+FROM golang:1.25.6-alpine@sha256:98e6cffc31ccc44c7c15d83df1d69891efee8115a5bb7ede2bf30a38af3e3c92 AS builder
 WORKDIR /build
 COPY containers/collector/go.mod containers/collector/go.sum* ./
 RUN go mod download 2>/dev/null || true
 COPY containers/collector/*.go ./
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /collector .
 
-FROM alpine:3.21@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
+FROM alpine:3.21.4@sha256:b6a6be0ff92ab6db8acd94f5d1b7a6c2f0f5d10ce3c24af348d333ac6da80685
 RUN apk add --no-cache ca-certificates && adduser -D -u 10001 app
 COPY --from=builder /collector /collector
 USER app
