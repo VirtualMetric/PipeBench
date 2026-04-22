@@ -1,11 +1,11 @@
-FROM golang:1.25.6-alpine@sha256:98e6cffc31ccc44c7c15d83df1d69891efee8115a5bb7ede2bf30a38af3e3c92 AS builder
+FROM golang:1.26.2-alpine@sha256:f85330846cde1e57ca9ec309382da3b8e6ae3ab943d2739500e08c86393a21b1 AS builder
 WORKDIR /build
 COPY containers/generator/go.mod containers/generator/go.sum* ./
 RUN go mod download 2>/dev/null || true
 COPY containers/generator/main.go .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /generator .
 
-FROM alpine:3.21.4@sha256:b6a6be0ff92ab6db8acd94f5d1b7a6c2f0f5d10ce3c24af348d333ac6da80685
+FROM alpine:3.22.4@sha256:310c62b5e7ca5b08167e4384c68db0fd2905dd9c7493756d356e893909057601
 RUN apk add --no-cache ca-certificates && adduser -D -u 10001 app
 COPY --from=builder /generator /generator
 USER app
