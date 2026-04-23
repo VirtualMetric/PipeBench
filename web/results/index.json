@@ -122,6 +122,7 @@
     "c7i.2xlarge": {
       "subjects": [
         "fluent-bit",
+        "logstash",
         "vector",
         "vmetric"
       ]
