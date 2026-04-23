@@ -135,6 +135,7 @@
     },
     "c7i.8xlarge": {
       "subjects": [
+        "fluent-bit",
         "logstash",
         "vmetric"
       ]
