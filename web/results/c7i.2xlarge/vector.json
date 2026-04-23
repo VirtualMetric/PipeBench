@@ -31,7 +31,7 @@
       "system_mem_mb": 15702
     },
     {
-      "test": "lua_base_performance",
+      "test": "set_field_performance",
       "config": "default",
       "timestamp": "2026-04-23T15:09:23.462013511Z",
       "duration_secs": 60,
@@ -109,7 +109,7 @@
       "system_mem_mb": 15702
     },
     {
-      "test": "regex_parsing_performance",
+      "test": "syslog_parsing_performance",
       "config": "default",
       "timestamp": "2026-04-23T15:13:18.721527234Z",
       "duration_secs": 60,
