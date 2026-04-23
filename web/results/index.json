@@ -121,6 +121,7 @@
   "by_hardware": {
     "c7i.2xlarge": {
       "subjects": [
+        "fluent-bit",
         "vector",
         "vmetric"
       ]
