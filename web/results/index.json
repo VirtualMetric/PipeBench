@@ -139,6 +139,7 @@
       "subjects": [
         "fluent-bit",
         "logstash",
+        "vector",
         "vmetric"
       ]
     }
