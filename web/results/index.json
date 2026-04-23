@@ -1,6 +1,7 @@
 {
-  "generated_at": "2026-04-23T20:47:49.2036113Z",
+  "generated_at": "2026-04-23T21:25:26.239948Z",
   "hardwares": [
+    "c7i.2xlarge",
     "c7i.4xlarge",
     "c7i.8xlarge"
   ],
@@ -42,6 +43,9 @@
       "description": "Verifies no data loss when a log file is directly truncated"
     },
     {
+      "test": "lua_base_performance"
+    },
+    {
       "test": "real_world_1_performance",
       "type": "performance",
       "description": "Simulates a real-world pipeline with parsing, filtering, and routing"
@@ -50,6 +54,9 @@
       "test": "regex_mask_performance",
       "type": "performance",
       "description": "Measures throughput of a TCP-in to TCP-out pipeline with a regex mask applied to every record (e.g. CONN=\u003cdigits\u003e → CONN=***)."
+    },
+    {
+      "test": "regex_parsing_performance"
     },
     {
       "test": "set_field_performance",
@@ -118,6 +125,12 @@
     }
   ],
   "by_hardware": {
+    "c7i.2xlarge": {
+      "subjects": [
+        "vector",
+        "vmetric"
+      ]
+    },
     "c7i.4xlarge": {
       "subjects": [
         "fluent-bit",
