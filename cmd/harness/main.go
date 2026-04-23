@@ -32,6 +32,7 @@ var (
 	testName         string
 	subjectName      string
 	allSubjects      bool
+	allTests         bool
 	configName       string
 	subjectVersion   string
 	noCleanup        bool
@@ -79,10 +80,17 @@ func testCmd() *cobra.Command {
 		Short: "Run a test case against one or more subjects",
 		Example: `  harness test -t tcp_to_tcp_performance -s vector
   harness test -t tcp_to_tcp_performance -s vector --version 0.40.0
-  harness test -t tcp_to_tcp_performance  # runs all subjects defined in case.yaml`,
+  harness test -t tcp_to_tcp_performance                     # all subjects listed in case.yaml
+  harness test -s vmetric --all-tests --hardware c7i.8xlarge # all tests for one subject`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if testName == "" {
-				return fmt.Errorf("--test (-t) is required")
+			if !allTests && testName == "" {
+				return fmt.Errorf("--test (-t) is required (or pass --all-tests to iterate every case for one subject)")
+			}
+			if allTests && subjectName == "" {
+				return fmt.Errorf("--all-tests requires -s <subject>; cannot loop every case × every subject")
+			}
+			if allTests && testName != "" {
+				return fmt.Errorf("--all-tests and --test are mutually exclusive")
 			}
 
 			// Thread the --hardware flag through to the runner via BENCH_HARDWARE
@@ -96,33 +104,75 @@ func testCmd() *cobra.Command {
 				hw = "custom"
 			}
 
-			tc, err := config.LoadCase(casesDir, testName)
-			if err != nil {
-				return err
+			// Resolve the list of (test, subject) pairs to execute.
+			type runPair struct {
+				tc      *config.TestCase
+				subject config.Subject
 			}
+			var pairs []runPair
 
-			var subjects []config.Subject
-			if allSubjects {
-				for _, s := range config.Registry {
-					subjects = append(subjects, s)
+			if allTests {
+				// One subject × every case that lists it in subjects:.
+				names, err := config.ListCases(casesDir)
+				if err != nil {
+					return fmt.Errorf("listing cases: %w", err)
 				}
+				for _, name := range names {
+					tc, err := config.LoadCase(casesDir, name)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "skip %s (load error: %v)\n", name, err)
+						continue
+					}
+					subs, err := resolveSubjects(tc, subjectName)
+					if err != nil {
+						// subject not listed in this case — skip silently
+						continue
+					}
+					for _, s := range subs {
+						pairs = append(pairs, runPair{tc: tc, subject: s})
+					}
+				}
+				if len(pairs) == 0 {
+					return fmt.Errorf("subject %q is not listed in any case.yaml under %s", subjectName, casesDir)
+				}
+				fmt.Printf("--all-tests: %d case(s) will run for subject %s\n", len(pairs), subjectName)
 			} else {
-				subjects, err = resolveSubjects(tc, subjectName)
+				tc, err := config.LoadCase(casesDir, testName)
 				if err != nil {
 					return err
 				}
+				var subjects []config.Subject
+				if allSubjects {
+					for _, s := range config.Registry {
+						subjects = append(subjects, s)
+					}
+				} else {
+					subjects, err = resolveSubjects(tc, subjectName)
+					if err != nil {
+						return err
+					}
+				}
+				for _, s := range subjects {
+					pairs = append(pairs, runPair{tc: tc, subject: s})
+				}
 			}
 
-			// Clean previous results for subjects about to be tested (within
+			// Clean previous results for pairs about to be tested (within
 			// this hardware tier only — other tiers' data stays intact).
 			cfgName := configName
 			if cfgName == "" {
 				cfgName = "default"
 			}
-			for _, s := range subjects {
-				old := filepath.Join(resultsDir, hw, tc.Name, cfgName, s.Name)
+			cleaned := map[string]bool{}
+			for _, p := range pairs {
+				key := p.tc.Name + "/" + p.subject.Name
+				if cleaned[key] {
+					continue
+				}
+				cleaned[key] = true
+				old := filepath.Join(resultsDir, hw, p.tc.Name, cfgName, p.subject.Name)
 				if _, err := os.Stat(old); err == nil {
-					fmt.Printf("  cleaning old results for %s…\n", s.Name)
+					fmt.Printf("  cleaning old results for %s/%s…\n", p.tc.Name, p.subject.Name)
 					os.RemoveAll(old)
 				}
 			}
@@ -146,31 +196,32 @@ func testCmd() *cobra.Command {
 			r := runner.New(opts)
 
 			var failed []string
-			for _, s := range subjects {
-				if _, err := r.Run(tc, s); err != nil {
-					fmt.Fprintf(os.Stderr, "ERROR running %s/%s: %v\n", tc.Name, s.Name, err)
-					failed = append(failed, s.Name)
+			for _, p := range pairs {
+				if _, err := r.Run(p.tc, p.subject); err != nil {
+					fmt.Fprintf(os.Stderr, "ERROR running %s/%s: %v\n", p.tc.Name, p.subject.Name, err)
+					failed = append(failed, p.tc.Name+"/"+p.subject.Name)
 				}
 			}
 
 			if len(failed) > 0 {
-				return fmt.Errorf("%d subject(s) failed: %v", len(failed), failed)
+				return fmt.Errorf("%d run(s) failed: %v", len(failed), failed)
 			}
 			return nil
 		},
 	}
 
-	cmd.Flags().StringVarP(&testName, "test", "t", "", "test case name (required)")
+	cmd.Flags().StringVarP(&testName, "test", "t", "", "test case name (required unless --all-tests)")
 	cmd.Flags().StringVarP(&subjectName, "subject", "s", "", "subject to test (default: all subjects in case.yaml)")
 	cmd.Flags().BoolVar(&allSubjects, "all-subjects", false, "run against all registered subjects")
+	cmd.Flags().BoolVar(&allTests, "all-tests", false, "run every case where the -s subject appears in case.yaml")
 	cmd.Flags().StringVarP(&configName, "config", "c", "default", "configuration name")
 	cmd.Flags().StringVar(&subjectVersion, "version", "", "subject image version tag (overrides registry default)")
 	cmd.Flags().BoolVar(&noCleanup, "no-cleanup", false, "leave containers running after test (for debugging)")
 	cmd.Flags().IntVar(&receiverHostPort, "receiver-port", 19001, "host port for receiver metrics endpoint")
 	cmd.Flags().DurationVar(&timeout, "timeout", 10*time.Minute, "maximum time to wait for test completion")
-	cmd.Flags().StringVar(&generatorImage, "generator-image", "virtualmetric/bench-generator:latest", "generator container image")
-	cmd.Flags().StringVar(&receiverImage, "receiver-image", "virtualmetric/bench-receiver:latest", "receiver container image")
-	cmd.Flags().StringVar(&collectorImage, "collector-image", "virtualmetric/bench-collector:latest", "collector container image")
+	cmd.Flags().StringVar(&generatorImage, "generator-image", "vmetric/bench-generator:latest", "generator container image")
+	cmd.Flags().StringVar(&receiverImage, "receiver-image", "vmetric/bench-receiver:latest", "receiver container image")
+	cmd.Flags().StringVar(&collectorImage, "collector-image", "vmetric/bench-collector:latest", "collector container image")
 	cmd.Flags().StringVar(&platform, "platform", "docker", "platform: docker or kubernetes")
 	cmd.Flags().StringVar(&cpuLimit, "cpu-limit", "", "CPU cores for subject container (e.g. \"1\", \"4\", \"0.5\")")
 	cmd.Flags().StringVar(&memLimit, "mem-limit", "", "memory limit for subject container (e.g. \"1g\", \"4g\", \"512m\")")

@@ -44,13 +44,13 @@ type Options struct {
 
 func (o *Options) applyDefaults() {
 	if o.GeneratorImage == "" {
-		o.GeneratorImage = "virtualmetric/bench-generator:latest"
+		o.GeneratorImage = "vmetric/bench-generator:latest"
 	}
 	if o.ReceiverImage == "" {
-		o.ReceiverImage = "virtualmetric/bench-receiver:latest"
+		o.ReceiverImage = "vmetric/bench-receiver:latest"
 	}
 	if o.CollectorImage == "" {
-		o.CollectorImage = "virtualmetric/bench-collector:latest"
+		o.CollectorImage = "vmetric/bench-collector:latest"
 	}
 	if o.ConfigName == "" {
 		o.ConfigName = "default"
@@ -68,17 +68,17 @@ func (o *Options) applyDefaults() {
 
 // ReceiverMetrics is the JSON response from the receiver's /metrics endpoint.
 type ReceiverMetrics struct {
-	LinesReceived int64    `json:"lines_received"`
-	BytesReceived int64    `json:"bytes_received"`
-	Done          bool     `json:"done"`
-	Passed        *bool    `json:"passed,omitempty"`
-	Errors        []string `json:"errors,omitempty"`
+	LinesReceived  int64    `json:"lines_received"`
+	BytesReceived  int64    `json:"bytes_received"`
+	Done           bool     `json:"done"`
+	Passed         *bool    `json:"passed,omitempty"`
+	Errors         []string `json:"errors,omitempty"`
 	UniqueLines    int64    `json:"unique_lines,omitempty"`
 	Duplicates     int64    `json:"duplicates,omitempty"`
 	MalformedLines int64    `json:"malformed_lines,omitempty"`
-	LatencyP50Ms  float64  `json:"latency_p50_ms,omitempty"`
-	LatencyP95Ms  float64  `json:"latency_p95_ms,omitempty"`
-	LatencyP99Ms  float64  `json:"latency_p99_ms,omitempty"`
+	LatencyP50Ms   float64  `json:"latency_p50_ms,omitempty"`
+	LatencyP95Ms   float64  `json:"latency_p95_ms,omitempty"`
+	LatencyP99Ms   float64  `json:"latency_p99_ms,omitempty"`
 }
 
 // GeneratorResult is the JSON output from the generator container.
@@ -314,39 +314,39 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	}
 
 	result := results.RunResult{
-		TestName:      tc.Name,
-		Config:        configName,
-		Subject:       subject.Name,
-		Version:       subject.Version,
-		Hardware:      hardwareID(),
-		Timestamp:     startTime,
-		DurationSec:   sendDuration,
-		LinesIn:       genStats.LinesSent,
-		LinesOut:      recvMetrics.LinesReceived,
-		BytesIn:       genStats.BytesSent,
-		BytesOut:      recvMetrics.BytesReceived,
-		LinesPerSec:   linesPerSec,
-		LossPercent:   lossPct,
-		AvgCPUPercent:  metrics.CPUAvg,
-		MaxCPUPercent:  metrics.CPUMax,
-		AvgMemMB:       metrics.MemAvgMB,
-		MaxMemMB:       metrics.MemMaxMB,
-		DiskReadBytes:  metrics.DiskRead,
-		DiskWriteBytes: metrics.DiskWrite,
-		NetRecvBytes:   metrics.NetRecv,
-		NetSendBytes:   metrics.NetSend,
+		TestName:        tc.Name,
+		Config:          configName,
+		Subject:         subject.Name,
+		Version:         subject.Version,
+		Hardware:        hardwareID(),
+		Timestamp:       startTime,
+		DurationSec:     sendDuration,
+		LinesIn:         genStats.LinesSent,
+		LinesOut:        recvMetrics.LinesReceived,
+		BytesIn:         genStats.BytesSent,
+		BytesOut:        recvMetrics.BytesReceived,
+		LinesPerSec:     linesPerSec,
+		LossPercent:     lossPct,
+		AvgCPUPercent:   metrics.CPUAvg,
+		MaxCPUPercent:   metrics.CPUMax,
+		AvgMemMB:        metrics.MemAvgMB,
+		MaxMemMB:        metrics.MemMaxMB,
+		DiskReadBytes:   metrics.DiskRead,
+		DiskWriteBytes:  metrics.DiskWrite,
+		NetRecvBytes:    metrics.NetRecv,
+		NetSendBytes:    metrics.NetSend,
 		IOThroughputAvg: metrics.IOThroughputAvg,
-		LoadAvg1:       metrics.LoadAvg1,
-		LoadAvg5:       metrics.LoadAvg5,
-		LoadAvg15:      metrics.LoadAvg15,
+		LoadAvg1:        metrics.LoadAvg1,
+		LoadAvg5:        metrics.LoadAvg5,
+		LoadAvg15:       metrics.LoadAvg15,
 		SystemCPUs:      sysCPUs,
 		SystemMemMB:     sysMemMB,
 		SubjectCPULimit: r.opts.CPULimit,
 		SubjectMemLimit: r.opts.MemLimit,
 		LatencyP50Ms:    recvMetrics.LatencyP50Ms,
-		LatencyP95Ms:  recvMetrics.LatencyP95Ms,
-		LatencyP99Ms:  recvMetrics.LatencyP99Ms,
-		Passed:        recvMetrics.Passed,
+		LatencyP95Ms:    recvMetrics.LatencyP95Ms,
+		LatencyP99Ms:    recvMetrics.LatencyP99Ms,
+		Passed:          recvMetrics.Passed,
 	}
 	if recvMetrics.Passed != nil && !*recvMetrics.Passed {
 		result.FailReason = strings.Join(recvMetrics.Errors, "; ")
@@ -413,12 +413,12 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 // receiver is down, then starts the receiver and verifies all logs arrive.
 //
 // Flow:
-//   1. Start subject + collector (no receiver, no generator)
-//   2. Start generator — sends sequenced logs for the configured duration
-//   3. Generator finishes, wait a moment for subject to persist
-//   4. Start receiver
-//   5. Wait for subject to forward buffered logs to receiver
-//   6. Verify: all logs should arrive with 0% loss
+//  1. Start subject + collector (no receiver, no generator)
+//  2. Start generator — sends sequenced logs for the configured duration
+//  3. Generator finishes, wait a moment for subject to persist
+//  4. Start receiver
+//  5. Wait for subject to forward buffered logs to receiver
+//  6. Verify: all logs should arrive with 0% loss
 func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
 	configName := r.opts.ConfigName
 	if r.opts.SubjectVersion != "" {
