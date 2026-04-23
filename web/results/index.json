@@ -1,6 +1,7 @@
 {
   "generated_at": "2026-04-23T21:29:11.8837271Z",
   "hardwares": [
+    "c7i.xlarge",
     "c7i.2xlarge",
     "c7i.4xlarge",
     "c7i.8xlarge"
@@ -119,6 +120,11 @@
     }
   ],
   "by_hardware": {
+    "c7i.xlarge": {
+      "subjects": [
+        "vmetric"
+      ]
+    },
     "c7i.2xlarge": {
       "subjects": [
         "fluent-bit",
