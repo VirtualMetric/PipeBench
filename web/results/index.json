@@ -1,10 +1,13 @@
 {
-  "generated_at": "2026-04-23T14:00:13.5989686Z",
+  "generated_at": "2026-04-23T20:47:49.2036113Z",
   "hardwares": [
+    "c7i.4xlarge",
     "c7i.8xlarge"
   ],
   "subjects": [
+    "fluent-bit",
     "logstash",
+    "vector",
     "vmetric"
   ],
   "tests": [
@@ -39,11 +42,6 @@
       "description": "Verifies no data loss when a log file is directly truncated"
     },
     {
-      "test": "lua_base_performance",
-      "type": "performance",
-      "description": "Measures throughput with a Lua/scripting transform (baseline overhead)"
-    },
-    {
       "test": "real_world_1_performance",
       "type": "performance",
       "description": "Simulates a real-world pipeline with parsing, filtering, and routing"
@@ -54,14 +52,19 @@
       "description": "Measures throughput of a TCP-in to TCP-out pipeline with a regex mask applied to every record (e.g. CONN=\u003cdigits\u003e → CONN=***)."
     },
     {
-      "test": "regex_parsing_performance",
+      "test": "set_field_performance",
       "type": "performance",
-      "description": "Measures throughput with a regex parsing transform in the pipeline"
+      "description": "Measures baseline pipeline engine overhead: add one field per record using each subject's native transform"
     },
     {
       "test": "sighup_correctness",
       "type": "correctness",
       "description": "Verifies no data loss during config reload via SIGHUP"
+    },
+    {
+      "test": "syslog_parsing_performance",
+      "type": "performance",
+      "description": "Measures throughput of syslog message parsing in the pipeline"
     },
     {
       "test": "tcp_to_blackhole_performance",
@@ -115,6 +118,13 @@
     }
   ],
   "by_hardware": {
+    "c7i.4xlarge": {
+      "subjects": [
+        "fluent-bit",
+        "vector",
+        "vmetric"
+      ]
+    },
     "c7i.8xlarge": {
       "subjects": [
         "logstash",

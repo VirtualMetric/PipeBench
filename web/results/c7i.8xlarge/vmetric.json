@@ -78,7 +78,7 @@
       "net_send_bytes": 0,
       "system_cpus": 32,
       "system_mem_mb": 63250,
-      "test": "lua_base_performance",
+      "test": "set_field_performance",
       "timestamp": "2026-04-23T10:14:41.667550626Z"
     },
     {
@@ -156,7 +156,7 @@
       "net_send_bytes": 0,
       "system_cpus": 32,
       "system_mem_mb": 63250,
-      "test": "regex_parsing_performance",
+      "test": "syslog_parsing_performance",
       "timestamp": "2026-04-23T10:19:38.191347147Z"
     },
     {

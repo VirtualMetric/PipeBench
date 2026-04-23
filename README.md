@@ -38,8 +38,8 @@ After the test, results are saved locally as `summary.json` + `metrics.csv`.
 | `tcp_to_blackhole_performance` | TCP in, discard output (overhead baseline) |
 | `disk_buffer_performance` | TCP in, disk buffer, TCP out |
 | `regex_mask_performance` | TCP in, regex mask on every record (e.g. `CONN=\d+` → `CONN=***`), TCP out |
-| `regex_parsing_performance` | TCP in, regex syslog parse, TCP out |
-| `lua_base_performance` | TCP in, scripting transform, TCP out |
+| `syslog_parsing_performance` | TCP in, parse syslog message, TCP out |
+| `set_field_performance` | TCP in, add one field via native transform, TCP out |
 | `real_world_1_performance` | Parse, filter, and route (mixed pipeline) |
 
 ### Correctness tests (8)
@@ -62,7 +62,7 @@ After the test, results are saved locally as `summary.json` + `metrics.csv`.
 | --- | --- | --- |
 | VirtualMetric DataStream | `vmetric/director` | `latest` |
 | Vector | `timberio/vector` | `0.54.0-alpine` |
-| Fluent Bit | `fluent/fluent-bit` | `3.2` |
+| Fluent Bit | `fluent/fluent-bit` | `5.0` |
 | Fluentd | `fluent/fluentd` | `v1.17-debian-1` |
 | Logstash | `docker.elastic.co/logstash/logstash` | `8.13.0` |
 | AxoSyslog | `ghcr.io/axoflow/axosyslog` | `4.24.0` |

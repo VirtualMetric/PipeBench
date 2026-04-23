@@ -61,7 +61,7 @@ To run additional tests or subjects beyond the smoke test, add steps to the work
         test:
           - tcp_to_tcp_performance
           - file_to_tcp_performance
-          - regex_parsing_performance
+          - syslog_parsing_performance
         subject:
           - vector
           - fluent-bit
@@ -283,7 +283,7 @@ jobs:
         test:
           - tcp_to_tcp_performance
           - file_to_tcp_performance
-          - regex_parsing_performance
+          - syslog_parsing_performance
         subject:
           - vector
           - fluent-bit
@@ -320,7 +320,7 @@ jobs:
 
       - name: Generate reports
         run: |
-          for test in tcp_to_tcp_performance file_to_tcp_performance regex_parsing_performance; do
+          for test in tcp_to_tcp_performance file_to_tcp_performance syslog_parsing_performance; do
             ./bin/harness compare -t $test --format html > "${test}_report.html" 2>/dev/null || true
             ./bin/harness compare -t $test --format table 2>/dev/null || true
           done

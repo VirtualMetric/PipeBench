@@ -317,6 +317,33 @@ let data = [];
 let pipeData = null;
 const TEST_TYPES = {};
 
+// Convert a snake_case test id into a human-readable label.
+// Examples:
+//   tcp_to_tcp_performance           -> "TCP to TCP (performance)"
+//   tcp_to_tcp_persistent_performance -> "TCP to TCP Persistent (performance)"
+//   disk_buffer_persistence_correctness -> "Disk Buffer Persistence (correctness)"
+//   wrapped_json_correctness         -> "Wrapped JSON (correctness)"
+//   sighup_correctness               -> "SIGHUP (correctness)"
+//   real_world_1_performance         -> "Real World 1 (performance)"
+//   set_field_performance            -> "Set Field (performance)"
+const TEST_ACRONYMS = new Set(['tcp', 'udp', 'http', 'https', 'json', 'xml', 'tls', 'ssl', 'api', 'io', 'url', 'uri', 'id', 'vm', 'os', 'sighup', 'sigterm']);
+function humanizeTestName(id) {
+    if (!id) return '';
+    let suffix = '';
+    let stem = id;
+    if (stem.endsWith('_performance')) { suffix = ' (performance)'; stem = stem.slice(0, -'_performance'.length); }
+    else if (stem.endsWith('_correctness')) { suffix = ' (correctness)'; stem = stem.slice(0, -'_correctness'.length); }
+    const words = stem.split('_').map(w => {
+        if (!w) return w;
+        if (TEST_ACRONYMS.has(w.toLowerCase())) return w.toUpperCase();
+        if (/^\d+(min|sec|ms|kb|mb|gb)?$/i.test(w)) return w;
+        // lowercase connectors stay lowercase
+        if (['to', 'and', 'or', 'of', 'in', 'on', 'at'].includes(w)) return w;
+        return w.charAt(0).toUpperCase() + w.slice(1);
+    });
+    return words.join(' ') + suffix;
+}
+
     </script>
 </head>
 <body>
@@ -870,7 +897,8 @@ function render() {
 
         let td_query_num = document.createElement('td');
         td_query_num.className = 'note';
-        td_query_num.appendChild(document.createTextNode(queries[query_num]));
+        td_query_num.title = queries[query_num]; // raw id on hover for search/debug
+        td_query_num.appendChild(document.createTextNode(humanizeTestName(queries[query_num])));
         tr.appendChild(td_query_num);
 
         sorted_indices.map(idx => {

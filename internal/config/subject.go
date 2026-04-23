@@ -53,7 +53,7 @@ var Registry = map[string]Subject{
 	"fluent-bit": {
 		Name:       "fluent-bit",
 		Image:      "fluent/fluent-bit",
-		Version:    "3.2",
+		Version:    "5.0",
 		ConfigPath: "/fluent-bit/etc/fluent-bit.conf",
 	},
 	"fluentd": {

@@ -38,8 +38,8 @@ The original harness required AWS (EC2, S3, Athena, DynamoDB), Terraform 0.12, A
 | `tcp_to_blackhole` | Receive over TCP, discard (baseline overhead) |
 | `disk_buffer` | Receive over TCP, buffer to disk, forward |
 | `regex_mask` | Regex mask applied to every record, forward |
-| `regex_parsing` | Receive over TCP, parse with regex, forward |
-| `lua_base` | Receive over TCP, run Lua/scripting transform, forward |
+| `syslog_parsing` | Receive over TCP, parse syslog message, forward |
+| `set_field` | Receive over TCP, add one field via native transform, forward |
 | `real_world_1` | Mixed transforms mimicking a real-world pipeline |
 
 **Correctness tests** — validate data integrity, ordering, deduplication:
@@ -130,8 +130,8 @@ PipeBench/
 │   ├── tcp_to_blackhole_performance/
 │   ├── disk_buffer_performance/
 │   ├── regex_mask_performance/
-│   ├── regex_parsing_performance/
-│   ├── lua_base_performance/
+│   ├── syslog_parsing_performance/
+│   ├── set_field_performance/
 │   ├── real_world_1_performance/
 │   ├── disk_buffer_persistence_correctness/
 │   ├── tcp_to_tcp_persistent_correctness/

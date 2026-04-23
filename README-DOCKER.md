@@ -376,8 +376,8 @@ These measure throughput, CPU, memory, and I/O while each subject processes data
 | `tcp_to_blackhole_performance` | TCP in, discard output (overhead baseline) |
 | `disk_buffer_performance` | TCP in, disk buffer, TCP out |
 | `regex_mask_performance` | TCP in, regex mask on every record (e.g. `CONN=\d+` → `CONN=***`), TCP out |
-| `regex_parsing_performance` | TCP in, regex syslog parse, TCP out |
-| `lua_base_performance` | TCP in, scripting transform, TCP out |
+| `syslog_parsing_performance` | TCP in, parse syslog message, TCP out |
+| `set_field_performance` | TCP in, add one field via native transform, TCP out |
 | `real_world_1_performance` | Parse, filter, and route (mixed pipeline) |
 
 ### Correctness tests (8)

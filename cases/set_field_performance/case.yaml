@@ -1,6 +1,6 @@
-name: lua_base_performance
+name: set_field_performance
 type: performance
-description: "Measures throughput with a Lua/scripting transform (baseline overhead)"
+description: "Measures baseline pipeline engine overhead: add one field per record using each subject's native transform"
 
 duration: 60s
 warmup: 10s
@@ -26,4 +26,4 @@ subjects:
 
 configurations:
   default:
-    description: "TCP in, Lua/VRL passthrough transform, TCP out"
+    description: "TCP in, add one field via native transform, TCP out"

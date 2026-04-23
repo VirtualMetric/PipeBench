@@ -1,6 +1,6 @@
-name: regex_parsing_performance
+name: syslog_parsing_performance
 type: performance
-description: "Measures throughput with a regex parsing transform in the pipeline"
+description: "Measures throughput of syslog message parsing in the pipeline"
 
 duration: 60s
 warmup: 10s
@@ -26,4 +26,4 @@ subjects:
 
 configurations:
   default:
-    description: "TCP in, regex parse syslog, TCP out"
+    description: "TCP in, parse syslog message, TCP out"
