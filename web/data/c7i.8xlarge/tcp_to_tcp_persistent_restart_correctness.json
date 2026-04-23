@@ -1,0 +1,26 @@
+{
+  "hardware": "c7i.8xlarge",
+  "test": "tcp_to_tcp_persistent_restart_correctness",
+  "results": [
+    {
+      "test": "tcp_to_tcp_persistent_restart_correctness",
+      "subject": "vmetric",
+      "hardware": "c7i.8xlarge",
+      "version": "latest",
+      "config": "default",
+      "timestamp": "2026-04-23T10:43:26.075232649Z",
+      "duration_secs": 60.463351493,
+      "lines_in": 100000,
+      "lines_out": 100000,
+      "bytes_out": 25700000,
+      "loss_pct": 0,
+      "lines_per_sec": 0,
+      "avg_cpu_pct": 0,
+      "max_cpu_pct": 0,
+      "avg_mem_mb": 0,
+      "max_mem_mb": 0,
+      "io_avg_bytes_per_sec": 0,
+      "passed": true
+    }
+  ]
+}

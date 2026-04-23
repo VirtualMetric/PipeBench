@@ -1,0 +1,26 @@
+{
+  "hardware": "c7i.8xlarge",
+  "test": "tcp_to_http_persistent_correctness",
+  "results": [
+    {
+      "test": "tcp_to_http_persistent_correctness",
+      "subject": "vmetric",
+      "hardware": "c7i.8xlarge",
+      "version": "latest",
+      "config": "default",
+      "timestamp": "2026-04-23T10:31:49.145641328Z",
+      "duration_secs": 67.18342547,
+      "lines_in": 677823,
+      "lines_out": 678484,
+      "bytes_out": 174370388,
+      "loss_pct": 0,
+      "lines_per_sec": 0,
+      "avg_cpu_pct": 0,
+      "max_cpu_pct": 0,
+      "avg_mem_mb": 0,
+      "max_mem_mb": 0,
+      "io_avg_bytes_per_sec": 0,
+      "passed": true
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "hardware": "c7i.8xlarge",
+  "test": "disk_buffer_persistence_correctness",
+  "results": [
+    {
+      "test": "disk_buffer_persistence_correctness",
+      "subject": "vmetric",
+      "hardware": "c7i.8xlarge",
+      "version": "latest",
+      "config": "default",
+      "timestamp": "2026-04-23T10:13:00.757654047Z",
+      "duration_secs": 59.999,
+      "lines_in": 55925,
+      "lines_out": 55925,
+      "bytes_out": 14372725,
+      "loss_pct": 0,
+      "lines_per_sec": 932.0988683144718,
+      "avg_cpu_pct": 0,
+      "max_cpu_pct": 0,
+      "avg_mem_mb": 0,
+      "max_mem_mb": 0,
+      "io_avg_bytes_per_sec": 0,
+      "passed": true
+    }
+  ]
+}

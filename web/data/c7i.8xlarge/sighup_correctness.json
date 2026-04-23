@@ -1,0 +1,26 @@
+{
+  "hardware": "c7i.8xlarge",
+  "test": "sighup_correctness",
+  "results": [
+    {
+      "test": "sighup_correctness",
+      "subject": "vmetric",
+      "hardware": "c7i.8xlarge",
+      "version": "latest",
+      "config": "default",
+      "timestamp": "2026-04-23T10:21:17.060839015Z",
+      "duration_secs": 59.999,
+      "lines_in": 56404,
+      "lines_out": 56404,
+      "bytes_out": 14495828,
+      "loss_pct": 0,
+      "lines_per_sec": 940.0823347055784,
+      "avg_cpu_pct": 0,
+      "max_cpu_pct": 0,
+      "avg_mem_mb": 0,
+      "max_mem_mb": 0,
+      "io_avg_bytes_per_sec": 0,
+      "passed": true
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "hardware": "c7i.8xlarge",
+  "test": "real_world_1_performance",
+  "results": [
+    {
+      "test": "real_world_1_performance",
+      "subject": "vmetric",
+      "hardware": "c7i.8xlarge",
+      "version": "latest",
+      "config": "default",
+      "timestamp": "2026-04-23T10:16:20.429819509Z",
+      "duration_secs": 59.999,
+      "lines_in": 64336610,
+      "lines_out": 64336610,
+      "bytes_out": 47021885273,
+      "loss_pct": 0,
+      "lines_per_sec": 1072294.7049117484,
+      "avg_cpu_pct": 0,
+      "max_cpu_pct": 0,
+      "avg_mem_mb": 0,
+      "max_mem_mb": 0,
+      "io_avg_bytes_per_sec": 0
+    }
+  ]
+}

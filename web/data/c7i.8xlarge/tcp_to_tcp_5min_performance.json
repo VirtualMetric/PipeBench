@@ -1,0 +1,25 @@
+{
+  "hardware": "c7i.8xlarge",
+  "test": "tcp_to_tcp_5min_performance",
+  "results": [
+    {
+      "test": "tcp_to_tcp_5min_performance",
+      "subject": "vmetric",
+      "hardware": "c7i.8xlarge",
+      "version": "latest",
+      "config": "default",
+      "timestamp": "2026-04-23T10:33:07.001516899Z",
+      "duration_secs": 300.003,
+      "lines_in": 1614114335,
+      "lines_out": 1614114335,
+      "bytes_out": 414827384095,
+      "loss_pct": 0,
+      "lines_per_sec": 5380327.313393533,
+      "avg_cpu_pct": 0,
+      "max_cpu_pct": 0,
+      "avg_mem_mb": 0,
+      "max_mem_mb": 0,
+      "io_avg_bytes_per_sec": 0
+    }
+  ]
+}

@@ -266,12 +266,14 @@ func SplitReport(rep *ReportData, catalog []CatalogEntry) (*IndexData, map[strin
 	sort.Strings(tests)
 
 	// Hardwares: union of what we have results for + "custom" if the
-	// catalog is present (so a clean repo still has a tier to render into).
+	// catalog is present AND there's at least one result. If the catalog
+	// is present but there's nothing in results/ yet, don't invent a
+	// "custom" tier out of thin air — let the UI show an empty tier list.
 	hwSet := map[string]bool{}
 	for hw := range byHW {
 		hwSet[hw] = true
 	}
-	if catalog != nil {
+	if catalog != nil && len(byHW) == 0 {
 		hwSet["custom"] = true
 	}
 	hardwares := make([]string, 0, len(hwSet))

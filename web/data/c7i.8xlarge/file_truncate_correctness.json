@@ -1,0 +1,5 @@
+{
+  "hardware": "c7i.8xlarge",
+  "test": "file_truncate_correctness",
+  "results": []
+}
