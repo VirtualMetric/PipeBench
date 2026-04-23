@@ -1,0 +1,33 @@
+{
+  "generated_at": "2026-04-23T13:05:32.2078848Z",
+  "hardware": "custom",
+  "results": [
+    {
+      "avg_cpu_percent": 546.3385596299271,
+      "avg_mem_mb": 395.3408627717391,
+      "bytes_in": 112364179185,
+      "bytes_out": 112364179185,
+      "config": "default",
+      "disk_read_bytes": 0,
+      "disk_write_bytes": 0,
+      "duration_secs": 60.039,
+      "io_throughput_avg_bytes_per_sec": 4893307787.478261,
+      "lines_in": 437214705,
+      "lines_out": 437214705,
+      "lines_per_sec": 7282178.334082846,
+      "load_avg_1": 0,
+      "load_avg_15": 0,
+      "load_avg_5": 0,
+      "loss_percent": 0,
+      "max_cpu_percent": 1147.6335802469134,
+      "max_mem_mb": 864.9453125,
+      "net_recv_bytes": 112551825365,
+      "net_send_bytes": 112540332859,
+      "system_cpus": 28,
+      "test": "tcp_to_tcp_performance",
+      "timestamp": "2026-04-23T15:03:55.044845+02:00"
+    }
+  ],
+  "subject": "vmetric",
+  "version": "latest"
+}
