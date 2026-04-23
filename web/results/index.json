@@ -1,0 +1,123 @@
+{
+  "generated_at": "2026-04-23T11:58:25.6748164Z",
+  "hardwares": [
+    "c7i.8xlarge"
+  ],
+  "subjects": [
+    "vmetric"
+  ],
+  "tests": [
+    {
+      "test": "disk_buffer_performance",
+      "type": "performance",
+      "description": "Measures throughput with disk-based buffering enabled"
+    },
+    {
+      "test": "disk_buffer_persistence_correctness",
+      "type": "correctness",
+      "description": "Verifies events survive subject restart when disk buffering is enabled"
+    },
+    {
+      "test": "file_rotate_create_correctness",
+      "type": "correctness",
+      "description": "Verifies no data loss when log files are rotated by creating a new file"
+    },
+    {
+      "test": "file_rotate_truncate_correctness",
+      "type": "correctness",
+      "description": "Verifies no data loss when log files are rotated by truncation"
+    },
+    {
+      "test": "file_to_tcp_performance",
+      "type": "performance",
+      "description": "Measures throughput of tailing a file and forwarding over TCP"
+    },
+    {
+      "test": "file_truncate_correctness",
+      "type": "correctness",
+      "description": "Verifies no data loss when a log file is directly truncated"
+    },
+    {
+      "test": "lua_base_performance",
+      "type": "performance",
+      "description": "Measures throughput with a Lua/scripting transform (baseline overhead)"
+    },
+    {
+      "test": "real_world_1_performance",
+      "type": "performance",
+      "description": "Simulates a real-world pipeline with parsing, filtering, and routing"
+    },
+    {
+      "test": "regex_mask_performance",
+      "type": "performance",
+      "description": "Measures throughput of a TCP-in to TCP-out pipeline with a regex mask applied to every record (e.g. CONN=\u003cdigits\u003e → CONN=***)."
+    },
+    {
+      "test": "regex_parsing_performance",
+      "type": "performance",
+      "description": "Measures throughput with a regex parsing transform in the pipeline"
+    },
+    {
+      "test": "sighup_correctness",
+      "type": "correctness",
+      "description": "Verifies no data loss during config reload via SIGHUP"
+    },
+    {
+      "test": "tcp_to_blackhole_performance",
+      "type": "performance",
+      "description": "Measures baseline overhead of receiving TCP with no output (blackhole sink)"
+    },
+    {
+      "test": "tcp_to_http_5min_performance",
+      "type": "performance",
+      "description": "Measures sustained throughput of TCP-in to HTTP-out pipeline (5 minutes)"
+    },
+    {
+      "test": "tcp_to_http_performance",
+      "type": "performance",
+      "description": "Measures throughput of TCP-in to HTTP-out pipeline"
+    },
+    {
+      "test": "tcp_to_http_persistent_correctness",
+      "type": "persistence_correctness",
+      "description": "Verifies that logs sent while the HTTP receiver is down are persisted and delivered once the receiver starts"
+    },
+    {
+      "test": "tcp_to_tcp_5min_performance",
+      "type": "performance",
+      "description": "Measures sustained throughput of a TCP-in to TCP-out pipeline with no transforms (5 minutes)"
+    },
+    {
+      "test": "tcp_to_tcp_performance",
+      "type": "performance",
+      "description": "Measures throughput of a TCP-in to TCP-out pipeline with no transforms"
+    },
+    {
+      "test": "tcp_to_tcp_persistent_correctness",
+      "type": "persistence_correctness",
+      "description": "Verifies that logs sent while the receiver is down are persisted and delivered once the receiver starts"
+    },
+    {
+      "test": "tcp_to_tcp_persistent_performance",
+      "type": "performance",
+      "description": "Measures throughput of a TCP-in to TCP-out pipeline with disk persistence enabled"
+    },
+    {
+      "test": "tcp_to_tcp_persistent_restart_correctness",
+      "type": "persistence_restart_correctness",
+      "description": "Verifies durable persistence across a subject restart: send logs, stop subject, start receiver, restart subject, verify all logs arrive"
+    },
+    {
+      "test": "wrapped_json_correctness",
+      "type": "correctness",
+      "description": "Verifies JSON-in-string fields are parsed and re-emitted correctly"
+    }
+  ],
+  "by_hardware": {
+    "c7i.8xlarge": {
+      "subjects": [
+        "vmetric"
+      ]
+    }
+  }
+}

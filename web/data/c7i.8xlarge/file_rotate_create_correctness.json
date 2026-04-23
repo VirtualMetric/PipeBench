@@ -1,5 +1,0 @@
-{
-  "hardware": "c7i.8xlarge",
-  "test": "file_rotate_create_correctness",
-  "results": []
-}

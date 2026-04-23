@@ -51,13 +51,13 @@ func main() {
 		Use:   "harness",
 		Short: "PipeBench — containerized data pipeline benchmarking",
 		Long: `harness runs performance and correctness tests against data pipeline tools
-(VirtualMetric DataStream, Vector, Fluent Bit, Fluentd, Logstash, AxoSyslog) using Docker containers.
+(Vector, Fluent Bit, Fluentd, Logstash, Filebeat, Telegraf) using Docker containers.
 
 No cloud account, Terraform, Ansible, or SSH required.`,
 	}
 
 	root.PersistentFlags().StringVar(&casesDir, "cases-dir", "./cases", "directory containing test cases")
-	root.PersistentFlags().StringVar(&resultsDir, "results-dir", "./results", "directory to write results")
+	root.PersistentFlags().StringVar(&resultsDir, "results-dir", "./web/results", "directory to write results (lives under web/ so Cloudflare Pages / static hosting can serve it)")
 
 	root.AddCommand(testCmd())
 	root.AddCommand(compareCmd())
@@ -168,9 +168,9 @@ func testCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&noCleanup, "no-cleanup", false, "leave containers running after test (for debugging)")
 	cmd.Flags().IntVar(&receiverHostPort, "receiver-port", 19001, "host port for receiver metrics endpoint")
 	cmd.Flags().DurationVar(&timeout, "timeout", 10*time.Minute, "maximum time to wait for test completion")
-	cmd.Flags().StringVar(&generatorImage, "generator-image", "vmetric/bench-generator:latest", "generator container image")
-	cmd.Flags().StringVar(&receiverImage, "receiver-image", "vmetric/bench-receiver:latest", "receiver container image")
-	cmd.Flags().StringVar(&collectorImage, "collector-image", "vmetric/bench-collector:latest", "collector container image")
+	cmd.Flags().StringVar(&generatorImage, "generator-image", "virtualmetric/bench-generator:latest", "generator container image")
+	cmd.Flags().StringVar(&receiverImage, "receiver-image", "virtualmetric/bench-receiver:latest", "receiver container image")
+	cmd.Flags().StringVar(&collectorImage, "collector-image", "virtualmetric/bench-collector:latest", "collector container image")
 	cmd.Flags().StringVar(&platform, "platform", "docker", "platform: docker or kubernetes")
 	cmd.Flags().StringVar(&cpuLimit, "cpu-limit", "", "CPU cores for subject container (e.g. \"1\", \"4\", \"0.5\")")
 	cmd.Flags().StringVar(&memLimit, "mem-limit", "", "memory limit for subject container (e.g. \"1g\", \"4g\", \"512m\")")
@@ -313,31 +313,22 @@ func pushCmd() *cobra.Command {
 }
 
 func reportCmd() *cobra.Command {
-	var (
-		outDir    string
-		outLegacy string
-	)
 	cmd := &cobra.Command{
 		Use:   "report",
-		Short: "Aggregate results/**/summary.json into web/data/index.json + per-case files",
+		Short: "(Re)generate results/index.json by scanning results/<hw>/<subject>.json",
+		Long: `report scans <results-dir>/<hardware>/<subject>.json files and writes
+<results-dir>/index.json listing hardware tiers, subjects, and tests.
+
+The harness serve command generates this index live on every request, so
+you only need to run 'report' explicitly when publishing the results/
+directory as static files (e.g. on Cloudflare Pages or GitHub Pages).`,
 		Example: `  harness report
-  harness report --out-dir web/data
-  harness report --legacy-out web/data.json`,
+  harness report --results-dir ./web/results`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			catalog := loadCatalog(casesDir)
-			if err := results.WriteSplitReport(resultsDir, outDir, catalog); err != nil {
-				return err
-			}
-			if outLegacy != "" {
-				if err := results.WriteReport(resultsDir, outLegacy); err != nil {
-					return err
-				}
-			}
-			return nil
+			return results.WriteIndex(resultsDir, catalog)
 		},
 	}
-	cmd.Flags().StringVar(&outDir, "out-dir", "web/data", "output directory for index.json + per-case JSON files")
-	cmd.Flags().StringVar(&outLegacy, "legacy-out", "", "also write a single aggregated file at this path (optional)")
 	return cmd
 }
 
