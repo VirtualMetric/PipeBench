@@ -7,6 +7,7 @@
     "c7i.8xlarge"
   ],
   "subjects": [
+    "axosyslog",
     "fluent-bit",
     "logstash",
     "vector",
@@ -135,6 +136,7 @@
     },
     "c7i.4xlarge": {
       "subjects": [
+        "axosyslog",
         "fluent-bit",
         "logstash",
         "vector",
