@@ -585,6 +585,12 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 			tc.Correctness.ExpectedLossPct, lossPct,
 			formatCount(genStats.LinesSent-recvMetrics.LinesReceived), formatCount(genStats.LinesSent)))
 	}
+	if recvMetrics.LinesReceived > genStats.LinesSent {
+		passed = false
+		extra := recvMetrics.LinesReceived - genStats.LinesSent
+		errors = append(errors, fmt.Sprintf("over-delivery: received %s lines but only %s were sent (%s extra/duplicate lines)",
+			formatCount(recvMetrics.LinesReceived), formatCount(genStats.LinesSent), formatCount(extra)))
+	}
 	if tc.Correctness.ValidateDedup && recvMetrics.Duplicates > 0 {
 		passed = false
 		errors = append(errors, fmt.Sprintf("expected 0 duplicates, got %s",
@@ -833,6 +839,12 @@ func (r *Runner) runPersistenceRestartCorrectness(tc *config.TestCase, subject c
 		errors = append(errors, fmt.Sprintf("expected loss <= %.2f%%, got %.2f%% (%s of %s lines lost)",
 			tc.Correctness.ExpectedLossPct, lossPct,
 			formatCount(genStats.LinesSent-recvMetrics.LinesReceived), formatCount(genStats.LinesSent)))
+	}
+	if recvMetrics.LinesReceived > genStats.LinesSent {
+		passed = false
+		extra := recvMetrics.LinesReceived - genStats.LinesSent
+		errors = append(errors, fmt.Sprintf("over-delivery: received %s lines but only %s were sent (%s extra/duplicate lines)",
+			formatCount(recvMetrics.LinesReceived), formatCount(genStats.LinesSent), formatCount(extra)))
 	}
 	if tc.Correctness.ValidateDedup && recvMetrics.Duplicates > 0 {
 		passed = false

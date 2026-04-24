@@ -33,6 +33,7 @@ var (
 	subjectName      string
 	allSubjects      bool
 	allTests         bool
+	typeFilter       string
 	configName       string
 	subjectVersion   string
 	noCleanup        bool
@@ -121,6 +122,9 @@ func testCmd() *cobra.Command {
 					tc, err := config.LoadCase(casesDir, name)
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "skip %s (load error: %v)\n", name, err)
+						continue
+					}
+					if typeFilter != "" && !matchesTypeFilter(tc.Type, typeFilter) {
 						continue
 					}
 					subs, err := resolveSubjects(tc, subjectName)
@@ -226,8 +230,21 @@ func testCmd() *cobra.Command {
 	cmd.Flags().StringVar(&cpuLimit, "cpu-limit", "", "CPU cores for subject container (e.g. \"1\", \"4\", \"0.5\")")
 	cmd.Flags().StringVar(&memLimit, "mem-limit", "", "memory limit for subject container (e.g. \"1g\", \"4g\", \"512m\")")
 	cmd.Flags().StringVar(&hardware, "hardware", "", "hardware tier label — groups results under results/<hardware>/ (e.g. \"c7i.4xlarge\"); defaults to $BENCH_HARDWARE or \"custom\"")
+	cmd.Flags().StringVar(&typeFilter, "type", "", "with --all-tests, run only cases whose type matches (e.g. \"correctness\" also matches \"persistence_correctness\"); \"performance\" matches only the plain performance type")
 
 	return cmd
+}
+
+// matchesTypeFilter reports whether a case's type: field satisfies the
+// --type filter. "correctness" is treated as a family match — it also
+// accepts "persistence_correctness" and "persistence_restart_correctness"
+// so users can run every correctness-style test in one command.
+// Other filter values require an exact match.
+func matchesTypeFilter(caseType, filter string) bool {
+	if filter == "correctness" {
+		return strings.Contains(caseType, "correctness")
+	}
+	return caseType == filter
 }
 
 func compareCmd() *cobra.Command {
