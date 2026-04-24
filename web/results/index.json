@@ -4,11 +4,13 @@
     "c7i.xlarge",
     "c7i.2xlarge",
     "c7i.4xlarge",
-    "c7i.8xlarge"
+    "c7i.8xlarge",
+    "c6a.metal"
   ],
   "subjects": [
     "axosyslog",
     "fluent-bit",
+    "fluentd",
     "logstash",
     "vector",
     "vmetric"
