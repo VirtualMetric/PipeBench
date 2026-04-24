@@ -123,6 +123,8 @@
   "by_hardware": {
     "c7i.xlarge": {
       "subjects": [
+        "fluent-bit",
+        "vector",
         "vmetric"
       ]
     },
@@ -130,6 +132,7 @@
       "subjects": [
         "axosyslog",
         "fluent-bit",
+        "fluentd",
         "logstash",
         "vector",
         "vmetric"
@@ -139,6 +142,7 @@
       "subjects": [
         "axosyslog",
         "fluent-bit",
+        "fluentd",
         "logstash",
         "vector",
         "vmetric"
@@ -146,9 +150,16 @@
     },
     "c7i.8xlarge": {
       "subjects": [
+        "axosyslog",
         "fluent-bit",
         "logstash",
         "vector",
+        "vmetric"
+      ]
+    },
+    "c6a.metal": {
+      "subjects": [
+        "fluent-bit",
         "vmetric"
       ]
     }
