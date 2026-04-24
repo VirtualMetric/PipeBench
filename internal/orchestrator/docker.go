@@ -112,6 +112,10 @@ services:
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock:ro"
       - "{{ .TmpDir }}:/results"
+{{- if .DockerSocketGID }}
+    group_add:
+      - "{{ .DockerSocketGID }}"
+{{- end }}
     environment:
       COLLECTOR_MODE: "docker"
       COLLECTOR_TARGET_CONTAINER: "{{ .SubjectContainer }}"
@@ -134,6 +138,7 @@ type RunConfig struct {
 	ExtraSubjectEnv  map[string]string
 	CPULimit         string // e.g. "1", "4" — number of cores for subject
 	MemLimit         string // e.g. "1g", "16g" — memory limit for subject
+	DockerSocketGID  string // numeric gid owning /var/run/docker.sock; passed to collector via group_add so a non-root image can still read the socket
 }
 
 // ComposeRunner manages a docker compose lifecycle for one test run.
@@ -151,6 +156,10 @@ func NewComposeRunner(cfg RunConfig) (*ComposeRunner, error) {
 		return nil, err
 	}
 
+	if cfg.DockerSocketGID == "" {
+		cfg.DockerSocketGID = dockerSocketGID()
+	}
+
 	composeFile := filepath.Join(cfg.TmpDir, "docker-compose.yaml")
 	if err := writeCompose(composeFile, cfg); err != nil {
 		return nil, err
@@ -158,6 +167,12 @@ func NewComposeRunner(cfg RunConfig) (*ComposeRunner, error) {
 
 	return &ComposeRunner{cfg: cfg, composeFile: composeFile}, nil
 }
+
+// dockerSocketGID is defined per-platform (docker_socket_gid_*.go). It returns
+// the numeric gid owning /var/run/docker.sock, or "" if it can't be determined
+// (e.g. Windows/macOS Docker Desktop). The collector image runs as a hardened
+// non-root uid and needs to be in the docker group to read the socket over its
+// HTTP API — the value is passed to docker-compose via `group_add`.
 
 // Up starts all services detached.
 func (r *ComposeRunner) Up() error {

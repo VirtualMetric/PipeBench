@@ -112,6 +112,7 @@ func runDockerMode(ctx context.Context, ticker *time.Ticker, emit func(MetricsRo
 
 	httpClient := buildClient(dockerHost)
 	var prev *dockerStats
+	var errCount int
 
 	for {
 		select {
@@ -120,6 +121,13 @@ func runDockerMode(ctx context.Context, ticker *time.Ticker, emit func(MetricsRo
 		case <-ticker.C:
 			stats, err := fetchDockerStats(httpClient, dockerHost, container)
 			if err != nil {
+				errCount++
+				// Log the first error immediately, then every 30 ticks,
+				// so a silent permission/DNS/container-missing failure is
+				// diagnosable but we don't spam the run.
+				if errCount == 1 || errCount%30 == 0 {
+					fmt.Fprintf(os.Stderr, "collector: fetch stats (err #%d): %v\n", errCount, err)
+				}
 				continue
 			}
 			row := dockerStatsToRow(stats, prev)
