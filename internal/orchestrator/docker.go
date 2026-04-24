@@ -239,10 +239,21 @@ func (r *ComposeRunner) StopCollector() error {
 func (r *ComposeRunner) CopyMetricsCSV(dst string) error {
 	src := "bench-collector:/results/metrics.csv"
 	out, err := exec.Command("docker", "cp", src, dst).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("docker cp %s → %s: %w\n%s", src, dst, err, out)
+	if err == nil {
+		return nil
 	}
-	return nil
+	// Enrich the error when the collector crashed before writing — otherwise
+	// the user just sees "Could not find the file" with no clue why.
+	stateOut, _ := exec.Command("docker", "inspect",
+		"--format={{.State.Status}}|{{.State.ExitCode}}|{{.State.Error}}",
+		"bench-collector").Output()
+	state := strings.TrimSpace(string(stateOut))
+	if state != "" && !strings.HasPrefix(state, "running|") {
+		logs, _ := exec.Command("docker", "logs", "--tail", "30", "bench-collector").CombinedOutput()
+		return fmt.Errorf("docker cp %s → %s: %w\ncollector state: %s\ncollector logs:\n%s\ndocker cp stderr:\n%s",
+			src, dst, err, state, string(logs), out)
+	}
+	return fmt.Errorf("docker cp %s → %s: %w\n%s", src, dst, err, out)
 }
 
 // SubjectContainer returns the container name used for the subject.

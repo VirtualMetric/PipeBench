@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -59,7 +60,14 @@ func main() {
 	defer ticker.Stop()
 
 	// Open the CSV file for incremental writes so the data survives even if
-	// the process is killed without a graceful SIGTERM.
+	// the process is killed without a graceful SIGTERM. Create the parent
+	// directory defensively — on some bind-mount races the container's
+	// /results/ doesn't materialize in time and os.Create would error out,
+	// leaving the harness' later `docker cp` unable to find the file.
+	if err := os.MkdirAll(filepath.Dir(output), 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "collector: mkdir %s: %v\n", filepath.Dir(output), err)
+		os.Exit(1)
+	}
 	csvFile, err := os.Create(output)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "collector: create %s: %v\n", output, err)
