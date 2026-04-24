@@ -332,6 +332,7 @@ type composeVars struct {
 	RecvValidateDedup   string
 	RecvValidateContent string
 	RecvExpectedLines   int64
+	DockerSocketGID     string
 }
 
 func writeCompose(path string, cfg RunConfig) error {
@@ -422,6 +423,7 @@ func writeCompose(path string, cfg RunConfig) error {
 		RecvValidateDedup:   boolStr(tc.Correctness.ValidateDedup),
 		RecvValidateContent: boolStr(tc.Correctness.ValidateContent),
 		RecvExpectedLines:   0,
+		DockerSocketGID:     cfg.DockerSocketGID,
 	}
 
 	tmpl, err := template.New("compose").Parse(composeTemplate)
