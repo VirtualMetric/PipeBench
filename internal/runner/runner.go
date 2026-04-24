@@ -147,6 +147,12 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	if err != nil {
 		return results.RunResult{}, err
 	}
+	// MkdirTemp creates mode 0700, but containers with hardened images
+	// (e.g. bench-collector runs as a non-root uid) bind-mount this dir
+	// and need to write into it. Widen permissions so any uid can write.
+	if err := os.Chmod(tmpDir, 0o777); err != nil {
+		return results.RunResult{}, fmt.Errorf("chmod tmpdir: %w", err)
+	}
 	defer func() {
 		if !r.opts.NoCleanup {
 			os.RemoveAll(tmpDir)
@@ -441,6 +447,12 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 	if err != nil {
 		return results.RunResult{}, err
 	}
+	// MkdirTemp creates mode 0700, but containers with hardened images
+	// (e.g. bench-collector runs as a non-root uid) bind-mount this dir
+	// and need to write into it. Widen permissions so any uid can write.
+	if err := os.Chmod(tmpDir, 0o777); err != nil {
+		return results.RunResult{}, fmt.Errorf("chmod tmpdir: %w", err)
+	}
 	defer func() {
 		if !r.opts.NoCleanup {
 			os.RemoveAll(tmpDir)
@@ -687,6 +699,12 @@ func (r *Runner) runPersistenceRestartCorrectness(tc *config.TestCase, subject c
 	tmpDir, err := os.MkdirTemp("", "bench-"+tc.Name+"-")
 	if err != nil {
 		return results.RunResult{}, err
+	}
+	// MkdirTemp creates mode 0700, but containers with hardened images
+	// (e.g. bench-collector runs as a non-root uid) bind-mount this dir
+	// and need to write into it. Widen permissions so any uid can write.
+	if err := os.Chmod(tmpDir, 0o777); err != nil {
+		return results.RunResult{}, fmt.Errorf("chmod tmpdir: %w", err)
 	}
 	defer func() {
 		if !r.opts.NoCleanup {
