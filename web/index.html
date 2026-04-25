@@ -909,7 +909,16 @@ function render() {
             let td = document.createElement('td');
             td.appendChild(document.createTextNode(formatCell(curr_timing, ratio)));
 
-            colorize(td, ratio);
+            // For correctness, the relative-to-baseline ratio collapses to 1
+            // when every subject fails the same test (best=worst=1000) — that
+            // would paint a failed cell green. Force the color to reflect the
+            // absolute pass/fail state so the icon (✗) and the color stay
+            // consistent.
+            const colorRatio =
+                (selectors.metric === 'correctness' && curr_timing !== null && curr_timing > 1)
+                    ? 1000
+                    : ratio;
+            colorize(td, colorRatio);
             tr.appendChild(td);
         });
 
