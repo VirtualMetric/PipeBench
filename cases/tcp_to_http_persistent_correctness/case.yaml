@@ -11,7 +11,6 @@ generator:
   rate: 100000
   line_size: 256
   format: raw
-  connections: 4
 
 receiver:
   mode: http

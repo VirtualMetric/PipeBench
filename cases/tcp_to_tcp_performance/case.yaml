@@ -14,7 +14,6 @@ generator:
   rate: 0           # unlimited — push as fast as possible
   line_size: 256    # bytes per log line
   format: raw
-  connections: 4    # parallel TCP connections
 
 receiver:
   mode: tcp
