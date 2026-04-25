@@ -9,3 +9,8 @@ bin/
 # in the private virtualmetric-backend repo; PipeBench pulls the published
 # image from Docker Hub (vmetric/director:latest) instead.
 containers/vmetric/
+
+# cribl-stream's auth files get generated when the container first boots;
+# they contain credentials (cribl.secret, users.json) and must never be
+# committed. The path matches every cribl-stream case directory.
+cases/*/configs/cribl-stream/auth/
