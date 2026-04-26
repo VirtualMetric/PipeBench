@@ -964,7 +964,7 @@ function render() {
 function formatCell(curr_timing, ratio) {
     if (curr_timing === null) return '☠';
     if (selectors.metric === 'correctness') {
-        return curr_timing > 1 ? `✗ (×${ratio.toFixed(2)})` : `✓`;
+        return curr_timing > 1 ? '✗' : '✓';
     }
     if (selectors.metric === 'eps') {
         // curr_timing = 1e9 / lines_per_sec  →  eps = 1e9 / curr_timing.
