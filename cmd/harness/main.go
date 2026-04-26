@@ -199,6 +199,27 @@ func testCmd() *cobra.Command {
 
 			r := runner.New(opts)
 
+			// Stub out per-(hardware, subject) result files up front so a
+			// subject that fails every test still appears in the index.
+			// EnsureSubjectFile is idempotent — files with existing
+			// results are left intact (only the version metadata
+			// refreshes when the caller passes a non-empty value).
+			store := results.NewStore(resultsDir)
+			seenSubject := map[string]bool{}
+			for _, p := range pairs {
+				if seenSubject[p.subject.Name] {
+					continue
+				}
+				seenSubject[p.subject.Name] = true
+				ver := p.subject.Version
+				if subjectVersion != "" {
+					ver = subjectVersion
+				}
+				if _, err := store.EnsureSubjectFile(hw, p.subject.Name, ver); err != nil {
+					fmt.Fprintf(os.Stderr, "  warning: ensure subject file %s/%s: %v\n", hw, p.subject.Name, err)
+				}
+			}
+
 			var failed []string
 			for _, p := range pairs {
 				if _, err := r.Run(p.tc, p.subject); err != nil {
