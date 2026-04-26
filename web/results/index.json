@@ -5,7 +5,9 @@
     "c7i.xlarge",
     "c7i.2xlarge",
     "c7i.4xlarge",
-    "c7i.8xlarge"
+    "c7i.8xlarge",
+    "c7i.16xlarge",
+    "c7i.24xlarge"
   ],
   "subjects": [
     "axosyslog",
