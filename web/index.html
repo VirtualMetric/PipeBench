@@ -930,7 +930,13 @@ function render() {
             const overDelivered = isOverDelivered(rawResult);
 
             let td = document.createElement('td');
-            const cellText = overDelivered ? '✗' : formatCell(curr_timing, ratio);
+            let cellText;
+            if (overDelivered) {
+                const overPct = (rawResult.lines_out - rawResult.lines_in) / rawResult.lines_in * 100;
+                cellText = `✗ (${overPct.toFixed(1)}% over delivery)`;
+            } else {
+                cellText = formatCell(curr_timing, ratio);
+            }
             td.appendChild(document.createTextNode(cellText));
 
             // Color logic — force "failing red" in three cases:
