@@ -1,13 +1,13 @@
 {
-  "generated_at": "2026-04-23T21:29:11.8837271Z",
+  "generated_at": "2026-04-26T19:00:35.7612989Z",
   "hardwares": [
     "c6a.metal",
-    "c7i.xlarge",
+    "c7i.16xlarge",
+    "c7i.24xlarge",
     "c7i.2xlarge",
     "c7i.4xlarge",
     "c7i.8xlarge",
-    "c7i.16xlarge",
-    "c7i.24xlarge"
+    "c7i.xlarge"
   ],
   "subjects": [
     "axosyslog",
@@ -125,7 +125,27 @@
     }
   ],
   "by_hardware": {
-    "c7i.xlarge": {
+    "c6a.metal": {
+      "subjects": [
+        "axosyslog",
+        "fluent-bit",
+        "fluentd",
+        "logstash",
+        "vector",
+        "vmetric"
+      ]
+    },
+    "c7i.16xlarge": {
+      "subjects": [
+        "axosyslog",
+        "fluent-bit",
+        "fluentd",
+        "logstash",
+        "vector",
+        "vmetric"
+      ]
+    },
+    "c7i.24xlarge": {
       "subjects": [
         "axosyslog",
         "fluent-bit",
@@ -165,7 +185,17 @@
         "vmetric"
       ]
     },
-    "c6a.metal": {
+    "c7i.large": {
+      "subjects": [
+        "axosyslog",
+        "fluent-bit",
+        "fluentd",
+        "logstash",
+        "vector",
+        "vmetric"
+      ]
+    },
+    "c7i.xlarge": {
       "subjects": [
         "axosyslog",
         "fluent-bit",
