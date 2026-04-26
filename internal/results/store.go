@@ -158,6 +158,65 @@ func (s *Store) SubjectPath(hardware, subject string) string {
 	return filepath.Join(s.BaseDir, hardware, subject+".json")
 }
 
+// EnsureSubjectFile guarantees that <hw>/<subject>.json exists, even if
+// no test has produced a successful entry yet. The harness calls this
+// before running a subject's tests so that subjects which fail every
+// run still appear in the UI (as a row of ☠ markers across the tests)
+// rather than being silently absent from the index.
+//
+// If the file already exists, it's left intact — only the version field
+// gets refreshed when the caller has a non-empty value, so a re-run
+// against a newer image bumps the metadata without dropping existing
+// results.
+func (s *Store) EnsureSubjectFile(hardware, subject, version string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if hardware == "" {
+		hardware = "custom"
+	}
+	dir := filepath.Join(s.BaseDir, hardware)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("creating subject dir: %w", err)
+	}
+	path := filepath.Join(dir, subject+".json")
+
+	var sf SubjectFile
+	existed := false
+	if data, err := os.ReadFile(path); err == nil {
+		if jerr := json.Unmarshal(data, &sf); jerr == nil {
+			existed = true
+		}
+	}
+
+	if !existed {
+		sf = SubjectFile{Results: []ResultEntry{}}
+	}
+	sf.Hardware = hardware
+	sf.Subject = subject
+	if version != "" {
+		sf.Version = version
+	}
+	if sf.Results == nil {
+		sf.Results = []ResultEntry{}
+	}
+	sf.GeneratedAt = time.Now().UTC()
+
+	buf, err := json.MarshalIndent(sf, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, buf, 0o644); err != nil {
+		return "", fmt.Errorf("writing %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("renaming %s → %s: %w", tmp, path, err)
+	}
+	return path, nil
+}
+
 // Save merges one RunResult into the subject file. Replaces any existing
 // entry with matching (test, config) — re-running the same test overwrites
 // the previous row in place. Appends if no match. The metrics CSV argument

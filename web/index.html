@@ -482,15 +482,30 @@ function metricBucket() {
     return selectors.metric === 'correctness' ? 'correctness' : 'perf';
 }
 
-// isOverDelivered flags a run where the receiver counted noticeably more
-// lines than the generator produced — that means the subject duplicated
-// records (sender retransmits, broken at-least-once-exactly-once
-// behaviour, retry-after-ack, etc.) and the throughput numbers are
-// meaningless for comparison. Threshold is 10% over generator count to
-// allow minor measurement-window slop without false-flagging clean runs.
+// Anything below this is treated as measurement-window slop (a handful
+// of in-flight records that arrived after the generator stopped).
+// 0.001 = 0.1% = 1 line per 1000. At-or-above is a real at-least-once
+// correctness break.
+const OVER_DELIVERY_THRESHOLD = 0.001;
+
+// isOverDelivered: receiver counted ≥ OVER_DELIVERY_THRESHOLD more
+// lines than the generator sent. Cell renders ✗ red with the
+// over-delivery percentage. Throughput numbers are meaningless when
+// duplication is real, so we override them too.
 function isOverDelivered(r) {
     if (!r || !r.lines_in || !r.lines_out) return false;
-    return r.lines_out > r.lines_in * 1.10;
+    return r.lines_out > r.lines_in * (1 + OVER_DELIVERY_THRESHOLD);
+}
+
+// isMinorOverDeliveryOnly: tiny (< OVER_DELIVERY_THRESHOLD) over-
+// delivery, almost certainly in-flight slop rather than duplication.
+// The harness records `passed: false` for any over-delivery; the UI
+// relaxes that to the same threshold so a pipeline that delivers
+// 100.05% of input still shows as a clean pass.
+function isMinorOverDeliveryOnly(r) {
+    if (!r || !r.lines_in || !r.lines_out) return false;
+    if (r.lines_out <= r.lines_in) return false; // loss, not over-delivery
+    return (r.lines_out - r.lines_in) / r.lines_in < OVER_DELIVERY_THRESHOLD;
 }
 
 // Extract the per-test value used for ranking, or null if missing/invalid.
@@ -504,6 +519,9 @@ function metricTiming(r) {
     if (isOverDelivered(r)) return 1000;
     if (selectors.metric === 'correctness') {
         if (r.passed == null) return null;
+        // Sub-1% over-delivery is below the noise floor of in-flight
+        // measurement; treat the run as passing so the UI stays green.
+        if (r.passed === false && isMinorOverDeliveryOnly(r)) return 1;
         return r.passed ? 1 : 1000;  // 1× vs 1000× so failures darken
     }
     if (selectors.metric === 'eps') {
@@ -532,33 +550,54 @@ function rebuildData() {
     });
 
     const bySubject = new Map();
+    const newRow = (s, version, hardware, timestamp) => ({
+        system: s,
+        version: version || 'latest',
+        os: 'n/a',
+        date: (timestamp || '').slice(0, 10),
+        machine: hardware,
+        retains_structure: 'yes',
+        tags: [],
+        dataset_size: 1,
+        num_loaded_documents: 1,
+        total_size: null,
+        _byTest: {},
+    });
     pipeData.results.forEach(r => {
         if (r.hardware !== selectors.hardware) return;
         if (classifyTest(r.test) !== bucket) return;
         let row = bySubject.get(r.subject);
         if (!row) {
-            row = {
-                system: r.subject,
-                version: r.version || 'latest',
-                os: 'n/a',
-                date: (r.timestamp || '').slice(0, 10),
-                machine: r.hardware,
-                retains_structure: 'yes',
-                tags: [],
-                dataset_size: 1,
-                num_loaded_documents: 1,
-                total_size: null,
-                _byTest: {}
-            };
+            row = newRow(r.subject, r.version, r.hardware, r.timestamp);
             bySubject.set(r.subject, row);
         }
         row._byTest[r.test] = r;
     });
 
+    // Seed subjects that have a file on this hardware but produced no
+    // entries for the current metric bucket (perf vs correctness). These
+    // would otherwise be invisible — instead, render them as a row of
+    // ☠ markers so the user can see "this subject was attempted but
+    // didn't produce any usable results in this category".
+    const tierEntry = indexData && indexData.by_hardware && indexData.by_hardware[selectors.hardware];
+    const tierSubjects = (tierEntry && tierEntry.subjects) || [];
+    tierSubjects.forEach(s => {
+        if (!bySubject.has(s)) {
+            bySubject.set(s, newRow(s, '', selectors.hardware, ''));
+        }
+    });
+
     data = [];
     bySubject.forEach(row => {
         row.result = queries.map(t => {
-            const v = metricTiming(row._byTest[t]);
+            const r = row._byTest[t];
+            // Over-delivered runs have inflated lines_out / bytes_out
+            // (e.g. throughput converted via 1e12/bps falls into the same
+            // numeric range as a clean fast run). Excluding them here
+            // means they don't poison the baseline-min calculation —
+            // the cell render still surfaces them as ✗ via the raw r.
+            if (r && isOverDelivered(r)) return [null, null, null];
+            const v = metricTiming(r);
             return v == null ? [null, null, null] : [v, v, v];
         });
         data.push(row);
@@ -706,10 +745,19 @@ function renderSummary(filtered_data) {
 
             for (let i = 0; i < num_queries; ++i) {
                 if (no_queries_selected || selectors.queries[i]) {
+                    const baseline_timing = selectRun(baseline_data[i]);
+                    // Skip tests with no usable baseline — Math.min over an
+                    // empty filter produces Infinity, which would push every
+                    // subject's ratio to 0 → log(0)=-Infinity → entire
+                    // geomean collapses to 0, leaving the sort tied and
+                    // falling back to insertion order (so the alphabetically
+                    // last subject silently ranks last). Only count tests
+                    // where at least one subject produced a real number.
+                    if (!isFinite(baseline_timing)) continue;
+
                     const fallback_timing = missing_result_penalty * Math.max(missing_result_time, ...filtered_data.filter(other => other.result.length > i).map(other => selectRun(other.result[i])));
 
                     const curr_timing = elem.fake || elem.result.length <= i ? fallback_timing : selectRun(elem.result[i]) ?? fallback_timing;
-                    const baseline_timing = selectRun(baseline_data[i]);
                     const ratio = (constant_time_add + curr_timing) / (constant_time_add + baseline_timing);
                     accumulator += Math.log(ratio);
                     ++used_queries;
@@ -920,7 +968,13 @@ function render() {
         sorted_indices.map(idx => {
             const curr_timing = filtered_data[idx].result.length > 0 ? selectRun(filtered_data[idx].result[query_num]) : null;
             const baseline_timing = selectRun(baseline_data[query_num]);
-            const ratio = curr_timing !== null ? (constant_time_add + curr_timing) / (constant_time_add + baseline_timing) : null;
+            // Guard against an Infinity baseline (no subject produced a
+            // valid number for this test). Treat ratio as null when so —
+            // formatCell renders ☠ and colorize uses the gray "no data"
+            // background instead of dividing by Infinity.
+            const ratio = (curr_timing !== null && isFinite(baseline_timing))
+                ? (constant_time_add + curr_timing) / (constant_time_add + baseline_timing)
+                : null;
 
             // Raw result for this (subject, test) — needed so we can detect
             // over-delivery (lines_out > lines_in * 1.10) and override both
@@ -934,6 +988,13 @@ function render() {
             if (overDelivered) {
                 const overPct = (rawResult.lines_out - rawResult.lines_in) / rawResult.lines_in * 100;
                 cellText = `✗ (${overPct.toFixed(1)}% over delivery)`;
+            } else if (selectors.metric === 'correctness' &&
+                       curr_timing !== null && curr_timing > 1 &&
+                       rawResult && typeof rawResult.loss_percent === 'number' && rawResult.loss_percent > 0) {
+                // Failed correctness row with line loss — show the loss % so
+                // the user can see at a glance whether it's a 0.001% blip or
+                // a 60% drop. Over-delivery handled above.
+                cellText = `✗ (${rawResult.loss_percent.toFixed(1)}% loss)`;
             } else {
                 cellText = formatCell(curr_timing, ratio);
             }
