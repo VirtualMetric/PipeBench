@@ -7,10 +7,55 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+// hardwareSortKey parses an AWS-style instance name (e.g. "c7i.2xlarge")
+// into a (family, sizeRank) tuple suitable for sort comparisons. Sizes
+// are ordered by their multiplier: xlarge=1, 2xlarge=2, 4xlarge=4, …,
+// with `metal` ranked above all numeric sizes within its family.
+// Anything that doesn't look like "<family>.<size>" gets a synthetic
+// family that sorts to the end (e.g. "custom", "local-win").
+func hardwareSortKey(name string) (family string, rank int) {
+	i := strings.LastIndex(name, ".")
+	if i < 0 {
+		// Non-AWS-shaped names (custom, local-win, etc.) sort last.
+		return "~" + name, 0
+	}
+	family = name[:i]
+	size := name[i+1:]
+	switch size {
+	case "xlarge":
+		return family, 1
+	case "metal":
+		return family, 9999
+	}
+	if strings.HasSuffix(size, "xlarge") {
+		if n, err := strconv.Atoi(strings.TrimSuffix(size, "xlarge")); err == nil {
+			return family, n
+		}
+	}
+	// Unknown size token: keep deterministic but order it after the
+	// known numeric sizes within the same family.
+	return family, 10000
+}
+
+// sortHardwares orders AWS-style instance names so that, within a family,
+// sizes go xlarge → 2xlarge → 4xlarge → … → metal. Across families it's
+// alphabetical by family. Names without a dot (custom, local-*) trail.
+func sortHardwares(names []string) {
+	sort.SliceStable(names, func(i, j int) bool {
+		fi, ri := hardwareSortKey(names[i])
+		fj, rj := hardwareSortKey(names[j])
+		if fi != fj {
+			return fi < fj
+		}
+		return ri < rj
+	})
+}
 
 // IndexEntry describes one test case for the UI's case list.
 // Derived from case.yaml via the catalog supplier.
@@ -130,7 +175,7 @@ func BuildIndex(resultsDir string, catalog []CatalogEntry) (*IndexData, error) {
 			Description: ce.Description,
 		})
 	}
-	sort.Strings(idx.Hardwares)
+	sortHardwares(idx.Hardwares)
 	sort.Strings(idx.Subjects)
 	sort.Slice(idx.Tests, func(i, j int) bool { return idx.Tests[i].Test < idx.Tests[j].Test })
 	return idx, nil

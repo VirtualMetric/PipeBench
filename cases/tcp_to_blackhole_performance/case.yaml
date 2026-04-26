@@ -11,7 +11,6 @@ generator:
   rate: 0
   line_size: 256
   format: raw
-  connections: 4
 
 receiver:
   mode: tcp

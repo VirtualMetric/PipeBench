@@ -241,17 +241,42 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		return results.RunResult{}, fmt.Errorf("waiting for generator: %w", err)
 	}
 
-	// Wait for receiver to drain
-	fmt.Println("  waiting for receiver to drain…")
-	time.Sleep(5 * time.Second)
-
-	// Get a local port to reach the receiver's /metrics endpoint.
-	// On Docker this is the host-mapped port; on K8s this starts port-forward.
+	// Get a local port to reach the receiver's /metrics endpoint, then
+	// poll until the receiver's line count stops moving (3 stable rounds)
+	// or we hit the drain deadline. The previous fixed 5-second sleep
+	// missed the tail when subjects had multi-GB in-flight buffers — we
+	// observed regex_mask reporting 60% "loss" that turned out to be the
+	// receiver still draining 200M+ lines after the harness had moved on.
 	metricsPort, stopPortFwd, err := orch.ReceiverMetricsPort()
 	if err != nil {
 		return results.RunResult{}, fmt.Errorf("setting up receiver access: %w", err)
 	}
 	defer stopPortFwd()
+
+	fmt.Println("  waiting for receiver to drain…")
+	const drainPoll = 5 * time.Second
+	const drainTimeout = 2 * time.Minute
+	drainDeadline := time.Now().Add(drainTimeout)
+	var drainStable int
+	var drainLast int64
+	for time.Now().Before(drainDeadline) {
+		time.Sleep(drainPoll)
+		rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+		if qerr != nil {
+			continue
+		}
+		fmt.Printf("    received: %s lines\n", formatCount(rm.LinesReceived))
+		if rm.LinesReceived == drainLast && rm.LinesReceived > 0 {
+			drainStable++
+			if drainStable >= 3 {
+				fmt.Println("    receiver stable — drain complete")
+				break
+			}
+		} else {
+			drainStable = 0
+		}
+		drainLast = rm.LinesReceived
+	}
 
 	// Fetch final metrics from receiver — this is the core result, so fail if unavailable.
 	recvMetrics, err := r.queryReceiverMetrics(metricsPort, 30*time.Second)

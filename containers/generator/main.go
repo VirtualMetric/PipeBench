@@ -199,7 +199,6 @@ func runTCPSingle(cfg config, clock *sendClock) (int64, int64, error) {
 
 	w := bufio.NewWriterSize(conn, 256*1024)
 	sent, bytesSent, err := sendLinesConn(cfg, 0, clock, func(line []byte) error {
-		line = append(line, '\n')
 		_, werr := w.Write(line)
 		return werr
 	})
@@ -288,7 +287,6 @@ func runFile(cfg config, clock *sendClock) (int64, int64, error) {
 
 	w := bufio.NewWriterSize(f, 64*1024)
 	sent, bytes, err := sendLines(cfg, clock, func(line []byte) error {
-		line = append(line, '\n')
 		_, err := w.Write(line)
 		return err
 	})
@@ -387,10 +385,13 @@ func sendLinesConn(cfg config, connID int, clock *sendClock, write func([]byte) 
 	// regenerate random padding on every line (the old path ran rand.Intn
 	// LineSize times per line — cratered perf when validate_content was on).
 	// Padding is generated once and the prefix is rewritten in place.
+	// Last byte is reserved for '\n' so the hot-loop write callback can
+	// skip a per-line append-newline allocation.
 	var seqBuf []byte
 	if cfg.Sequenced {
-		seqBuf = make([]byte, cfg.LineSize)
+		seqBuf = make([]byte, cfg.LineSize+1)
 		copy(seqBuf, randString(cfg.LineSize))
+		seqBuf[cfg.LineSize] = '\n'
 	}
 
 	var linesSent, bytesSent int64
@@ -439,7 +440,7 @@ func sendLinesConn(cfg config, connID int, clock *sendClock, write func([]byte) 
 		}
 
 		linesSent++
-		bytesSent += int64(len(line)) + 1 // +1 for newline
+		bytesSent += int64(len(line)) // line already includes the '\n'
 
 		// Record first/last send timestamps (sampled to reduce overhead)
 		if linesSent == 1 || linesSent%clockSampleInterval == 0 {
@@ -456,36 +457,36 @@ func sendLinesConn(cfg config, connID int, clock *sendClock, write func([]byte) 
 }
 
 // generateTimestampedLine creates a line with an embedded nanosecond timestamp
-// for latency measurement: "TS=<nanos> <padding...>"
+// for latency measurement: "TS=<nanos> <padding...>\n" (newline included).
 func generateTimestampedLine(size int) []byte {
 	prefix := fmt.Sprintf("TS=%d ", time.Now().UnixNano())
 	pad := size - len(prefix)
 	if pad < 0 {
 		pad = 0
 	}
-	return []byte(prefix + randString(pad))
+	return []byte(prefix + randString(pad) + "\n")
 }
 
 // generateSequencedLine creates a line with an embedded sequence number
-// for correctness validation: "SEQ=<n> <padding...>"
+// for correctness validation: "SEQ=<n> <padding...>\n" (newline included).
 func generateSequencedLine(seq int64, size int) []byte {
 	prefix := fmt.Sprintf("SEQ=%d ", seq)
 	pad := size - len(prefix)
 	if pad < 0 {
 		pad = 0
 	}
-	return []byte(prefix + randString(pad))
+	return []byte(prefix + randString(pad) + "\n")
 }
 
 // generateSequencedLineConn creates a line uniquely identifiable across
-// parallel connections: "CONN=<id> SEQ=<n> <padding...>"
+// parallel connections: "CONN=<id> SEQ=<n> <padding...>\n".
 func generateSequencedLineConn(connID int, seq int64, size int) []byte {
 	prefix := fmt.Sprintf("CONN=%d SEQ=%d ", connID, seq)
 	pad := size - len(prefix)
 	if pad < 0 {
 		pad = 0
 	}
-	return []byte(prefix + randString(pad))
+	return []byte(prefix + randString(pad) + "\n")
 }
 
 // writeSequencedPrefix rewrites the "CONN=<id> SEQ=<n> " header in place
@@ -498,12 +499,21 @@ func writeSequencedPrefix(buf []byte, connID int, seq int64) []byte {
 	prefix := fmt.Sprintf("CONN=%d SEQ=%d ", connID, seq)
 	if len(prefix) > len(buf) {
 		// Line is shorter than the prefix — fall back to the slow path.
-		return generateSequencedLineConn(connID, seq, len(buf))
+		// buf is sized LineSize+1 (last byte = '\n'); the slow path
+		// produces size+1 bytes, so pass len(buf)-1 to match.
+		return generateSequencedLineConn(connID, seq, len(buf)-1)
 	}
+	// Overwrite only the prefix; preserve the random padding AND the
+	// trailing '\n' the caller pre-stamped at buf[len(buf)-1].
 	copy(buf, prefix)
 	return buf
 }
 
+// generateLine returns a `size`-byte line with a trailing '\n' already
+// appended (final length size+1). Baking the newline in here lets the
+// per-connection hot loop skip a `append(line, '\n')` allocation on
+// every line — at 6 M+ lines/s × N connections that allocation alone
+// caps throughput on garbage-collection pressure.
 func generateLine(size int, format string) []byte {
 	switch format {
 	case "syslog":
@@ -513,13 +523,21 @@ func generateLine(size int, format string) []byte {
 		if pad < 1 {
 			pad = 1
 		}
-		return []byte(prefix + randString(pad))
+		line := make([]byte, 0, size+1)
+		line = append(line, prefix...)
+		line = append(line, randString(pad)...)
+		return append(line, '\n')
 	case "json":
 		ts := time.Now().UnixMilli()
 		msg := randString(size - 50)
-		return []byte(fmt.Sprintf(`{"ts":%d,"level":"info","msg":"%s"}`, ts, msg))
+		return []byte(fmt.Sprintf(`{"ts":%d,"level":"info","msg":"%s"}`+"\n", ts, msg))
 	default: // raw
-		return []byte(randString(size))
+		b := make([]byte, size+1)
+		for i := 0; i < size; i++ {
+			b[i] = charset[rand.Intn(len(charset))]
+		}
+		b[size] = '\n'
+		return b
 	}
 }
 
