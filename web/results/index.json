@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-04-26T19:00:35.7612989Z",
+  "generated_at": "2026-04-26T19:05:23.5449612Z",
   "hardwares": [
     "c6a.metal",
     "c7i.16xlarge",
@@ -176,16 +176,6 @@
       ]
     },
     "c7i.8xlarge": {
-      "subjects": [
-        "axosyslog",
-        "fluent-bit",
-        "fluentd",
-        "logstash",
-        "vector",
-        "vmetric"
-      ]
-    },
-    "c7i.large": {
       "subjects": [
         "axosyslog",
         "fluent-bit",
