@@ -1,6 +1,7 @@
 {
   "generated_at": "2026-04-23T21:29:11.8837271Z",
   "hardwares": [
+    "c6a.metal",
     "c7i.xlarge",
     "c7i.2xlarge",
     "c7i.4xlarge",
