@@ -383,6 +383,33 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		result.FailReason = strings.Join(recvMetrics.Errors, "; ")
 	}
 
+	// Plain correctness tests (type: correctness) typically don't enable
+	// validate_order/dedup/content, so the receiver leaves Passed=nil.
+	// Without a verdict, the UI renders ☠ even on a clean lines_in==
+	// lines_out run. Compute pass/fail from loss_percent vs the case's
+	// expected_loss_pct so plain correctness tests get a real green/red.
+	// Also fail on over-delivery (sender duplicated records).
+	if tc.Type == "correctness" && result.Passed == nil {
+		passed := lossPct <= tc.Correctness.ExpectedLossPct
+		var failReasons []string
+		if !passed {
+			failReasons = append(failReasons, fmt.Sprintf(
+				"expected loss <= %.2f%%, got %.2f%%",
+				tc.Correctness.ExpectedLossPct, lossPct))
+		}
+		if recvMetrics.LinesReceived > genStats.LinesSent {
+			passed = false
+			extra := recvMetrics.LinesReceived - genStats.LinesSent
+			failReasons = append(failReasons, fmt.Sprintf(
+				"over-delivery: received %s lines but only %s were sent (%s extra/duplicate lines)",
+				formatCount(recvMetrics.LinesReceived), formatCount(genStats.LinesSent), formatCount(extra)))
+		}
+		result.Passed = &passed
+		if !passed {
+			result.FailReason = strings.Join(failReasons, "; ")
+		}
+	}
+
 	dir, err := r.store.Save(result, metricsCSVSrc)
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
