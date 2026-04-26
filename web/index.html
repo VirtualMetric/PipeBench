@@ -482,10 +482,26 @@ function metricBucket() {
     return selectors.metric === 'correctness' ? 'correctness' : 'perf';
 }
 
+// isOverDelivered flags a run where the receiver counted noticeably more
+// lines than the generator produced — that means the subject duplicated
+// records (sender retransmits, broken at-least-once-exactly-once
+// behaviour, retry-after-ack, etc.) and the throughput numbers are
+// meaningless for comparison. Threshold is 10% over generator count to
+// allow minor measurement-window slop without false-flagging clean runs.
+function isOverDelivered(r) {
+    if (!r || !r.lines_in || !r.lines_out) return false;
+    return r.lines_out > r.lines_in * 1.10;
+}
+
 // Extract the per-test value used for ranking, or null if missing/invalid.
 // Returns a "timing" where lower = better (so JSONBench's ratio math works unchanged).
 function metricTiming(r) {
     if (!r) return null;
+    // Over-delivery is a correctness failure regardless of which metric
+    // the user is viewing — duplicated records make any throughput number
+    // a lie. Treat the run as failed (highest "timing" so the ratio math
+    // pushes it to the bottom, and downstream code paints it red).
+    if (isOverDelivered(r)) return 1000;
     if (selectors.metric === 'correctness') {
         if (r.passed == null) return null;
         return r.passed ? 1 : 1000;  // 1× vs 1000× so failures darken
@@ -906,19 +922,27 @@ function render() {
             const baseline_timing = selectRun(baseline_data[query_num]);
             const ratio = curr_timing !== null ? (constant_time_add + curr_timing) / (constant_time_add + baseline_timing) : null;
 
-            let td = document.createElement('td');
-            td.appendChild(document.createTextNode(formatCell(curr_timing, ratio)));
+            // Raw result for this (subject, test) — needed so we can detect
+            // over-delivery (lines_out > lines_in * 1.10) and override both
+            // the cell text and color when that happens, regardless of the
+            // currently-selected metric.
+            const rawResult = filtered_data[idx]._byTest && filtered_data[idx]._byTest[queries[query_num]];
+            const overDelivered = isOverDelivered(rawResult);
 
-            // For correctness, the relative-to-baseline ratio collapses to 1
-            // when every subject fails the same test (best=worst=1000) — that
-            // would paint a failed cell green. Force the color to reflect the
-            // absolute pass/fail state so the icon (✗) and the color stay
-            // consistent.
-            const colorRatio =
-                (selectors.metric === 'correctness' && curr_timing !== null && curr_timing > 1)
-                    ? 1000
-                    : ratio;
-            colorize(td, colorRatio);
+            let td = document.createElement('td');
+            const cellText = overDelivered ? '✗' : formatCell(curr_timing, ratio);
+            td.appendChild(document.createTextNode(cellText));
+
+            // Color logic — force "failing red" in three cases:
+            //   1. over-delivery (regardless of metric)
+            //   2. correctness mode with curr_timing > 1 (so a row where every
+            //      subject failed equally doesn't get painted green by the
+            //      ratio normalising to 1)
+            // Otherwise use the normal ratio-based shading.
+            const failing =
+                overDelivered ||
+                (selectors.metric === 'correctness' && curr_timing !== null && curr_timing > 1);
+            colorize(td, failing ? 1000 : ratio);
             tr.appendChild(td);
         });
 
