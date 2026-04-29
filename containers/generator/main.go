@@ -235,7 +235,6 @@ func runTCPParallel(cfg config, clock *sendClock) (int64, int64, error) {
 
 			w := bufio.NewWriterSize(conn, 256*1024)
 			sent, bytes, err := sendLinesConn(cfg, id, clock, func(line []byte) error {
-				line = append(line, '\n')
 				_, werr := w.Write(line)
 				return werr
 			})
