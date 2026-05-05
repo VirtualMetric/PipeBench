@@ -16,6 +16,7 @@ type TestCase struct {
 	Description    string                   `yaml:"description"`
 	Duration       string                   `yaml:"duration"`
 	Warmup         string                   `yaml:"warmup"`
+	DrainGrace     string                   `yaml:"drain_grace"`
 	Generator      GeneratorConfig          `yaml:"generator"`
 	Receiver       ReceiverConfig           `yaml:"receiver"`
 	Subjects       []string                 `yaml:"subjects"`
@@ -41,6 +42,19 @@ func (tc *TestCase) WarmupOrDefault(defaultVal time.Duration) time.Duration {
 		return defaultVal
 	}
 	d, err := time.ParseDuration(tc.Warmup)
+	if err != nil {
+		return defaultVal
+	}
+	return d
+}
+
+// DrainGraceOrDefault parses DrainGrace, returning defaultVal on empty/error.
+// Performance tests use this as the fixed post-generator receive budget.
+func (tc *TestCase) DrainGraceOrDefault(defaultVal time.Duration) time.Duration {
+	if tc.DrainGrace == "" {
+		return defaultVal
+	}
+	d, err := time.ParseDuration(tc.DrainGrace)
 	if err != nil {
 		return defaultVal
 	}
@@ -87,13 +101,13 @@ func (tc *TestCase) ConfigFilePath(casesDir, configName string, s Subject) (stri
 }
 
 type GeneratorConfig struct {
-	Mode        string `yaml:"mode"`         // "tcp" | "file" | "http"
-	Target      string `yaml:"target"`       // "subject:9000" or file path
-	Rate        int    `yaml:"rate"`         // lines/sec per connection, 0 = unlimited
-	TotalLines  int64  `yaml:"total_lines"`  // total lines to send, 0 = use duration
-	LineSize    int    `yaml:"line_size"`    // bytes per line
-	Format      string `yaml:"format"`       // "raw" | "syslog" | "json"
-	Connections int    `yaml:"connections"`  // parallel connections (default 1)
+	Mode        string `yaml:"mode"`        // "tcp" | "file" | "http"
+	Target      string `yaml:"target"`      // "subject:9000" or file path
+	Rate        int    `yaml:"rate"`        // lines/sec per connection, 0 = unlimited
+	TotalLines  int64  `yaml:"total_lines"` // total lines to send, 0 = use duration
+	LineSize    int    `yaml:"line_size"`   // bytes per line
+	Format      string `yaml:"format"`      // "raw" | "syslog" | "json"
+	Connections int    `yaml:"connections"` // parallel connections (default 1)
 }
 
 type ReceiverConfig struct {

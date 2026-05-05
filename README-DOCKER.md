@@ -2,7 +2,7 @@
 
 A containerized benchmarking and correctness testing framework for data pipeline tools. Compare **VirtualMetric DataStream**, **Vector**, **Fluent Bit**, **Fluentd**, **Logstash**, and **AxoSyslog** side by side — no cloud account required.
 
-> This guide covers running tests locally with Docker. For Kubernetes deployments, see [README-KUBERNETES.md](README-KUBERNETES.md).
+> This guide covers running tests locally or on a single EC2 host with Docker — the supported way to run PipeBench.
 
 ---
 
@@ -118,34 +118,36 @@ What happens behind the scenes:
    - **generator** — sends log lines to Vector as fast as possible for 60 seconds.
    - **receiver** — listens on port 9001, counts every line it receives.
    - **collector** — polls Docker for CPU/memory/network stats on the Vector container once per second.
-3. After the generator finishes, the harness fetches the final line count from the receiver, stops the collector (which writes its CSV), and tears everything down.
-4. Results are saved to `results/tcp_to_tcp_performance/default/vector/<version>/<timestamp>/`.
+3. After the generator finishes, the harness waits the configured `drain_grace`, fetches the final line count from the receiver, stops the subject and collector, and tears everything down.
+4. The result is merged into a single per-(hardware, subject) JSON file at `web/results/<hardware>/<subject>.json` — re-running the same `(test, config)` replaces the previous row in place.
 
 The output will look something like:
 
 ```
-→ test=tcp_to_tcp_performance  subject=vector  version=0.45.0-alpine  config=default
+→ test=tcp_to_tcp_performance  subject=vector  version=0.54.0-alpine  config=default
   starting containers…
-  waiting for generator (up to 2m40s)…
-  waiting for receiver to drain…
-  stopping collector…
-  done. results → results/tcp_to_tcp_performance/default/vector/0.45.0-alpine/2026-04-04T120000Z
-  lines received: 12345678  bytes received: 3160493568  elapsed: 142.3s
+  waiting for generator (up to 3m10s)…
+  waiting post-send receive grace (5s)…
+  stopping subject (SIGTERM, 5s grace)…
+  collecting metrics…
+  done. results → web/results/custom/vector.json
+  throughput: 879,039 lines/s
+  lines in: 52,790,908  lines out: 52,790,906  loss: 0.00%
 ```
+
+(`custom` is the default hardware label when neither `--hardware` nor `BENCH_HARDWARE` is set; pass `--hardware c7i.4xlarge` etc. to land results under `web/results/c7i.4xlarge/`.)
 
 ### Step 8: Look at the results
 
-Each test run produces two files:
+Each subject's runs are aggregated into one JSON file per hardware tier:
 
 ```bash
-# Human-readable summary
-cat results/tcp_to_tcp_performance/default/vector/*/*/summary.json
-
-# Per-second CPU, memory, network, disk metrics (CSV)
-head results/tcp_to_tcp_performance/default/vector/*/*/metrics.csv
+# Pretty-print the latest entry for tcp_to_tcp_performance
+jq '.results[] | select(.test == "tcp_to_tcp_performance")' \
+  web/results/custom/vector.json
 ```
 
-`summary.json` contains the total lines received, bytes, and elapsed time. `metrics.csv` has one row per second with columns like `cpu_usr`, `mem_used`, `net_recv`, etc.
+The file contains throughput, loss, CPU/memory averages over the active benchmark window, and the raw `first_sent_ns` / `last_sent_ns` / `first_received_ns` / `last_received_ns` timestamps so window math can be re-derived from the persisted data alone. The collector still writes a per-run `metrics.csv` into a temp directory during the run for in-process aggregation, but it is not archived once the run finishes.
 
 ---
 
@@ -305,6 +307,7 @@ Each test run produces a `summary.json` with all metrics:
 
 | Field | Meaning |
 |---|---|
+| `duration_secs` | Active benchmark window used for throughput: first generator send through the later of generator completion or final in-grace receiver delivery |
 | `lines_in` / `lines_out` | Lines sent by generator vs received by receiver |
 | `lines_per_sec` | Throughput (lines out / duration) |
 | `loss_percent` | Percentage of lines lost in transit |
@@ -316,6 +319,8 @@ Each test run produces a `summary.json` with all metrics:
 | `latency_p50/p95/p99_ms` | End-to-end latency percentiles (sampled) |
 
 The per-second `metrics.csv` file has one row per second with CPU, memory, network, and disk I/O columns for detailed analysis.
+
+For performance tests, `warmup` is a readiness budget before the first send, not part of the throughput divisor. TCP/HTTP generators start as soon as the target port is reachable, or after the warmup budget expires and the normal connection retry takes over. After the generator finishes, the receiver gets a fixed `drain_grace` budget (default `5s`) before final line counts are captured; later output is scored as backlog/loss for that run. CPU and memory averages are computed only over the active benchmark window so startup and cleanup samples do not dilute the result.
 
 ---
 

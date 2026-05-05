@@ -7,11 +7,12 @@
 3. [Component Specifications](#3-component-specifications)
 4. [Test Case Format](#4-test-case-format)
 5. [Docker Compose Orchestration](#5-docker-compose-orchestration)
-6. [Kubernetes Support](#6-kubernetes-support)
-7. [Metrics Schema](#7-metrics-schema)
-8. [Implementation Phases](#8-implementation-phases)
-9. [Build and Runtime Requirements](#9-build-and-runtime-requirements)
-10. [CLI Command Reference](#10-cli-command-reference)
+6. [Metrics Schema](#6-metrics-schema)
+7. [Implementation Phases](#7-implementation-phases)
+8. [Build and Runtime Requirements](#8-build-and-runtime-requirements)
+9. [CLI Command Reference](#9-cli-command-reference)
+
+> **Note (2026):** an earlier draft of this plan included a Kubernetes orchestrator and a corresponding implementation phase. That mode shipped, then was removed when the project consolidated on Docker Compose for fairness and maintenance reasons. Sections below have been renumbered; the supported runtime is Docker.
 
 ---
 
@@ -21,7 +22,7 @@
 
 A fully containerized, cloud-free rewrite of the [Vector Test Harness](https://github.com/vectordotdev/vector-test-harness) — an end-to-end benchmarking and correctness-validation framework for data pipeline tools.
 
-The original harness required AWS (EC2, S3, Athena, DynamoDB), Terraform 0.12, Ansible over SSH, Packer AMIs, and Debian Buster (EOL). This rewrite replaces every cloud and VM dependency with Docker containers (local mode) and Kubernetes manifests (cluster mode), while preserving the full test matrix, the original 36-column metrics schema, and the comparative results tables.
+The original harness required AWS (EC2, S3, Athena, DynamoDB), Terraform 0.12, Ansible over SSH, Packer AMIs, and Debian Buster (EOL). This rewrite replaces every cloud and VM dependency with Docker containers, while preserving the full test matrix, the original 36-column metrics schema, and the comparative results tables.
 
 ### Test Matrix
 
@@ -92,8 +93,7 @@ PipeBench/
 │   │   └── subject.go               # Subject registry and definitions
 │   ├── orchestrator/
 │   │   ├── orchestrator.go          # Interface: Orchestrator
-│   │   ├── docker.go                # Docker Compose orchestration
-│   │   └── kubernetes.go            # Kubernetes manifest generation
+│   │   └── docker.go                # Docker Compose orchestration
 │   ├── runner/
 │   │   └── runner.go                # Test lifecycle: start → wait → collect → teardown
 │   ├── metrics/
@@ -329,7 +329,6 @@ Polls the Docker Stats API or reads cgroup v2 data and writes a CSV file in the 
 | `COLLECTOR_TARGET_CONTAINER` | container name/ID to monitor | required |
 | `COLLECTOR_INTERVAL` | sampling interval | `1s` |
 | `COLLECTOR_OUTPUT` | output CSV file path | `/results/metrics.csv` |
-| `COLLECTOR_MODE` | `docker-api` or `cgroup` | `docker-api` |
 | `DOCKER_HOST` | Docker socket path | `unix:///var/run/docker.sock` |
 
 **Docker socket mount:** The collector container requires `/var/run/docker.sock` mounted read-only so it can call the Docker Stats API.
@@ -523,67 +522,7 @@ harness test -t tcp_to_tcp_performance -s vector
 
 ---
 
-## 6. Kubernetes Support
-
-Activated with `--platform kubernetes` flag. The harness generates Kubernetes Job manifests and applies them via `kubectl`.
-
-### Namespace Lifecycle
-
-```
-harness test -t tcp_to_tcp_performance -s vector --platform kubernetes
-  │
-  ├─ 1. Generate namespace: bench-<test>-<ts> (e.g. bench-tcp-to-tcp-20240401-143022)
-  ├─ 2. kubectl create namespace bench-tcp-to-tcp-20240401-143022
-  ├─ 3. Apply ConfigMap (subject config file contents)
-  ├─ 4. Apply Services (ClusterIP for subject, receiver)
-  ├─ 5. Apply Jobs: subject, generator, receiver, collector
-  ├─ 6. Wait for generator Job to complete
-  ├─ 7. Wait for receiver Job to complete
-  ├─ 8. kubectl cp results from collector pod
-  ├─ 9. kubectl delete namespace bench-tcp-to-tcp-20240401-143022
-  └─ 10. Write local results
-```
-
-### Resource Guarantees
-
-For fair benchmarking, subject containers use `Guaranteed` QoS class:
-
-```yaml
-resources:
-  requests:
-    cpu: "2"
-    memory: "2Gi"
-  limits:
-    cpu: "2"
-    memory: "2Gi"
-```
-
-Generator, receiver, and collector use `Burstable` QoS (no limits).
-
-### Shared Volume (file tests)
-
-For file-based tests, an `emptyDir` volume is shared between generator (writer) and subject (reader).
-
-### ConfigMap Pattern
-
-Subject config files are loaded into a ConfigMap and mounted as files:
-
-```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: subject-config
-  namespace: bench-tcp-to-tcp-20240401-143022
-data:
-  vector.toml: |
-    [sources.in]
-    type = "socket"
-    ...
-```
-
----
-
-## 7. Metrics Schema
+## 6. Metrics Schema
 
 The collector outputs a CSV matching the original dstat schema as closely as possible. This preserves backward compatibility with existing result analysis tooling.
 
@@ -672,7 +611,7 @@ results/
 
 ---
 
-## 8. Implementation Phases
+## 7. Implementation Phases
 
 ### Phase 1 — Working Single-Subject Performance Test (Docker)
 
@@ -718,36 +657,20 @@ Deliverables:
 - [ ] AxoSyslog subject configs
 - [ ] `harness test --all-subjects` shorthand
 
-### Phase 4 — Kubernetes Support
+### Phase 4 — Polish, Reporting
 
-**Goal:** `harness test -t tcp_to_tcp -s vector --platform kubernetes` works on any k8s cluster.
-
-Deliverables:
-- [ ] `internal/orchestrator/kubernetes.go` — generate + apply manifests
-- [ ] Namespace lifecycle management
-- [ ] ConfigMap generation for subject configs
-- [ ] Service manifest generation (ClusterIP)
-- [ ] Job manifests for all four containers
-- [ ] Result retrieval via `kubectl cp`
-- [ ] `--platform docker|kubernetes` flag wired throughout
-- [ ] Optional Helm chart in `charts/harness/`
-- [ ] Tested on k3s and kind
-
-### Phase 5 — Polish, CI, Reporting
-
-**Goal:** The harness runs itself in GitHub Actions and produces an HTML report.
+**Goal:** Polished CLI and a reproducible reporting flow that produces the in-repo `web/` index.
 
 Deliverables:
 - [ ] JSON report output (`harness compare --format json`)
 - [ ] HTML report output (`harness compare --format html`)
-- [ ] GitHub Actions workflow that builds containers and runs `tcp_to_tcp` with Vector
 - [ ] Optional MinIO/S3 result upload (`harness push --bucket <name>`)
 - [ ] `README.md` with quick-start guide
 - [ ] `harness version` command showing embedded build info
 
 ---
 
-## 9. Build and Runtime Requirements
+## 8. Build and Runtime Requirements
 
 ### Build Requirements
 
@@ -756,21 +679,13 @@ Deliverables:
 | Go | 1.22+ | CLI and container binaries |
 | Docker | 24+ with Compose v2 | Local orchestration |
 | Make | any | Build automation |
-| kubectl | 1.28+ | Kubernetes mode only |
 
-### Runtime Requirements (Docker mode)
+### Runtime Requirements
 
 - Docker daemon running with access to `/var/run/docker.sock`
 - 4+ GB RAM available (for running multiple subjects simultaneously in compare mode)
 - Network access to pull images from Docker Hub and Elastic registry
 - Disk space: ~500MB for images + results
-
-### Runtime Requirements (Kubernetes mode)
-
-- `kubectl` configured with cluster access
-- Cluster with ≥4GB allocatable memory
-- Ability to create namespaces, ConfigMaps, Services, Jobs
-- Image registry access from cluster nodes (Docker Hub, Elastic)
 
 ### No Longer Required
 
@@ -787,7 +702,7 @@ Deliverables:
 
 ---
 
-## 10. CLI Command Reference
+## 9. CLI Command Reference
 
 ### `harness test`
 
@@ -800,7 +715,6 @@ Flags:
   -t, --test string        Test case name (required). Use 'harness list' to see all.
   -s, --subject string     Subject to test. Defaults to all subjects in case.yaml.
   -c, --config string      Configuration name. Defaults to "default".
-      --platform string    "docker" or "kubernetes" (default: "docker")
       --version string     Subject image version tag (default: from subject registry)
       --no-cleanup         Leave containers running after test (debug)
       --results-dir string Directory to write results (default: ./results)
@@ -865,9 +779,6 @@ require (
     github.com/docker/compose/v2 v2.26.0
     gopkg.in/yaml.v3 v3.0.1
     github.com/gocarina/gocsv v0.0.0-20231116093920-b87c2d0e983a
-    k8s.io/client-go v0.29.3
-    k8s.io/api v0.29.3
-    k8s.io/apimachinery v0.29.3
     text/tabwriter  // stdlib
 )
 ```

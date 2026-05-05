@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"text/tabwriter"
+	"time"
 )
 
 // CompareOptions controls what the comparison loads and how it's rendered.
@@ -195,20 +196,20 @@ func loadRunSummary(subject, runDir string) (SubjectSummary, error) {
 
 // AggregatedMetrics holds all metrics extracted from a collector CSV.
 type AggregatedMetrics struct {
-	CPUAvg     float64
-	CPUMax     float64
-	MemAvgMB   float64
-	MemMaxMB   float64
-	NetRecv    int64   // total bytes received
-	NetSend    int64   // total bytes sent
-	NetTotalMB float64 // (recv+send) in MB
-	DiskRead   int64   // total bytes read
-	DiskWrite  int64   // total bytes written
-	LoadAvg1   float64 // last sample
-	LoadAvg5   float64
-	LoadAvg15  float64
+	CPUAvg          float64
+	CPUMax          float64
+	MemAvgMB        float64
+	MemMaxMB        float64
+	NetRecv         int64   // total bytes received
+	NetSend         int64   // total bytes sent
+	NetTotalMB      float64 // (recv+send) in MB
+	DiskRead        int64   // total bytes read
+	DiskWrite       int64   // total bytes written
+	LoadAvg1        float64 // last sample
+	LoadAvg5        float64
+	LoadAvg15       float64
 	IOThroughputAvg float64 // avg bytes/sec (disk+net combined)
-	Samples    int
+	Samples         int
 }
 
 // AggregateMetricsFromCSV returns the legacy 5-value tuple for backward compatibility.
@@ -222,6 +223,12 @@ func AggregateMetricsFromCSV(csvPath string) (cpuAvg, cpuMax, memAvgMB, memMaxMB
 
 // AggregateAllMetricsFromCSV extracts all metrics from the collector CSV.
 func AggregateAllMetricsFromCSV(csvPath string) (AggregatedMetrics, error) {
+	return AggregateAllMetricsFromCSVWindow(csvPath, 0, 0)
+}
+
+// AggregateAllMetricsFromCSVWindow extracts metrics from rows whose epoch
+// timestamp falls inside [startNs, endNs]. A zero window keeps all rows.
+func AggregateAllMetricsFromCSVWindow(csvPath string, startNs, endNs int64) (AggregatedMetrics, error) {
 	f, err := os.Open(csvPath)
 	if err != nil {
 		return AggregatedMetrics{}, err
@@ -235,6 +242,7 @@ func AggregateAllMetricsFromCSV(csvPath string) (AggregatedMetrics, error) {
 		return AggregatedMetrics{}, err
 	}
 
+	epochIdx := indexOf(header, "epoch")
 	cpuIdx := indexOf(header, "cpu_usr")
 	memIdx := indexOf(header, "mem_used")
 	netRecvIdx := indexOf(header, "net_recv")
@@ -248,6 +256,9 @@ func AggregateAllMetricsFromCSV(csvPath string) (AggregatedMetrics, error) {
 	var m AggregatedMetrics
 	var cpuSum, memSum float64
 	var netSum, dskSum int64
+	filterByWindow := startNs > 0 && endNs > startNs && epochIdx >= 0
+	startSec := startNs / int64(time.Second)
+	endSec := (endNs + int64(time.Second) - 1) / int64(time.Second)
 
 	for {
 		record, err := reader.Read()
@@ -256,6 +267,16 @@ func AggregateAllMetricsFromCSV(csvPath string) (AggregatedMetrics, error) {
 		}
 		if err != nil {
 			continue
+		}
+
+		if filterByWindow {
+			if epochIdx >= len(record) {
+				continue
+			}
+			epoch, err := strconv.ParseInt(strings.TrimSpace(record[epochIdx]), 10, 64)
+			if err != nil || epoch < startSec || epoch > endSec {
+				continue
+			}
 		}
 
 		if cpuIdx >= 0 && cpuIdx < len(record) {

@@ -1,16 +1,19 @@
 # PipeBench — Data Pipeline Benchmark
 
-A containerized benchmarking and correctness testing framework for data pipeline tools. Compare **VirtualMetric DataStream**, **Vector**, **Fluent Bit**, **Fluentd**, **Logstash**, and **AxoSyslog** side by side — no cloud account, Terraform, or Ansible required.
+A containerized benchmarking and correctness testing framework for data pipeline tools. Compare **VirtualMetric DataStream**, **Vector**, **Fluent Bit**, **Fluentd**, **Logstash**, and **AxoSyslog** side by side. Everything runs in Docker — clone the repo, build the harness and helper images, and reproduce any published result on the same hardware tier with one command.
 
-## Choose your platform
+## Getting started
 
-| Platform | Guide | When to use |
-|---|---|---|
-| **Docker** | [README-DOCKER.md](README-DOCKER.md) | Local machine, single-node testing, getting started |
-| **Kubernetes** | [README-KUBERNETES.md](README-KUBERNETES.md) | Cluster-based benchmarking, fair resource isolation |
-| **GitHub Actions** | [README-CI.md](README-CI.md) | Automated CI/CD benchmarks, scheduled runs, HTML reports |
+PipeBench runs on Docker — local machine or single-node EC2. Follow [README-DOCKER.md](README-DOCKER.md) to install dependencies, build the harness and helper images, and run your first test.
 
-All platforms use the same `harness` CLI, the same test cases, and produce the same results format.
+## Project guides
+
+| Guide | What it covers |
+|---|---|
+| [METHODOLOGY.md](METHODOLOGY.md) | How tests are run, what is measured, and how fairness is handled |
+| [ADDING-SUBJECTS.md](ADDING-SUBJECTS.md) | How to add a new subject and submit comparable result files |
+| [REPRODUCING-RESULTS.md](REPRODUCING-RESULTS.md) | How to reproduce published results locally or on matching AWS hardware |
+| [REPORTING-MISTAKES.md](REPORTING-MISTAKES.md) | How to report unfair configs, bad results, broken tests, or documentation errors |
 
 ## What this project does
 
@@ -21,7 +24,7 @@ The harness runs a test by spinning up four containers:
 3. **Receiver** — captures the subject's output and counts lines/bytes
 4. **Collector** — monitors the subject's CPU, memory, network, and disk usage every second
 
-After the test, results are saved locally as `summary.json` + `metrics.csv`.
+After the test, the result is merged into a single per-(hardware, subject) JSON file at `web/results/<hardware>/<subject>.json`. Re-running the same `(test, config)` replaces the previous row in place — the UI always shows the latest run.
 
 ## Available tests
 
@@ -87,20 +90,26 @@ A tool that can't do these three things isn't in the same category, and benchmar
 
 ### Submitting your own results
 
-If you maintain a tool on this list — or want to make the case for adding one — **you can run PipeBench yourself and submit a pull request with the generated `results/` directory**. We'll publish vendor-submitted numbers clearly labelled as such. The harness is fully reproducible (Docker or Kubernetes, cases pinned in-repo), so submitted results are auditable against a re-run.
+If you maintain a tool on this list — or want to make the case for adding one — **you can run PipeBench yourself and submit a pull request with the generated `results/` directory**. We'll publish vendor-submitted numbers clearly labelled as such. The harness is fully reproducible (Docker, cases pinned in-repo), so submitted results are auditable against a re-run.
 
 ## Project structure
 
 ```
 PipeBench/
   cmd/harness/           CLI binary
-  internal/              Config, orchestration (Docker + K8s), runner, results
+  internal/              Config, orchestration (Docker Compose), runner, results
   containers/
     generator/           Sends test load (TCP, file, or HTTP)
     receiver/            Receives output, counts lines, validates correctness
     collector/           Polls Docker stats API, writes metrics CSV
     vmetric/             Dockerfile + pre-built binary for the VirtualMetric Director subject
   cases/                 22 test cases, each with per-subject configs
-  web/                   Static PipeBench UI (single HTML + data/index.json + per-case JSON)
-  results/               Created at runtime: results/<hardware>/<test>/<config>/<subject>/…
+  web/                   Static PipeBench UI (single HTML + per-(hardware, subject) JSON under web/results/)
 ```
+
+## Credits
+
+PipeBench stands on the shoulders of two prior projects:
+
+- **[Vector Test Harness](https://github.com/vectordotdev/vector-test-harness)** — the original benchmarking framework that defined the test cases, the metrics schema, and the comparative results tables PipeBench inherits. The upstream project is archived, and its AWS + Terraform + Ansible + Packer + Debian Buster (EOL) toolchain is no longer practical to stand up. PipeBench keeps the test matrix and methodology intact while replacing the entire deployment story with Docker Compose: clone, `make build build-containers`, run.
+- **[ClickBench](https://github.com/ClickHouse/ClickBench)** — the inspiration for the comparative results UI in [web/](web/). We simplified the layout around standard hardware tiers (one tab per EC2 instance class) and the smaller subject set, but the side-by-side ranking-card style is theirs.

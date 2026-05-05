@@ -42,7 +42,6 @@ var (
 	generatorImage   string
 	receiverImage    string
 	collectorImage   string
-	platform         string
 	cpuLimit         string
 	memLimit         string
 	hardware         string
@@ -192,7 +191,6 @@ func testCmd() *cobra.Command {
 				NoCleanup:        noCleanup,
 				ReceiverHostPort: receiverHostPort,
 				Timeout:          timeout,
-				Platform:         platform,
 				CPULimit:         cpuLimit,
 				MemLimit:         memLimit,
 			}
@@ -247,7 +245,6 @@ func testCmd() *cobra.Command {
 	cmd.Flags().StringVar(&generatorImage, "generator-image", "vmetric/bench-generator:latest", "generator container image")
 	cmd.Flags().StringVar(&receiverImage, "receiver-image", "vmetric/bench-receiver:latest", "receiver container image")
 	cmd.Flags().StringVar(&collectorImage, "collector-image", "vmetric/bench-collector:latest", "collector container image")
-	cmd.Flags().StringVar(&platform, "platform", "docker", "platform: docker or kubernetes")
 	cmd.Flags().StringVar(&cpuLimit, "cpu-limit", "", "CPU cores for subject container (e.g. \"1\", \"4\", \"0.5\")")
 	cmd.Flags().StringVar(&memLimit, "mem-limit", "", "memory limit for subject container (e.g. \"1g\", \"4g\", \"512m\")")
 	cmd.Flags().StringVar(&hardware, "hardware", "", "hardware tier label — groups results under results/<hardware>/ (e.g. \"c7i.4xlarge\"); defaults to $BENCH_HARDWARE or \"custom\"")

@@ -5,6 +5,10 @@ bin/
 *.log
 *.exe
 
+# Side-output JSON files written by interactive test runs that should not
+# touch web/results/ — keeps experimental output out of git.
+/.test-output-*.json
+
 # vmetric subject image build context — Dockerfile + director binary live
 # in the private virtualmetric-backend repo; PipeBench pulls the published
 # image from Docker Hub (vmetric/director:latest) instead.

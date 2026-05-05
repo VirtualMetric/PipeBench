@@ -20,6 +20,14 @@ type RunResult struct {
 	Timestamp   time.Time `json:"timestamp"`
 	DurationSec float64   `json:"duration_secs"`
 
+	// Active benchmark window inputs. The runner computes DurationSec from
+	// first generator send through the later of generator completion and final
+	// in-grace receiver delivery.
+	FirstSentNs     int64 `json:"first_sent_ns,omitempty"`
+	LastSentNs      int64 `json:"last_sent_ns,omitempty"`
+	FirstReceivedNs int64 `json:"first_received_ns,omitempty"`
+	LastReceivedNs  int64 `json:"last_received_ns,omitempty"`
+
 	// Hardware identity — set via BENCH_HARDWARE env var or the
 	// `--hardware` flag on `harness test` (e.g. "c7i.4xlarge", "m7i.8xlarge").
 	// Defaults to "custom" for unlabeled local runs. Results live under
@@ -101,6 +109,11 @@ type ResultEntry struct {
 	Config      string    `json:"config"`
 	Timestamp   time.Time `json:"timestamp"`
 	DurationSec float64   `json:"duration_secs"`
+
+	FirstSentNs     int64 `json:"first_sent_ns,omitempty"`
+	LastSentNs      int64 `json:"last_sent_ns,omitempty"`
+	FirstReceivedNs int64 `json:"first_received_ns,omitempty"`
+	LastReceivedNs  int64 `json:"last_received_ns,omitempty"`
 
 	LinesIn     int64   `json:"lines_in"`
 	LinesOut    int64   `json:"lines_out"`
@@ -250,6 +263,10 @@ func (s *Store) Save(r RunResult, _unusedMetricsCSVSrc string) (string, error) {
 		Config:          r.Config,
 		Timestamp:       r.Timestamp,
 		DurationSec:     r.DurationSec,
+		FirstSentNs:     r.FirstSentNs,
+		LastSentNs:      r.LastSentNs,
+		FirstReceivedNs: r.FirstReceivedNs,
+		LastReceivedNs:  r.LastReceivedNs,
 		LinesIn:         r.LinesIn,
 		LinesOut:        r.LinesOut,
 		BytesIn:         r.BytesIn,

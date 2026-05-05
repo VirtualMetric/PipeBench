@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -26,14 +27,16 @@ type config struct {
 	LineSize    int           // bytes per line
 	Format      string        // raw | syslog | json
 	Warmup      time.Duration
-	Sequenced   bool          // embed SEQ=<n> in each line for correctness
-	Connections int           // parallel TCP/HTTP connections (default 1)
+	Sequenced   bool // embed SEQ=<n> in each line for correctness
+	Connections int  // parallel TCP/HTTP connections (default 1)
 }
 
 type result struct {
-	LinesSent  int64 `json:"lines_sent"`
-	BytesSent  int64 `json:"bytes_sent"`
-	DurationMs int64 `json:"duration_ms"`
+	LinesSent   int64 `json:"lines_sent"`
+	BytesSent   int64 `json:"bytes_sent"`
+	DurationMs  int64 `json:"duration_ms"`
+	FirstSentNs int64 `json:"first_sent_ns,omitempty"`
+	LastSentNs  int64 `json:"last_sent_ns,omitempty"`
 }
 
 // sendClock tracks the time from first successful send to last send across
@@ -68,12 +71,15 @@ func (sc *sendClock) Duration() time.Duration {
 	return time.Duration(last - first)
 }
 
+func (sc *sendClock) Bounds() (first, last int64) {
+	return sc.firstSend.Load(), sc.lastSend.Load()
+}
+
 func main() {
 	cfg := loadConfig()
 
 	if cfg.Warmup > 0 {
-		fmt.Fprintf(os.Stderr, "generator: warmup %s…\n", cfg.Warmup)
-		time.Sleep(cfg.Warmup)
+		waitForWarmup(cfg)
 	}
 
 	fmt.Fprintf(os.Stderr, "generator: mode=%s target=%s rate=%d/s duration=%s connections=%d\n",
@@ -101,11 +107,14 @@ func main() {
 	}
 
 	sendDuration := clock.Duration()
+	firstSent, lastSent := clock.Bounds()
 
 	r := result{
-		LinesSent:  linesSent,
-		BytesSent:  bytesSent,
-		DurationMs: sendDuration.Milliseconds(),
+		LinesSent:   linesSent,
+		BytesSent:   bytesSent,
+		DurationMs:  sendDuration.Milliseconds(),
+		FirstSentNs: firstSent,
+		LastSentNs:  lastSent,
 	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
@@ -115,6 +124,57 @@ func main() {
 
 	fmt.Fprintf(os.Stderr, "generator: done. lines=%d bytes=%d send_duration=%s\n",
 		linesSent, bytesSent, sendDuration)
+}
+
+func waitForWarmup(cfg config) {
+	target, ok := readinessTarget(cfg)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "generator: warmup %s\n", cfg.Warmup)
+		time.Sleep(cfg.Warmup)
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "generator: waiting up to %s for %s\n", cfg.Warmup, target)
+	deadline := time.Now().Add(cfg.Warmup)
+	var lastErr error
+	for {
+		conn, err := net.DialTimeout("tcp", target, 500*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			fmt.Fprintf(os.Stderr, "generator: target ready: %s\n", target)
+			return
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			fmt.Fprintf(os.Stderr, "generator: warmup expired waiting for %s: %v\n", target, lastErr)
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+func readinessTarget(cfg config) (string, bool) {
+	switch cfg.Mode {
+	case "tcp":
+		return cfg.Target, true
+	case "http":
+		u, err := url.Parse(cfg.Target)
+		if err != nil || u.Host == "" {
+			return "", false
+		}
+		host := u.Host
+		if _, _, err := net.SplitHostPort(host); err == nil {
+			return host, true
+		}
+		switch u.Scheme {
+		case "https":
+			return net.JoinHostPort(host, "443"), true
+		default:
+			return net.JoinHostPort(host, "80"), true
+		}
+	default:
+		return "", false
+	}
 }
 
 func loadConfig() config {

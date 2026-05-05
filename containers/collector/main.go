@@ -47,7 +47,6 @@ type MetricsRow struct {
 }
 
 func main() {
-	mode := getEnv("COLLECTOR_MODE", "docker")
 	output := getEnv("COLLECTOR_OUTPUT", "/results/metrics.csv")
 	intervalSecs := getEnvInt("COLLECTOR_INTERVAL_SECS", 1)
 	interval := time.Duration(intervalSecs) * time.Second
@@ -94,14 +93,8 @@ func main() {
 		_ = csvFile.Sync()
 	}
 
-	switch mode {
-	case "kubernetes":
-		fmt.Fprintf(os.Stderr, "collector: mode=kubernetes output=%s interval=%s\n", output, interval)
-		runKubernetesMode(ctx, ticker, appendRow)
-	default:
-		fmt.Fprintf(os.Stderr, "collector: mode=docker output=%s interval=%s\n", output, interval)
-		runDockerMode(ctx, ticker, appendRow)
-	}
+	fmt.Fprintf(os.Stderr, "collector: mode=docker output=%s interval=%s\n", output, interval)
+	runDockerMode(ctx, ticker, appendRow)
 
 	fmt.Fprintf(os.Stderr, "collector: done. %d rows written to %s\n", len(rows), output)
 }
@@ -133,38 +126,6 @@ func runDockerMode(ctx context.Context, ticker *time.Ticker, emit func(MetricsRo
 			row := dockerStatsToRow(stats, prev)
 			emit(row)
 			prev = stats
-		}
-	}
-}
-
-func runKubernetesMode(ctx context.Context, ticker *time.Ticker, emit func(MetricsRow)) {
-	namespace := mustEnv("COLLECTOR_NAMESPACE")
-	podLabel := getEnv("COLLECTOR_POD_LABEL", "app=subject")
-
-	kc, err := newKubeCollector(namespace, podLabel)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "collector: failed to init kubernetes collector: %v\n", err)
-		<-ctx.Done()
-		return
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			cpuMillicores, memBytes, err := kc.sample()
-			if err != nil {
-				continue
-			}
-			cpuPct := float64(cpuMillicores) / 10.0
-			row := MetricsRow{
-				Epoch:   time.Now().Unix(),
-				CpuUsr:  cpuPct,
-				CpuIdl:  100.0 - cpuPct,
-				MemUsed: memBytes,
-			}
-			emit(row)
 		}
 	}
 }

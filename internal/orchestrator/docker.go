@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"text/template"
 	"time"
@@ -137,7 +138,6 @@ services:
       - "{{ .DockerSocketGID }}"
 {{- end }}
     environment:
-      COLLECTOR_MODE: "docker"
       COLLECTOR_TARGET_CONTAINER: "{{ .SubjectContainer }}"
       COLLECTOR_INTERVAL_SECS: "1"
       COLLECTOR_OUTPUT: "/results/metrics.csv"
@@ -205,10 +205,14 @@ func (r *ComposeRunner) UpServices(services ...string) error {
 	return r.compose(args...)
 }
 
-// StopServices sends SIGTERM to named services and waits up to 30s for each to exit.
-// Uses `docker compose stop -t 30 <svc>...` so the subject can flush persistent state.
-func (r *ComposeRunner) StopServices(services ...string) error {
-	args := append([]string{"stop", "-t", "30"}, services...)
+// StopServices sends SIGTERM to named services with the given grace timeout
+// before SIGKILL. Uses `docker compose stop -t <seconds> <svc>...`.
+func (r *ComposeRunner) StopServices(timeout time.Duration, services ...string) error {
+	secs := int(timeout.Seconds())
+	if secs < 0 {
+		secs = 0
+	}
+	args := append([]string{"stop", "-t", strconv.Itoa(secs)}, services...)
 	return r.compose(args...)
 }
 

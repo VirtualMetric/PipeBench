@@ -35,9 +35,7 @@ type Options struct {
 	ReceiverHostPort int
 	// Maximum time to wait for the test to complete
 	Timeout time.Duration
-	// Platform: "docker" or "kubernetes"
-	Platform string
-	// Resource limits for the subject container (both platforms)
+	// Resource limits for the subject container
 	CPULimit string // e.g. "1", "4", "0.5" — number of cores
 	MemLimit string // e.g. "1g", "16g", "512m"
 }
@@ -61,31 +59,32 @@ func (o *Options) applyDefaults() {
 	if o.Timeout == 0 {
 		o.Timeout = 10 * time.Minute
 	}
-	if o.Platform == "" {
-		o.Platform = "docker"
-	}
 }
 
 // ReceiverMetrics is the JSON response from the receiver's /metrics endpoint.
 type ReceiverMetrics struct {
-	LinesReceived  int64    `json:"lines_received"`
-	BytesReceived  int64    `json:"bytes_received"`
-	Done           bool     `json:"done"`
-	Passed         *bool    `json:"passed,omitempty"`
-	Errors         []string `json:"errors,omitempty"`
-	UniqueLines    int64    `json:"unique_lines,omitempty"`
-	Duplicates     int64    `json:"duplicates,omitempty"`
-	MalformedLines int64    `json:"malformed_lines,omitempty"`
-	LatencyP50Ms   float64  `json:"latency_p50_ms,omitempty"`
-	LatencyP95Ms   float64  `json:"latency_p95_ms,omitempty"`
-	LatencyP99Ms   float64  `json:"latency_p99_ms,omitempty"`
+	LinesReceived   int64    `json:"lines_received"`
+	BytesReceived   int64    `json:"bytes_received"`
+	Done            bool     `json:"done"`
+	FirstReceivedNs int64    `json:"first_received_ns"`
+	LastReceivedNs  int64    `json:"last_received_ns"`
+	Passed          *bool    `json:"passed,omitempty"`
+	Errors          []string `json:"errors,omitempty"`
+	UniqueLines     int64    `json:"unique_lines,omitempty"`
+	Duplicates      int64    `json:"duplicates,omitempty"`
+	MalformedLines  int64    `json:"malformed_lines,omitempty"`
+	LatencyP50Ms    float64  `json:"latency_p50_ms,omitempty"`
+	LatencyP95Ms    float64  `json:"latency_p95_ms,omitempty"`
+	LatencyP99Ms    float64  `json:"latency_p99_ms,omitempty"`
 }
 
 // GeneratorResult is the JSON output from the generator container.
 type GeneratorResult struct {
-	LinesSent  int64 `json:"lines_sent"`
-	BytesSent  int64 `json:"bytes_sent"`
-	DurationMs int64 `json:"duration_ms"`
+	LinesSent   int64 `json:"lines_sent"`
+	BytesSent   int64 `json:"bytes_sent"`
+	DurationMs  int64 `json:"duration_ms"`
+	FirstSentNs int64 `json:"first_sent_ns"`
+	LastSentNs  int64 `json:"last_sent_ns"`
 }
 
 // Runner executes a single test case against a single subject.
@@ -182,24 +181,11 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		MemLimit:         r.opts.MemLimit,
 	}
 
-	var orch orchestrator.Orchestrator
-	switch r.opts.Platform {
-	case "kubernetes":
-		kubeCfg := orchestrator.KubeConfig{
-			RunConfig: runCfg,
-		}
-		kr, err := orchestrator.NewKubeRunner(kubeCfg)
-		if err != nil {
-			return results.RunResult{}, fmt.Errorf("kubernetes setup: %w", err)
-		}
-		orch = kr
-	default: // docker
-		cr, err := orchestrator.NewComposeRunner(runCfg)
-		if err != nil {
-			return results.RunResult{}, fmt.Errorf("compose setup: %w", err)
-		}
-		orch = cr
+	cr, err := orchestrator.NewComposeRunner(runCfg)
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("compose setup: %w", err)
 	}
+	var orch orchestrator.Orchestrator = cr
 
 	// Force cleanup any leftover containers from previous runs to prevent
 	// name collisions when running multiple subjects sequentially.
@@ -241,41 +227,45 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		return results.RunResult{}, fmt.Errorf("waiting for generator: %w", err)
 	}
 
-	// Get a local port to reach the receiver's /metrics endpoint, then
-	// poll until the receiver's line count stops moving (3 stable rounds)
-	// or we hit the drain deadline. The previous fixed 5-second sleep
-	// missed the tail when subjects had multi-GB in-flight buffers — we
-	// observed regex_mask reporting 60% "loss" that turned out to be the
-	// receiver still draining 200M+ lines after the harness had moved on.
 	metricsPort, stopPortFwd, err := orch.ReceiverMetricsPort()
 	if err != nil {
 		return results.RunResult{}, fmt.Errorf("setting up receiver access: %w", err)
 	}
 	defer stopPortFwd()
 
-	fmt.Println("  waiting for receiver to drain…")
-	const drainPoll = 5 * time.Second
-	const drainTimeout = 2 * time.Minute
-	drainDeadline := time.Now().Add(drainTimeout)
-	var drainStable int
-	var drainLast int64
-	for time.Now().Before(drainDeadline) {
-		time.Sleep(drainPoll)
-		rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
-		if qerr != nil {
-			continue
+	if tc.Type == "performance" {
+		drainGrace := tc.DrainGraceOrDefault(5 * time.Second)
+		if drainGrace > 0 {
+			fmt.Printf("  waiting post-send receive grace (%s)…\n", drainGrace)
+			time.Sleep(drainGrace)
 		}
-		fmt.Printf("    received: %s lines\n", formatCount(rm.LinesReceived))
-		if rm.LinesReceived == drainLast && rm.LinesReceived > 0 {
-			drainStable++
-			if drainStable >= 3 {
-				fmt.Println("    receiver stable — drain complete")
-				break
+	} else {
+		// Correctness tests need completeness rather than a fixed SLA window:
+		// wait until the receiver stops moving or the bounded drain timeout hits.
+		fmt.Println("  waiting for receiver to drain…")
+		const drainPoll = 5 * time.Second
+		const drainTimeout = 2 * time.Minute
+		drainDeadline := time.Now().Add(drainTimeout)
+		var drainStable int
+		var drainLast int64
+		for time.Now().Before(drainDeadline) {
+			time.Sleep(drainPoll)
+			rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+			if qerr != nil {
+				continue
 			}
-		} else {
-			drainStable = 0
+			fmt.Printf("    received: %s lines\n", formatCount(rm.LinesReceived))
+			if rm.LinesReceived == drainLast && rm.LinesReceived > 0 {
+				drainStable++
+				if drainStable >= 3 {
+					fmt.Println("    receiver stable — drain complete")
+					break
+				}
+			} else {
+				drainStable = 0
+			}
+			drainLast = rm.LinesReceived
 		}
-		drainLast = rm.LinesReceived
 	}
 
 	// Fetch final metrics from receiver — this is the core result, so fail if unavailable.
@@ -286,9 +276,16 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 
 	elapsed := time.Since(startTime).Seconds()
 
+	// The result cutoff has been captured. Stop the subject now as cleanup;
+	// lines flushed during this SIGTERM grace are intentionally outside the
+	// scored performance window.
+	fmt.Println("  stopping subject (SIGTERM, 5s grace)…")
+	if err := orch.StopServices(5*time.Second, "subject"); err != nil {
+		return results.RunResult{}, fmt.Errorf("stopping subject: %w", err)
+	}
+
 	// Copy the metrics CSV first (collector writes rows incrementally),
-	// then stop the collector. This order is required for Kubernetes where
-	// stopping the pod deletes the emptyDir volume.
+	// then stop the collector.
 	metricsCSVSrc := filepath.Join(tmpDir, "metrics.csv")
 	fmt.Println("  collecting metrics…")
 	if err := orch.CopyMetricsCSV(metricsCSVSrc); err != nil {
@@ -307,19 +304,26 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	// Get system info (CPU cores, memory)
 	sysCPUs, sysMemMB := getSystemInfo()
 
-	// Aggregate all metrics from CSV
-	var metrics results.AggregatedMetrics
-	if metricsCSVSrc != "" {
-		metrics, _ = results.AggregateAllMetricsFromCSV(metricsCSVSrc)
-	}
-
-	// Compute derived stats — use the generator's actual send duration for
-	// throughput, not total elapsed time. This ensures tools with slow startup
-	// (Cribl, Logstash, OTel Collector) are measured fairly on actual processing
-	// time, not boot time.
+	// Compute the active benchmark window. Startup/warmup is excluded, while
+	// send back-pressure and in-grace receiver drain are included.
 	sendDuration := elapsed
 	if genStats.DurationMs > 0 {
 		sendDuration = float64(genStats.DurationMs) / 1000.0
+	}
+	activeStartNs, activeEndNs, rateDuration := benchmarkWindow(genStats, recvMetrics, sendDuration)
+
+	// Aggregate resource metrics over the active work window so averages are
+	// not diluted by cold start or post-cutoff idle samples.
+	var metrics results.AggregatedMetrics
+	if metricsCSVSrc != "" {
+		if activeStartNs > 0 && activeEndNs > activeStartNs {
+			metrics, _ = results.AggregateAllMetricsFromCSVWindow(metricsCSVSrc, activeStartNs, activeEndNs)
+			if metrics.Samples == 0 {
+				metrics, _ = results.AggregateAllMetricsFromCSV(metricsCSVSrc)
+			}
+		} else {
+			metrics, _ = results.AggregateAllMetricsFromCSV(metricsCSVSrc)
+		}
 	}
 	// For blackhole / discard-target tests, the receiver never gets any
 	// data (by design) — reporting throughput as lines_out/duration would
@@ -333,8 +337,8 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		linesForRate = genStats.LinesSent
 	}
 	linesPerSec := 0.0
-	if sendDuration > 0 {
-		linesPerSec = float64(linesForRate) / sendDuration
+	if rateDuration > 0 {
+		linesPerSec = float64(linesForRate) / rateDuration
 	}
 	lossPct := 0.0
 	if genStats.LinesSent > 0 {
@@ -351,7 +355,11 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		Version:         subject.Version,
 		Hardware:        hardwareID(),
 		Timestamp:       startTime,
-		DurationSec:     sendDuration,
+		DurationSec:     rateDuration,
+		FirstSentNs:     genStats.FirstSentNs,
+		LastSentNs:      genStats.LastSentNs,
+		FirstReceivedNs: recvMetrics.FirstReceivedNs,
+		LastReceivedNs:  recvMetrics.LastReceivedNs,
 		LinesIn:         genStats.LinesSent,
 		LinesOut:        recvMetrics.LinesReceived,
 		BytesIn:         genStats.BytesSent,
@@ -443,7 +451,12 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		fmt.Printf("  subject limits: cpu=%s mem=%s\n",
 			defaultVal(r.opts.CPULimit, "unlimited"), defaultVal(r.opts.MemLimit, "unlimited"))
 	}
-	fmt.Printf("  system: %d CPUs, %d MB RAM  send: %.1fs  total: %.1fs\n", sysCPUs, sysMemMB, sendDuration, elapsed)
+	recvWindow := 0.0
+	if recvMetrics.FirstReceivedNs > 0 && recvMetrics.LastReceivedNs > recvMetrics.FirstReceivedNs {
+		recvWindow = float64(recvMetrics.LastReceivedNs-recvMetrics.FirstReceivedNs) / 1e9
+	}
+	fmt.Printf("  system: %d CPUs, %d MB RAM  send: %.1fs  recv: %.1fs  active: %.1fs  total: %.1fs\n",
+		sysCPUs, sysMemMB, sendDuration, recvWindow, rateDuration, elapsed)
 
 	if recvMetrics.Passed != nil {
 		if *recvMetrics.Passed {
@@ -667,19 +680,23 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 	}
 
 	result := results.RunResult{
-		TestName:    tc.Name,
-		Config:      configName,
-		Subject:     subject.Name,
-		Version:     subject.Version,
-		Hardware:    hardwareID(),
-		Timestamp:   startTime,
-		DurationSec: elapsed,
-		LinesIn:     genStats.LinesSent,
-		LinesOut:    recvMetrics.LinesReceived,
-		BytesIn:     genStats.BytesSent,
-		BytesOut:    recvMetrics.BytesReceived,
-		LossPercent: lossPct,
-		Passed:      &passed,
+		TestName:        tc.Name,
+		Config:          configName,
+		Subject:         subject.Name,
+		Version:         subject.Version,
+		Hardware:        hardwareID(),
+		Timestamp:       startTime,
+		DurationSec:     elapsed,
+		FirstSentNs:     genStats.FirstSentNs,
+		LastSentNs:      genStats.LastSentNs,
+		FirstReceivedNs: recvMetrics.FirstReceivedNs,
+		LastReceivedNs:  recvMetrics.LastReceivedNs,
+		LinesIn:         genStats.LinesSent,
+		LinesOut:        recvMetrics.LinesReceived,
+		BytesIn:         genStats.BytesSent,
+		BytesOut:        recvMetrics.BytesReceived,
+		LossPercent:     lossPct,
+		Passed:          &passed,
 	}
 	if !passed {
 		result.FailReason = strings.Join(errors, "; ")
@@ -837,7 +854,7 @@ func (r *Runner) runPersistenceRestartCorrectness(tc *config.TestCase, subject c
 
 	// PHASE 3: immediately stop subject — SIGTERM must flush in-flight state to disk
 	fmt.Println("  phase 3: stopping subject immediately (SIGTERM)…")
-	if err := orch.StopServices("subject"); err != nil {
+	if err := orch.StopServices(30*time.Second, "subject"); err != nil {
 		return results.RunResult{}, fmt.Errorf("stopping subject: %w", err)
 	}
 
@@ -928,19 +945,23 @@ func (r *Runner) runPersistenceRestartCorrectness(tc *config.TestCase, subject c
 	}
 
 	result := results.RunResult{
-		TestName:    tc.Name,
-		Config:      configName,
-		Subject:     subject.Name,
-		Version:     subject.Version,
-		Hardware:    hardwareID(),
-		Timestamp:   startTime,
-		DurationSec: elapsed,
-		LinesIn:     genStats.LinesSent,
-		LinesOut:    recvMetrics.LinesReceived,
-		BytesIn:     genStats.BytesSent,
-		BytesOut:    recvMetrics.BytesReceived,
-		LossPercent: lossPct,
-		Passed:      &passed,
+		TestName:        tc.Name,
+		Config:          configName,
+		Subject:         subject.Name,
+		Version:         subject.Version,
+		Hardware:        hardwareID(),
+		Timestamp:       startTime,
+		DurationSec:     elapsed,
+		FirstSentNs:     genStats.FirstSentNs,
+		LastSentNs:      genStats.LastSentNs,
+		FirstReceivedNs: recvMetrics.FirstReceivedNs,
+		LastReceivedNs:  recvMetrics.LastReceivedNs,
+		LinesIn:         genStats.LinesSent,
+		LinesOut:        recvMetrics.LinesReceived,
+		BytesIn:         genStats.BytesSent,
+		BytesOut:        recvMetrics.BytesReceived,
+		LossPercent:     lossPct,
+		Passed:          &passed,
 	}
 	if !passed {
 		result.FailReason = strings.Join(errors, "; ")
@@ -1020,6 +1041,39 @@ func (r *Runner) parseGeneratorStats(stdout string) GeneratorResult {
 		return GeneratorResult{}
 	}
 	return g
+}
+
+func benchmarkWindow(gen GeneratorResult, recv ReceiverMetrics, sendDuration float64) (startNs, endNs int64, durationSec float64) {
+	startNs = gen.FirstSentNs
+	endNs = gen.LastSentNs
+	durationSec = sendDuration
+
+	if startNs > 0 && endNs <= startNs && sendDuration > 0 {
+		endNs = startNs + int64(sendDuration*1e9)
+	}
+	if startNs == 0 && endNs > 0 && sendDuration > 0 {
+		startNs = endNs - int64(sendDuration*1e9)
+	}
+
+	if startNs == 0 && recv.FirstReceivedNs > 0 {
+		startNs = recv.FirstReceivedNs
+	}
+	if recv.LastReceivedNs > endNs {
+		endNs = recv.LastReceivedNs
+	}
+
+	if startNs > 0 && endNs > startNs {
+		durationSec = float64(endNs-startNs) / 1e9
+		return startNs, endNs, durationSec
+	}
+
+	if recv.FirstReceivedNs > 0 && recv.LastReceivedNs > recv.FirstReceivedNs {
+		recvDuration := float64(recv.LastReceivedNs-recv.FirstReceivedNs) / 1e9
+		if recvDuration > durationSec {
+			durationSec = recvDuration
+		}
+	}
+	return startNs, endNs, durationSec
 }
 
 // getSystemInfo returns the number of CPU cores and total memory in MB.

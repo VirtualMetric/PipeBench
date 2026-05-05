@@ -32,10 +32,84 @@ type config struct {
 	ExpectedLines   int64 // 0 = don't check
 }
 
+// connStats holds per-connection counters. We keep the running totals in a
+// per-connection struct (rather than a single shared counter) so multiple
+// connection goroutines don't pingpong the same cache line on every line —
+// at multi-million lines/s the contention dwarfed the actual work. The
+// trailing padding rounds the struct to 64 bytes (one cache line) so two
+// adjacent shards in memory never share a line.
+type connStats struct {
+	lines   atomic.Int64
+	bytes   atomic.Int64
+	firstNs atomic.Int64 // earliest line on this shard, unix nanos
+	lastNs  atomic.Int64 // latest line on this shard, unix nanos
+	_       [64 - 32]byte
+}
+
+// recordLine bumps line/byte counters and refreshes the receive-window
+// timestamps. To bound `time.Now()` overhead at multi-million lines/s, we
+// only sample the timestamp on the very first line of the shard and then
+// every 1024 lines after. The receive window is at second-scale so 1024-
+// line resolution is far more precision than the runner needs. Returns the
+// new line count for callers that want it.
+func (s *connStats) recordLine(byteCount int64) int64 {
+	n := s.lines.Add(1)
+	s.bytes.Add(byteCount)
+	if n == 1 {
+		now := time.Now().UnixNano()
+		s.firstNs.CompareAndSwap(0, now)
+		s.lastNs.Store(now)
+	} else if n&0x3FF == 0 {
+		s.lastNs.Store(time.Now().UnixNano())
+	}
+	return n
+}
+
+// finish records a closing timestamp regardless of where the 1024-line
+// sampling left off, so the last bucket of lines in a connection isn't
+// silently dropped from the receive window.
+func (s *connStats) finish() {
+	if s.lines.Load() > 0 {
+		s.lastNs.Store(time.Now().UnixNano())
+	}
+}
+
+// counters is the global aggregator. Hot paths never touch this struct
+// after a shard is created — they write to their own connStats directly.
+// /metrics walks all shards under a read lock and aggregates.
 type counters struct {
-	LinesReceived atomic.Int64
-	BytesReceived atomic.Int64
-	Done          atomic.Bool
+	mu     sync.RWMutex
+	shards []*connStats
+	Done   atomic.Bool
+}
+
+// newShard registers and returns a fresh per-connection shard.
+func (c *counters) newShard() *connStats {
+	s := &connStats{}
+	c.mu.Lock()
+	c.shards = append(c.shards, s)
+	c.mu.Unlock()
+	return s
+}
+
+// totals aggregates every shard. The receive window spans from the
+// EARLIEST first-received timestamp to the LATEST last-received timestamp
+// across all connections, so a vmetric run with many parallel forwarders
+// or staggered HTTP requests still produces an honest window.
+func (c *counters) totals() (lines, bytes, firstNs, lastNs int64) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, s := range c.shards {
+		lines += s.lines.Load()
+		bytes += s.bytes.Load()
+		if f := s.firstNs.Load(); f > 0 && (firstNs == 0 || f < firstNs) {
+			firstNs = f
+		}
+		if l := s.lastNs.Load(); l > lastNs {
+			lastNs = l
+		}
+	}
+	return
 }
 
 // validator tracks correctness state. All access is protected by mu except
@@ -334,20 +408,12 @@ func main() {
 	fmt.Fprintf(os.Stderr, "receiver: mode=%s listen=%s http_data=:%s metrics=:%s order=%v dedup=%v content=%v\n",
 		cfg.Mode, cfg.Listen, httpDataPort, cfg.MetricsPort, cfg.ValidateOrder, cfg.ValidateDedup, cfg.ValidateContent)
 
-	lineCallback := func(line []byte) {
-		cnt.LinesReceived.Add(1)
-		cnt.BytesReceived.Add(int64(len(line)) + 1)
-		if cfg.ValidateOrder || cfg.ValidateDedup || cfg.ValidateContent {
-			val.recordLine(line, cfg)
-		}
-	}
-
 	var err error
 	switch cfg.Mode {
 	case "tcp":
-		err = receiveTCP(cfg, lineCallback)
+		err = receiveTCP(cfg, cnt, val)
 	case "file":
-		err = receiveFile(cfg, lineCallback)
+		err = receiveFile(cfg, cnt, val)
 	case "http":
 		err = receiveHTTP(cfg, cnt, val)
 	default:
@@ -362,14 +428,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	totalLines := cnt.LinesReceived.Load()
+	totalLines, totalBytes, _, _ := cnt.totals()
 
 	// Run correctness validation
 	passed, errors := val.validate(cfg, totalLines)
 
 	summary := map[string]any{
 		"lines_received": totalLines,
-		"bytes_received": cnt.BytesReceived.Load(),
+		"bytes_received": totalBytes,
 	}
 	if cfg.ValidateOrder || cfg.ValidateDedup || cfg.ExpectedLines > 0 {
 		summary["passed"] = passed
@@ -385,7 +451,7 @@ func main() {
 	}
 
 	fmt.Fprintf(os.Stderr, "receiver: done. lines=%d bytes=%d passed=%v\n",
-		totalLines, cnt.BytesReceived.Load(), passed)
+		totalLines, totalBytes, passed)
 
 	if !passed {
 		for _, e := range errors {
@@ -395,7 +461,7 @@ func main() {
 	}
 }
 
-func receiveTCP(cfg config, onLine func([]byte)) error {
+func receiveTCP(cfg config, cnt *counters, val *validator) error {
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", cfg.Listen, err)
@@ -411,29 +477,42 @@ func receiveTCP(cfg config, onLine func([]byte)) error {
 			wg.Wait()
 			return nil
 		}
+		// One shard per connection — eliminates cache-line contention between
+		// concurrent connection goroutines on the line/byte counters.
+		shard := cnt.newShard()
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			handleConn(conn, onLine)
+			handleConn(conn, shard, val, cfg)
 		}()
 	}
 }
 
-func handleConn(conn net.Conn, onLine func([]byte)) {
+func handleConn(conn net.Conn, shard *connStats, val *validator, cfg config) {
 	defer conn.Close()
+	defer shard.finish()
 	scanner := bufio.NewScanner(conn)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
-	// Pass the scanner's internal slice directly. onLine + validator
-	// only read len() and copy via `string(line)` / hash when they need
-	// to keep bytes — they never retain the slice past return. Skipping
-	// the outer make+copy here saves one alloc and one memcpy per line,
-	// which at multi-million-lines/s was the receiver's hot ceiling.
+	needsValidation := cfg.ValidateOrder || cfg.ValidateDedup || cfg.ValidateContent
+	// Pass the scanner's internal slice directly. shard.recordLine + validator
+	// only read len() and copy via `string(line)` / hash when they need to
+	// keep bytes — they never retain the slice past return. Skipping the
+	// outer make+copy here saves one alloc and one memcpy per line, which at
+	// multi-million-lines/s was the receiver's hot ceiling.
 	for scanner.Scan() {
-		onLine(scanner.Bytes())
+		b := scanner.Bytes()
+		shard.recordLine(int64(len(b)) + 1)
+		if needsValidation {
+			val.recordLine(b, cfg)
+		}
 	}
 }
 
-func receiveFile(cfg config, onLine func([]byte)) error {
+func receiveFile(cfg config, cnt *counters, val *validator) error {
+	shard := cnt.newShard()
+	defer shard.finish()
+	needsValidation := cfg.ValidateOrder || cfg.ValidateDedup || cfg.ValidateContent
+
 	deadline := time.Now().Add(cfg.Timeout + 5*time.Minute) // generous for file tests
 	f, err := os.Open(cfg.Listen)
 	if err != nil {
@@ -457,7 +536,10 @@ func receiveFile(cfg config, onLine func([]byte)) error {
 		for scanner.Scan() {
 			line := make([]byte, len(scanner.Bytes()))
 			copy(line, scanner.Bytes())
-			onLine(line)
+			shard.recordLine(int64(len(line)) + 1)
+			if needsValidation {
+				val.recordLine(line, cfg)
+			}
 			lastActivity = time.Now()
 		}
 		if scanner.Err() != nil {
@@ -472,6 +554,11 @@ func receiveFile(cfg config, onLine func([]byte)) error {
 }
 
 func receiveHTTP(cfg config, cnt *counters, val *validator) error {
+	// One shared shard for the HTTP server — HTTP rates are far below the
+	// per-shard ceiling so contention here doesn't matter, and a single
+	// shard keeps the per-request bookkeeping trivial.
+	httpShard := cnt.newShard()
+	needsValidation := cfg.ValidateOrder || cfg.ValidateDedup || cfg.ValidateContent
 	mux := http.NewServeMux()
 
 	// Generic POST handler — counts every line in the body
@@ -492,14 +579,13 @@ func receiveHTTP(cfg config, cnt *counters, val *validator) error {
 			lines := strings.Split(content, "\n")
 			for _, l := range lines {
 				lineBytes := []byte(l)
-				cnt.LinesReceived.Add(1)
-				cnt.BytesReceived.Add(int64(len(lineBytes)) + 1)
-				if cfg.ValidateOrder || cfg.ValidateDedup || cfg.ValidateContent {
+				httpShard.recordLine(int64(len(lineBytes)) + 1)
+				if needsValidation {
 					val.recordLine(lineBytes, cfg)
 				}
 			}
 		} else {
-			cnt.BytesReceived.Add(int64(len(body)))
+			httpShard.bytes.Add(int64(len(body)))
 		}
 		w.WriteHeader(http.StatusOK)
 	}
@@ -528,9 +614,8 @@ func receiveHTTP(cfg config, cnt *counters, val *validator) error {
 					continue
 				}
 				lineBytes := []byte(l)
-				cnt.LinesReceived.Add(1)
-				cnt.BytesReceived.Add(int64(len(lineBytes)) + 1)
-				if cfg.ValidateOrder || cfg.ValidateDedup || cfg.ValidateContent {
+				httpShard.recordLine(int64(len(lineBytes)) + 1)
+				if needsValidation {
 					val.recordLine(lineBytes, cfg)
 				}
 			}
@@ -561,10 +646,11 @@ func receiveHTTP(cfg config, cnt *counters, val *validator) error {
 // startHTTPDataEndpoint runs a standalone HTTP server that accepts data via
 // POST. It handles both plain line-per-request and ES /_bulk NDJSON format.
 func startHTTPDataEndpoint(port string, cnt *counters, val *validator, cfg config) error {
+	httpShard := cnt.newShard()
+	needsValidation := cfg.ValidateOrder || cfg.ValidateDedup || cfg.ValidateContent
 	lineCallback := func(line []byte) {
-		cnt.LinesReceived.Add(1)
-		cnt.BytesReceived.Add(int64(len(line)) + 1)
-		if cfg.ValidateOrder || cfg.ValidateDedup || cfg.ValidateContent {
+		httpShard.recordLine(int64(len(line)) + 1)
+		if needsValidation {
 			val.recordLine(line, cfg)
 		}
 	}
@@ -661,11 +747,15 @@ func serveMetrics(port string, cnt *counters, val *validator, cfg config) {
 
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		totalLines := cnt.LinesReceived.Load()
+		// Aggregate across all per-connection shards. firstNs is the earliest
+		// first-line timestamp across every shard; lastNs is the latest.
+		totalLines, totalBytes, firstNs, lastNs := cnt.totals()
 		resp := map[string]any{
-			"lines_received": totalLines,
-			"bytes_received": cnt.BytesReceived.Load(),
-			"done":           cnt.Done.Load(),
+			"lines_received":    totalLines,
+			"bytes_received":    totalBytes,
+			"done":              cnt.Done.Load(),
+			"first_received_ns": firstNs,
+			"last_received_ns":  lastNs,
 		}
 		// Include correctness data if validation is enabled
 		if cfg.ValidateOrder || cfg.ValidateDedup || cfg.ValidateContent || cfg.ExpectedLines > 0 {
