@@ -123,7 +123,7 @@ What happens behind the scenes:
 
 The output will look something like:
 
-```
+```text
 → test=tcp_to_tcp_performance  subject=vector  version=0.54.0-alpine  config=default
   starting containers…
   waiting for generator (up to 3m10s)…
@@ -154,7 +154,7 @@ The file contains throughput, loss, CPU/memory averages over the active benchmar
 ## Common commands
 
 | What you want to do | Command |
-|---|---|
+| --- | --- |
 | List all available tests and subjects | `./bin/harness list` |
 | Run a test against a specific subject | `./bin/harness test -t tcp_to_tcp_performance -s vector` |
 | Run a test against multiple subjects | `./bin/harness test -t tcp_to_tcp_performance -s vector,fluent-bit,logstash` |
@@ -187,7 +187,7 @@ After running the same test against multiple subjects, use `compare` to see them
 
 This prints a table like:
 
-```
+```text
   Test: tcp_to_tcp_performance  Config: default
 
   SUBJECT      VERSION          THROUGHPUT       AVG CPU   MAX CPU   AVG MEM   MAX MEM   NET I/O
@@ -199,7 +199,7 @@ This prints a table like:
 
 For correctness tests, the table shows PASS/FAIL instead of throughput:
 
-```
+```text
   Test: sighup_correctness  Config: default  (correctness)
 
   SUBJECT      VERSION          RESULT   LINES OUT   DURATION   DETAILS
@@ -227,7 +227,7 @@ generator:
 All TCP-based performance tests default to `connections: 4`. You can change this to match your hardware and the subject under test:
 
 | connections | When to use |
-|---|---|
+| --- | --- |
 | `1` | Correctness tests, low-throughput subjects, single-core machines |
 | `4` | Default for performance tests. Good baseline for most subjects. |
 | `8` | High-performance subjects (Vector) on 4+ core machines |
@@ -306,7 +306,7 @@ Each test run produces a `summary.json` with all metrics:
 ```
 
 | Field | Meaning |
-|---|---|
+| --- | --- |
 | `duration_secs` | Active benchmark window used for throughput: first generator send through the later of generator completion or final in-grace receiver delivery |
 | `lines_in` / `lines_out` | Lines sent by generator vs received by receiver |
 | `lines_per_sec` | Throughput (lines out / duration) |
@@ -371,7 +371,7 @@ Make sure no other heavy processes are running. For fair benchmarking, a machine
 These measure throughput, CPU, memory, and I/O while each subject processes data at maximum speed for 2 minutes.
 
 | Test | What it does |
-|---|---|
+| --- | --- |
 | `tcp_to_tcp_performance` | TCP in, TCP out (raw passthrough baseline) |
 | `tcp_to_tcp_5min_performance` | Same as above but 5-minute sustained run |
 | `tcp_to_tcp_persistent_performance` | TCP in, TCP out with disk persistence on the forwarding path |
@@ -390,7 +390,7 @@ These measure throughput, CPU, memory, and I/O while each subject processes data
 These verify data integrity — no lost, duplicated, or reordered events. The generator embeds sequence numbers in each line, and the receiver validates them.
 
 | Test | What it checks |
-|---|---|
+| --- | --- |
 | `disk_buffer_persistence_correctness` | Events survive subject restart with disk buffer |
 | `tcp_to_tcp_persistent_correctness` | Logs sent while receiver is down are persisted and delivered when it comes up |
 | `tcp_to_tcp_persistent_restart_correctness` | Same as above, plus the subject is restarted mid-test |
@@ -405,7 +405,7 @@ These verify data integrity — no lost, duplicated, or reordered events. The ge
 
 ## Project structure (for the curious)
 
-```
+```text
 PipeBench/
   cmd/harness/           CLI binary (the tool you run)
   internal/              Go packages for config, orchestration, metrics, results
@@ -438,7 +438,7 @@ PipeBench/
 For each test, the harness captures these metrics every second:
 
 | Metric | What it means |
-|---|---|
+| --- | --- |
 | `cpu_usr` | CPU time spent in userspace (higher = subject is working harder) |
 | `mem_used` | Memory used by the subject container in bytes |
 | `net_recv` / `net_send` | Network bytes received and sent per second |

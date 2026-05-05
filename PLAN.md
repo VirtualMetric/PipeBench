@@ -29,7 +29,7 @@ The original harness required AWS (EC2, S3, Athena, DynamoDB), Terraform 0.12, A
 **Performance tests** — measure CPU, memory, disk I/O, network I/O while each subject processes a fixed data volume:
 
 | Slug | Description |
-|---|---|
+| --- | --- |
 | `tcp_to_tcp` | Receive events over TCP, forward over TCP |
 | `tcp_to_tcp_5min` | Same as above but 5-minute sustained run |
 | `tcp_to_tcp_persistent` | TCP in, TCP out with disk persistence on the forwarding path |
@@ -46,7 +46,7 @@ The original harness required AWS (EC2, S3, Athena, DynamoDB), Terraform 0.12, A
 **Correctness tests** — validate data integrity, ordering, deduplication:
 
 | Slug | Description |
-|---|---|
+| --- | --- |
 | `disk_buffer_persistence` | Events survive subject restart with disk buffer |
 | `tcp_to_tcp_persistent` | Logs sent while receiver is down are persisted and delivered when it comes up |
 | `tcp_to_tcp_persistent_restart` | Same as above, plus the subject is restarted mid-test |
@@ -60,7 +60,7 @@ The original harness required AWS (EC2, S3, Athena, DynamoDB), Terraform 0.12, A
 ### Subjects
 
 | Subject | Image | Phase |
-|---|---|---|
+| --- | --- | --- |
 | VirtualMetric DataStream | `vmetric/director:<version>` | Phase 1 |
 | Vector | `timberio/vector:<version>` | Phase 1 |
 | Fluent Bit | `fluent/fluent-bit:<version>` | Phase 2 |
@@ -82,7 +82,7 @@ The original harness required AWS (EC2, S3, Athena, DynamoDB), Terraform 0.12, A
 
 ## 2. Repository Structure
 
-```
+```text
 PipeBench/
 ├── cmd/
 │   └── harness/
@@ -268,7 +268,7 @@ A single Go binary with no external dependencies.
 **Environment variables:**
 
 | Variable | Description | Default |
-|---|---|---|
+| --- | --- | --- |
 | `GENERATOR_MODE` | `tcp`, `file`, `http` | `tcp` |
 | `GENERATOR_TARGET` | `host:port` or file path | required |
 | `GENERATOR_RATE` | lines/sec, `0` = unlimited | `0` |
@@ -279,6 +279,7 @@ A single Go binary with no external dependencies.
 | `GENERATOR_WARMUP` | pause before starting (let subject boot) | `5s` |
 
 **Behavior:**
+
 - TCP mode: dials `GENERATOR_TARGET`, writes `\n`-delimited lines at the configured rate.
 - File mode: writes to the file path in `GENERATOR_TARGET`, appending lines.
 - HTTP mode: POSTs batches of lines to `GENERATOR_TARGET` URL.
@@ -286,6 +287,7 @@ A single Go binary with no external dependencies.
 - Prints final stats to stdout as JSON: `{"lines_sent": N, "bytes_sent": N, "duration_ms": N}`.
 
 **Dockerfile:**
+
 ```dockerfile
 FROM golang:1.22-alpine AS builder
 WORKDIR /build
@@ -304,7 +306,7 @@ ENTRYPOINT ["/generator"]
 **Environment variables:**
 
 | Variable | Description | Default |
-|---|---|---|
+| --- | --- | --- |
 | `RECEIVER_MODE` | `tcp`, `file`, `http` | `tcp` |
 | `RECEIVER_LISTEN` | `host:port` or file path | `:9001` |
 | `RECEIVER_EXPECTED_LINES` | for correctness tests: fail if not equal | unset |
@@ -313,6 +315,7 @@ ENTRYPOINT ["/generator"]
 | `RECEIVER_TIMEOUT` | max wait after generator done | `30s` |
 
 **HTTP endpoints exposed by receiver:**
+
 - `GET /metrics` — returns JSON `{"lines_received": N, "bytes_received": N, "done": bool}`
 - `GET /health` — returns `200 OK`
 
@@ -325,7 +328,7 @@ Polls the Docker Stats API or reads cgroup v2 data and writes a CSV file in the 
 **Environment variables:**
 
 | Variable | Description | Default |
-|---|---|---|
+| --- | --- | --- |
 | `COLLECTOR_TARGET_CONTAINER` | container name/ID to monitor | required |
 | `COLLECTOR_INTERVAL` | sampling interval | `1s` |
 | `COLLECTOR_OUTPUT` | output CSV file path | `/results/metrics.csv` |
@@ -392,7 +395,7 @@ correctness:
 
 For a test case with multiple configurations:
 
-```
+```text
 cases/tcp_to_tcp_performance/
   case.yaml
   configs/
@@ -411,7 +414,7 @@ cases/tcp_to_tcp_performance/
 
 For a test case with a single `default` configuration, configs can be flat:
 
-```
+```text
 cases/tcp_to_tcp_performance/
   case.yaml
   configs/
@@ -503,7 +506,7 @@ services:
 
 ### Test Lifecycle (Docker mode)
 
-```
+```text
 harness test -t tcp_to_tcp_performance -s vector
   │
   ├─ 1. Parse case.yaml
@@ -528,7 +531,7 @@ The collector outputs a CSV matching the original dstat schema as closely as pos
 
 ### CSV Column Definitions
 
-```
+```text
 epoch        — Unix timestamp (integer seconds)
 cpu_usr      — User CPU % (0-100 per core, not normalized)
 cpu_sys      — System CPU %
@@ -593,7 +596,7 @@ type MetricsRow struct {
 
 ### Results Directory Layout
 
-```
+```text
 results/
   tcp_to_tcp_performance/
     default/
@@ -618,6 +621,7 @@ results/
 **Goal:** `harness test -t tcp_to_tcp -s vector` produces a local results directory with `metrics.csv` and `summary.json`.
 
 Deliverables:
+
 - [ ] `go.mod` with cobra, docker SDK dependencies
 - [ ] `internal/config/case.go` — parse `case.yaml`
 - [ ] `internal/config/subject.go` — Vector entry in registry
@@ -636,6 +640,7 @@ Deliverables:
 **Goal:** `harness compare -t tcp_to_tcp` prints a comparison table across all subjects.
 
 Deliverables:
+
 - [ ] Add Fluent Bit, Fluentd, Logstash, AxoSyslog to subject registry
 - [ ] Subject configs for all performance test cases
 - [ ] `internal/results/compare.go` — load results and render tabular comparison
@@ -650,6 +655,7 @@ Deliverables:
 **Goal:** `harness test -t file_rotate_create -s vector` passes/fails with explanation.
 
 Deliverables:
+
 - [ ] Receiver: `RECEIVER_VALIDATE_ORDER`, `RECEIVER_VALIDATE_DEDUP`, line hashing
 - [ ] Correctness result type (pass/fail + details)
 - [ ] All 7 correctness test case directories
@@ -662,6 +668,7 @@ Deliverables:
 **Goal:** Polished CLI and a reproducible reporting flow that produces the in-repo `web/` index.
 
 Deliverables:
+
 - [ ] JSON report output (`harness compare --format json`)
 - [ ] HTML report output (`harness compare --format html`)
 - [ ] Optional MinIO/S3 result upload (`harness push --bucket <name>`)
@@ -675,7 +682,7 @@ Deliverables:
 ### Build Requirements
 
 | Tool | Version | Purpose |
-|---|---|---|
+| --- | --- | --- |
 | Go | 1.22+ | CLI and container binaries |
 | Docker | 24+ with Compose v2 | Local orchestration |
 | Make | any | Build automation |
@@ -690,7 +697,7 @@ Deliverables:
 ### No Longer Required
 
 | Removed | Replaced By |
-|---|---|
+| --- | --- |
 | AWS account, EC2, S3, Athena, DynamoDB | Local filesystem + optional MinIO |
 | Terraform | None |
 | Ansible | None |
@@ -708,7 +715,7 @@ Deliverables:
 
 Run a single test case against one or more subjects.
 
-```
+```text
 harness test -t <test_slug> [-s <subject>] [-c <config>] [flags]
 
 Flags:
@@ -725,7 +732,7 @@ Flags:
 
 Load and compare results across subjects or time.
 
-```
+```text
 harness compare -t <test_slug> [-c <config>] [flags]
 
 Flags:
@@ -740,7 +747,7 @@ Flags:
 
 List all available test cases and subjects.
 
-```
+```text
 harness list [flags]
 
 Flags:
@@ -752,7 +759,7 @@ Flags:
 
 Remove all bench containers, networks, and temp files.
 
-```
+```text
 harness clean [flags]
 
 Flags:
@@ -763,7 +770,7 @@ Flags:
 
 Print build version information.
 
-```
+```text
 harness version
 ```
 
@@ -785,6 +792,7 @@ require (
 
 ## Appendix: Makefile Targets
 
+<!-- markdownlint-disable MD010 -->
 ```makefile
 .PHONY: build build-containers test-local clean
 
@@ -806,3 +814,4 @@ clean:
 	./bin/harness clean
 	rm -f bin/harness
 ```
+<!-- markdownlint-enable MD010 -->

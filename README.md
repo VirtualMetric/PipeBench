@@ -9,7 +9,7 @@ PipeBench runs on Docker — local machine or single-node EC2. Follow [README-DO
 ## Project guides
 
 | Guide | What it covers |
-|---|---|
+| --- | --- |
 | [METHODOLOGY.md](METHODOLOGY.md) | How tests are run, what is measured, and how fairness is handled |
 | [ADDING-SUBJECTS.md](ADDING-SUBJECTS.md) | How to add a new subject and submit comparable result files |
 | [REPRODUCING-RESULTS.md](REPRODUCING-RESULTS.md) | How to reproduce published results locally or on matching AWS hardware |
@@ -31,7 +31,7 @@ After the test, the result is merged into a single per-(hardware, subject) JSON 
 ### Performance tests (13)
 
 | Test | What it does |
-|---|---|
+| --- | --- |
 | `tcp_to_tcp_performance` | TCP in, TCP out (raw passthrough baseline) |
 | `tcp_to_tcp_5min_performance` | Same as above but 5-minute sustained run |
 | `tcp_to_tcp_persistent_performance` | TCP in, TCP out with disk persistence on the forwarding path |
@@ -48,7 +48,7 @@ After the test, the result is merged into a single per-(hardware, subject) JSON 
 ### Correctness tests (8)
 
 | Test | What it checks |
-|---|---|
+| --- | --- |
 | `disk_buffer_persistence_correctness` | Events survive subject restart with disk buffer |
 | `tcp_to_tcp_persistent_correctness` | Logs sent while receiver is down are persisted and delivered when it comes up |
 | `tcp_to_tcp_persistent_restart_correctness` | Same as above, plus the subject is restarted mid-test |
@@ -94,7 +94,7 @@ If you maintain a tool on this list — or want to make the case for adding one 
 
 ## Project structure
 
-```
+```text
 PipeBench/
   cmd/harness/           CLI binary
   internal/              Config, orchestration (Docker Compose), runner, results
