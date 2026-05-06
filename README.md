@@ -1,6 +1,6 @@
 # PipeBench — Data Pipeline Benchmark
 
-A containerized benchmarking and correctness testing framework for data pipeline tools. Compare **VirtualMetric DataStream**, **Vector**, **Fluent Bit**, **Fluentd**, **Logstash**, and **AxoSyslog** side by side. Everything runs in Docker — clone the repo, build the harness and helper images, and reproduce any published result on the same hardware tier with one command.
+A containerized benchmarking and correctness testing framework for data pipeline tools. Compare **VirtualMetric DataStream**, **Vector**, **Fluent Bit**, **Fluentd**, **Logstash**, **Filebeat**, **Telegraf**, **AxoSyslog**, **NXLog**, **Tenzir**, **Splunk Heavy Forwarder**, **OpenTelemetry Collector**, **Grafana Alloy**, **observIQ BindPlane Agent**, **Cribl Stream**, and **Streamfold Rotel** side by side. Everything runs in Docker — clone the repo, build the harness and helper images, and reproduce any published result on the same hardware tier with one command.
 
 ## Getting started
 
@@ -28,7 +28,7 @@ After the test, the result is merged into a single per-(hardware, subject) JSON 
 
 ## Available tests
 
-### Performance tests (13)
+### Performance tests (16)
 
 | Test | What it does |
 | --- | --- |
@@ -44,8 +44,12 @@ After the test, the result is merged into a single per-(hardware, subject) JSON 
 | `syslog_parsing_performance` | TCP in, parse syslog message, TCP out |
 | `set_field_performance` | TCP in, add one field via native transform, TCP out |
 | `real_world_1_performance` | Parse, filter, and route (mixed pipeline) |
+| `netflow_to_tcp_performance` | NetFlow v5 over UDP in, decoded records as TCP lines out |
+| `otlp_to_otlp_generic_performance` | OTLP/HTTP+protobuf in, OTLP/HTTP+protobuf out (no transforms) |
+| `otlp_grpc_to_otlp_grpc_performance` | OTLP/gRPC end-to-end (isolates protocol cost vs. HTTP+protobuf) |
+| `otlp_pipeline_to_otlp_performance` | OTLP/HTTP in, OTLP/HTTP out with one add-attribute transform per record |
 
-### Correctness tests (8)
+### Correctness tests (13)
 
 | Test | What it checks |
 | --- | --- |
@@ -58,6 +62,10 @@ After the test, the result is merged into a single per-(hardware, subject) JSON 
 | `file_truncate_correctness` | Direct file truncation handled correctly |
 | `sighup_correctness` | Config reload via SIGHUP without data loss |
 | `wrapped_json_correctness` | JSON-in-string fields parsed correctly |
+| `netflow_to_tcp_correctness` | NetFlow v5 binary records decoded and forwarded with no record loss |
+| `otlp_to_otlp_generic_correctness` | OTLP/HTTP+protobuf round-trip preserves every LogRecord body |
+| `otlp_grpc_to_otlp_grpc_correctness` | OTLP/gRPC round-trip preserves every LogRecord body |
+| `otlp_pipeline_to_otlp_correctness` | OTLP/HTTP round-trip with one add-attribute transform preserves every body |
 
 ## Subjects
 
@@ -68,25 +76,19 @@ After the test, the result is merged into a single per-(hardware, subject) JSON 
 | Fluent Bit | `fluent/fluent-bit` | `5.0` |
 | Fluentd | `fluent/fluentd` | `v1.17-debian-1` |
 | Logstash | `docker.elastic.co/logstash/logstash` | `8.13.0` |
+| Filebeat | `docker.elastic.co/beats/filebeat` | `8.13.0` |
+| Telegraf | `telegraf` | `1.30-alpine` |
 | AxoSyslog | `ghcr.io/axoflow/axosyslog` | `4.24.0` |
+| NXLog CE | `nxlog/nxlog-ce` | `latest` |
+| Tenzir | `ghcr.io/tenzir/tenzir` | `v5.30.0` |
+| Splunk Heavy Forwarder | `splunk/splunk` | `latest` |
+| OpenTelemetry Collector (contrib) | `otel/opentelemetry-collector-contrib` | `0.149.0` |
+| Grafana Alloy | `grafana/alloy` | `v1.15.0` |
+| observIQ BindPlane Agent | `observiq/bindplane-agent` | `latest` |
+| Cribl Stream | `cribl/cribl` | `4.17.0` |
+| Streamfold Rotel | `streamfold/rotel` | `latest` |
 
-## Why this list?
-
-PipeBench deliberately keeps the subject list short. Every tool here meets the same bar, which is what makes the numbers comparable.
-
-### What every subject must support
-
-- **Disk persistence on the forwarding path.** If the downstream dies, events survive a restart. This rules out tools that only buffer in memory.
-- **Basic pipeline primitives.** TCP/HTTP in and out, file tailing, regex parsing and masking, simple routing. Anything less and most cases can't even run.
-- **Realistic enterprise use.** Production-grade agents that organizations actually ship to fleets — not single-purpose shippers or experimental collectors.
-
-A tool that can't do these three things isn't in the same category, and benchmarking it here would be misleading.
-
-### Why some well-known tools aren't here
-
-- **Cribl Stream.** The free tier caps throughput, so any performance number would reflect the licence gate, not the engine. Including it would misrepresent the product.
-- **Splunk Heavy Forwarder.** Licensing and EULA constraints make publishing head-to-head results awkward at best. We'd rather leave it out than risk misrepresenting Splunk.
-- **Filebeat, Telegraf, NXLog, Tenzir, OpenTelemetry Collector, Grafana Alloy, BindPlane Agent.** All capable tools, but each fails at least one bar above (e.g. memory-only buffering, narrow scope, missing transforms) which would make cross-comparison apples-to-oranges.
+Not every subject participates in every case — coverage depends on each tool's native capabilities. For example, only `vmetric`, `otel-collector`, `bindplane-agent`, and `cribl-stream` ship a first-party NetFlow v5 listener; OTLP cases skip subjects whose OTLP support is partial (e.g. Vector's OTLP sink is HTTP-only). Each `case.yaml` lists the subjects that case actually runs.
 
 ### Submitting your own results
 
@@ -103,7 +105,7 @@ PipeBench/
     receiver/            Receives output, counts lines, validates correctness
     collector/           Polls Docker stats API, writes metrics CSV
     vmetric/             Dockerfile + pre-built binary for the VirtualMetric Director subject
-  cases/                 22 test cases, each with per-subject configs
+  cases/                 29 test cases (16 performance + 13 correctness), each with per-subject configs
   web/                   Static PipeBench UI (single HTML + per-(hardware, subject) JSON under web/results/)
 ```
 

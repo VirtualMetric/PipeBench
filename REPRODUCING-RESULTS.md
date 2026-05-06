@@ -94,12 +94,21 @@ If you need to run a specific configuration:
 Run the same test against each subject on the same machine:
 
 ```bash
-./bin/harness test -t tcp_to_tcp_performance -s vmetric --hardware c7i.4xlarge
-./bin/harness test -t tcp_to_tcp_performance -s vector --hardware c7i.4xlarge
-./bin/harness test -t tcp_to_tcp_performance -s fluent-bit --hardware c7i.4xlarge
-./bin/harness test -t tcp_to_tcp_performance -s fluentd --hardware c7i.4xlarge
-./bin/harness test -t tcp_to_tcp_performance -s logstash --hardware c7i.4xlarge
-./bin/harness test -t tcp_to_tcp_performance -s axosyslog --hardware c7i.4xlarge
+./bin/harness test -t tcp_to_tcp_performance -s vmetric          --hardware c7i.4xlarge
+./bin/harness test -t tcp_to_tcp_performance -s vector           --hardware c7i.4xlarge
+./bin/harness test -t tcp_to_tcp_performance -s fluent-bit       --hardware c7i.4xlarge
+./bin/harness test -t tcp_to_tcp_performance -s fluentd          --hardware c7i.4xlarge
+./bin/harness test -t tcp_to_tcp_performance -s logstash         --hardware c7i.4xlarge
+./bin/harness test -t tcp_to_tcp_performance -s filebeat         --hardware c7i.4xlarge
+./bin/harness test -t tcp_to_tcp_performance -s telegraf         --hardware c7i.4xlarge
+./bin/harness test -t tcp_to_tcp_performance -s axosyslog        --hardware c7i.4xlarge
+./bin/harness test -t tcp_to_tcp_performance -s nxlog            --hardware c7i.4xlarge
+./bin/harness test -t tcp_to_tcp_performance -s tenzir           --hardware c7i.4xlarge
+./bin/harness test -t tcp_to_tcp_performance -s splunk-hf        --hardware c7i.4xlarge
+./bin/harness test -t tcp_to_tcp_performance -s otel-collector   --hardware c7i.4xlarge
+./bin/harness test -t tcp_to_tcp_performance -s grafana-alloy    --hardware c7i.4xlarge
+./bin/harness test -t tcp_to_tcp_performance -s bindplane-agent  --hardware c7i.4xlarge
+./bin/harness test -t tcp_to_tcp_performance -s cribl-stream     --hardware c7i.4xlarge
 ```
 
 Or run all subjects listed by the case:

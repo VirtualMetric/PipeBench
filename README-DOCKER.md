@@ -1,6 +1,6 @@
 # PipeBench — Docker Guide
 
-A containerized benchmarking and correctness testing framework for data pipeline tools. Compare **VirtualMetric DataStream**, **Vector**, **Fluent Bit**, **Fluentd**, **Logstash**, and **AxoSyslog** side by side — no cloud account required.
+A containerized benchmarking and correctness testing framework for data pipeline tools. Compare **VirtualMetric DataStream**, **Vector**, **Fluent Bit**, **Fluentd**, **Logstash**, **Filebeat**, **Telegraf**, **AxoSyslog**, **NXLog**, **Tenzir**, **Splunk Heavy Forwarder**, **OpenTelemetry Collector**, **Grafana Alloy**, **observIQ BindPlane Agent**, **Cribl Stream**, and **Streamfold Rotel** side by side — no cloud account required.
 
 > This guide covers running tests locally or on a single EC2 host with Docker — the supported way to run PipeBench.
 

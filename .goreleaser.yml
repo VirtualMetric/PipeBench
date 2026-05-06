@@ -68,8 +68,9 @@ archives:
       - METHODOLOGY.md
       - ADDING-SUBJECTS.md
 
-checksums:
+checksum:
   name_template: "checksums.txt"
+  algorithm: sha256
 
 snapshot:
   version_template: "{{ incpatch .Version }}-next"
