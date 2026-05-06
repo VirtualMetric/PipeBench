@@ -1,0 +1,113 @@
+# GoReleaser configuration — produces cross-compiled harness binaries
+# for Linux / macOS / Windows on every git tag (v*).
+#
+# Triggered automatically by .github/workflows/release.yml when you push
+# a tag like `v0.1.0`. To cut a release manually:
+#   git tag v0.1.0
+#   git push origin v0.1.0
+#
+# GoReleaser will then:
+#   1. Cross-compile cmd/harness for each (os, arch) target below.
+#   2. Inject buildVersion / buildCommit / buildDate via ldflags.
+#   3. Wrap each binary in a tar.gz (linux/macOS) or zip (windows)
+#      archive together with README + LICENSE.
+#   4. Generate SHA256 checksums for every archive.
+#   5. Auto-generate a changelog from commits since the previous tag.
+#   6. Push everything to a GitHub Release page.
+#
+# Schema reference: https://goreleaser.com/customization/
+
+version: 2
+
+project_name: pipebench
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: harness
+    main: ./cmd/harness
+    binary: harness
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      # Windows on arm64 isn't a common deployment target; skip it to
+      # keep the matrix tight.
+      - goos: windows
+        goarch: arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.buildVersion={{.Version}}
+      - -X main.buildCommit={{.ShortCommit}}
+      - -X main.buildDate={{.Date}}
+
+archives:
+  - id: harness-archive
+    ids: [harness]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_
+      {{- if eq .Os "darwin" }}macOS{{- else }}{{ .Os }}{{ end }}_
+      {{- if eq .Arch "amd64" }}x86_64{{- else }}{{ .Arch }}{{ end }}
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - README.md
+      - LICENSE
+      - METHODOLOGY.md
+      - ADDING-SUBJECTS.md
+
+checksums:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "Merge pull request"
+      - "Merge branch"
+
+release:
+  github:
+    owner: VirtualMetric
+    name: PipeBench
+  draft: false
+  prerelease: auto
+  name_template: "PipeBench {{ .Version }}"
+  header: |
+    ## PipeBench {{ .Version }}
+
+    Cross-compiled harness CLI for orchestrating data-pipeline benchmark runs.
+    Bench-* container images for the same revision live on Docker Hub:
+    - `vmetric/bench-generator:sha-{{ .ShortCommit }}`
+    - `vmetric/bench-receiver:sha-{{ .ShortCommit }}`
+    - `vmetric/bench-collector:sha-{{ .ShortCommit }}`
+    - `vmetric/pipebench:sha-{{ .ShortCommit }}`
+
+    ### Install
+
+    Download the archive that matches your OS/arch below, extract, and put
+    `harness` on your `PATH`. Verify the checksum against `checksums.txt`.
+
+    ### What's changed
+  footer: |
+    ---
+    **Full Changelog**: https://github.com/VirtualMetric/PipeBench/compare/{{ .PreviousTag }}...{{ .Tag }}

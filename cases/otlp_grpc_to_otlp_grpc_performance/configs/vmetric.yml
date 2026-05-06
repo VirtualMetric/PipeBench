@@ -1,0 +1,31 @@
+devices:
+  - id: 1
+    name: otel-bench
+    type: otel
+    properties:
+      address: "0.0.0.0"
+      otlp_grpc_status: true
+      otlp_http_status: true
+      otlp_logs_status: true
+      otlp_metrics_status: false
+      otlp_traces_status: false
+
+# Same gRPC outbound config as http_to_grpc — only the inbound
+# transport changes (driven by GENERATOR_OTLP_TRANSPORT=grpc), so
+# the listener config and target config are identical. The
+# performance delta vs. http_to_grpc isolates ingress overhead.
+targets:
+  - name: otlp-target-bench-grpc
+    type: otlp
+    properties:
+      protocol: grpc
+      address: "receiver"
+      port: 4317
+      compression: false
+
+routes:
+  - name: otel-to-otlp-grpc-bench
+    devices:
+      - name: otel-bench
+    targets:
+      - name: otlp-target-bench-grpc

@@ -1,0 +1,48 @@
+name: netflow_to_tcp_performance
+type: performance
+description: "Measures the rate at which a NetFlow v5 listener can decode binary records and forward them as TCP lines."
+
+# Steady-state window. Same shape as the other *_performance cases —
+# warmup so the listener finishes UDP socket bring-up + template setup,
+# then a measurement window long enough to amortize over GC/jitter.
+duration: 60s
+# 30s warmup mirrors the correctness case — the flow listener's
+# device-discovery loop + per-collector random startup sleep can take
+# up to ~22s before the UDP port is bound. Firing earlier yields
+# ICMP-port-unreachable on the first datagrams and skews the rate
+# measurement downward.
+warmup: 30s
+
+generator:
+  mode: udp_netflow_v5
+  target: "subject:2055"
+  # rate=0 = unlimited; the generator pushes datagrams as fast as the
+  # subject's UDP receive buffer drains. UDP has no flow control, so a
+  # subject that can't keep up will see kernel-side packet drops; the
+  # harness reports throughput as records-decoded/sec from the
+  # receiver's TCP-line count, which is the metric users actually care
+  # about.
+  rate: 0
+  # No total_lines — duration drives the test the way other
+  # performance cases do.
+  format: raw
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+subjects:
+  # Native NetFlow v5 listeners only. otel-collector-contrib +
+  # bindplane-agent share the upstream `netflowreceiver`;
+  # cribl-stream has a first-party "NetFlow & IPFIX" source.
+  # alloy + fluent-bit excluded — contrib's netflowreceiver isn't
+  # an Alloy component, fluent-bit's `in_netflow` is community
+  # out-of-tree.
+  - vmetric
+  - otel-collector
+  - bindplane-agent
+  - cribl-stream
+
+configurations:
+  default:
+    description: "NetFlow v5 → ECS JSON over TCP — pure decode+forward throughput, no transforms"

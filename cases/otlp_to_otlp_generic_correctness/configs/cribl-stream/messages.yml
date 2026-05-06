@@ -1,0 +1,11 @@
+messages:
+  UNKNOWN_DESTINATION_otlp:
+    severity: warn
+    title: Unknown Destination type "otlp"
+    text: Skipping configuring Destination "bench_otel_out" due to unrecognized type
+    time: 1778056270614
+  UNKNOWN_SOURCE_otlp:
+    severity: warn
+    title: Unknown Source type "otlp"
+    text: Skipping configuring Source "bench_otel_in" due to unrecognized type
+    time: 1778052066409

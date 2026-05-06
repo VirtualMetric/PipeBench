@@ -101,17 +101,22 @@ func (tc *TestCase) ConfigFilePath(casesDir, configName string, s Subject) (stri
 }
 
 type GeneratorConfig struct {
-	Mode        string `yaml:"mode"`        // "tcp" | "file" | "http"
-	Target      string `yaml:"target"`      // "subject:9000" or file path
-	Rate        int    `yaml:"rate"`        // lines/sec per connection, 0 = unlimited
-	TotalLines  int64  `yaml:"total_lines"` // total lines to send, 0 = use duration
-	LineSize    int    `yaml:"line_size"`   // bytes per line
-	Format      string `yaml:"format"`      // "raw" | "syslog" | "json"
-	Connections int    `yaml:"connections"` // parallel connections (default 1)
+	Mode        string            `yaml:"mode"`        // "tcp" | "file" | "http" | "udp_netflow_v5" | "otlp"
+	Target      string            `yaml:"target"`      // "subject:9000" or file path
+	Rate        int               `yaml:"rate"`        // lines/sec per connection, 0 = unlimited
+	TotalLines  int64             `yaml:"total_lines"` // total lines to send, 0 = use duration
+	LineSize    int               `yaml:"line_size"`   // bytes per line
+	Format      string            `yaml:"format"`      // "raw" | "syslog" | "json"
+	Connections int               `yaml:"connections"` // parallel connections (default 1)
+	// Env is mode-specific extra env passed straight through to the
+	// generator container (e.g. GENERATOR_OTLP_TRANSPORT=grpc). Lets a
+	// case dial in transport variants without growing GeneratorConfig
+	// for every new mode-specific knob.
+	Env         map[string]string `yaml:"env"`
 }
 
 type ReceiverConfig struct {
-	Mode   string `yaml:"mode"`   // "tcp" | "file" | "http"
+	Mode   string `yaml:"mode"`   // "tcp" | "file" | "http" | "otlp"
 	Listen string `yaml:"listen"` // ":9001" or file path
 }
 
@@ -128,6 +133,13 @@ type CorrectnessConfig struct {
 	// for performance tests (O(1) per line, no heap growth).
 	ValidateContent bool    `yaml:"validate_content"`
 	ExpectedLossPct float64 `yaml:"expected_loss_pct"`
+	// RequiredSubstring is a protocol-agnostic decode check: every emitted
+	// line must contain the configured substring. Used by tests where the
+	// generator and the on-the-wire output don't share a literal byte
+	// stream (e.g. NetFlow → JSON pipelines, OTLP body extraction) — a
+	// successful decode is proven by the presence of a value the generator
+	// embedded in every record. Empty = check disabled.
+	RequiredSubstring string `yaml:"required_substring"`
 }
 
 // LoadCase reads and parses a case.yaml from the given cases directory.

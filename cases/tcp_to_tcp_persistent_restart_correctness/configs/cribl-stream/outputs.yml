@@ -1,0 +1,19 @@
+outputs:
+  default:
+    defaultId: bench_tcp_out
+    type: default
+  bench_tcp_out:
+    type: tcpjson
+    host: receiver
+    port: 9001
+    nestedFields: none
+    throttleRatePerSec: "0"
+    compression: none
+    tls:
+      disabled: true
+    authType: manual
+    pqEnabled: true
+    pqMaxFileSize: "1 MB"
+    pqMaxSize: "4 GB"
+    pqPath: "$CRIBL_HOME/state/queues"
+    pqCompress: none

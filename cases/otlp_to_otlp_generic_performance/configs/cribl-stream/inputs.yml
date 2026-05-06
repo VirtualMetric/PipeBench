@@ -1,0 +1,28 @@
+# Cribl Stream OTLP/HTTP source.
+#
+# Cribl's OpenTelemetry source (`type: open_telemetry`, not `otlp`)
+# supports gRPC and HTTP, with the transport selected by `protocol`.
+# This case targets HTTP on 4318.
+#
+# `extractLogs: true` breaks each incoming OTLP request into one
+# Cribl event per LogRecord. Required if you want lines_in to match
+# lines_out at the receiver.
+#
+# Smoke-verified on cribl-stream:4.17.0. The matching destination
+# must use `type: open_telemetry`, the HTTP endpoint must include
+# `http://`, and the route pipeline must live at
+# `pipelines/<id>/conf.yml`.
+
+inputs:
+  bench_otel_in:
+    type: open_telemetry
+    disabled: false
+    host: 0.0.0.0
+    port: 4318
+    protocol: http
+    otlpVersion: 1.3.1
+    extractLogs: true
+    tls:
+      disabled: true
+    sendToRoutes: true
+    pqEnabled: false

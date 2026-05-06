@@ -1,0 +1,12 @@
+id: default
+groups: {}
+comments: []
+routes:
+  - id: bench_route
+    name: bench_real_world
+    final: true
+    disabled: false
+    pipeline: real_world
+    filter: "true"
+    output: bench_tcp_out
+    description: "Route all data through real_world parse+filter to TCP"

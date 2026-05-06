@@ -1,0 +1,21 @@
+output: default
+groups: {}
+asyncFuncTimeout: 1000
+functions:
+  # Eval adds the static bench_marker attribute to every Cribl
+  # event — analogous to vmetric's `set` processor and otel-collector's
+  # attributes/insert action.
+  - id: eval
+    filter: "true"
+    disabled: false
+    conf:
+      add:
+        - name: bench_marker
+          value: "'pipeline'"
+  # OTLP Logs reshapes extracted Cribl events back into a form the
+  # OTel Destination can emit. Required after the input's
+  # `extractLogs: true` + any field mutations.
+  - id: otlp_logs
+    filter: "true"
+    disabled: false
+    conf: {}

@@ -1,0 +1,50 @@
+name: Release
+
+# Triggered automatically when you push a tag like `v0.1.0`. There is no
+# manual "build a release" step — git tag + push is the entire workflow:
+#
+#   git tag v0.1.0
+#   git push origin v0.1.0
+#
+# What this does:
+#   1. Cross-compiles cmd/harness for linux/macOS/windows × amd64/arm64.
+#   2. Wraps each binary into a tar.gz/zip with README + LICENSE.
+#   3. Computes SHA256 checksums.
+#   4. Auto-generates the changelog from commits since the previous tag.
+#   5. Pushes everything to a GitHub Release at the tag.
+#
+# Configured via .goreleaser.yml at the repo root.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  # GoReleaser needs `contents: write` to create the release + upload assets.
+  contents: write
+
+jobs:
+  release:
+    name: Build & publish release artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          # Fetch full history so GoReleaser can resolve the previous tag
+          # for changelog generation.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "stable"
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,32 @@
+name: otlp_pipeline_to_otlp_correctness
+type: correctness
+description: "OTLP/HTTP receive→forward with one pipeline-stage transform per record (add a static attribute). Validates the per-record decode → mutate → re-encode round-trip preserves the LogRecord body bytes. rotel is excluded — its built-in transform layer doesn't expose a portable add-attribute primitive."
+
+duration: 60s
+warmup: 30s
+
+generator:
+  mode: otlp
+  target: "subject:4318"
+  rate: 0
+  total_lines: 500
+  format: raw
+
+receiver:
+  mode: otlp
+  listen: ":4318"
+
+subjects:
+  - vmetric
+  - vector
+  - fluent-bit
+  - otel-collector
+  - grafana-alloy
+  - bindplane-agent
+  - cribl-stream
+
+correctness:
+  validate_order: false
+  validate_dedup: true
+  expected_loss_pct: 0.0
+  required_substring: "OTEL-"

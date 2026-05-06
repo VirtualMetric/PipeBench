@@ -1,0 +1,31 @@
+devices:
+  - id: 1
+    name: otel-bench
+    type: otel
+    properties:
+      address: "0.0.0.0"
+      otlp_grpc_status: true
+      otlp_http_status: true
+      otlp_logs_status: true
+      # Metrics + traces explicitly off — case sends logs only, and
+      # the disable flags exercise our per-signal toggle so the
+      # disabled signals return 404 (HTTP) or Unimplemented (gRPC)
+      # rather than silently accepting and discarding.
+      otlp_metrics_status: false
+      otlp_traces_status: false
+
+targets:
+  - name: otlp-target-bench
+    type: otlp
+    properties:
+      url: "http://receiver:4318"
+      path: "/v1/logs"
+      format: "protobuf"
+      compression: true
+
+routes:
+  - name: otel-to-otlp-bench
+    devices:
+      - name: otel-bench
+    targets:
+      - name: otlp-target-bench

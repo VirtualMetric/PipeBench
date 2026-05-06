@@ -1,0 +1,27 @@
+// grafana-alloy → OTLP/gRPC head-to-head config.
+// otelcol.exporter.otlp speaks gRPC by default; the http variant
+// is a separate component (otelcol.exporter.otlphttp). TLS off
+// on the bench-local network so we measure protocol cost, not
+// certificate handshakes.
+
+otelcol.receiver.otlp "in" {
+  http {
+    endpoint = "0.0.0.0:4318"
+  }
+  grpc {
+    endpoint = "0.0.0.0:4317"
+  }
+  output {
+    logs = [otelcol.exporter.otlp.out.input]
+  }
+}
+
+otelcol.exporter.otlp "out" {
+  client {
+    endpoint = "receiver:4317"
+    compression = "gzip"
+    tls {
+      insecure = true
+    }
+  }
+}

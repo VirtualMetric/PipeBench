@@ -1,0 +1,15 @@
+id: mask
+conf:
+  output: default
+  groups: {}
+  asyncFuncTimeout: 1000
+  functions:
+    - id: mask
+      filter: "true"
+      disabled: false
+      conf:
+        rules:
+          - matchRegex: "/CONN=\\d+/g"
+            replaceExpr: "'CONN=***'"
+        fields:
+          - _raw

@@ -1,0 +1,26 @@
+// grafana-alloy → OTLP/HTTP head-to-head config.
+//
+// Alloy is a Grafana-distributed OTel Collector; the otelcol.*
+// components share the upstream contrib codebase, so this config
+// matches otel-collector.yaml in spirit. Performance differences
+// between alloy and otel-collector tend to be ~5-10% noise from
+// runtime/version drift rather than algorithmic differences.
+
+otelcol.receiver.otlp "in" {
+  http {
+    endpoint = "0.0.0.0:4318"
+  }
+  grpc {
+    endpoint = "0.0.0.0:4317"
+  }
+  output {
+    logs = [otelcol.exporter.otlphttp.out.input]
+  }
+}
+
+otelcol.exporter.otlphttp "out" {
+  client {
+    endpoint = "http://receiver:4318"
+    compression = "gzip"
+  }
+}

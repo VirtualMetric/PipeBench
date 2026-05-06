@@ -1,0 +1,12 @@
+id: default
+groups: {}
+comments: []
+routes:
+  - id: bench_route
+    name: bench_marker
+    final: true
+    disabled: false
+    pipeline: marker
+    filter: "true"
+    output: bench_otel_out
+    description: "Route OTLP-in → marker pipeline (eval add bench_marker) → OTLP-out"

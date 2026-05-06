@@ -1,0 +1,41 @@
+devices:
+  - id: 1
+    name: otel-bench
+    type: otel
+    properties:
+      address: "0.0.0.0"
+      otlp_grpc_status: true
+      otlp_http_status: true
+      otlp_logs_status: true
+      otlp_metrics_status: false
+      otlp_traces_status: false
+
+targets:
+  - name: otlp-target-bench
+    type: otlp
+    properties:
+      url: "http://receiver:4318"
+      path: "/v1/logs"
+      format: "protobuf"
+      compression: true
+
+# Same shape as the perf case's pipeline_route. Correctness
+# specifically validates that a no-op-ish pipeline preserves the
+# LogRecord body's "OTEL-<seq>" substring through the
+# DecodeRawToJSON → pipeline → parseOTELEnvelope → MarshalVT
+# round-trip.
+routes:
+  - name: otel-to-otlp-bench
+    devices:
+      - name: otel-bench
+    pipelines:
+      - name: otel-route-marker
+    targets:
+      - name: otlp-target-bench
+
+pipelines:
+  - name: otel-route-marker
+    processors:
+      - set:
+          field: _vmetric.pipeline_marker
+          value: route

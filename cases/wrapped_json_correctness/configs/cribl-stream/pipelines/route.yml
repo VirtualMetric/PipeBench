@@ -1,0 +1,12 @@
+id: default
+groups: {}
+comments: []
+routes:
+  - id: bench_route
+    name: bench_json_parse
+    final: true
+    disabled: false
+    pipeline: json_parse
+    filter: "true"
+    output: bench_tcp_out
+    description: "Route all data through json parser to TCP output"

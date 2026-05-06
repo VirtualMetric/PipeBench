@@ -20,8 +20,12 @@ subjects:
   - vector
   - fluent-bit
   - fluentd
+  - filebeat
   - logstash
+  - nxlog
   - axosyslog
+  - tenzir
+  - cribl-stream
 
 correctness:
   validate_order: true

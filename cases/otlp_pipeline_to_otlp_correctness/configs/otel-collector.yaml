@@ -1,0 +1,32 @@
+# otel-collector → OTLP/HTTP head-to-head config with a single
+# attribute-insert processor between receive and export. Mirrors the
+# `set` processor in vmetric's pipeline config — both add a static
+# key/value to every record so the decode → mutate → re-encode cost
+# is the same shape across subjects.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  attributes/bench_marker:
+    actions:
+      - key: bench_marker
+        value: pipeline
+        action: insert
+
+exporters:
+  otlphttp:
+    endpoint: http://receiver:4318
+    compression: gzip
+
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [attributes/bench_marker]
+      exporters: [otlphttp]

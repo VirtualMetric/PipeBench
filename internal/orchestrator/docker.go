@@ -106,6 +106,9 @@ services:
 {{- if .GenTotalLines }}
       GENERATOR_TOTAL_LINES: "{{ .GenTotalLines }}"
 {{- end }}
+{{- range $k, $v := .GenEnv }}
+      {{ $k }}: "{{ $v }}"
+{{- end }}
     restart: "no"
 
   receiver:
@@ -123,6 +126,9 @@ services:
       RECEIVER_VALIDATE_CONTENT: "{{ .RecvValidateContent }}"
 {{- if .RecvExpectedLines }}
       RECEIVER_EXPECTED_LINES: "{{ .RecvExpectedLines }}"
+{{- end }}
+{{- if .RecvRequiredSubstring }}
+      RECEIVER_REQUIRED_SUBSTRING: "{{ .RecvRequiredSubstring }}"
 {{- end }}
     restart: "no"
 
@@ -350,13 +356,15 @@ type composeVars struct {
 	GenSequenced      string
 	GenConnections    int
 	GenTotalLines     int64
-	RecvMode            string
-	RecvListen          string
-	RecvValidateOrder   string
-	RecvValidateDedup   string
-	RecvValidateContent string
-	RecvExpectedLines   int64
-	DockerSocketGID     string
+	GenEnv            map[string]string
+	RecvMode              string
+	RecvListen            string
+	RecvValidateOrder     string
+	RecvValidateDedup     string
+	RecvValidateContent   string
+	RecvExpectedLines     int64
+	RecvRequiredSubstring string
+	DockerSocketGID       string
 }
 
 func writeCompose(path string, cfg RunConfig) error {
@@ -441,13 +449,15 @@ func writeCompose(path string, cfg RunConfig) error {
 		GenSequenced:      boolStr(tc.Type == "correctness" || tc.Type == "persistence_correctness" || tc.Type == "persistence_restart_correctness" || tc.Correctness.ValidateDedup || tc.Correctness.ValidateContent),
 		GenConnections:    resolveGeneratorConnections(tc.Generator.Connections),
 		GenTotalLines:     tc.Generator.TotalLines,
-		RecvMode:          tc.Receiver.Mode,
-		RecvListen:        tc.Receiver.Listen,
-		RecvValidateOrder:   boolStr(tc.Correctness.ValidateOrder),
-		RecvValidateDedup:   boolStr(tc.Correctness.ValidateDedup),
-		RecvValidateContent: boolStr(tc.Correctness.ValidateContent),
-		RecvExpectedLines:   0,
-		DockerSocketGID:     cfg.DockerSocketGID,
+		GenEnv:            tc.Generator.Env,
+		RecvMode:              tc.Receiver.Mode,
+		RecvListen:            tc.Receiver.Listen,
+		RecvValidateOrder:     boolStr(tc.Correctness.ValidateOrder),
+		RecvValidateDedup:     boolStr(tc.Correctness.ValidateDedup),
+		RecvValidateContent:   boolStr(tc.Correctness.ValidateContent),
+		RecvExpectedLines:     0,
+		RecvRequiredSubstring: tc.Correctness.RequiredSubstring,
+		DockerSocketGID:       cfg.DockerSocketGID,
 	}
 
 	tmpl, err := template.New("compose").Parse(composeTemplate)

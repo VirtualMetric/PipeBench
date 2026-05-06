@@ -1,0 +1,11 @@
+tenzir:
+  pipelines:
+    tcp-to-tcp-script:
+      name: TCP set-field to TCP
+      restart-on-error: 5 seconds
+      definition: |
+        load_tcp "0.0.0.0:9000"
+        read_lines
+        this.processed_by = "tenzir-pipeline"
+        write_lines
+        save_tcp "receiver:9001"

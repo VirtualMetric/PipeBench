@@ -1,0 +1,12 @@
+id: default
+groups: {}
+comments: []
+routes:
+  - id: bench_route
+    name: bench_passthru
+    final: true
+    disabled: false
+    pipeline: passthru
+    filter: "true"
+    output: bench_tcp_out
+    description: "Route NetFlow records straight to TCP — Cribl's source already breaks out fields, so passthru is enough"

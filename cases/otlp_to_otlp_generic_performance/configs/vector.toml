@@ -1,0 +1,35 @@
+# vector → OTLP/HTTP head-to-head config.
+#
+# Source: opentelemetry — exposes both gRPC (4317) and HTTP (4318)
+# endpoints. Vector's OTLP source binds both unconditionally, which
+# matches the bench generator's expectations.
+#
+# Sink: opentelemetry — forwards via HTTP+protobuf to the bench
+# receiver's /v1/logs. The `otlp` codec emits OTLP-compliant
+# protobuf bodies (NOT JSON — `codec = "json"` produces bodies
+# the receiver fails to decode under the protobuf Content-Type).
+
+[sources.otel_in]
+type = "opentelemetry"
+
+  [sources.otel_in.grpc]
+  address = "0.0.0.0:4317"
+
+  [sources.otel_in.http]
+  address = "0.0.0.0:4318"
+
+[sinks.otel_out]
+type = "opentelemetry"
+inputs = ["otel_in.logs"]
+
+  [sinks.otel_out.protocol]
+  type = "http"
+  uri = "http://receiver:4318/v1/logs"
+  method = "post"
+  encoding.codec = "otlp"
+
+    [sinks.otel_out.protocol.request.headers]
+    Content-Type = "application/x-protobuf"
+
+  [sinks.otel_out.protocol.compression]
+  algorithm = "gzip"

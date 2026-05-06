@@ -21,7 +21,12 @@ subjects:
   - fluent-bit
   - fluentd
   - logstash
+  - filebeat
+  - telegraf
+  - nxlog
   - axosyslog
+  - tenzir
+  - cribl-stream
 
 configurations:
   default:

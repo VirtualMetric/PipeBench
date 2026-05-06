@@ -1,0 +1,57 @@
+name: otlp_to_otlp_generic_correctness
+type: correctness
+description: "End-to-end OTLP/Logs correctness head-to-head: each subject receives OTLP/HTTP+protobuf and forwards via OTLP/HTTP+protobuf. Verifies the full receive→forward path and zero-loss across vmetric, vector, fluent-bit, otel-collector, rotel, grafana-alloy, bindplane-agent, and cribl-stream."
+
+# Total test duration (after warmup). Short window because the
+# generator emits a finite total_lines and exits — duration is just
+# an upper bound while waiting for the receiver to drain.
+duration: 60s
+
+# Subject startup time varies by subject:
+#   - vmetric: ~10-25s (config parse, workqueue init, per-collector
+#              random load-balancing sleep, double socket bind)
+#   - rotel: ~1s (small Rust binary)
+#   - otel-collector: ~3-5s
+#   - vector: ~2-3s
+#   - fluent-bit: ~1-2s
+# 30s gives the slowest subject (vmetric) full headroom plus slow
+# Docker image start.
+warmup: 30s
+
+generator:
+  mode: otlp
+  target: "subject:4318"
+  rate: 0
+  # 500 records (5 batches of 100) — enough to catch decode bugs
+  # without taking long to run.
+  total_lines: 500
+  format: raw
+
+receiver:
+  mode: otlp
+  listen: ":4318"
+
+subjects:
+  - vmetric
+  - vector
+  - fluent-bit
+  - otel-collector
+  - rotel
+  - grafana-alloy
+  - bindplane-agent
+  - cribl-stream
+
+correctness:
+  validate_order: false
+  # Hash-dedup is decoupled from the CONN=/SEQ= shape check so OTLP
+  # bodies ("OTEL-<seq>") work too. Combined with the globally-unique
+  # seq the generator emits across workers, this catches both record
+  # loss AND duplicate delivery — every body must be present exactly
+  # once.
+  validate_dedup: true
+  expected_loss_pct: 0.0
+  # The otlp generator embeds "OTEL-<seq>" in every LogRecord's body.
+  # The OTLP receiver mode passes the body string straight to the
+  # required_substring check, so a subject that decoded + forwarded
+  # OTLP correctly sees every line contain "OTEL-".
+  required_substring: "OTEL-"

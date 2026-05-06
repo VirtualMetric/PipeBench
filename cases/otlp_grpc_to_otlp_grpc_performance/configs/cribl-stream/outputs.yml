@@ -1,0 +1,19 @@
+# Cribl Stream OTLP/gRPC destination to bench receiver.
+#
+# Destination type is `open_telemetry` in Cribl Stream 4.17.0.
+# `type: otlp` initializes but cannot route events and causes
+# "unknown output type otlp" backpressure. For gRPC, endpoint is
+# plain host:port.
+
+outputs:
+  default:
+    defaultId: bench_otel_out
+    type: default
+  bench_otel_out:
+    type: open_telemetry
+    endpoint: receiver:4317
+    protocol: grpc
+    otlpVersion: 1.3.1
+    compression: gzip
+    tls:
+      disabled: true

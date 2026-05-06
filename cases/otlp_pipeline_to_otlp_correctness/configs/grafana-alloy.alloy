@@ -1,0 +1,35 @@
+// grafana-alloy → OTLP/HTTP head-to-head config with a single
+// attribute-insert processor between receive and export. Mirrors
+// the `set` processor in vmetric's pipeline config and the
+// `attributes/insert` action in otel-collector — adds a static
+// key/value attribute to every record.
+
+otelcol.receiver.otlp "in" {
+  http {
+    endpoint = "0.0.0.0:4318"
+  }
+  grpc {
+    endpoint = "0.0.0.0:4317"
+  }
+  output {
+    logs = [otelcol.processor.attributes.bench_marker.input]
+  }
+}
+
+otelcol.processor.attributes "bench_marker" {
+  action {
+    key    = "bench_marker"
+    value  = "pipeline"
+    action = "insert"
+  }
+  output {
+    logs = [otelcol.exporter.otlphttp.out.input]
+  }
+}
+
+otelcol.exporter.otlphttp "out" {
+  client {
+    endpoint = "http://receiver:4318"
+    compression = "gzip"
+  }
+}

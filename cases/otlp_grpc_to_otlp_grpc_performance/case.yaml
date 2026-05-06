@@ -1,0 +1,38 @@
+name: otlp_grpc_to_otlp_grpc_performance
+type: performance
+description: "End-to-end OTLP/gRPC throughput head-to-head: each subject receives OTLP/gRPC on 4317 and forwards as OTLP/gRPC. Isolates per-protocol overhead vs. the HTTP+protobuf generic case. vector is excluded — its OTLP sink is HTTP-only as of 2026."
+
+# Steady-state window. Same shape as the other *_performance cases —
+# warmup so the listener finishes gRPC + HTTP socket bring-up, then
+# a measurement window long enough to amortize over GC / jitter.
+duration: 60s
+warmup: 30s
+
+generator:
+  mode: otlp
+  # OTLP/gRPC standard port. The receiver also binds 4317 so subjects
+  # can forward back over gRPC end-to-end.
+  target: "subject:4317"
+  rate: 0
+  format: raw
+  env:
+    # Switch the generator's OTLP transport from the http_proto default
+    # to gRPC. The grpc transport sends the same LogRecord shape as
+    # http_proto; only the wire framing changes.
+    GENERATOR_OTLP_TRANSPORT: grpc
+
+receiver:
+  mode: otlp
+  # The receiver listens on both 4318 (HTTP) and 4317 (gRPC); the
+  # listen field is informational here.
+  listen: ":4318"
+
+subjects:
+  - vmetric
+  - otel-collector
+  - rotel
+  - fluent-bit
+  - grafana-alloy
+  - bindplane-agent
+  - cribl-stream
+  - axosyslog

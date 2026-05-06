@@ -23,7 +23,10 @@ subjects:
   - fluent-bit
   - fluentd
   - logstash
+  - nxlog
   - axosyslog
+  - tenzir
+  - cribl-stream
 
 correctness:
   validate_order: false

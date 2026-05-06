@@ -1,0 +1,67 @@
+name: netflow_to_tcp_correctness
+type: correctness
+description: "Verifies a NetFlow v5 listener decodes binary records and forwards them as TCP lines, with no records lost."
+
+# Total test duration (after warmup). Short window because the generator
+# emits a finite total_lines and exits — duration is just an upper bound
+# while waiting for the receiver to drain.
+duration: 60s
+# Wait for the subject's flow listener to come up before the generator
+# starts shooting datagrams. Flow startup is observably slow:
+#   ~10s   — director boot (config parse + workqueue init)
+#   ~1-9s  — per-collector random load-balancing sleep
+#   ~1-3s  — collector loop poll interval
+# 30s gives all of that plus headroom for a slow Docker image start
+# without making the test feel sluggish. Empirically the listener
+# binds at T≈20s, so 30s leaves 10s of slack.
+warmup: 30s
+
+generator:
+  mode: udp_netflow_v5
+  # NetFlow v5 default port. The subject is configured to listen here.
+  target: "subject:2055"
+  rate: 0          # unlimited — flush as fast as possible, then exit
+  # 500 records (= 100 datagrams of 5 records each) is enough to catch
+  # decode bugs that misread a record's offset and produce garbage on
+  # subsequent records, without taking long to run.
+  total_lines: 500
+  format: raw      # ignored by the udp_netflow_v5 mode; format is fixed v5
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+subjects:
+  # Native NetFlow v5 listeners only. otel-collector-contrib +
+  # bindplane-agent share the upstream `netflowreceiver`;
+  # cribl-stream has a first-party "NetFlow & IPFIX" source.
+  # Excluded:
+  #   - grafana-alloy v1.15: contrib's netflowreceiver isn't wrapped
+  #     as an `otelcol.receiver.netflow` Alloy component yet.
+  #   - fluent-bit: `in_netflow` is a community out-of-tree plugin,
+  #     not in fluent/fluent-bit:5.0.
+  #   - logstash, fluentd: third-party plugins only, alpha-quality.
+  - vmetric
+  - otel-collector
+  - bindplane-agent
+  - cribl-stream
+
+correctness:
+  validate_order: false
+  # Don't enable validate_dedup: the existing dedup check is coupled to
+  # the sequenced "CONN=/SEQ=" line format produced by the TCP-mode
+  # generator. NetFlow records carry a different uniqueness marker
+  # (per-record IP encoded by the generator) which the substring check
+  # exercises instead.
+  validate_dedup: false
+  expected_loss_pct: 0.0
+  # The udp_netflow_v5 generator embeds "10.99.<hi>.<lo>" in every
+  # record's source IP. A subject that decoded the binary correctly
+  # MUST emit "10.99." somewhere on every output line; a subject that
+  # forwarded the raw datagram or dropped fields silently fails this
+  # check.
+  required_substring: "10.99."
+
+configurations:
+  default:
+    description: "NetFlow v5 → ECS JSON over TCP — verifies decode + forward path"

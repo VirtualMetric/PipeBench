@@ -1,0 +1,28 @@
+name: otlp_pipeline_to_otlp_performance
+type: performance
+description: "OTLP/HTTP receive→forward with one pipeline-stage transform per record (add a static attribute). Measures the per-record decode → mutate → re-encode cost on top of the generic case. rotel is excluded — its built-in transform layer doesn't expose a portable add-attribute primitive (Python processor mount would be required, which we don't ship)."
+
+# Steady-state window. Same shape as the other *_performance cases —
+# warmup so the listener finishes gRPC + HTTP socket bring-up, then
+# a measurement window long enough to amortize over GC / jitter.
+duration: 60s
+warmup: 30s
+
+generator:
+  mode: otlp
+  target: "subject:4318"
+  rate: 0
+  format: raw
+
+receiver:
+  mode: otlp
+  listen: ":4318"
+
+subjects:
+  - vmetric
+  - vector
+  - fluent-bit
+  - otel-collector
+  - grafana-alloy
+  - bindplane-agent
+  - cribl-stream

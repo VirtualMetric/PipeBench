@@ -1,0 +1,24 @@
+devices:
+  - id: 1
+    name: netflow-bench
+    type: netflow
+    properties:
+      address: "0.0.0.0"
+      port: 2055
+      # SO_REUSEPORT lets the listener bring up multiple workers behind
+      # the same port for higher throughput. Worth enabling on the perf
+      # case so we measure decoder ceiling rather than single-socket
+      # contention.
+      reuse: true
+targets:
+  - name: tcp-target-bench
+    type: tcp
+    properties:
+      address: "receiver"
+      port: 9001
+routes:
+  - name: netflow-to-tcp-bench
+    devices:
+      - name: netflow-bench
+    targets:
+      - name: tcp-target-bench

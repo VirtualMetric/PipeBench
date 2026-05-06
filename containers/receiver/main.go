@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
@@ -20,16 +21,17 @@ import (
 )
 
 type config struct {
-	Mode        string // tcp | file | http
+	Mode        string // tcp | file | http | otlp
 	Listen      string // :9001 or file path
 	MetricsPort string // port for /metrics HTTP endpoint
 	Timeout     time.Duration
 
 	// Correctness validation (all optional, off by default)
-	ValidateOrder   bool
-	ValidateDedup   bool
-	ValidateContent bool  // O(1) per line, no heap map — safe for high-volume tests
-	ExpectedLines   int64 // 0 = don't check
+	ValidateOrder     bool
+	ValidateDedup     bool
+	ValidateContent   bool   // O(1) per line, no heap map — safe for high-volume tests
+	ExpectedLines     int64  // 0 = don't check
+	RequiredSubstring string // empty = don't check; protocol-agnostic decode check
 }
 
 // connStats holds per-connection counters. We keep the running totals in a
@@ -135,6 +137,15 @@ type validator struct {
 	// been corrupted between the generator and the receiver.
 	malformedLines atomic.Int64
 	malformedSamp  []string // up to 10 examples
+
+	// Required-substring check: every line must contain a configured
+	// substring (e.g. an IP prefix the generator embedded). Used by
+	// protocol-decoding tests where the generator and the on-the-wire
+	// output don't share a literal byte stream — a successful decode
+	// is proven by the presence of a value the generator put in. Counts
+	// + up to 10 sample violators.
+	missingSubstr     atomic.Int64
+	missingSubstrSamp []string
 }
 
 func newValidator() *validator {
@@ -188,6 +199,26 @@ func (v *validator) recordLine(line []byte, cfg config) {
 					s = s[:120] + "…"
 				}
 				v.malformedSamp = append(v.malformedSamp, s)
+			}
+			v.mu.Unlock()
+		}
+	}
+
+	// Protocol-agnostic decode check: every line must contain a
+	// configured substring (e.g. an IP prefix the generator embedded
+	// into NetFlow records, or "OTEL-<seq>" embedded into LogRecord
+	// bodies). Catches subjects that emit garbage instead of decoded
+	// records.
+	if cfg.RequiredSubstring != "" {
+		if !bytes.Contains(line, []byte(cfg.RequiredSubstring)) {
+			v.missingSubstr.Add(1)
+			v.mu.Lock()
+			if len(v.missingSubstrSamp) < 10 {
+				s := string(line)
+				if len(s) > 120 {
+					s = s[:120] + "…"
+				}
+				v.missingSubstrSamp = append(v.missingSubstrSamp, s)
 			}
 			v.mu.Unlock()
 		}
@@ -416,6 +447,28 @@ func main() {
 		err = receiveFile(cfg, cnt, val)
 	case "http":
 		err = receiveHTTP(cfg, cnt, val)
+	case "otlp":
+		// OTLP/HTTP on cfg.Listen + OTLP/gRPC on a fixed sibling
+		// port so subjects can target either transport. The HTTP
+		// listener accepts /v1/logs, /v1/metrics, /v1/traces over
+		// protobuf or JSON with optional gzip. The gRPC listener
+		// registers the standard OTLP service stubs and walks the
+		// same per-record fan-out. One onLine() call per LogRecord
+		// / data point / Span across both transports.
+		otlpShard := cnt.newShard()
+		onLine := func(line []byte) {
+			otlpShard.recordLine(int64(len(line)) + 1)
+			if cfg.ValidateOrder || cfg.ValidateDedup || cfg.ValidateContent || cfg.RequiredSubstring != "" {
+				val.recordLine(line, cfg)
+			}
+		}
+		grpcAddr := getEnv("RECEIVER_OTLP_GRPC_LISTEN", ":4317")
+		go func() {
+			if grpcErr := startOTLPGRPCEndpoint(grpcAddr, onLine); grpcErr != nil {
+				fmt.Fprintf(os.Stderr, "receiver: otlp grpc: %v\n", grpcErr)
+			}
+		}()
+		err = receiveOTLP(cfg, onLine)
 	default:
 		fmt.Fprintf(os.Stderr, "receiver: unknown mode %q\n", cfg.Mode)
 		os.Exit(1)
@@ -811,10 +864,11 @@ func loadConfig() config {
 		Listen:        getEnv("RECEIVER_LISTEN", ":9001"),
 		MetricsPort:   getEnv("RECEIVER_METRICS_PORT", "9090"),
 		Timeout:       time.Duration(getEnvInt("RECEIVER_TIMEOUT_SECS", 30)) * time.Second,
-		ValidateOrder:   getEnvBool("RECEIVER_VALIDATE_ORDER", false),
-		ValidateDedup:   getEnvBool("RECEIVER_VALIDATE_DEDUP", false),
-		ValidateContent: getEnvBool("RECEIVER_VALIDATE_CONTENT", false),
-		ExpectedLines: int64(getEnvInt("RECEIVER_EXPECTED_LINES", 0)),
+		ValidateOrder:     getEnvBool("RECEIVER_VALIDATE_ORDER", false),
+		ValidateDedup:     getEnvBool("RECEIVER_VALIDATE_DEDUP", false),
+		ValidateContent:   getEnvBool("RECEIVER_VALIDATE_CONTENT", false),
+		ExpectedLines:     int64(getEnvInt("RECEIVER_EXPECTED_LINES", 0)),
+		RequiredSubstring: getEnv("RECEIVER_REQUIRED_SUBSTRING", ""),
 	}
 }
 

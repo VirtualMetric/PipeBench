@@ -1,0 +1,9 @@
+tenzir:
+  pipelines:
+    tcp-to-http:
+      name: TCP to HTTP
+      restart-on-error: 5 seconds
+      definition: |
+        load_tcp "0.0.0.0:9000"
+        save_http "http://receiver:9001/",
+          method="POST"

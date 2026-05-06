@@ -1,0 +1,31 @@
+# otel-collector → OTLP/gRPC head-to-head config.
+#
+# Receivers: otlp — both gRPC (4317) and HTTP (4318) endpoints. The
+# generator hits the gRPC endpoint in this case; the HTTP endpoint
+# stays exposed so the same image can be used across cases without
+# config divergence.
+# Exporters: otlp — the generic OTLP exporter speaks gRPC by default,
+# targeting the bench receiver's gRPC endpoint on 4317.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+exporters:
+  otlp:
+    endpoint: receiver:4317
+    # gRPC exporter — TLS off because the bench network is bench-local
+    # and we want to measure the protocol cost, not certificate handshakes.
+    tls:
+      insecure: true
+    compression: gzip
+
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [otlp]

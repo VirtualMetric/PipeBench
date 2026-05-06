@@ -1,0 +1,35 @@
+name: otlp_grpc_to_otlp_grpc_correctness
+type: correctness
+description: "End-to-end OTLP/gRPC correctness head-to-head: each subject receives OTLP/gRPC and forwards as OTLP/gRPC. Validates the full receive→forward path is zero-loss across vmetric, otel-collector, rotel, fluent-bit, grafana-alloy, bindplane-agent, cribl-stream, and axosyslog. vector is excluded — its OTLP sink is HTTP-only as of 2026."
+
+duration: 60s
+warmup: 30s
+
+generator:
+  mode: otlp
+  target: "subject:4317"
+  rate: 0
+  total_lines: 500
+  format: raw
+  env:
+    GENERATOR_OTLP_TRANSPORT: grpc
+
+receiver:
+  mode: otlp
+  listen: ":4318"
+
+subjects:
+  - vmetric
+  - otel-collector
+  - rotel
+  - fluent-bit
+  - grafana-alloy
+  - bindplane-agent
+  - cribl-stream
+  - axosyslog
+
+correctness:
+  validate_order: false
+  validate_dedup: true
+  expected_loss_pct: 0.0
+  required_substring: "OTEL-"

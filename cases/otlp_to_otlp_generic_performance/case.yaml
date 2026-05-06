@@ -1,0 +1,32 @@
+name: otlp_to_otlp_generic_performance
+type: performance
+description: "End-to-end OTLP/Logs throughput head-to-head: rate at which each subject can receive OTLP/HTTP+protobuf and forward it as OTLP/HTTP+protobuf. vmetric vs. rotel vs. otel-collector vs. vector vs. fluent-bit vs. grafana-alloy vs. bindplane-agent vs. cribl-stream."
+
+# Steady-state window. Same shape as the other *_performance cases —
+# warmup so the listener finishes gRPC + HTTP socket bring-up, then
+# a measurement window long enough to amortize over GC / jitter.
+duration: 60s
+warmup: 30s
+
+generator:
+  mode: otlp
+  target: "subject:4318"
+  # rate=0 = unlimited; the generator pushes batches as fast as the
+  # subject can ack them. HTTP has request-response semantics so
+  # backpressure is implicit (slow ack → fewer batches/sec).
+  rate: 0
+  format: raw
+
+receiver:
+  mode: otlp
+  listen: ":4318"
+
+subjects:
+  - vmetric
+  - vector
+  - fluent-bit
+  - otel-collector
+  - rotel
+  - grafana-alloy
+  - bindplane-agent
+  - cribl-stream

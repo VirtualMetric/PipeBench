@@ -1,0 +1,40 @@
+# vector → OTLP/HTTP head-to-head config with a single VRL remap
+# transform between source and sink that adds a static attribute
+# to every event. Vector's OTLP source decodes LogRecord attributes
+# under `.attributes`, so the remap targets that path — writing to
+# `.bench_marker` directly would put the field at event root and
+# the otlp-encoded sink would either drop it or relocate it,
+# making the transform's wire-cost shape incomparable to the
+# otel-collector / fluent-bit / vmetric variants.
+
+[sources.otel_in]
+type = "opentelemetry"
+
+  [sources.otel_in.grpc]
+  address = "0.0.0.0:4317"
+
+  [sources.otel_in.http]
+  address = "0.0.0.0:4318"
+
+[transforms.add_marker]
+type = "remap"
+inputs = ["otel_in.logs"]
+source = '''
+.attributes.bench_marker = "pipeline"
+'''
+
+[sinks.otel_out]
+type = "opentelemetry"
+inputs = ["add_marker"]
+
+  [sinks.otel_out.protocol]
+  type = "http"
+  uri = "http://receiver:4318/v1/logs"
+  method = "post"
+  encoding.codec = "otlp"
+
+    [sinks.otel_out.protocol.request.headers]
+    Content-Type = "application/x-protobuf"
+
+  [sinks.otel_out.protocol.compression]
+  algorithm = "gzip"

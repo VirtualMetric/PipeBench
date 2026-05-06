@@ -1,0 +1,32 @@
+# bindplane-agent → OTLP/HTTP head-to-head config with a single
+# attribute-insert processor between receive and export. bindplane-agent
+# is observIQ's distribution of otel-collector-contrib; this file is
+# intentionally byte-identical to otel-collector.yaml so head-to-head
+# numbers measure the distribution overhead alone.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  attributes/bench_marker:
+    actions:
+      - key: bench_marker
+        value: pipeline
+        action: insert
+
+exporters:
+  otlphttp:
+    endpoint: http://receiver:4318
+    compression: gzip
+
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [attributes/bench_marker]
+      exporters: [otlphttp]

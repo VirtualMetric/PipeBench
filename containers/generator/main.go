@@ -19,7 +19,7 @@ import (
 )
 
 type config struct {
-	Mode        string        // tcp | file | http
+	Mode        string        // tcp | file | http | udp_netflow_v5 | otlp
 	Target      string        // host:port or file path or URL
 	Rate        int           // lines/sec per connection, 0 = unlimited
 	Duration    time.Duration // 0 = run until total lines
@@ -27,8 +27,9 @@ type config struct {
 	LineSize    int           // bytes per line
 	Format      string        // raw | syslog | json
 	Warmup      time.Duration
-	Sequenced   bool // embed SEQ=<n> in each line for correctness
-	Connections int  // parallel TCP/HTTP connections (default 1)
+	Sequenced   bool  // embed SEQ=<n> in each line for correctness
+	Connections int   // parallel TCP/HTTP connections (default 1)
+	SeqOffset   int64 // starting sequence number — set per worker by the parallel dispatcher so global sequences don't overlap across workers (otherwise each worker emits 0..perWorker, breaking the receiver-side dedup check)
 }
 
 type result struct {
@@ -96,6 +97,18 @@ func main() {
 		linesSent, bytesSent, err = runFile(cfg, &clock)
 	case "http":
 		linesSent, bytesSent, err = runHTTP(cfg, &clock)
+	case "udp_netflow_v5":
+		// "lines" here counts UDP datagrams sent. Each datagram carries
+		// netflowV5RecordsPer flow records, so the receiver should see
+		// linesSent * netflowV5RecordsPer lines emitted by the subject.
+		linesSent, bytesSent, err = runNetflowV5(cfg, &clock)
+	case "otlp":
+		// OTLP/Logs over gRPC or HTTP (proto/json) — transport picked
+		// via GENERATOR_OTLP_TRANSPORT. "lines" counts LogRecords sent
+		// (not batches) so the harness's lines-sent vs lines-received
+		// comparison stays meaningful: the receiver sees one TCP line
+		// per decoded record.
+		linesSent, bytesSent, err = runOTLPLogs(cfg, &clock)
 	default:
 		fmt.Fprintf(os.Stderr, "generator: unknown mode %q\n", cfg.Mode)
 		os.Exit(1)

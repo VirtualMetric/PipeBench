@@ -1,0 +1,33 @@
+# otel-collector → OTLP/HTTP head-to-head config.
+#
+# Receivers: otlp — both gRPC (4317) and HTTP (4318) endpoints.
+# Exporters: otlphttp — forwards to the bench receiver's /v1/logs
+# endpoint. (The generic `otlp` exporter speaks gRPC by default;
+# `otlphttp` is the explicit HTTP variant — clearer than aliasing.)
+#
+# Pipeline: logs only. The case disables metrics + traces on the
+# generator side so we don't bother registering processors for them
+# — keeps the otel-collector startup tight and the per-signal
+# dispatch path narrow.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+exporters:
+  otlphttp:
+    endpoint: http://receiver:4318
+    compression: gzip
+    # Default request encoding is protobuf; matches what every
+    # other subject's OTLP-out path emits, so head-to-head numbers
+    # measure the same wire format.
+
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [otlphttp]
