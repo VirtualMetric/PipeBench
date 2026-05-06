@@ -5,7 +5,7 @@ go 1.26.2
 require (
 	github.com/valyala/fasthttp v1.70.0
 	go.opentelemetry.io/proto/otlp v1.10.0
-	google.golang.org/grpc v1.79.2
+	google.golang.org/grpc v1.79.3
 	google.golang.org/protobuf v1.36.11
 )
 
