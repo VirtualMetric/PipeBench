@@ -32,14 +32,27 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          # Fetch full history so GoReleaser can resolve the previous tag
-          # for changelog generation.
+          # Fetch full history AND tags so GoReleaser can describe the
+          # current commit and resolve the previous tag for changelog
+          # generation. fetch-depth: 0 alone has a quirk on tag-triggered
+          # runs where lightweight tags aren't always present in the
+          # local clone — fetch-tags: true is the belt to the suspenders.
           fetch-depth: 0
+          fetch-tags: true
 
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
           go-version: "stable"
+
+      # Sanity print so a failed-but-silent release surfaces a real
+      # diagnostic in the run log instead of a 30-second false-success.
+      - name: Verify tag is visible to git
+        run: |
+          echo "GITHUB_REF=$GITHUB_REF"
+          echo "git describe (exact): $(git describe --tags --exact-match 2>&1 || true)"
+          echo "git describe (any):   $(git describe --tags --always 2>&1)"
+          git tag -l | head
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
