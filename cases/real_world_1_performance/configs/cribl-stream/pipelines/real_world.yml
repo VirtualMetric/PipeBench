@@ -12,7 +12,10 @@ conf:
         type: regex
         srcField: _raw
         regex: "/<(?<priority>\\d+)>(?<timestamp>\\S+) (?<host>\\S+) (?<program>\\S+?)(?:\\[(?<pid>\\d+)\\])?: (?<msg>.*)/"
-    - id: drop
+    - id: eval
       filter: "priority && (Number(priority) % 8) === 7"
       disabled: false
-      conf: {}
+      conf:
+        add:
+          - name: dropped
+            value: "true"

@@ -3,21 +3,22 @@ type = "socket"
 mode = "tcp"
 address = "0.0.0.0:9000"
 
+# Tag debug records with `dropped = true` instead of filtering them
+# out. Dropping skews the receiver's EPS measurement downward, which
+# is not the throughput we want to compare.
 [transforms.parse]
 type = "remap"
 inputs = ["in"]
 source = '''
 . = parse_syslog!(.message)
+if .severity == "debug" {
+  .dropped = true
+}
 '''
-
-[transforms.filter]
-type = "filter"
-inputs = ["parse"]
-condition = '.severity != "debug"'
 
 [sinks.out]
 type = "socket"
 mode = "tcp"
-inputs = ["filter"]
+inputs = ["parse"]
 address = "receiver:9001"
 encoding.codec = "json"

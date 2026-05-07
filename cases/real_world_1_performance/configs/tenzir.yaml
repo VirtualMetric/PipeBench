@@ -3,9 +3,12 @@ tenzir:
     tcp-to-tcp-realworld:
       name: TCP syslog parse + filter to TCP
       restart-on-error: 5 seconds
+      # Tag debug records (severity == 7) with `dropped = true`
+      # instead of filtering them out. Dropping records would skew
+      # the receiver's EPS measurement.
       definition: |
         load_tcp "0.0.0.0:9000"
         read_syslog
-        where severity != 7
+        this.dropped = severity == 7
         write_ndjson
         save_tcp "receiver:9001"

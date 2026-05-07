@@ -19,8 +19,11 @@ routes:
       - name: real-world
     targets:
       - name: tcp-target-bench
-# Real-world shape: parse syslog → drop debug → forward.
-# Mirrors the Vector remap+filter pipeline in configs/vector.toml.
+# Real-world shape: parse syslog → tag debug records → forward.
+# Mirrors the Vector remap pipeline in configs/vector.toml.
+# Note: we tag debug records with `dropped: true` instead of dropping
+# them — actually dropping skews the receiver's EPS measurement
+# downward, which is not the throughput we want to compare.
 pipelines:
   - name: real-world
     processors:
@@ -28,6 +31,8 @@ pipelines:
           field: message
           ignore_missing: true
           ignore_failure: true
-      - drop:
+      - set:
           if: 'log?.syslog?.severity?.name == "Debug"'
+          field: dropped
+          value: true
           ignore_failure: true
