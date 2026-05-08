@@ -137,7 +137,7 @@ var Registry = map[string]Subject{
 	"axosyslog": {
 		Name:       "axosyslog",
 		Image:      "ghcr.io/axoflow/axosyslog",
-		Version:    "4.24.0",
+		Version:    "4.25.0",
 		ConfigPath: "/etc/syslog-ng/syslog-ng.conf",
 	},
 	"vmetric": {
