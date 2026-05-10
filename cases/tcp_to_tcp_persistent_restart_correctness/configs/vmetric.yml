@@ -1,6 +1,5 @@
 persistent_storage:
   status: true
-  crash_resistance: true
 devices:
   - id: 1
     name: tcp-bench

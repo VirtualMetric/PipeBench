@@ -197,7 +197,12 @@ func (v *validator) recordLine(line []byte, cfg config) {
 	// prefix almost always breaks one of these tokens. Runs independently of
 	// ValidateDedup so performance tests can enable this cheap check without
 	// building a 600M-entry hash map.
-	if cfg.ValidateContent || cfg.ValidateDedup {
+	// Memory-corruption check is gated on ValidateContent specifically.
+	// ValidateDedup used to imply this check too, but that broke tests
+	// whose payload format is not "CONN=<id> SEQ=<n> ..." (e.g. OTLP,
+	// where every line is "OTEL-<seq>"). Tests that want both dedup AND
+	// the CONN=/SEQ= structural check should set both flags.
+	if cfg.ValidateContent {
 		if !isWellFormedSequenced(line) {
 			v.malformedLines.Add(1)
 			v.mu.Lock()
@@ -405,8 +410,10 @@ func (v *validator) validate(cfg config, totalLines int64) (bool, []string) {
 		}
 	}
 
-	// Content integrity (cheap, runs independently of dedup)
-	if cfg.ValidateDedup || cfg.ValidateContent {
+	// Content integrity check. Same gating as the per-line check above —
+	// only fire when ValidateContent is set, since the structural rule
+	// (CONN=<id> SEQ=<n>) only applies to the sequenced payload format.
+	if cfg.ValidateContent {
 		if m := v.malformedLines.Load(); m > 0 {
 			errors = append(errors, fmt.Sprintf(
 				"malformed: %d lines failed structural check (memory corruption)",

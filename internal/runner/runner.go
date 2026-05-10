@@ -445,7 +445,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		fmt.Printf("  latency: p50=%.1fms p95=%.1fms p99=%.1fms\n",
 			recvMetrics.LatencyP50Ms, recvMetrics.LatencyP95Ms, recvMetrics.LatencyP99Ms)
 	}
-	if tc.Correctness.ValidateContent || tc.Correctness.ValidateDedup {
+	if tc.Correctness.ValidateContent {
 		fmt.Printf("  malformed lines: %s\n", formatCount(recvMetrics.MalformedLines))
 	}
 	if r.opts.CPULimit != "" || r.opts.MemLimit != "" {
@@ -674,7 +674,7 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 		errors = append(errors, fmt.Sprintf("expected 0 duplicates, got %s",
 			formatCount(recvMetrics.Duplicates)))
 	}
-	if (tc.Correctness.ValidateDedup || tc.Correctness.ValidateContent) && recvMetrics.MalformedLines > 0 {
+	if tc.Correctness.ValidateContent && recvMetrics.MalformedLines > 0 {
 		passed = false
 		errors = append(errors, fmt.Sprintf("expected 0 malformed lines, got %s (memory corruption)",
 			formatCount(recvMetrics.MalformedLines)))
@@ -717,9 +717,10 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 	fmt.Printf("  lines sent: %s  lines received: %s  loss: %.2f%%\n",
 		formatCount(genStats.LinesSent), formatCount(recvMetrics.LinesReceived), lossPct)
 	if tc.Correctness.ValidateDedup {
-		fmt.Printf("  unique lines: %s  duplicates: %s  malformed: %s\n",
-			formatCount(recvMetrics.UniqueLines), formatCount(recvMetrics.Duplicates), formatCount(recvMetrics.MalformedLines))
-	} else if tc.Correctness.ValidateContent {
+		fmt.Printf("  unique lines: %s  duplicates: %s\n",
+			formatCount(recvMetrics.UniqueLines), formatCount(recvMetrics.Duplicates))
+	}
+	if tc.Correctness.ValidateContent {
 		fmt.Printf("  malformed: %s\n", formatCount(recvMetrics.MalformedLines))
 	}
 	fmt.Printf("  total time: %.1fs\n", elapsed)
@@ -944,7 +945,7 @@ func (r *Runner) runPersistenceRestartCorrectness(tc *config.TestCase, subject c
 		errors = append(errors, fmt.Sprintf("expected 0 duplicates, got %s",
 			formatCount(recvMetrics.Duplicates)))
 	}
-	if (tc.Correctness.ValidateDedup || tc.Correctness.ValidateContent) && recvMetrics.MalformedLines > 0 {
+	if tc.Correctness.ValidateContent && recvMetrics.MalformedLines > 0 {
 		passed = false
 		errors = append(errors, fmt.Sprintf("expected 0 malformed lines, got %s (memory corruption)",
 			formatCount(recvMetrics.MalformedLines)))
@@ -987,9 +988,10 @@ func (r *Runner) runPersistenceRestartCorrectness(tc *config.TestCase, subject c
 	fmt.Printf("  lines sent: %s  lines received: %s  loss: %.2f%%\n",
 		formatCount(genStats.LinesSent), formatCount(recvMetrics.LinesReceived), lossPct)
 	if tc.Correctness.ValidateDedup {
-		fmt.Printf("  unique lines: %s  duplicates: %s  malformed: %s\n",
-			formatCount(recvMetrics.UniqueLines), formatCount(recvMetrics.Duplicates), formatCount(recvMetrics.MalformedLines))
-	} else if tc.Correctness.ValidateContent {
+		fmt.Printf("  unique lines: %s  duplicates: %s\n",
+			formatCount(recvMetrics.UniqueLines), formatCount(recvMetrics.Duplicates))
+	}
+	if tc.Correctness.ValidateContent {
 		fmt.Printf("  malformed: %s\n", formatCount(recvMetrics.MalformedLines))
 	}
 	fmt.Printf("  total time: %.1fs\n", elapsed)
