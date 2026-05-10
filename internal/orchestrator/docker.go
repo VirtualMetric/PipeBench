@@ -92,6 +92,11 @@ services:
 {{- if .UseSharedData }}
     volumes:
       - "shared-data:/data"
+    # File-mode tests need the generator to create /data/input.log on the
+    # shared volume, which is initialized as root:root 0755. The image's
+    # default uid 10001 cannot write there, so override to root for these
+    # runs. TCP/HTTP/OTLP/netflow runs leave the hardened uid in place.
+    user: "0:0"
 {{- end }}
     environment:
       GENERATOR_MODE: "{{ .GenMode }}"
