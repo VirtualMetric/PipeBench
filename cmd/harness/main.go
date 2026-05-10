@@ -218,13 +218,23 @@ func testCmd() *cobra.Command {
 				}
 			}
 
+			outcomes := make([]runOutcome, 0, len(pairs))
 			var failed []string
 			for _, p := range pairs {
-				if _, err := r.Run(p.tc, p.subject); err != nil {
+				res, err := r.Run(p.tc, p.subject)
+				if err != nil {
 					fmt.Fprintf(os.Stderr, "ERROR running %s/%s: %v\n", p.tc.Name, p.subject.Name, err)
 					failed = append(failed, p.tc.Name+"/"+p.subject.Name)
 				}
+				outcomes = append(outcomes, runOutcome{
+					testName:    p.tc.Name,
+					subjectName: p.subject.Name,
+					result:      res,
+					runErr:      err,
+				})
 			}
+
+			printRunSummary(outcomes)
 
 			if len(failed) > 0 {
 				return fmt.Errorf("%d run(s) failed: %v", len(failed), failed)
@@ -232,6 +242,10 @@ func testCmd() *cobra.Command {
 			return nil
 		},
 	}
+	// Test failures and other RunE errors are not CLI misuse — don't print
+	// the full --help block on every failure. Cobra still prints usage
+	// for unknown flags / missing required args (those happen before RunE).
+	cmd.SilenceUsage = true
 
 	cmd.Flags().StringVarP(&testName, "test", "t", "", "test case name (required unless --all-tests)")
 	cmd.Flags().StringVarP(&subjectName, "subject", "s", "", "subject to test (default: all subjects in case.yaml)")
@@ -263,6 +277,83 @@ func matchesTypeFilter(caseType, filter string) bool {
 		return strings.Contains(caseType, "correctness")
 	}
 	return caseType == filter
+}
+
+// runOutcome is one row in the post-run summary table. Either result
+// is populated (the run completed and a result was persisted) or runErr
+// is non-nil (the run failed before producing a result).
+type runOutcome struct {
+	testName    string
+	subjectName string
+	result      results.RunResult
+	runErr      error
+}
+
+// printRunSummary writes a one-row-per-run table to stdout. The columns
+// chosen are the headline numbers users want to compare at a glance:
+// status (PASS/FAIL/OK/ERROR), throughput, CPU, memory, loss%. Long-form
+// per-run output is still printed inline by the runner during execution.
+func printRunSummary(outcomes []runOutcome) {
+	if len(outcomes) == 0 {
+		return
+	}
+	fmt.Println()
+	fmt.Printf("Summary (%d run%s):\n", len(outcomes), pluralS(len(outcomes)))
+
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "TEST\tSUBJECT\tSTATUS\tEPS\tCPU%\tMEM\tLOSS%")
+	for _, o := range outcomes {
+		status := "OK"
+		eps := "—"
+		cpu := "—"
+		mem := "—"
+		loss := "—"
+		switch {
+		case o.runErr != nil:
+			status = "ERROR"
+		case o.result.Passed != nil && !*o.result.Passed:
+			status = "FAIL"
+		case o.result.Passed != nil && *o.result.Passed:
+			status = "PASS"
+		}
+		if o.runErr == nil {
+			eps = formatThousands(int64(o.result.LinesPerSec))
+			cpu = fmt.Sprintf("%.1f", o.result.AvgCPUPercent)
+			mem = fmt.Sprintf("%.0f MB", o.result.AvgMemMB)
+			loss = fmt.Sprintf("%.2f%%", o.result.LossPercent)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			o.testName, o.subjectName, status, eps, cpu, mem, loss)
+	}
+	_ = tw.Flush()
+}
+
+func pluralS(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}
+
+// formatThousands prints n with comma group separators, e.g. 1234567 -> "1,234,567".
+func formatThousands(n int64) string {
+	s := fmt.Sprintf("%d", n)
+	neg := false
+	if strings.HasPrefix(s, "-") {
+		neg = true
+		s = s[1:]
+	}
+	var b strings.Builder
+	for i, c := range s {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			b.WriteByte(',')
+		}
+		b.WriteRune(c)
+	}
+	if neg {
+		return "-" + b.String()
+	}
+	return b.String()
 }
 
 func compareCmd() *cobra.Command {

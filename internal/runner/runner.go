@@ -73,6 +73,7 @@ type ReceiverMetrics struct {
 	UniqueLines     int64    `json:"unique_lines,omitempty"`
 	Duplicates      int64    `json:"duplicates,omitempty"`
 	MalformedLines  int64    `json:"malformed_lines,omitempty"`
+	InvalidJSONLines int64   `json:"invalid_json_lines,omitempty"`
 	LatencyP50Ms    float64  `json:"latency_p50_ms,omitempty"`
 	LatencyP95Ms    float64  `json:"latency_p95_ms,omitempty"`
 	LatencyP99Ms    float64  `json:"latency_p99_ms,omitempty"`
@@ -678,6 +679,11 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 		errors = append(errors, fmt.Sprintf("expected 0 malformed lines, got %s (memory corruption)",
 			formatCount(recvMetrics.MalformedLines)))
 	}
+	if tc.Correctness.ValidateJSON && recvMetrics.InvalidJSONLines > 0 {
+		passed = false
+		errors = append(errors, fmt.Sprintf("expected 0 invalid-JSON lines, got %s",
+			formatCount(recvMetrics.InvalidJSONLines)))
+	}
 
 	result := results.RunResult{
 		TestName:        tc.Name,
@@ -942,6 +948,11 @@ func (r *Runner) runPersistenceRestartCorrectness(tc *config.TestCase, subject c
 		passed = false
 		errors = append(errors, fmt.Sprintf("expected 0 malformed lines, got %s (memory corruption)",
 			formatCount(recvMetrics.MalformedLines)))
+	}
+	if tc.Correctness.ValidateJSON && recvMetrics.InvalidJSONLines > 0 {
+		passed = false
+		errors = append(errors, fmt.Sprintf("expected 0 invalid-JSON lines, got %s",
+			formatCount(recvMetrics.InvalidJSONLines)))
 	}
 
 	result := results.RunResult{

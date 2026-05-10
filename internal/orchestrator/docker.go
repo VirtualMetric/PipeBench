@@ -135,6 +135,9 @@ services:
 {{- if .RecvRequiredSubstring }}
       RECEIVER_REQUIRED_SUBSTRING: "{{ .RecvRequiredSubstring }}"
 {{- end }}
+{{- if .RecvValidateJSON }}
+      RECEIVER_VALIDATE_JSON: "true"
+{{- end }}
     restart: "no"
 
   collector:
@@ -369,6 +372,7 @@ type composeVars struct {
 	RecvValidateContent   string
 	RecvExpectedLines     int64
 	RecvRequiredSubstring string
+	RecvValidateJSON      bool
 	DockerSocketGID       string
 }
 
@@ -451,7 +455,14 @@ func writeCompose(path string, cfg RunConfig) error {
 		GenLineSize:       genLineSize,
 		GenFormat:         genFormat,
 		GenWarmup:         warmup,
-		GenSequenced:      boolStr(tc.Type == "correctness" || tc.Type == "persistence_correctness" || tc.Type == "persistence_restart_correctness" || tc.Correctness.ValidateDedup || tc.Correctness.ValidateContent),
+		// Sequenced lines (CONN=<id> SEQ=<n> ...) are only needed when the
+		// receiver runs a check that requires per-line uniqueness or a
+		// known prefix structure — dedup, content, or order validation.
+		// The previous blanket "type == correctness" rule forced sequenced
+		// data into tests like wrapped_json_correctness whose generator
+		// format is "json"; those lines started with CONN= instead of {,
+		// silently failing JSON-parsing subjects (e.g. AxoSyslog).
+		GenSequenced:      boolStr(tc.Correctness.ValidateOrder || tc.Correctness.ValidateDedup || tc.Correctness.ValidateContent),
 		GenConnections:    resolveGeneratorConnections(tc.Generator.Connections),
 		GenTotalLines:     tc.Generator.TotalLines,
 		GenEnv:            tc.Generator.Env,
@@ -462,6 +473,7 @@ func writeCompose(path string, cfg RunConfig) error {
 		RecvValidateContent:   boolStr(tc.Correctness.ValidateContent),
 		RecvExpectedLines:     0,
 		RecvRequiredSubstring: tc.Correctness.RequiredSubstring,
+		RecvValidateJSON:      tc.Correctness.ValidateJSON,
 		DockerSocketGID:       cfg.DockerSocketGID,
 	}
 

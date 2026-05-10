@@ -32,6 +32,7 @@ type config struct {
 	ValidateContent   bool   // O(1) per line, no heap map — safe for high-volume tests
 	ExpectedLines     int64  // 0 = don't check
 	RequiredSubstring string // empty = don't check; protocol-agnostic decode check
+	ValidateJSON      bool   // every emitted line must parse as JSON
 }
 
 // connStats holds per-connection counters. We keep the running totals in a
@@ -146,6 +147,13 @@ type validator struct {
 	// + up to 10 sample violators.
 	missingSubstr     atomic.Int64
 	missingSubstrSamp []string
+
+	// JSON-validity check: every emitted line must parse as a JSON value.
+	// Enabled by ValidateJSON. Without this, a JSON test could be passed
+	// by a subject that emits the right line count of garbage. Counts +
+	// up to 10 sample violators.
+	invalidJSON     atomic.Int64
+	invalidJSONSamp []string
 }
 
 func newValidator() *validator {
@@ -219,6 +227,24 @@ func (v *validator) recordLine(line []byte, cfg config) {
 					s = s[:120] + "…"
 				}
 				v.missingSubstrSamp = append(v.missingSubstrSamp, s)
+			}
+			v.mu.Unlock()
+		}
+	}
+
+	// JSON-validity check: every line must parse as JSON. json.Valid is
+	// streaming-friendly (no allocation for the parse tree) so it's cheap
+	// enough to run per-line at multi-million lines/s.
+	if cfg.ValidateJSON {
+		if !json.Valid(line) {
+			v.invalidJSON.Add(1)
+			v.mu.Lock()
+			if len(v.invalidJSONSamp) < 10 {
+				s := string(line)
+				if len(s) > 120 {
+					s = s[:120] + "…"
+				}
+				v.invalidJSONSamp = append(v.invalidJSONSamp, s)
 			}
 			v.mu.Unlock()
 		}
@@ -390,6 +416,17 @@ func (v *validator) validate(cfg config, totalLines int64) (bool, []string) {
 		}
 	}
 
+	// JSON validity — every emitted line must parse as JSON.
+	if cfg.ValidateJSON {
+		if m := v.invalidJSON.Load(); m > 0 {
+			errors = append(errors, fmt.Sprintf(
+				"invalid JSON: %d lines failed to parse as JSON",
+				m,
+			))
+			passed = false
+		}
+	}
+
 	return passed, errors
 }
 
@@ -546,7 +583,7 @@ func handleConn(conn net.Conn, shard *connStats, val *validator, cfg config) {
 	defer shard.finish()
 	scanner := bufio.NewScanner(conn)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
-	needsValidation := cfg.ValidateOrder || cfg.ValidateDedup || cfg.ValidateContent
+	needsValidation := cfg.ValidateOrder || cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.RequiredSubstring != ""
 	// Pass the scanner's internal slice directly. shard.recordLine + validator
 	// only read len() and copy via `string(line)` / hash when they need to
 	// keep bytes — they never retain the slice past return. Skipping the
@@ -564,7 +601,7 @@ func handleConn(conn net.Conn, shard *connStats, val *validator, cfg config) {
 func receiveFile(cfg config, cnt *counters, val *validator) error {
 	shard := cnt.newShard()
 	defer shard.finish()
-	needsValidation := cfg.ValidateOrder || cfg.ValidateDedup || cfg.ValidateContent
+	needsValidation := cfg.ValidateOrder || cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.RequiredSubstring != ""
 
 	deadline := time.Now().Add(cfg.Timeout + 5*time.Minute) // generous for file tests
 	f, err := os.Open(cfg.Listen)
@@ -611,7 +648,7 @@ func receiveHTTP(cfg config, cnt *counters, val *validator) error {
 	// per-shard ceiling so contention here doesn't matter, and a single
 	// shard keeps the per-request bookkeeping trivial.
 	httpShard := cnt.newShard()
-	needsValidation := cfg.ValidateOrder || cfg.ValidateDedup || cfg.ValidateContent
+	needsValidation := cfg.ValidateOrder || cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.RequiredSubstring != ""
 	mux := http.NewServeMux()
 
 	// Generic POST handler — counts every line in the body
@@ -700,7 +737,7 @@ func receiveHTTP(cfg config, cnt *counters, val *validator) error {
 // POST. It handles both plain line-per-request and ES /_bulk NDJSON format.
 func startHTTPDataEndpoint(port string, cnt *counters, val *validator, cfg config) error {
 	httpShard := cnt.newShard()
-	needsValidation := cfg.ValidateOrder || cfg.ValidateDedup || cfg.ValidateContent
+	needsValidation := cfg.ValidateOrder || cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.RequiredSubstring != ""
 	lineCallback := func(line []byte) {
 		httpShard.recordLine(int64(len(line)) + 1)
 		if needsValidation {
@@ -811,7 +848,7 @@ func serveMetrics(port string, cnt *counters, val *validator, cfg config) {
 			"last_received_ns":  lastNs,
 		}
 		// Include correctness data if validation is enabled
-		if cfg.ValidateOrder || cfg.ValidateDedup || cfg.ValidateContent || cfg.ExpectedLines > 0 {
+		if cfg.ValidateOrder || cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.ExpectedLines > 0 {
 			passed, errors := val.validate(cfg, totalLines)
 			resp["passed"] = passed
 			if len(errors) > 0 {
@@ -832,6 +869,14 @@ func serveMetrics(port string, cnt *counters, val *validator, cfg config) {
 				val.mu.Lock()
 				if len(val.malformedSamp) > 0 {
 					resp["malformed_samples"] = val.malformedSamp
+				}
+				val.mu.Unlock()
+			}
+			if cfg.ValidateJSON {
+				resp["invalid_json_lines"] = val.invalidJSON.Load()
+				val.mu.Lock()
+				if len(val.invalidJSONSamp) > 0 {
+					resp["invalid_json_samples"] = val.invalidJSONSamp
 				}
 				val.mu.Unlock()
 			}
@@ -869,6 +914,7 @@ func loadConfig() config {
 		ValidateContent:   getEnvBool("RECEIVER_VALIDATE_CONTENT", false),
 		ExpectedLines:     int64(getEnvInt("RECEIVER_EXPECTED_LINES", 0)),
 		RequiredSubstring: getEnv("RECEIVER_REQUIRED_SUBSTRING", ""),
+		ValidateJSON:      getEnvBool("RECEIVER_VALIDATE_JSON", false),
 	}
 }
 

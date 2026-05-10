@@ -140,6 +140,12 @@ type CorrectnessConfig struct {
 	// successful decode is proven by the presence of a value the generator
 	// embedded in every record. Empty = check disabled.
 	RequiredSubstring string `yaml:"required_substring"`
+	// ValidateJSON, when true, requires every emitted line to parse as a
+	// JSON object. Without this, a subject can pass a JSON-shape test by
+	// truncating to a matching line count or by re-emitting binary garbage —
+	// the receiver only counts newlines. Use for tests that exist to verify
+	// JSON-handling correctness (e.g. wrapped_json_correctness).
+	ValidateJSON bool `yaml:"validate_json"`
 }
 
 // LoadCase reads and parses a case.yaml from the given cases directory.

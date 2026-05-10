@@ -502,7 +502,7 @@ func sendLinesConn(cfg config, connID int, clock *sendClock, write func([]byte) 
 			line = writeSequencedPrefix(seqBuf, connID, linesSent)
 		} else if linesSent%1000 == 0 {
 			// Sample every 1000th line with a timestamp for latency measurement
-			line = generateTimestampedLine(cfg.LineSize)
+			line = generateTimestampedLine(cfg.LineSize, cfg.Format)
 		} else {
 			line = templateLine
 		}
@@ -529,14 +529,28 @@ func sendLinesConn(cfg config, connID int, clock *sendClock, write func([]byte) 
 }
 
 // generateTimestampedLine creates a line with an embedded nanosecond timestamp
-// for latency measurement: "TS=<nanos> <padding...>\n" (newline included).
-func generateTimestampedLine(size int) []byte {
-	prefix := fmt.Sprintf("TS=%d ", time.Now().UnixNano())
-	pad := size - len(prefix)
+// for latency measurement. The receiver locates the timestamp via the literal
+// substring "TS=<digits>"; the surrounding wrapper depends on the line format
+// so the line stays parseable by JSON-aware subjects (e.g. AxoSyslog's
+// json-parser, which would otherwise drop a bare "TS=..." line).
+func generateTimestampedLine(size int, format string) []byte {
+	tsTag := fmt.Sprintf("TS=%d ", time.Now().UnixNano())
+	if format == "json" {
+		// Embed TS=<nanos> inside the msg field of a JSON envelope that
+		// matches the shape used for non-sample json lines.
+		wrapper := `{"ts":` + fmt.Sprintf("%d", time.Now().UnixMilli()) + `,"level":"info","msg":"` + tsTag
+		suffix := `"}` + "\n"
+		pad := size - len(wrapper) - len(suffix)
+		if pad < 0 {
+			pad = 0
+		}
+		return []byte(wrapper + randString(pad) + suffix)
+	}
+	pad := size - len(tsTag)
 	if pad < 0 {
 		pad = 0
 	}
-	return []byte(prefix + randString(pad) + "\n")
+	return []byte(tsTag + randString(pad) + "\n")
 }
 
 // generateSequencedLine creates a line with an embedded sequence number
