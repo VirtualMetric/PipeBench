@@ -230,6 +230,14 @@ func (r *ComposeRunner) StopServices(timeout time.Duration, services ...string) 
 	return r.compose(args...)
 }
 
+// KillServices sends SIGKILL immediately — no grace period, no chance for
+// the process to clean up. Mirrors a crash scenario for persistence tests.
+// Uses `docker compose kill -s SIGKILL <svc>...`.
+func (r *ComposeRunner) KillServices(services ...string) error {
+	args := append([]string{"kill", "-s", "SIGKILL"}, services...)
+	return r.compose(args...)
+}
+
 // Down stops and removes all containers and anonymous volumes.
 func (r *ComposeRunner) Down() error {
 	return r.compose("down", "-v", "--remove-orphans")

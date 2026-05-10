@@ -1,0 +1,15 @@
+[sources.in]
+type = "socket"
+mode = "tcp"
+address = "0.0.0.0:9000"
+
+[sinks.out]
+type = "socket"
+inputs = ["in"]
+mode = "tcp"
+address = "receiver:9001"
+encoding.codec = "text"
+
+[sinks.out.buffer]
+type = "disk"
+max_size = 4294967296

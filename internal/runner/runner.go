@@ -119,7 +119,10 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		return r.runPersistenceCorrectness(tc, subject)
 	}
 	if tc.Type == "persistence_restart_correctness" {
-		return r.runPersistenceRestartCorrectness(tc, subject)
+		return r.runPersistenceShutdownCorrectness(tc, subject, false)
+	}
+	if tc.Type == "persistence_crash_correctness" {
+		return r.runPersistenceShutdownCorrectness(tc, subject, true)
 	}
 
 	configName := r.opts.ConfigName
@@ -744,17 +747,19 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 	return result, nil
 }
 
-// runPersistenceRestartCorrectness tests true durable persistence across a
-// subject restart:
+// runPersistenceShutdownCorrectness tests durable persistence across a subject
+// shutdown. `crash=false` does a graceful SIGTERM (matches the original
+// restart-correctness flow); `crash=true` SIGKILLs the subject mid-flight to
+// verify recovery without any chance to flush state.
 //
 //  1. Start subject + collector (receiver DOWN)
 //  2. Start generator — sends sequenced logs
-//  3. Wait for subject to persist
-//  4. Stop subject (SIGTERM, graceful shutdown → must flush state to disk)
+//  3. Wait for generator to finish writing
+//  4. Stop subject (SIGTERM 30s if !crash, SIGKILL if crash)
 //  5. Start receiver
 //  6. Restart subject — it should read from persistent store and forward
 //  7. Drain and verify all logs arrive with 0% loss, 0 duplicates
-func (r *Runner) runPersistenceRestartCorrectness(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
+func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject config.Subject, crash bool) (results.RunResult, error) {
 	configName := r.opts.ConfigName
 	if r.opts.SubjectVersion != "" {
 		subject = subject.WithVersion(r.opts.SubjectVersion)
@@ -859,10 +864,19 @@ func (r *Runner) runPersistenceRestartCorrectness(tc *config.TestCase, subject c
 	genStats := r.parseGeneratorStats(orch.GeneratorStdout())
 	fmt.Printf("  generator sent %s lines\n", formatCount(genStats.LinesSent))
 
-	// PHASE 3: immediately stop subject — SIGTERM must flush in-flight state to disk
-	fmt.Println("  phase 3: stopping subject immediately (SIGTERM)…")
-	if err := orch.StopServices(30*time.Second, "subject"); err != nil {
-		return results.RunResult{}, fmt.Errorf("stopping subject: %w", err)
+	// PHASE 3: stop subject. SIGTERM (restart variant) lets the subject flush
+	// state to disk gracefully; SIGKILL (crash variant) gives no chance for
+	// cleanup — only writes already persisted before the kill are recoverable.
+	if crash {
+		fmt.Println("  phase 3: killing subject (SIGKILL — no graceful shutdown)…")
+		if err := orch.KillServices("subject"); err != nil {
+			return results.RunResult{}, fmt.Errorf("killing subject: %w", err)
+		}
+	} else {
+		fmt.Println("  phase 3: stopping subject immediately (SIGTERM)…")
+		if err := orch.StopServices(30*time.Second, "subject"); err != nil {
+			return results.RunResult{}, fmt.Errorf("stopping subject: %w", err)
+		}
 	}
 
 	// PHASE 4: Start receiver while subject is stopped

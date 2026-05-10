@@ -19,6 +19,11 @@ type Orchestrator interface {
 	//     cutoff has already been captured
 	StopServices(timeout time.Duration, services ...string) error
 
+	// KillServices sends SIGKILL to the named services immediately, simulating
+	// a crash with no chance to flush state. Used by persistence_crash_correctness
+	// to verify recovery from non-graceful shutdown.
+	KillServices(services ...string) error
+
 	// Down tears down all containers and volumes.
 	Down() error
 
