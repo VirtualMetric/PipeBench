@@ -11,6 +11,11 @@ generator:
   rate: 500
   line_size: 256
   format: raw
+  file_rotation:
+    mode: copytruncate
+    at: 30s
+    quiesce: 200ms
+    archive_suffix: ".1"
 
 receiver:
   mode: tcp
@@ -29,7 +34,7 @@ subjects:
 
 correctness:
   validate_order: true
-  validate_dedup: false
+  validate_dedup: true
   expected_loss_pct: 0.0
 
 configurations:

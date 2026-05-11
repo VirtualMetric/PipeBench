@@ -124,6 +124,9 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	if tc.Type == "persistence_crash_correctness" {
 		return r.runPersistenceShutdownCorrectness(tc, subject, true)
 	}
+	if tc.Type == "persistence_file_restart_correctness" {
+		return r.runPersistenceFileRestartCorrectness(tc, subject)
+	}
 
 	configName := r.opts.ConfigName
 
@@ -1015,6 +1018,264 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 	} else {
 		fmt.Println("  persistence restart correctness: FAILED ✗")
 		for _, e := range errors {
+			fmt.Printf("    - %s\n", e)
+		}
+	}
+
+	if recvMetrics.LinesReceived == 0 {
+		fmt.Fprintln(os.Stderr, "\n  WARNING: 0 lines received. Container logs:")
+		fmt.Fprintf(os.Stderr, "\n  --- generator ---\n%s", orch.Logs("generator", 30))
+		fmt.Fprintf(os.Stderr, "\n  --- subject ---\n%s", orch.Logs("subject", 30))
+		fmt.Fprintf(os.Stderr, "\n  --- receiver ---\n%s", orch.Logs("receiver", 30))
+	}
+
+	return result, nil
+}
+
+// runPersistenceFileRestartCorrectness verifies that a file-tail subject
+// recovers correctly when it's offline across a file rotation.
+//
+//  1. Start subject + receiver + collector + generator together. Subject
+//     tails the input file and forwards to the receiver in real time.
+//  2. Generator does a `create`-mode rotation at FileRotation.At — rename
+//     /data/input.log → /data/input.log.1 and create a fresh /data/input.log.
+//  3. Shortly after the rotation fires, SIGTERM the subject (its file-tail
+//     position and any pending forwards must persist to disk so a re-read
+//     can resume in the right place).
+//  4. Generator continues writing post-rotation events to the new
+//     /data/input.log while the subject is offline.
+//  5. Generator finishes.
+//  6. Restart subject. To pass, it must:
+//        - read the un-read tail of input.log.1 (events written between its
+//          last forwarded byte and the rotation point)
+//        - read the new input.log from offset 0 (post-rotation events)
+//        - NOT re-forward anything already sent before SIGTERM
+//
+// This catches subjects whose file source watches a single path with no
+// persistent state — they can't see input.log.1 after restart, so all
+// un-read pre-rotation events are lost.
+func (r *Runner) runPersistenceFileRestartCorrectness(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
+	configName := r.opts.ConfigName
+	if r.opts.SubjectVersion != "" {
+		subject = subject.WithVersion(r.opts.SubjectVersion)
+	}
+
+	fmt.Printf("→ test=%s  subject=%s  version=%s  config=%s\n",
+		tc.Name, subject.Name, subject.Version, configName)
+
+	configSrc, err := tc.ConfigFilePath(r.opts.CasesDir, configName, subject)
+	if err != nil {
+		return results.RunResult{}, err
+	}
+	configSrc, err = filepath.Abs(configSrc)
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("resolving config path: %w", err)
+	}
+
+	tmpDir, err := os.MkdirTemp("", "bench-"+tc.Name+"-")
+	if err != nil {
+		return results.RunResult{}, err
+	}
+	if err := os.Chmod(tmpDir, 0o777); err != nil {
+		return results.RunResult{}, fmt.Errorf("chmod tmpdir: %w", err)
+	}
+	defer func() {
+		if !r.opts.NoCleanup {
+			os.RemoveAll(tmpDir)
+		}
+	}()
+
+	extraEnv := map[string]string{}
+	if cfg, ok := tc.Configurations[configName]; ok {
+		for k, v := range cfg.Env {
+			extraEnv[k] = v
+		}
+	}
+
+	runCfg := orchestrator.RunConfig{
+		TestCase:         tc,
+		Subject:          subject,
+		ConfigName:       configName,
+		ConfigSrcPath:    configSrc,
+		TmpDir:           tmpDir,
+		GeneratorImage:   r.opts.GeneratorImage,
+		ReceiverImage:    r.opts.ReceiverImage,
+		CollectorImage:   r.opts.CollectorImage,
+		ReceiverHostPort: r.opts.ReceiverHostPort,
+		ExtraSubjectEnv:  extraEnv,
+		CPULimit:         r.opts.CPULimit,
+		MemLimit:         r.opts.MemLimit,
+	}
+
+	cr, err := orchestrator.NewComposeRunner(runCfg)
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("compose setup: %w", err)
+	}
+	orch := cr
+
+	for _, c := range []string{"bench-generator", "bench-receiver", "bench-collector", "bench-subject-" + subject.Name} {
+		_ = exec.Command("docker", "rm", "-f", c).Run()
+	}
+	_ = orch.Down()
+
+	startTime := time.Now()
+	cleanup := func() {
+		if !r.opts.NoCleanup {
+			fmt.Println("  tearing down…")
+			_ = orch.Down()
+		}
+	}
+	defer cleanup()
+
+	// PHASE 1: start every service together — subject tails file, receiver
+	// records, generator writes.
+	fmt.Println("  phase 1: starting all services (subject tails + forwards in real time)…")
+	if err := orch.Up(); err != nil {
+		return results.RunResult{}, fmt.Errorf("starting services: %w", err)
+	}
+
+	// PHASE 2: wait until just after the rotation event has fired.
+	rotateAt := 30 * time.Second
+	if s := tc.Generator.FileRotation.At; s != "" {
+		if d, err := time.ParseDuration(s); err == nil {
+			rotateAt = d
+		}
+	}
+	warmup := tc.WarmupOrDefault(10 * time.Second)
+	stopAfter := warmup + rotateAt + 5*time.Second
+	fmt.Printf("  phase 2: waiting %s (rotation fires at warmup+%s)…\n", stopAfter, rotateAt)
+	time.Sleep(stopAfter)
+
+	// PHASE 3: SIGTERM subject. Its file-tail state must be flushed to disk
+	// (persist file, position file, sincedb, …) so the restart can resume.
+	fmt.Println("  phase 3: stopping subject (SIGTERM, must persist file-tail position)…")
+	if err := orch.StopServices(30*time.Second, "subject"); err != nil {
+		return results.RunResult{}, fmt.Errorf("stopping subject: %w", err)
+	}
+
+	// PHASE 4: generator continues writing the rest of the test budget to
+	// the new file while the subject is offline.
+	duration := tc.DurationOrDefault(60 * time.Second)
+	genTimeout := duration + warmup + 2*time.Minute
+	if genTimeout > r.opts.Timeout {
+		genTimeout = r.opts.Timeout
+	}
+	fmt.Printf("  phase 4: waiting for generator to finish writing (up to %s)…\n", genTimeout)
+	if err := orch.WaitForGeneratorExit(genTimeout); err != nil {
+		return results.RunResult{}, fmt.Errorf("waiting for generator: %w", err)
+	}
+	genStats := r.parseGeneratorStats(orch.GeneratorStdout())
+	fmt.Printf("  generator sent %s lines\n", formatCount(genStats.LinesSent))
+
+	// PHASE 5: restart subject — must catch up on un-read tail of input.log.1
+	// AND the new input.log from offset 0.
+	fmt.Println("  phase 5: restarting subject (must read .1 archive + new file)…")
+	if err := orch.UpServices("subject"); err != nil {
+		return results.RunResult{}, fmt.Errorf("restarting subject: %w", err)
+	}
+
+	// PHASE 6: drain wait.
+	drainTimeout := 3 * time.Minute
+	fmt.Printf("  phase 6: waiting for logs to drain (up to %s)…\n", drainTimeout)
+	metricsPort, stopPortFwd, err := orch.ReceiverMetricsPort()
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("setting up receiver access: %w", err)
+	}
+	defer stopPortFwd()
+
+	var lastCount int64
+	stableRounds := 0
+	drainDeadline := time.Now().Add(drainTimeout)
+	var recvMetrics ReceiverMetrics
+	for time.Now().Before(drainDeadline) {
+		time.Sleep(5 * time.Second)
+		rm, err := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+		if err != nil {
+			continue
+		}
+		recvMetrics = rm
+		fmt.Printf("    received: %s / %s lines\n", formatCount(rm.LinesReceived), formatCount(genStats.LinesSent))
+		if rm.LinesReceived == lastCount && rm.LinesReceived > 0 {
+			stableRounds++
+			if stableRounds >= 3 {
+				fmt.Println("    receiver stable — all logs drained")
+				break
+			}
+		} else {
+			stableRounds = 0
+		}
+		lastCount = rm.LinesReceived
+	}
+
+	// Evaluate.
+	elapsed := time.Since(startTime).Seconds()
+	lossPct := 0.0
+	if genStats.LinesSent > 0 {
+		lossPct = 100.0 * (1.0 - float64(recvMetrics.LinesReceived)/float64(genStats.LinesSent))
+		if lossPct < 0 {
+			lossPct = 0
+		}
+	}
+	passed := true
+	var perrs []string
+	if recvMetrics.LinesReceived < genStats.LinesSent {
+		loss := genStats.LinesSent - recvMetrics.LinesReceived
+		perrs = append(perrs, fmt.Sprintf("loss: %s lines (%.2f%%)", formatCount(loss), lossPct))
+		passed = false
+	}
+	if recvMetrics.LinesReceived > genStats.LinesSent {
+		extra := recvMetrics.LinesReceived - genStats.LinesSent
+		perrs = append(perrs, fmt.Sprintf("over-delivery: received %s, sent %s (%s extra/duplicate)",
+			formatCount(recvMetrics.LinesReceived), formatCount(genStats.LinesSent), formatCount(extra)))
+		passed = false
+	}
+	if tc.Correctness.ValidateDedup && recvMetrics.Duplicates > 0 {
+		perrs = append(perrs, fmt.Sprintf("expected 0 duplicates, got %s", formatCount(recvMetrics.Duplicates)))
+		passed = false
+	}
+
+	result := results.RunResult{
+		TestName:        tc.Name,
+		Config:          configName,
+		Subject:         subject.Name,
+		Version:         subject.Version,
+		Hardware:        hardwareID(),
+		Timestamp:       startTime,
+		DurationSec:     elapsed,
+		FirstSentNs:     genStats.FirstSentNs,
+		LastSentNs:      genStats.LastSentNs,
+		FirstReceivedNs: recvMetrics.FirstReceivedNs,
+		LastReceivedNs:  recvMetrics.LastReceivedNs,
+		LinesIn:         genStats.LinesSent,
+		LinesOut:        recvMetrics.LinesReceived,
+		BytesIn:         genStats.BytesSent,
+		BytesOut:        recvMetrics.BytesReceived,
+		LossPercent:     lossPct,
+		Passed:          &passed,
+	}
+	if !passed {
+		result.FailReason = strings.Join(perrs, "; ")
+	}
+
+	dir, err := r.store.Save(result, "")
+	if err != nil {
+		return result, fmt.Errorf("saving results: %w", err)
+	}
+
+	fmt.Printf("  done. results → %s\n", dir)
+	fmt.Printf("  lines sent: %s  lines received: %s  loss: %.2f%%\n",
+		formatCount(genStats.LinesSent), formatCount(recvMetrics.LinesReceived), lossPct)
+	if tc.Correctness.ValidateDedup {
+		fmt.Printf("  unique lines: %s  duplicates: %s\n",
+			formatCount(recvMetrics.UniqueLines), formatCount(recvMetrics.Duplicates))
+	}
+	fmt.Printf("  total time: %.1fs\n", elapsed)
+
+	if passed {
+		fmt.Println("  file-rotation restart correctness: PASSED ✓")
+	} else {
+		fmt.Println("  file-rotation restart correctness: FAILED ✗")
+		for _, e := range perrs {
 			fmt.Printf("    - %s\n", e)
 		}
 	}

@@ -111,6 +111,12 @@ services:
 {{- if .GenTotalLines }}
       GENERATOR_TOTAL_LINES: "{{ .GenTotalLines }}"
 {{- end }}
+{{- if .GenRotateMode }}
+      GENERATOR_ROTATE_MODE: "{{ .GenRotateMode }}"
+      GENERATOR_ROTATE_AT: "{{ .GenRotateAt }}"
+      GENERATOR_ROTATE_QUIESCE: "{{ .GenRotateQuiesce }}"
+      GENERATOR_ROTATE_ARCHIVE_SUFFIX: "{{ .GenRotateSuffix }}"
+{{- end }}
 {{- range $k, $v := .GenEnv }}
       {{ $k }}: "{{ $v }}"
 {{- end }}
@@ -373,6 +379,10 @@ type composeVars struct {
 	GenConnections    int
 	GenTotalLines     int64
 	GenEnv            map[string]string
+	GenRotateMode     string
+	GenRotateAt       string
+	GenRotateQuiesce  string
+	GenRotateSuffix   string
 	RecvMode              string
 	RecvListen            string
 	RecvValidateOrder     string
@@ -474,6 +484,10 @@ func writeCompose(path string, cfg RunConfig) error {
 		GenConnections:    resolveGeneratorConnections(tc.Generator.Connections),
 		GenTotalLines:     tc.Generator.TotalLines,
 		GenEnv:            tc.Generator.Env,
+		GenRotateMode:     tc.Generator.FileRotation.Mode,
+		GenRotateAt:       tc.Generator.FileRotation.At,
+		GenRotateQuiesce:  tc.Generator.FileRotation.Quiesce,
+		GenRotateSuffix:   tc.Generator.FileRotation.ArchiveSuffix,
 		RecvMode:              tc.Receiver.Mode,
 		RecvListen:            tc.Receiver.Listen,
 		RecvValidateOrder:     boolStr(tc.Correctness.ValidateOrder),

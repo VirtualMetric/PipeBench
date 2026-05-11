@@ -1,0 +1,42 @@
+name: file_rotate_restart_correctness
+type: persistence_file_restart_correctness
+description: "Verifies that a file-tail subject can recover when it's offline across a rotation: subject reads partway, gets SIGTERM'd, generator rotates the log file (create mode) and writes more events to the new file while subject is offline, then subject restarts and must catch up on the un-read tail of input.log.1 + the new input.log without re-emitting anything already forwarded. A subject that only watches /data/input.log by path (no glob, no persistent state) will lose every un-read pre-rotation event in input.log.1 — that's the case this test catches."
+
+duration: 60s
+warmup: 10s
+
+generator:
+  mode: file
+  target: "/data/input.log"
+  rate: 500
+  line_size: 256
+  format: raw
+  file_rotation:
+    mode: create
+    at: 15s
+    quiesce: 200ms
+    archive_suffix: ".1"
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+subjects:
+  - vector
+  - fluent-bit
+  - fluentd
+  - filebeat
+  - logstash
+  - nxlog
+  - axosyslog
+  - tenzir
+  - cribl-stream
+
+correctness:
+  validate_order: false
+  validate_dedup: true
+  expected_loss_pct: 0.0
+
+configurations:
+  default:
+    description: "Subject SIGTERM'd after rotation; restart must catch up via archive + new file"

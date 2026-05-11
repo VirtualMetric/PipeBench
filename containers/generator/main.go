@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"net/http"
@@ -30,6 +31,12 @@ type config struct {
 	Sequenced   bool  // embed SEQ=<n> in each line for correctness
 	Connections int   // parallel TCP/HTTP connections (default 1)
 	SeqOffset   int64 // starting sequence number — set per worker by the parallel dispatcher so global sequences don't overlap across workers (otherwise each worker emits 0..perWorker, breaking the receiver-side dedup check)
+
+	// File-rotation knobs (file mode only). Empty RotateMode = disabled.
+	RotateMode    string // "create" | "copytruncate" | "truncate"
+	RotateAt      time.Duration
+	RotateQuiesce time.Duration
+	RotateSuffix  string
 }
 
 type result struct {
@@ -225,6 +232,17 @@ func loadConfig() config {
 		cfg.Warmup = w
 	}
 
+	cfg.RotateMode = strings.ToLower(strings.TrimSpace(os.Getenv("GENERATOR_ROTATE_MODE")))
+	if cfg.RotateMode != "" {
+		if at, err := time.ParseDuration(getEnv("GENERATOR_ROTATE_AT", "30s")); err == nil {
+			cfg.RotateAt = at
+		}
+		if q, err := time.ParseDuration(getEnv("GENERATOR_ROTATE_QUIESCE", "200ms")); err == nil {
+			cfg.RotateQuiesce = q
+		}
+		cfg.RotateSuffix = getEnv("GENERATOR_ROTATE_ARCHIVE_SUFFIX", ".1")
+	}
+
 	return cfg
 }
 
@@ -350,20 +368,140 @@ func isDurationTimeout(err error) bool {
 	return false
 }
 
+// fileRotator owns the generator-side file fd and serializes writes against
+// mid-test rotation events so a rotation can't tear a partially-buffered line.
+//
+// The hot path takes mu.RLock() per line (cheap at the file-mode rates we run).
+// The rotation goroutine takes mu.Lock() once per test, flushes the buffer,
+// pauses for cfg.RotateQuiesce so the subject can drain to EOF, then performs
+// the destructive op. For "create" rotation it swaps both f and w; for the
+// truncate variants it keeps the same fd (which is O_APPEND, so post-truncate
+// writes resume at offset 0 atomically).
+type fileRotator struct {
+	mu sync.RWMutex
+	f  *os.File
+	w  *bufio.Writer
+}
+
 func runFile(cfg config, clock *sendClock) (int64, int64, error) {
 	f, err := os.OpenFile(cfg.Target, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return 0, 0, fmt.Errorf("open file %s: %w", cfg.Target, err)
 	}
-	defer f.Close()
 
-	w := bufio.NewWriterSize(f, 64*1024)
+	rot := &fileRotator{
+		f: f,
+		w: bufio.NewWriterSize(f, 64*1024),
+	}
+	defer func() {
+		rot.mu.Lock()
+		_ = rot.w.Flush()
+		_ = rot.f.Close()
+		rot.mu.Unlock()
+	}()
+
+	// Mid-test rotation timer.
+	rotateDone := make(chan struct{})
+	if cfg.RotateMode != "" && cfg.RotateAt > 0 {
+		go func() {
+			defer close(rotateDone)
+			timer := time.NewTimer(cfg.RotateAt)
+			defer timer.Stop()
+			<-timer.C
+
+			rot.mu.Lock()
+			defer rot.mu.Unlock()
+
+			if err := rot.w.Flush(); err != nil {
+				fmt.Fprintf(os.Stderr, "generator: rotate flush: %v\n", err)
+				return
+			}
+			if cfg.RotateQuiesce > 0 {
+				time.Sleep(cfg.RotateQuiesce)
+			}
+			if err := performFileRotation(cfg, rot); err != nil {
+				fmt.Fprintf(os.Stderr, "generator: rotate (%s): %v\n", cfg.RotateMode, err)
+				return
+			}
+			fmt.Fprintf(os.Stderr, "generator: rotated target=%s mode=%s\n", cfg.Target, cfg.RotateMode)
+		}()
+	} else {
+		close(rotateDone)
+	}
+
 	sent, bytes, err := sendLines(cfg, clock, func(line []byte) error {
-		_, err := w.Write(line)
-		return err
+		rot.mu.RLock()
+		_, werr := rot.w.Write(line)
+		rot.mu.RUnlock()
+		return werr
 	})
-	_ = w.Flush()
+
+	// Make sure the rotation goroutine has finished before we close out the
+	// fd so any in-flight rename/truncate observes a consistent fd/writer.
+	<-rotateDone
 	return sent, bytes, err
+}
+
+// performFileRotation runs the destructive step. Caller must hold rot.mu (write).
+func performFileRotation(cfg config, rot *fileRotator) error {
+	suffix := cfg.RotateSuffix
+	if suffix == "" {
+		suffix = ".1"
+	}
+	switch cfg.RotateMode {
+	case "create":
+		// Close current fd, rename file out of the way, reopen target as a
+		// fresh inode. Subject must notice the path now points to a new
+		// inode and pick it up.
+		if err := rot.f.Close(); err != nil {
+			return fmt.Errorf("close before rename: %w", err)
+		}
+		if err := os.Rename(cfg.Target, cfg.Target+suffix); err != nil {
+			return fmt.Errorf("rename: %w", err)
+		}
+		nf, err := os.OpenFile(cfg.Target, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			return fmt.Errorf("reopen after rename: %w", err)
+		}
+		rot.f = nf
+		rot.w = bufio.NewWriterSize(nf, 64*1024)
+		return nil
+
+	case "copytruncate":
+		// Snapshot current contents into the archive, then truncate the
+		// live file. Same fd (O_APPEND) — next write lands at offset 0.
+		src, err := os.Open(cfg.Target)
+		if err != nil {
+			return fmt.Errorf("open for archive: %w", err)
+		}
+		defer src.Close()
+		dst, err := os.OpenFile(cfg.Target+suffix, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		if err != nil {
+			return fmt.Errorf("open archive: %w", err)
+		}
+		if _, err := io.Copy(dst, src); err != nil {
+			dst.Close()
+			return fmt.Errorf("copy archive: %w", err)
+		}
+		if err := dst.Close(); err != nil {
+			return fmt.Errorf("close archive: %w", err)
+		}
+		if err := rot.f.Truncate(0); err != nil {
+			return fmt.Errorf("truncate: %w", err)
+		}
+		return nil
+
+	case "truncate":
+		// Direct truncate, no archive. With O_APPEND the next write goes
+		// to offset 0 atomically.
+		if err := rot.f.Truncate(0); err != nil {
+			return fmt.Errorf("truncate: %w", err)
+		}
+		return nil
+
+	default:
+		return fmt.Errorf("unknown rotate mode %q", cfg.RotateMode)
+	}
 }
 
 func runHTTP(cfg config, clock *sendClock) (int64, int64, error) {

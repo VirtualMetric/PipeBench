@@ -1,0 +1,18 @@
+# Vector's file source tracks per-inode offsets via its data directory's
+# checkpoints. The glob include + checkpoints together let it pick up
+# input.log.1 after a rotation that happened while vector was offline and
+# resume from the saved offset — instead of re-reading the archive from 0
+# (which would produce duplicates).
+data_dir = "/var/lib/vector"
+
+[sources.in]
+type = "file"
+include = ["/data/input.log*"]
+read_from = "beginning"
+
+[sinks.out]
+type = "socket"
+mode = "tcp"
+inputs = ["in"]
+address = "receiver:9001"
+encoding.codec = "text"

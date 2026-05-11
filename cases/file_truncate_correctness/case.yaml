@@ -11,6 +11,10 @@ generator:
   rate: 500
   line_size: 256
   format: raw
+  file_rotation:
+    mode: truncate
+    at: 30s
+    quiesce: 200ms
 
 receiver:
   mode: tcp
@@ -29,7 +33,7 @@ subjects:
 
 correctness:
   validate_order: true
-  validate_dedup: false
+  validate_dedup: true
   expected_loss_pct: 0.0
 
 configurations:

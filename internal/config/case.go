@@ -113,6 +113,29 @@ type GeneratorConfig struct {
 	// case dial in transport variants without growing GeneratorConfig
 	// for every new mode-specific knob.
 	Env         map[string]string `yaml:"env"`
+	// FileRotation triggers a mid-test rotation/truncation of the target
+	// file. Only valid when Mode == "file". Empty Mode = no rotation.
+	FileRotation FileRotationConfig `yaml:"file_rotation"`
+}
+
+// FileRotationConfig drives a mid-test file rotation event so file-tail
+// subjects are actually exercised against rotation, not just steady append.
+type FileRotationConfig struct {
+	// Mode picks the rotation style:
+	//   "create"        — rename target → target+suffix, recreate target as a fresh inode
+	//   "copytruncate"  — copy target → target+suffix, then truncate target to 0
+	//   "truncate"      — truncate target to 0 with no copy
+	//   ""              — no rotation (default)
+	Mode string `yaml:"mode"`
+	// At is the time offset from generator start at which to fire.
+	At string `yaml:"at"`
+	// Quiesce is the pause (with writes flushed and stopped) before the
+	// destructive op runs — gives the subject's poller time to drain to EOF
+	// so no pre-rotation lines are lost.
+	Quiesce string `yaml:"quiesce"`
+	// ArchiveSuffix is appended to the target path for the archive copy
+	// in create/copytruncate modes (default ".1").
+	ArchiveSuffix string `yaml:"archive_suffix"`
 }
 
 type ReceiverConfig struct {
