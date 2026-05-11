@@ -38,6 +38,7 @@ The original harness required AWS (EC2, S3, Athena, DynamoDB), Terraform 0.12, A
 | `tcp_to_http_5min` | Same as above but 5-minute sustained run |
 | `tcp_to_blackhole` | Receive over TCP, discard (baseline overhead) |
 | `disk_buffer` | Receive over TCP, buffer to disk, forward |
+| `disk_buffer_crash` | Same as above but with fsync-per-write crash-safe mode on every subject |
 | `regex_mask` | Regex mask applied to every record, forward |
 | `syslog_parsing` | Receive over TCP, parse syslog message, forward |
 | `set_field` | Receive over TCP, add one field via native transform, forward |
@@ -49,7 +50,8 @@ The original harness required AWS (EC2, S3, Athena, DynamoDB), Terraform 0.12, A
 | --- | --- |
 | `disk_buffer_persistence` | Events survive subject restart with disk buffer |
 | `tcp_to_tcp_persistent` | Logs sent while receiver is down are persisted and delivered when it comes up |
-| `tcp_to_tcp_persistent_restart` | Same as above, plus the subject is restarted mid-test |
+| `tcp_to_tcp_persistent_restart` | Same as above, plus the subject is restarted mid-test (SIGTERM, graceful) |
+| `tcp_to_tcp_persistent_crash` | Same as above, but the subject is SIGKILL'd (no graceful flush) |
 | `tcp_to_http_persistent` | Persistence correctness with an HTTP receiver as the target |
 | `file_rotate_create` | New-file log rotation handled without data loss |
 | `file_rotate_truncate` | Truncation-based log rotation handled correctly |
@@ -129,6 +131,7 @@ PipeBench/
 │   ├── tcp_to_http_5min_performance/
 │   ├── tcp_to_blackhole_performance/
 │   ├── disk_buffer_performance/
+│   ├── disk_buffer_crash_performance/
 │   ├── regex_mask_performance/
 │   ├── syslog_parsing_performance/
 │   ├── set_field_performance/
@@ -136,6 +139,7 @@ PipeBench/
 │   ├── disk_buffer_persistence_correctness/
 │   ├── tcp_to_tcp_persistent_correctness/
 │   ├── tcp_to_tcp_persistent_restart_correctness/
+│   ├── tcp_to_tcp_persistent_crash_correctness/
 │   ├── tcp_to_http_persistent_correctness/
 │   ├── file_rotate_create_correctness/
 │   ├── file_rotate_truncate_correctness/

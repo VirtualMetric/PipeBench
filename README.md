@@ -28,7 +28,7 @@ After the test, the result is merged into a single per-(hardware, subject) JSON 
 
 ## Available tests
 
-### Performance tests (16)
+### Performance tests (17)
 
 | Test | What it does |
 | --- | --- |
@@ -40,6 +40,7 @@ After the test, the result is merged into a single per-(hardware, subject) JSON 
 | `tcp_to_http_5min_performance` | Same as above but 5-minute sustained run |
 | `tcp_to_blackhole_performance` | TCP in, discard output (overhead baseline) |
 | `disk_buffer_performance` | TCP in, disk buffer, TCP out |
+| `disk_buffer_crash_performance` | Same as above but every subject in its strongest crash-safe (fsync-per-write) disk-buffer mode — measures the EPS cost of zero-loss durability |
 | `regex_mask_performance` | TCP in, regex mask on every record (e.g. `CONN=\d+` → `CONN=***`), TCP out |
 | `syslog_parsing_performance` | TCP in, parse syslog message, TCP out |
 | `set_field_performance` | TCP in, add one field via native transform, TCP out |
@@ -49,13 +50,14 @@ After the test, the result is merged into a single per-(hardware, subject) JSON 
 | `otlp_grpc_to_otlp_grpc_performance` | OTLP/gRPC end-to-end (isolates protocol cost vs. HTTP+protobuf) |
 | `otlp_pipeline_to_otlp_performance` | OTLP/HTTP in, OTLP/HTTP out with one add-attribute transform per record |
 
-### Correctness tests (13)
+### Correctness tests (14)
 
 | Test | What it checks |
 | --- | --- |
 | `disk_buffer_persistence_correctness` | Events survive subject restart with disk buffer |
 | `tcp_to_tcp_persistent_correctness` | Logs sent while receiver is down are persisted and delivered when it comes up |
-| `tcp_to_tcp_persistent_restart_correctness` | Same as above, plus the subject is restarted mid-test |
+| `tcp_to_tcp_persistent_restart_correctness` | Same as above, plus the subject is restarted mid-test (SIGTERM, graceful) |
+| `tcp_to_tcp_persistent_crash_correctness` | Same as above, but the subject is SIGKILL'd (no graceful flush — only fsync'd writes survive) |
 | `tcp_to_http_persistent_correctness` | Persistence correctness with an HTTP receiver as the target |
 | `file_rotate_create_correctness` | New-file log rotation handled without loss |
 | `file_rotate_truncate_correctness` | Truncation-based log rotation handled correctly |

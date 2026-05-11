@@ -1,0 +1,7 @@
+path.config: /usr/share/logstash/config/logstash.conf
+queue.type: persisted
+queue.max_bytes: 1gb
+path.queue: /usr/share/logstash/data/queue
+pipeline.batch.size: 1000
+# Crash-safety: checkpoint (fsync the page file) on every write.
+queue.checkpoint.writes: 1

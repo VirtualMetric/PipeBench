@@ -366,7 +366,7 @@ Make sure no other heavy processes are running. For fair benchmarking, a machine
 
 ## Available tests
 
-### Performance tests (13)
+### Performance tests (14)
 
 These measure throughput, CPU, memory, and I/O while each subject processes data at maximum speed for 2 minutes.
 
@@ -380,12 +380,13 @@ These measure throughput, CPU, memory, and I/O while each subject processes data
 | `tcp_to_http_5min_performance` | Same as above but 5-minute sustained run |
 | `tcp_to_blackhole_performance` | TCP in, discard output (overhead baseline) |
 | `disk_buffer_performance` | TCP in, disk buffer, TCP out |
+| `disk_buffer_crash_performance` | Same as above but with fsync-per-write crash-safe mode on every subject |
 | `regex_mask_performance` | TCP in, regex mask on every record (e.g. `CONN=\d+` → `CONN=***`), TCP out |
 | `syslog_parsing_performance` | TCP in, parse syslog message, TCP out |
 | `set_field_performance` | TCP in, add one field via native transform, TCP out |
 | `real_world_1_performance` | Parse, filter, and route (mixed pipeline) |
 
-### Correctness tests (8)
+### Correctness tests (9)
 
 These verify data integrity — no lost, duplicated, or reordered events. The generator embeds sequence numbers in each line, and the receiver validates them.
 
@@ -393,7 +394,8 @@ These verify data integrity — no lost, duplicated, or reordered events. The ge
 | --- | --- |
 | `disk_buffer_persistence_correctness` | Events survive subject restart with disk buffer |
 | `tcp_to_tcp_persistent_correctness` | Logs sent while receiver is down are persisted and delivered when it comes up |
-| `tcp_to_tcp_persistent_restart_correctness` | Same as above, plus the subject is restarted mid-test |
+| `tcp_to_tcp_persistent_restart_correctness` | Same as above, plus the subject is restarted mid-test (SIGTERM, graceful) |
+| `tcp_to_tcp_persistent_crash_correctness` | Same as above, but the subject is SIGKILL'd (no graceful flush) |
 | `tcp_to_http_persistent_correctness` | Persistence correctness with an HTTP receiver as the target |
 | `file_rotate_create_correctness` | New-file log rotation handled without loss |
 | `file_rotate_truncate_correctness` | Truncation-based log rotation handled correctly |
