@@ -156,6 +156,13 @@ services:
 {{- if .DockerSocketGID }}
     group_add:
       - "{{ .DockerSocketGID }}"
+{{- else }}
+    # Docker Desktop (Windows/macOS) doesn't expose a numeric gid owning
+    # /var/run/docker.sock that we can map onto the host filesystem, so
+    # the hardened uid 10001 collector image can't read the socket. Fall
+    # back to uid 0 inside the container — this is a measurement sidecar
+    # reading its own host's Docker stats API, not exposed to traffic.
+    user: "0:0"
 {{- end }}
     environment:
       COLLECTOR_TARGET_CONTAINER: "{{ .SubjectContainer }}"

@@ -1,6 +1,8 @@
 [sources.in]
 type = "file"
-include = ["/data/input.log"]
+# Pick up every parallel writer the generator produces
+# (/data/input-0.log … /data/input-N.log).
+include = ["/data/*.log"]
 read_from = "beginning"
 
 [sinks.out]

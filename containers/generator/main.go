@@ -384,6 +384,87 @@ type fileRotator struct {
 }
 
 func runFile(cfg config, clock *sendClock) (int64, int64, error) {
+	if cfg.Connections > 1 {
+		return runFileParallel(cfg, clock)
+	}
+	return runFileSingle(cfg, clock)
+}
+
+// runFileParallel fans the generator across N output files. The target path
+// is treated as a template — each worker writes to <stem>-<id><ext>, e.g.
+// /data/input.log → /data/input-0.log, /data/input-1.log, …
+//
+// Each worker owns its own fd + bufio writer, so there's no cross-worker
+// lock contention on the hot path. Rotation is not supported in parallel
+// mode (the rotation path was built around a single shared fd); workers
+// run rotation-free even if RotateMode is set in case.yaml.
+func runFileParallel(cfg config, clock *sendClock) (int64, int64, error) {
+	stem, ext := splitFileTarget(cfg.Target)
+
+	type worker struct {
+		f *os.File
+		w *bufio.Writer
+	}
+	workers := make([]worker, cfg.Connections)
+	for i := 0; i < cfg.Connections; i++ {
+		path := fmt.Sprintf("%s-%d%s", stem, i, ext)
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			for j := 0; j < i; j++ {
+				_ = workers[j].w.Flush()
+				_ = workers[j].f.Close()
+			}
+			return 0, 0, fmt.Errorf("open file %s: %w", path, err)
+		}
+		workers[i] = worker{f: f, w: bufio.NewWriterSize(f, 64*1024)}
+	}
+
+	defer func() {
+		for i := range workers {
+			_ = workers[i].w.Flush()
+			_ = workers[i].f.Close()
+		}
+	}()
+
+	var totalLines, totalBytes atomic.Int64
+	var firstErr error
+	var errOnce sync.Once
+	var wg sync.WaitGroup
+
+	for i := 0; i < cfg.Connections; i++ {
+		wg.Add(1)
+		go func(id int, w *bufio.Writer) {
+			defer wg.Done()
+			sent, bytesSent, werr := sendLinesConn(cfg, id, clock, func(line []byte) error {
+				_, e := w.Write(line)
+				return e
+			})
+			totalLines.Add(sent)
+			totalBytes.Add(bytesSent)
+			if werr != nil {
+				errOnce.Do(func() { firstErr = werr })
+			}
+		}(i, workers[i].w)
+	}
+	wg.Wait()
+	return totalLines.Load(), totalBytes.Load(), firstErr
+}
+
+// splitFileTarget splits a target path into (stem, ext) for worker-id
+// substitution. /data/input.log → ("/data/input", ".log"); /data/foo → ("/data/foo", "").
+func splitFileTarget(target string) (string, string) {
+	for i := len(target) - 1; i >= 0; i-- {
+		if target[i] == '/' || target[i] == '\\' {
+			break
+		}
+		if target[i] == '.' {
+			return target[:i], target[i:]
+		}
+	}
+	return target, ""
+}
+
+func runFileSingle(cfg config, clock *sendClock) (int64, int64, error) {
 	f, err := os.OpenFile(cfg.Target, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return 0, 0, fmt.Errorf("open file %s: %w", cfg.Target, err)
@@ -611,15 +692,37 @@ func sendLinesConn(cfg config, connID int, clock *sendClock, write func([]byte) 
 		deadline = time.Now().Add(cfg.Duration)
 	}
 
-	var rateLimiter <-chan time.Time
+	// Batched rate limiter. The previous design (time.NewTicker(1s/rate)
+	// + per-line <-channel) is gated by OS timer resolution — Linux
+	// typically caps tick precision at ~1–10 µs, so a 10 µs ticker (the
+	// rate=100k case) actually fires far slower and the achieved rate
+	// collapses to ~30–40k regardless of how high `rate` is set.
+	//
+	// Batched approach: emit a fixed-size batch of `batchSize` lines as
+	// fast as the loop can go, then sleep until the next batch slot
+	// (batchInterval = 100ms apart, so 10 batches per second).
+	// batchSize = rate/10 keeps the long-run rate at `rate` lines/sec
+	// regardless of how short the burst is — 100 ms is well within OS
+	// timer precision so the sleep doesn't drift.
+	//
+	// Floors and caps:
+	//   - rate < 10  → batchSize 1 (≤ 10 lines/sec is single-line pacing)
+	//   - rate ≥ 10  → batchSize rate/10 (no upper cap; the writer's own
+	//     loop overhead naturally bounds burst-time per batch)
+	const batchInterval = 100 * time.Millisecond
+	batchSize := 0
+	nextBatch := time.Now()
 	if cfg.Rate > 0 {
-		ticker := time.NewTicker(time.Second / time.Duration(cfg.Rate))
-		defer ticker.Stop()
-		rateLimiter = ticker.C
+		batchSize = cfg.Rate / 10
+		if batchSize < 1 {
+			batchSize = 1
+		}
 	}
 
 	// Sample clock recording: every 10,000 lines to avoid overhead
 	const clockSampleInterval = 10000
+
+	var batchEmitted int
 
 	for {
 		// Check exit conditions
@@ -630,9 +733,21 @@ func sendLinesConn(cfg config, connID int, clock *sendClock, write func([]byte) 
 			break
 		}
 
-		// Rate limiting
-		if rateLimiter != nil {
-			<-rateLimiter
+		// Rate limiting — batched: after each batchSize emitted lines,
+		// sleep until the next batch slot. Skip when rate is 0
+		// (unlimited).
+		if batchSize > 0 && batchEmitted >= batchSize {
+			batchEmitted = 0
+			nextBatch = nextBatch.Add(batchInterval)
+			if d := time.Until(nextBatch); d > 0 {
+				time.Sleep(d)
+			} else {
+				// We're behind — reset the slot to now so a long
+				// pause (e.g. write backpressure) doesn't make
+				// subsequent batches sprint to "catch up" and
+				// briefly run unbounded.
+				nextBatch = time.Now()
+			}
 		}
 
 		var line []byte
@@ -651,6 +766,7 @@ func sendLinesConn(cfg config, connID int, clock *sendClock, write func([]byte) 
 
 		linesSent++
 		bytesSent += int64(len(line)) // line already includes the '\n'
+		batchEmitted++
 
 		// Record first/last send timestamps (sampled to reduce overhead)
 		if linesSent == 1 || linesSent%clockSampleInterval == 0 {

@@ -1,0 +1,46 @@
+profiler:
+  status: false
+  remote: false
+devices:
+  - id: 1
+    name: file-bench
+    type: file
+    properties:
+      # Generator fans out across /data/input-0.log … /data/input-N.log.
+      # Glob picks up every produced file so the file device runs one
+      # reader goroutine per matched file (capped by file_log_concurrency).
+      path: "/data/*.log"
+      # File device polls on a tick (not streaming tail). 1s minimizes the
+      # gap between writes and reads for steady-state throughput.
+      poll_interval: 1
+      # file_log_concurrency left unset → vmetric defaults to NumCPU,
+      # which scales with the host. errgroup caps concurrent file
+      # readers, so a glob matching K ≤ NumCPU files runs K goroutines
+      # in parallel and a glob matching K > NumCPU caps at NumCPU.
+      # Don't reject the file based on mtime window — the test runs for ~70s
+      # but the harness recycles environments between runs.
+      start_date: -1
+      # Generator output is raw 256-byte lines with no timestamps; skip the
+      # date detector and per-line time / retention filters.
+      ignore_time: true
+      ignore_old_date: true
+      ignore_retention: true
+      # Per-line pattern + level enrichment (SystemD9/S9/S8 + SystemD10/S10).
+      # Default off in the reader; toggled in this case to measure cost.
+      compute_pattern: false
+      compute_level: false
+      # Each newline is one log entry — no multiline detection needed.
+      line_parser:
+        type: newline
+targets:
+  - name: tcp-target-bench
+    type: tcp
+    properties:
+      address: "receiver"
+      port: 9001
+routes:
+  - name: file-to-tcp-bench
+    devices:
+      - name: file-bench
+    targets:
+      - name: tcp-target-bench

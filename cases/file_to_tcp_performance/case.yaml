@@ -8,7 +8,13 @@ warmup: 10s
 generator:
   mode: file
   target: "/data/input.log"
-  rate: 0
+  # 100k lines/sec per connection. With auto-resolved 7 connections on
+  # a 28-core host that's 700k lines/sec total — well above the realistic
+  # ~300k single-tail ceiling but bounded enough that a 60s bench writes
+  # ~10 GB to the shared volume instead of the ~75 GB an unrate-limited
+  # generator produces at full disk speed. Keeps repeated runs from
+  # filling the Docker Desktop vhdx.
+  rate: 500000
   line_size: 256
   format: raw
 
@@ -17,6 +23,7 @@ receiver:
   listen: ":9001"
 
 subjects:
+  - vmetric
   - vector
   - fluent-bit
   - fluentd
