@@ -1,7 +1,7 @@
 filebeat.inputs:
   - type: log
     paths:
-      - /data/input.log
+      - /data/*.log
 
 output.logstash:
   hosts: ["receiver:9001"]

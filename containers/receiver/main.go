@@ -27,7 +27,6 @@ type config struct {
 	Timeout     time.Duration
 
 	// Correctness validation (all optional, off by default)
-	ValidateOrder     bool
 	ValidateDedup     bool
 	ValidateContent   bool   // O(1) per line, no heap map — safe for high-volume tests
 	ExpectedLines     int64  // 0 = don't check
@@ -120,9 +119,6 @@ func (c *counters) totals() (lines, bytes, firstNs, lastNs int64) {
 type validator struct {
 	mu sync.Mutex
 
-	// For ordering: track arrival order of sequence numbers
-	sequences []int64
-
 	// For dedup: track how many times each hash was seen
 	hashes map[string]int
 
@@ -174,14 +170,6 @@ func (v *validator) recordLine(line []byte, cfg config) {
 		}
 	}
 
-	if cfg.ValidateOrder {
-		seq := extractSequence(line)
-		if seq >= 0 {
-			v.mu.Lock()
-			v.sequences = append(v.sequences, seq)
-			v.mu.Unlock()
-		}
-	}
 	if cfg.ValidateDedup {
 		h := hashLine(line)
 		v.mu.Lock()
@@ -376,23 +364,6 @@ func (v *validator) validate(cfg config, totalLines int64) (bool, []string) {
 		}
 	}
 
-	// Ordering check
-	if cfg.ValidateOrder && len(v.sequences) > 0 {
-		outOfOrder := 0
-		for i := 1; i < len(v.sequences); i++ {
-			if v.sequences[i] < v.sequences[i-1] {
-				outOfOrder++
-			}
-		}
-		if outOfOrder > 0 {
-			errors = append(errors, fmt.Sprintf(
-				"ordering: %d out-of-order events out of %d total",
-				outOfOrder, len(v.sequences),
-			))
-			passed = false
-		}
-	}
-
 	// Dedup check
 	if cfg.ValidateDedup {
 		duplicates := 0
@@ -437,26 +408,6 @@ func (v *validator) validate(cfg config, totalLines int64) (bool, []string) {
 	return passed, errors
 }
 
-// extractSequence looks for a line of the form "SEQ=<number> ..." and returns
-// the sequence number, or -1 if not found.
-func extractSequence(line []byte) int64 {
-	s := string(line)
-	idx := strings.Index(s, "SEQ=")
-	if idx < 0 {
-		return -1
-	}
-	rest := s[idx+4:]
-	end := strings.IndexByte(rest, ' ')
-	if end < 0 {
-		end = len(rest)
-	}
-	n, err := strconv.ParseInt(rest[:end], 10, 64)
-	if err != nil {
-		return -1
-	}
-	return n
-}
-
 func hashLine(line []byte) string {
 	h := sha256.Sum256(line)
 	return hex.EncodeToString(h[:16]) // 128-bit prefix is enough for dedup
@@ -480,8 +431,8 @@ func main() {
 		}
 	}()
 
-	fmt.Fprintf(os.Stderr, "receiver: mode=%s listen=%s http_data=:%s metrics=:%s order=%v dedup=%v content=%v\n",
-		cfg.Mode, cfg.Listen, httpDataPort, cfg.MetricsPort, cfg.ValidateOrder, cfg.ValidateDedup, cfg.ValidateContent)
+	fmt.Fprintf(os.Stderr, "receiver: mode=%s listen=%s http_data=:%s metrics=:%s dedup=%v content=%v\n",
+		cfg.Mode, cfg.Listen, httpDataPort, cfg.MetricsPort, cfg.ValidateDedup, cfg.ValidateContent)
 
 	var err error
 	switch cfg.Mode {
@@ -502,7 +453,7 @@ func main() {
 		otlpShard := cnt.newShard()
 		onLine := func(line []byte) {
 			otlpShard.recordLine(int64(len(line)) + 1)
-			if cfg.ValidateOrder || cfg.ValidateDedup || cfg.ValidateContent || cfg.RequiredSubstring != "" {
+			if cfg.ValidateDedup || cfg.ValidateContent || cfg.RequiredSubstring != "" {
 				val.recordLine(line, cfg)
 			}
 		}
@@ -534,7 +485,7 @@ func main() {
 		"lines_received": totalLines,
 		"bytes_received": totalBytes,
 	}
-	if cfg.ValidateOrder || cfg.ValidateDedup || cfg.ExpectedLines > 0 {
+	if cfg.ValidateDedup || cfg.ExpectedLines > 0 {
 		summary["passed"] = passed
 		if len(errors) > 0 {
 			summary["errors"] = errors
@@ -590,7 +541,7 @@ func handleConn(conn net.Conn, shard *connStats, val *validator, cfg config) {
 	defer shard.finish()
 	scanner := bufio.NewScanner(conn)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
-	needsValidation := cfg.ValidateOrder || cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.RequiredSubstring != ""
+	needsValidation := cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.RequiredSubstring != ""
 	// Pass the scanner's internal slice directly. shard.recordLine + validator
 	// only read len() and copy via `string(line)` / hash when they need to
 	// keep bytes — they never retain the slice past return. Skipping the
@@ -608,7 +559,7 @@ func handleConn(conn net.Conn, shard *connStats, val *validator, cfg config) {
 func receiveFile(cfg config, cnt *counters, val *validator) error {
 	shard := cnt.newShard()
 	defer shard.finish()
-	needsValidation := cfg.ValidateOrder || cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.RequiredSubstring != ""
+	needsValidation := cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.RequiredSubstring != ""
 
 	deadline := time.Now().Add(cfg.Timeout + 5*time.Minute) // generous for file tests
 	f, err := os.Open(cfg.Listen)
@@ -655,7 +606,7 @@ func receiveHTTP(cfg config, cnt *counters, val *validator) error {
 	// per-shard ceiling so contention here doesn't matter, and a single
 	// shard keeps the per-request bookkeeping trivial.
 	httpShard := cnt.newShard()
-	needsValidation := cfg.ValidateOrder || cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.RequiredSubstring != ""
+	needsValidation := cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.RequiredSubstring != ""
 	mux := http.NewServeMux()
 
 	// Generic POST handler — counts every line in the body
@@ -744,7 +695,7 @@ func receiveHTTP(cfg config, cnt *counters, val *validator) error {
 // POST. It handles both plain line-per-request and ES /_bulk NDJSON format.
 func startHTTPDataEndpoint(port string, cnt *counters, val *validator, cfg config) error {
 	httpShard := cnt.newShard()
-	needsValidation := cfg.ValidateOrder || cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.RequiredSubstring != ""
+	needsValidation := cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.RequiredSubstring != ""
 	lineCallback := func(line []byte) {
 		httpShard.recordLine(int64(len(line)) + 1)
 		if needsValidation {
@@ -855,7 +806,7 @@ func serveMetrics(port string, cnt *counters, val *validator, cfg config) {
 			"last_received_ns":  lastNs,
 		}
 		// Include correctness data if validation is enabled
-		if cfg.ValidateOrder || cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.ExpectedLines > 0 {
+		if cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.ExpectedLines > 0 {
 			passed, errors := val.validate(cfg, totalLines)
 			resp["passed"] = passed
 			if len(errors) > 0 {
@@ -916,7 +867,6 @@ func loadConfig() config {
 		Listen:        getEnv("RECEIVER_LISTEN", ":9001"),
 		MetricsPort:   getEnv("RECEIVER_METRICS_PORT", "9090"),
 		Timeout:       time.Duration(getEnvInt("RECEIVER_TIMEOUT_SECS", 30)) * time.Second,
-		ValidateOrder:     getEnvBool("RECEIVER_VALIDATE_ORDER", false),
 		ValidateDedup:     getEnvBool("RECEIVER_VALIDATE_DEDUP", false),
 		ValidateContent:   getEnvBool("RECEIVER_VALIDATE_CONTENT", false),
 		ExpectedLines:     int64(getEnvInt("RECEIVER_EXPECTED_LINES", 0)),

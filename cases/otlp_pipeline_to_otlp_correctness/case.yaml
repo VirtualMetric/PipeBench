@@ -26,7 +26,6 @@ subjects:
   - cribl-stream
 
 correctness:
-  validate_order: false
   validate_dedup: true
   expected_loss_pct: 0.0
   required_substring: "OTEL-"

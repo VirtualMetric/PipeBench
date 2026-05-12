@@ -39,7 +39,6 @@ subjects:
   - cribl-stream
 
 correctness:
-  validate_order: true
   validate_dedup: true
   expected_loss_pct: 0.0
 

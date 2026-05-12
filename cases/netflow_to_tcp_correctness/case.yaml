@@ -47,7 +47,6 @@ subjects:
   - cribl-stream
 
 correctness:
-  validate_order: false
   # Don't enable validate_dedup: the existing dedup check is coupled to
   # the sequenced "CONN=/SEQ=" line format produced by the TCP-mode
   # generator. NetFlow records carry a different uniqueness marker

@@ -399,7 +399,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	}
 
 	// Plain correctness tests (type: correctness) typically don't enable
-	// validate_order/dedup/content, so the receiver leaves Passed=nil.
+	// validate_dedup/content, so the receiver leaves Passed=nil.
 	// Without a verdict, the UI renders ☠ even on a clean lines_in==
 	// lines_out run. Compute pass/fail from loss_percent vs the case's
 	// expected_loss_pct so plain correctness tests get a real green/red.

@@ -314,7 +314,6 @@ ENTRYPOINT ["/generator"]
 | `RECEIVER_MODE` | `tcp`, `file`, `http` | `tcp` |
 | `RECEIVER_LISTEN` | `host:port` or file path | `:9001` |
 | `RECEIVER_EXPECTED_LINES` | for correctness tests: fail if not equal | unset |
-| `RECEIVER_VALIDATE_ORDER` | check line ordering (correctness) | `false` |
 | `RECEIVER_VALIDATE_DEDUP` | check for duplicates (correctness) | `false` |
 | `RECEIVER_TIMEOUT` | max wait after generator done | `30s` |
 
@@ -390,7 +389,6 @@ configurations:
 
 # Correctness-only fields
 correctness:
-  validate_order: false
   validate_dedup: false
   expected_loss_pct: 0.0     # allow up to N% line loss before failing
 ```
@@ -660,7 +658,7 @@ Deliverables:
 
 Deliverables:
 
-- [ ] Receiver: `RECEIVER_VALIDATE_ORDER`, `RECEIVER_VALIDATE_DEDUP`, line hashing
+- [ ] Receiver: `RECEIVER_VALIDATE_DEDUP`, line hashing
 - [ ] Correctness result type (pass/fail + details)
 - [ ] All 7 correctness test case directories
 - [ ] Correctness report in `harness compare` output

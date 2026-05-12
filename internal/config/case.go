@@ -149,7 +149,6 @@ type Configuration struct {
 }
 
 type CorrectnessConfig struct {
-	ValidateOrder bool `yaml:"validate_order"`
 	ValidateDedup bool `yaml:"validate_dedup"`
 	// ValidateContent runs a per-line structural check (CONN=/SEQ= prefix) to
 	// detect memory corruption without building a full hash map. Cheap enough

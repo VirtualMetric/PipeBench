@@ -132,7 +132,6 @@ services:
       RECEIVER_MODE: "{{ .RecvMode }}"
       RECEIVER_LISTEN: "{{ .RecvListen }}"
       RECEIVER_METRICS_PORT: "9090"
-      RECEIVER_VALIDATE_ORDER: "{{ .RecvValidateOrder }}"
       RECEIVER_VALIDATE_DEDUP: "{{ .RecvValidateDedup }}"
       RECEIVER_VALIDATE_CONTENT: "{{ .RecvValidateContent }}"
 {{- if .RecvExpectedLines }}
@@ -392,7 +391,6 @@ type composeVars struct {
 	GenRotateSuffix   string
 	RecvMode              string
 	RecvListen            string
-	RecvValidateOrder     string
 	RecvValidateDedup     string
 	RecvValidateContent   string
 	RecvExpectedLines     int64
@@ -482,12 +480,12 @@ func writeCompose(path string, cfg RunConfig) error {
 		GenWarmup:         warmup,
 		// Sequenced lines (CONN=<id> SEQ=<n> ...) are only needed when the
 		// receiver runs a check that requires per-line uniqueness or a
-		// known prefix structure — dedup, content, or order validation.
-		// The previous blanket "type == correctness" rule forced sequenced
+		// known prefix structure — dedup or content validation. The
+		// previous blanket "type == correctness" rule forced sequenced
 		// data into tests like wrapped_json_correctness whose generator
 		// format is "json"; those lines started with CONN= instead of {,
 		// silently failing JSON-parsing subjects (e.g. AxoSyslog).
-		GenSequenced:      boolStr(tc.Correctness.ValidateOrder || tc.Correctness.ValidateDedup || tc.Correctness.ValidateContent),
+		GenSequenced:      boolStr(tc.Correctness.ValidateDedup || tc.Correctness.ValidateContent),
 		GenConnections:    resolveGeneratorConnections(tc.Generator.Connections),
 		GenTotalLines:     tc.Generator.TotalLines,
 		GenEnv:            tc.Generator.Env,
@@ -497,7 +495,6 @@ func writeCompose(path string, cfg RunConfig) error {
 		GenRotateSuffix:   tc.Generator.FileRotation.ArchiveSuffix,
 		RecvMode:              tc.Receiver.Mode,
 		RecvListen:            tc.Receiver.Listen,
-		RecvValidateOrder:     boolStr(tc.Correctness.ValidateOrder),
 		RecvValidateDedup:     boolStr(tc.Correctness.ValidateDedup),
 		RecvValidateContent:   boolStr(tc.Correctness.ValidateContent),
 		RecvExpectedLines:     0,

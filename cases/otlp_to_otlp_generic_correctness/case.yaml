@@ -42,7 +42,6 @@ subjects:
   - cribl-stream
 
 correctness:
-  validate_order: false
   # Hash-dedup is decoupled from the CONN=/SEQ= shape check so OTLP
   # bodies ("OTEL-<seq>") work too. Combined with the globally-unique
   # seq the generator emits across workers, this catches both record
