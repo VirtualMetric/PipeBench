@@ -1,0 +1,39 @@
+profiler:
+  status: false
+  remote: false
+devices:
+  - id: 1
+    name: file-bench
+    type: file
+    properties:
+      # Single-file tail; harness's generator renames input.log →
+      # input.log.1 and creates a fresh input.log mid-test. vmetric
+      # re-globs every poll_interval so the new inode is picked up.
+      path: "/data/input.log"
+      poll_interval: 1
+      # Skip date / retention gating — correctness generator emits raw
+      # lines without timestamps, so the default mtime / start-date
+      # filters would discard everything.
+      start_date: -1
+      ignore_time: true
+      ignore_old_date: true
+      ignore_retention: true
+      # Pattern + level enrichment off (raw passthrough); the receiver
+      # asserts dedup / order on the line bytes, not the SystemD9/S9
+      # metadata.
+      compute_pattern: false
+      compute_level: false
+      line_parser:
+        type: newline
+targets:
+  - name: tcp-target-bench
+    type: tcp
+    properties:
+      address: "receiver"
+      port: 9001
+routes:
+  - name: file-to-tcp-bench
+    devices:
+      - name: file-bench
+    targets:
+      - name: tcp-target-bench

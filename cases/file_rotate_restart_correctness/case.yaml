@@ -22,6 +22,7 @@ receiver:
   listen: ":9001"
 
 subjects:
+  - vmetric
   - vector
   - fluent-bit
   - fluentd

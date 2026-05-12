@@ -1,0 +1,34 @@
+profiler:
+  status: false
+  remote: false
+devices:
+  - id: 1
+    name: file-bench
+    type: file
+    properties:
+      # Single-file tail. Generator truncates input.log to 0 bytes
+      # at the 30s mark with no archive copy. The detector must
+      # notice "file size < last known position" and rewind to 0;
+      # data written before truncate is gone by design.
+      path: "/data/input.log"
+      poll_interval: 1
+      start_date: -1
+      ignore_time: true
+      ignore_old_date: true
+      ignore_retention: true
+      compute_pattern: false
+      compute_level: false
+      line_parser:
+        type: newline
+targets:
+  - name: tcp-target-bench
+    type: tcp
+    properties:
+      address: "receiver"
+      port: 9001
+routes:
+  - name: file-to-tcp-bench
+    devices:
+      - name: file-bench
+    targets:
+      - name: tcp-target-bench
