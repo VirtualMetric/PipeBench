@@ -384,7 +384,13 @@ type fileRotator struct {
 }
 
 func runFile(cfg config, clock *sendClock) (int64, int64, error) {
-	if cfg.Connections > 1 {
+	// Rotation logic operates on the single cfg.Target fd — there is no
+	// per-worker rotation in the parallel path. If the case configures
+	// any rotation mode, force single-file regardless of Connections so
+	// the test exercises the rotation behavior it was written for. The
+	// alternative (silently rotating just file 0) would make the test
+	// nondeterministic and uninstrumented.
+	if cfg.Connections > 1 && cfg.RotateMode == "" {
 		return runFileParallel(cfg, clock)
 	}
 	return runFileSingle(cfg, clock)

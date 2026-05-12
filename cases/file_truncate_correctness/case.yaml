@@ -11,6 +11,7 @@ generator:
   rate: 500
   line_size: 256
   format: raw
+  connections: 1
   file_rotation:
     mode: truncate
     at: 30s

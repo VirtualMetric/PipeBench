@@ -11,6 +11,11 @@ generator:
   rate: 500
   line_size: 256
   format: raw
+  # Single-file tail: this case is specifically about rotation
+  # behavior on /data/input.log. Auto-resolved Connections would
+  # otherwise fan out to input-0.log … input-N.log and the rotation
+  # would have no observable effect (the rotation path is single-fd).
+  connections: 1
   file_rotation:
     mode: create
     at: 30s
