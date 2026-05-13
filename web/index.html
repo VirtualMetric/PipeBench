@@ -327,6 +327,32 @@ const TEST_TYPES = {};
 //   real_world_1_performance         -> "Real World 1 (performance)"
 //   set_field_performance            -> "Set Field (performance)"
 const TEST_ACRONYMS = new Set(['tcp', 'udp', 'http', 'https', 'json', 'xml', 'tls', 'ssl', 'api', 'io', 'url', 'uri', 'id', 'vm', 'os', 'sighup', 'sigterm']);
+
+// Display names for subjects. Raw IDs remain in dataset.* and hover titles so
+// search / debug stays cheap; only the visible label changes.
+const SUBJECT_NAMES = {
+    'vmetric':         'VirtualMetric DataStream',
+    'vector':          'Vector by Datadog',
+    'fluent-bit':      'Fluent Bit',
+    'fluentd':         'Fluentd',
+    'logstash':        'Logstash by Elastic',
+    'filebeat':        'Filebeat by Elastic',
+    'telegraf':        'Telegraf by InfluxData',
+    'axosyslog':       'AxoSyslog by Axoflow',
+    'nxlog':           'NXLog Community Edition',
+    'tenzir':          'Tenzir',
+    'splunk':          'Splunk Heavy Forwarder',
+    'otel-collector':  'OpenTelemetry Collector',
+    'alloy':           'Grafana Alloy',
+    'bindplane-agent': 'BindPlane Agent by observIQ',
+    'cribl-stream':    'Cribl Stream',
+    'rotel':           'Streamfold Rotel',
+};
+function humanizeSubjectName(id) {
+    if (!id) return '';
+    return SUBJECT_NAMES[id] || id;
+}
+
 function humanizeTestName(id) {
     if (!id) return '';
     let suffix = '';
@@ -642,7 +668,8 @@ function buildSystemPills() {
         const a = document.createElement('a');
         a.className = 'selector selector-active';
         a.dataset.name = s;
-        a.appendChild(document.createTextNode(s));
+        a.title = s; // raw id on hover for search/debug
+        a.appendChild(document.createTextNode(humanizeSubjectName(s)));
         systems.appendChild(a);
         selectors.system[s] = true;
         a.addEventListener('click', e => toggle(e, s, selectors.system));
@@ -791,7 +818,8 @@ function renderSummary(filtered_data) {
         td_name.className = 'summary-name';
 
         let link = document.createElement('a');
-        link.appendChild(document.createTextNode(`${elem.system}`));
+        link.appendChild(document.createTextNode(humanizeSubjectName(elem.system)));
+        link.title = elem.system; // raw id on hover for search/debug
         link.href = "https://github.com/VirtualMetric/PipeBench";
         td_name.appendChild(link);
 
@@ -933,7 +961,8 @@ function render() {
     sorted_indices.map(idx => {
         const elem = filtered_data[idx];
         let th = document.createElement('th');
-        th.appendChild(document.createTextNode(`${elem.system}`));
+        th.appendChild(document.createTextNode(humanizeSubjectName(elem.system)));
+        th.title = elem.system; // raw id on hover for search/debug
         th.className = 'th-entry';
         th.dataset.system = elem.system;
         details_head.appendChild(th);
