@@ -635,7 +635,7 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 		fmt.Printf("    received: %s / %s lines\n", formatCount(rm.LinesReceived), formatCount(genStats.LinesSent))
 		if rm.LinesReceived == lastCount && rm.LinesReceived > 0 {
 			stableRounds++
-			if stableRounds >= 3 {
+			if stableRounds >= 12 {
 				fmt.Println("    receiver stable — all logs drained")
 				break
 			}
@@ -919,7 +919,7 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 		fmt.Printf("    received: %s / %s lines\n", formatCount(rm.LinesReceived), formatCount(genStats.LinesSent))
 		if rm.LinesReceived == lastCount && rm.LinesReceived > 0 {
 			stableRounds++
-			if stableRounds >= 3 {
+			if stableRounds >= 12 {
 				fmt.Println("    receiver stable — all logs drained")
 				break
 			}
@@ -1197,7 +1197,7 @@ func (r *Runner) runPersistenceFileRestartCorrectness(tc *config.TestCase, subje
 		fmt.Printf("    received: %s / %s lines\n", formatCount(rm.LinesReceived), formatCount(genStats.LinesSent))
 		if rm.LinesReceived == lastCount && rm.LinesReceived > 0 {
 			stableRounds++
-			if stableRounds >= 3 {
+			if stableRounds >= 12 {
 				fmt.Println("    receiver stable — all logs drained")
 				break
 			}

@@ -7,7 +7,7 @@ data_dir = "/var/lib/vector"
 
 [sources.in]
 type = "file"
-include = ["/data/input.log*"]
+include = ["/data/*.log"]
 read_from = "beginning"
 
 [sinks.out]

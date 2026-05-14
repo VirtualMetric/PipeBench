@@ -3,7 +3,7 @@ inputs:
     type: file_monitor
     disabled: false
     path: /data
-    filenameExpr: "/input\\.log$/"
+    filenameExpr: "/.*\\.log$/"
     mode: oldest
     pqEnabled: false
     preprocess:

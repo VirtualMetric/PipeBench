@@ -1,17 +1,15 @@
-profiler:
-  status: false
-  remote: false
 devices:
   - id: 1
     name: file-bench
     type: file
     properties:
-      # Single-file tail. The generator runs copytruncate: snapshots
-      # input.log → input.log.1, then truncates input.log to 0 bytes
-      # and keeps appending. The subject's open fd stays valid; the
-      # detector must notice "file size < last known position" and
-      # rewind to 0 to avoid losing the post-truncate data.
-      path: "/data/input.log"
+      # Glob tail across /data/*.log so vmetric sees both the
+      # archived input.log.1 (snapshot of the pre-truncate content)
+      # and the live input.log (truncated then re-appended). The
+      # reader's offset correlation across rotations forwards the
+      # un-read tail of the archive without re-emitting content
+      # already shipped from the live file.
+      path: "/data/*.log"
       poll_interval: 1
       start_date: -1
       ignore_time: true

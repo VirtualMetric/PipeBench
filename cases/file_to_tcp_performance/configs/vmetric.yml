@@ -1,6 +1,3 @@
-profiler:
-  status: false
-  remote: false
 devices:
   - id: 1
     name: file-bench

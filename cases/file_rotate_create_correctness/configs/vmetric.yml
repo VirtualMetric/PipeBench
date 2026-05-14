@@ -1,15 +1,14 @@
-profiler:
-  status: false
-  remote: false
 devices:
   - id: 1
     name: file-bench
     type: file
     properties:
-      # Single-file tail; harness's generator renames input.log →
-      # input.log.1 and creates a fresh input.log mid-test. vmetric
-      # re-globs every poll_interval so the new inode is picked up.
-      path: "/data/input.log"
+      # Glob tail across /data/*.log so vmetric sees both the archived
+      # input.log.1 (renamed by the generator at the 30s mark) and the
+      # new input.log. The reader's offset correlation across rotations
+      # forwards the un-read tail of the archive without re-emitting
+      # already-forwarded content.
+      path: "/data/*.log"
       poll_interval: 1
       # Skip date / retention gating — correctness generator emits raw
       # lines without timestamps, so the default mtime / start-date
