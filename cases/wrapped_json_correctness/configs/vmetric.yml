@@ -1,3 +1,5 @@
+persistent_storage:
+  status: true
 devices:
   - id: 1
     name: tcp-bench
