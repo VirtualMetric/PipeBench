@@ -143,7 +143,7 @@ var Registry = map[string]Subject{
 	"vmetric": {
 		Name:       "vmetric",
 		Image:      "vmetric/director",
-		Version:    "latest",
+		Version:    "2.0.0",
 		ConfigPath: "/config.yml",
 		Entrypoint: []string{"/director"},
 		Command:    []string{"-config-path", "config.yml"},

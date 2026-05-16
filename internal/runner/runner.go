@@ -264,7 +264,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 			fmt.Printf("    received: %s lines\n", formatCount(rm.LinesReceived))
 			if rm.LinesReceived == drainLast && rm.LinesReceived > 0 {
 				drainStable++
-				if drainStable >= 3 {
+				if drainStable >= 12 {
 					fmt.Println("    receiver stable — drain complete")
 					break
 				}
