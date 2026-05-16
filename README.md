@@ -64,7 +64,6 @@ After the test, the result is merged into a single per-(hardware, subject) JSON 
 | `file_truncate_correctness` | Direct file truncation handled correctly |
 | `sighup_correctness` | Config reload via SIGHUP without data loss |
 | `wrapped_json_correctness` | JSON-in-string fields parsed correctly |
-| `netflow_to_tcp_correctness` | NetFlow v5 binary records decoded and forwarded with no record loss |
 | `otlp_to_otlp_generic_correctness` | OTLP/HTTP+protobuf round-trip preserves every LogRecord body |
 | `otlp_grpc_to_otlp_grpc_correctness` | OTLP/gRPC round-trip preserves every LogRecord body |
 | `otlp_pipeline_to_otlp_correctness` | OTLP/HTTP round-trip with one add-attribute transform preserves every body |

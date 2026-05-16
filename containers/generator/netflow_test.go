@@ -92,10 +92,10 @@ func TestPacketSizeMatchesSpec(t *testing.T) {
 }
 
 // TestRequiredSubstringPresent is a tripwire: if anyone changes the
-// 10.99 prefix in writeNetflowV5Record without updating the
-// netflow_to_tcp_correctness case's required_substring, the test would
-// silently start failing in CI. Belt-and-suspenders by repeating the
-// expected literal here so the diff is loud.
+// 10.99 prefix in writeNetflowV5Record without updating any consumer
+// that asserts the substring, the test would silently start failing
+// in CI. Belt-and-suspenders by repeating the expected literal here
+// so the diff is loud.
 func TestRequiredSubstringPresent(t *testing.T) {
 	buf := make([]byte, netflowV5PacketSize)
 	buildNetflowV5Packet(buf, 0, 0, 0)
