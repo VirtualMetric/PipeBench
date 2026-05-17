@@ -508,30 +508,13 @@ function metricBucket() {
     return selectors.metric === 'correctness' ? 'correctness' : 'perf';
 }
 
-// Anything below this is treated as measurement-window slop (a handful
-// of in-flight records that arrived after the generator stopped).
-// 0.001 = 0.1% = 1 line per 1000. At-or-above is a real at-least-once
-// correctness break.
-const OVER_DELIVERY_THRESHOLD = 0.001;
-
-// isOverDelivered: receiver counted ≥ OVER_DELIVERY_THRESHOLD more
-// lines than the generator sent. Cell renders ✗ red with the
-// over-delivery percentage. Throughput numbers are meaningless when
-// duplication is real, so we override them too.
+// isOverDelivered: receiver counted ANY lines beyond what the generator
+// sent. Even a single duplicate is a real at-least-once break. Cell
+// renders ✗ red with the over-delivery percentage. Throughput numbers
+// are meaningless when duplication is real, so we override them too.
 function isOverDelivered(r) {
     if (!r || !r.lines_in || !r.lines_out) return false;
-    return r.lines_out > r.lines_in * (1 + OVER_DELIVERY_THRESHOLD);
-}
-
-// isMinorOverDeliveryOnly: tiny (< OVER_DELIVERY_THRESHOLD) over-
-// delivery, almost certainly in-flight slop rather than duplication.
-// The harness records `passed: false` for any over-delivery; the UI
-// relaxes that to the same threshold so a pipeline that delivers
-// 100.05% of input still shows as a clean pass.
-function isMinorOverDeliveryOnly(r) {
-    if (!r || !r.lines_in || !r.lines_out) return false;
-    if (r.lines_out <= r.lines_in) return false; // loss, not over-delivery
-    return (r.lines_out - r.lines_in) / r.lines_in < OVER_DELIVERY_THRESHOLD;
+    return r.lines_out > r.lines_in;
 }
 
 // Extract the per-test value used for ranking, or null if missing/invalid.
@@ -545,9 +528,6 @@ function metricTiming(r) {
     if (isOverDelivered(r)) return 1000;
     if (selectors.metric === 'correctness') {
         if (r.passed == null) return null;
-        // Sub-1% over-delivery is below the noise floor of in-flight
-        // measurement; treat the run as passing so the UI stays green.
-        if (r.passed === false && isMinorOverDeliveryOnly(r)) return 1;
         return r.passed ? 1 : 1000;  // 1× vs 1000× so failures darken
     }
     if (selectors.metric === 'eps') {
