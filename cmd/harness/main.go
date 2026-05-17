@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -81,13 +82,14 @@ func testCmd() *cobra.Command {
 		Example: `  harness test -t tcp_to_tcp_performance -s vector
   harness test -t tcp_to_tcp_performance -s vector --version 0.40.0
   harness test -t tcp_to_tcp_performance                     # all subjects listed in case.yaml
-  harness test -s vmetric --all-tests --hardware c7i.8xlarge # all tests for one subject`,
+  harness test -s vmetric --all-tests --hardware c7i.8xlarge # all tests for one subject
+  harness test --all-subjects --all-tests --hardware c7i.2xlarge # every subject × every case it appears in`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !allTests && testName == "" {
 				return fmt.Errorf("--test (-t) is required (or pass --all-tests to iterate every case for one subject)")
 			}
-			if allTests && subjectName == "" {
-				return fmt.Errorf("--all-tests requires -s <subject>; cannot loop every case × every subject")
+			if allTests && subjectName == "" && !allSubjects {
+				return fmt.Errorf("--all-tests requires -s <subject> or --all-subjects")
 			}
 			if allTests && testName != "" {
 				return fmt.Errorf("--all-tests and --test are mutually exclusive")
@@ -112,33 +114,59 @@ func testCmd() *cobra.Command {
 			var pairs []runPair
 
 			if allTests {
-				// One subject × every case that lists it in subjects:.
+				// One or many subjects × every case that lists each in subjects:.
+				// With --all-subjects, iterate the registry in a stable order
+				// so the outer loop is predictable: for each subject, collect
+				// every case that names it.
+				var subjectsToLoop []string
+				if allSubjects && subjectName == "" {
+					for name := range config.Registry {
+						subjectsToLoop = append(subjectsToLoop, name)
+					}
+					sort.Strings(subjectsToLoop)
+				} else {
+					subjectsToLoop = []string{subjectName}
+				}
+
 				names, err := config.ListCases(casesDir)
 				if err != nil {
 					return fmt.Errorf("listing cases: %w", err)
 				}
-				for _, name := range names {
-					tc, err := config.LoadCase(casesDir, name)
-					if err != nil {
-						fmt.Fprintf(os.Stderr, "skip %s (load error: %v)\n", name, err)
-						continue
+				for _, sName := range subjectsToLoop {
+					subjectPairsBefore := len(pairs)
+					for _, name := range names {
+						tc, err := config.LoadCase(casesDir, name)
+						if err != nil {
+							fmt.Fprintf(os.Stderr, "skip %s (load error: %v)\n", name, err)
+							continue
+						}
+						if typeFilter != "" && !matchesTypeFilter(tc.Type, typeFilter) {
+							continue
+						}
+						subs, err := resolveSubjects(tc, sName)
+						if err != nil {
+							// subject not listed in this case — skip silently
+							continue
+						}
+						for _, s := range subs {
+							pairs = append(pairs, runPair{tc: tc, subject: s})
+						}
 					}
-					if typeFilter != "" && !matchesTypeFilter(tc.Type, typeFilter) {
-						continue
-					}
-					subs, err := resolveSubjects(tc, subjectName)
-					if err != nil {
-						// subject not listed in this case — skip silently
-						continue
-					}
-					for _, s := range subs {
-						pairs = append(pairs, runPair{tc: tc, subject: s})
+					if len(subjectsToLoop) > 1 {
+						fmt.Printf("--all-tests: %d case(s) queued for subject %s\n", len(pairs)-subjectPairsBefore, sName)
 					}
 				}
 				if len(pairs) == 0 {
-					return fmt.Errorf("subject %q is not listed in any case.yaml under %s", subjectName, casesDir)
+					if len(subjectsToLoop) == 1 {
+						return fmt.Errorf("subject %q is not listed in any case.yaml under %s", subjectsToLoop[0], casesDir)
+					}
+					return fmt.Errorf("no cases under %s list any registered subject", casesDir)
 				}
-				fmt.Printf("--all-tests: %d case(s) will run for subject %s\n", len(pairs), subjectName)
+				if len(subjectsToLoop) == 1 {
+					fmt.Printf("--all-tests: %d case(s) will run for subject %s\n", len(pairs), subjectsToLoop[0])
+				} else {
+					fmt.Printf("--all-tests --all-subjects: %d (subject, case) run(s) queued across %d subject(s)\n", len(pairs), len(subjectsToLoop))
+				}
 			} else {
 				tc, err := config.LoadCase(casesDir, testName)
 				if err != nil {
@@ -250,7 +278,7 @@ func testCmd() *cobra.Command {
 	cmd.Flags().StringVarP(&testName, "test", "t", "", "test case name (required unless --all-tests)")
 	cmd.Flags().StringVarP(&subjectName, "subject", "s", "", "subject to test (default: all subjects in case.yaml)")
 	cmd.Flags().BoolVar(&allSubjects, "all-subjects", false, "run against all registered subjects")
-	cmd.Flags().BoolVar(&allTests, "all-tests", false, "run every case where the -s subject appears in case.yaml")
+	cmd.Flags().BoolVar(&allTests, "all-tests", false, "run every case where the -s subject appears in case.yaml (combine with --all-subjects to loop every subject)")
 	cmd.Flags().StringVarP(&configName, "config", "c", "default", "configuration name")
 	cmd.Flags().StringVar(&subjectVersion, "version", "", "subject image version tag (overrides registry default)")
 	cmd.Flags().BoolVar(&noCleanup, "no-cleanup", false, "leave containers running after test (for debugging)")
