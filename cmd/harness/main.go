@@ -107,10 +107,6 @@ func testCmd() *cobra.Command {
 			}
 
 			// Resolve the list of (test, subject) pairs to execute.
-			type runPair struct {
-				tc      *config.TestCase
-				subject config.Subject
-			}
 			var pairs []runPair
 
 			if allTests {
@@ -248,20 +244,67 @@ func testCmd() *cobra.Command {
 
 			outcomes := make([]runOutcome, 0, len(pairs))
 			var failed []string
+
+			// In multi-subject runs (typically --all-subjects), flush a
+			// per-subject summary block each time the subject changes so
+			// users see results as each subject finishes, instead of
+			// waiting for every (subject, case) pair to complete first.
+			// The final overall summary still prints at the bottom.
+			perSubjectSummaries := len(pairs) > 0 && countDistinctSubjects(pairs) > 1
+			var subjectOutcomes []runOutcome
+			var currentSubject string
+
+			flushSubjectSummary := func() {
+				if !perSubjectSummaries || len(subjectOutcomes) == 0 {
+					return
+				}
+				fmt.Printf("\n=== Summary for subject %s ===\n", currentSubject)
+				printRunSummary(subjectOutcomes)
+				subjectOutcomes = subjectOutcomes[:0]
+			}
+
 			for _, p := range pairs {
+				if perSubjectSummaries && p.subject.Name != currentSubject {
+					flushSubjectSummary()
+					currentSubject = p.subject.Name
+				}
+
+				// Soft-skip when no config file exists for this (case,
+				// subject) pair. Happens with `-t <case> --all-subjects`
+				// because that path doesn't filter by case.yaml's
+				// subjects: list — every registered subject is tried,
+				// and ones without a config for this case should skip
+				// cleanly rather than ERROR through the runner.
+				cfgName := configName
+				if cfgName == "" {
+					cfgName = "default"
+				}
+				if _, err := p.tc.ConfigFilePath(casesDir, cfgName, p.subject); err != nil {
+					fmt.Fprintf(os.Stderr, "  skip %s/%s: no config file (%v)\n", p.tc.Name, p.subject.Name, err)
+					continue
+				}
+
 				res, err := r.Run(p.tc, p.subject)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "ERROR running %s/%s: %v\n", p.tc.Name, p.subject.Name, err)
 					failed = append(failed, p.tc.Name+"/"+p.subject.Name)
 				}
-				outcomes = append(outcomes, runOutcome{
+				o := runOutcome{
 					testName:    p.tc.Name,
 					subjectName: p.subject.Name,
 					result:      res,
 					runErr:      err,
-				})
+				}
+				outcomes = append(outcomes, o)
+				if perSubjectSummaries {
+					subjectOutcomes = append(subjectOutcomes, o)
+				}
 			}
 
+			flushSubjectSummary()
+			if perSubjectSummaries {
+				fmt.Println("\n=== Overall ===")
+			}
 			printRunSummary(outcomes)
 
 			if len(failed) > 0 {
@@ -354,6 +397,26 @@ func printRunSummary(outcomes []runOutcome) {
 			o.testName, o.subjectName, status, eps, cpu, mem, loss)
 	}
 	_ = tw.Flush()
+}
+
+// runPair is one (test case, subject) row queued for execution.
+// Lives at package scope so summary helpers (countDistinctSubjects)
+// can take it as a parameter without scope-leak gymnastics.
+type runPair struct {
+	tc      *config.TestCase
+	subject config.Subject
+}
+
+// countDistinctSubjects returns the number of unique subject names across
+// the queued run pairs. Used to decide whether to flush per-subject
+// summary blocks during the run loop — with only one subject we keep
+// the single end-of-run summary.
+func countDistinctSubjects(pairs []runPair) int {
+	seen := map[string]struct{}{}
+	for _, p := range pairs {
+		seen[p.subject.Name] = struct{}{}
+	}
+	return len(seen)
 }
 
 func pluralS(n int) string {
