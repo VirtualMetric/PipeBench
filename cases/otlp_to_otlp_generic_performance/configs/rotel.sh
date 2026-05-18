@@ -8,8 +8,13 @@
 # the disable flags exercise rotel's per-signal toggle the same way
 # vmetric's otlp_metrics_status / otlp_traces_status do.
 #
-# Exporter: otlp over HTTP, gzip on (rotel's default), targeting the
-# bench receiver's /v1/logs endpoint.
+# Exporter: otlp over HTTP, compression disabled. Rotel v0.2.2's gzip
+# path produces bodies the bench receiver rejects with
+# "protobuf unmarshal: cannot parse invalid wire-format data" even
+# though 7 other gzip-OTLP subjects round-trip cleanly through the
+# same receiver. Disable compression here as the diagnosed workaround
+# — revisit when an upstream rotel release fixes the gzip exporter.
+# Targets the bench receiver's /v1/logs endpoint.
 
 set -e
 
@@ -21,4 +26,4 @@ exec /rotel start \
     --exporter otlp \
     --otlp-exporter-endpoint http://receiver:4318 \
     --otlp-exporter-protocol http \
-    --otlp-exporter-compression gzip
+    --otlp-exporter-compression none
