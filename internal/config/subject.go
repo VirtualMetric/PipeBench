@@ -7,9 +7,9 @@ type Subject struct {
 	Name       string
 	Image      string
 	Version    string
-	ConfigPath string   // mount point inside container
-	Ports      []string // internal ports (not exposed to host)
-	Command    []string // optional entrypoint override
+	ConfigPath string            // mount point inside container
+	Ports      []string          // internal ports (not exposed to host)
+	Command    []string          // optional entrypoint override
 	User       string            // optional user override
 	Entrypoint []string          // optional entrypoint override
 	ConfigRW   bool              // mount config read-write (for tools that write state alongside config)
@@ -164,7 +164,7 @@ var Registry = map[string]Subject{
 	"vmetric": {
 		Name:         "vmetric",
 		Image:        "vmetric/director",
-		Version:      "2.0.0",
+		Version:      "2.0.1",
 		ConfigPath:   "/config.yml",
 		Entrypoint:   []string{"/director"},
 		Command:      []string{"-config-path", "config.yml"},

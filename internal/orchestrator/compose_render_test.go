@@ -35,7 +35,7 @@ func TestSingularComposeRendersClean(t *testing.T) {
 	subj := config.Subject{
 		Name:       "vmetric",
 		Image:      "vmetric/director",
-		Version:    "2.0.0",
+		Version:    "2.0.1",
 		ConfigPath: "/config.yml",
 	}
 	tmp, err := os.MkdirTemp("", "compose-test-")
@@ -105,7 +105,7 @@ func TestPluralComposeRenders(t *testing.T) {
 	subj := config.Subject{
 		Name:       "vmetric",
 		Image:      "vmetric/director",
-		Version:    "2.0.0",
+		Version:    "2.0.1",
 		ConfigPath: "/config.yml",
 	}
 	tmp, err := os.MkdirTemp("", "compose-plural-test-")
@@ -151,7 +151,7 @@ func TestPluralComposeRenders(t *testing.T) {
 
 func TestValidateRejectsBothForms(t *testing.T) {
 	tc := &config.TestCase{
-		Name: "bad",
+		Name:      "bad",
 		Generator: config.GeneratorConfig{Mode: "tcp", Target: "x:1"},
 		Generators: []config.GeneratorConfig{
 			{ID: "g1", Mode: "tcp", Target: "x:1"},
