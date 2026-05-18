@@ -23,6 +23,12 @@ import (
 	"os"
 
 	"google.golang.org/grpc"
+	// Side-effect import: registers the gzip Decompressor with the gRPC
+	// runtime. Without it, clients that send grpc-encoding: gzip (the
+	// default in otel-collector's otlp/grpc exporter) get an
+	// Unimplemented response and drop every batch. The OTLP/HTTP path
+	// is unaffected because fasthttp gunzips inline in otlp.go.
+	_ "google.golang.org/grpc/encoding/gzip"
 
 	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
