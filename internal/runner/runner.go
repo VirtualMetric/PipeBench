@@ -488,29 +488,39 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		result.PerReceiver = pr
 	}
 
-	// Plain correctness tests (type: correctness) typically don't enable
-	// validate_dedup/content, so the receiver leaves Passed=nil.
-	// Without a verdict, the UI renders ☠ even on a clean lines_in==
-	// lines_out run. Compute pass/fail from loss_percent vs the case's
-	// expected_loss_pct so plain correctness tests get a real green/red.
-	// Also fail on over-delivery (sender duplicated records).
-	if tc.Type == "correctness" && result.Passed == nil {
-		passed := lossPct <= tc.Correctness.ExpectedLossPct
+	// For type: correctness, the loss budget (expected_loss_pct) and the
+	// over-delivery check are authoritative. AND them with the receiver's
+	// verdict — receiver Passed=nil means "no opinion" and doesn't veto.
+	// Previously this block was gated on result.Passed == nil, which meant
+	// validate_dedup runs with zero received lines reported PASSED: the
+	// dedup check trivially passes over an empty set, so the receiver set
+	// Passed=true and the loss check below was skipped entirely.
+	if tc.Type == "correctness" {
+		lossOK := lossPct <= tc.Correctness.ExpectedLossPct
+		overOK := recvMetrics.LinesReceived <= expectedOut
+		recvOK := result.Passed == nil || *result.Passed
+
 		var failReasons []string
-		if !passed {
+		if result.FailReason != "" {
+			failReasons = append(failReasons, result.FailReason)
+		}
+		if !lossOK {
 			failReasons = append(failReasons, fmt.Sprintf(
 				"expected loss <= %.2f%%, got %.2f%%",
 				tc.Correctness.ExpectedLossPct, lossPct))
 		}
-		if recvMetrics.LinesReceived > expectedOut {
-			passed = false
+		if !overOK {
 			extra := recvMetrics.LinesReceived - expectedOut
 			failReasons = append(failReasons, fmt.Sprintf(
 				"over-delivery: received %s lines but only %s were expected (%s extra/duplicate lines)",
 				formatCount(recvMetrics.LinesReceived), formatCount(expectedOut), formatCount(extra)))
 		}
+
+		passed := lossOK && overOK && recvOK
 		result.Passed = &passed
-		if !passed {
+		if passed {
+			result.FailReason = ""
+		} else {
 			result.FailReason = strings.Join(failReasons, "; ")
 		}
 	}
@@ -617,13 +627,23 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	fmt.Printf("  system: %d CPUs, %d MB RAM  send: %.1fs  recv: %.1fs  active: %.1fs  total: %.1fs\n",
 		sysCPUs, sysMemMB, sendDuration, recvWindow, rateDuration, elapsed)
 
-	if recvMetrics.Passed != nil {
-		if *recvMetrics.Passed {
+	// Print the final, merged verdict — not the receiver-only verdict.
+	// The block above ANDs the loss budget and over-delivery checks in;
+	// printing recvMetrics.Passed here would silently disagree with what
+	// got persisted to result.Passed.
+	if result.Passed != nil {
+		if *result.Passed {
 			fmt.Println("  correctness: PASSED")
 		} else {
 			fmt.Println("  correctness: FAILED")
-			for _, e := range recvMetrics.Errors {
-				fmt.Printf("    - %s\n", e)
+			if result.FailReason != "" {
+				for _, e := range strings.Split(result.FailReason, "; ") {
+					fmt.Printf("    - %s\n", e)
+				}
+			} else {
+				for _, e := range recvMetrics.Errors {
+					fmt.Printf("    - %s\n", e)
+				}
 			}
 		}
 	}
