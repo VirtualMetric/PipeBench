@@ -37,13 +37,13 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
       -X main.buildDate=${BUILDDATE}" \
     -o /harness ./cmd/harness
 
-FROM alpine:3.22.4@sha256:310c62b5e7ca5b08167e4384c68db0fd2905dd9c7493756d356e893909057601
-
-# docker-cli ships the `docker` binary plus `docker compose` v2 plugin.
-# The harness invokes `docker compose -f compose.yaml up -d` and friends,
-# so both pieces are required at runtime. ca-certificates is needed for
-# the docker daemon's TLS verification when pulling subject images.
-RUN apk add --no-cache ca-certificates docker-cli docker-cli-compose
+# Runtime base is the official Docker CLI image rather than `alpine + apk
+# add docker-cli`. The Alpine apk-packaged docker-cli lags upstream
+# (Alpine 3.22.4 shipped docker-cli 28.1.1 built with Go 1.24.12, which
+# pulled in a stack of stdlib + moby/buildkit CVEs). The Docker-Inc
+# official image ships current docker-cli + compose plugin built freshly
+# with current Go, and already includes ca-certificates.
+FROM docker:29.5.0-cli-alpine3.23@sha256:864f36643a29d212f6cc88ec3aa1ebd2d939283df933c4c5c1074a982237f9bd
 
 # Workdir defaults to /work so default flags `--cases-dir ./cases` and
 # `--results-dir ./web/results` resolve against caller-mounted volumes.
@@ -55,4 +55,8 @@ COPY --from=builder /harness /usr/local/bin/harness
 # docker group not present in this minimal image) is accessible without
 # extra group_add gymnastics on the caller's side. The harness itself
 # only writes to mounted volumes; it doesn't touch the rootfs.
+#
+# Overrides the base image's ENTRYPOINT ["docker-entrypoint.sh"]; we
+# don't need its DOCKER_HOST/TLS env-var bootstrapping since the harness
+# talks to /var/run/docker.sock directly.
 ENTRYPOINT ["/usr/local/bin/harness"]
