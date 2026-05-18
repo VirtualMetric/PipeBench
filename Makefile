@@ -1,5 +1,5 @@
-.PHONY: build build-containers build-generator build-receiver build-collector build-harness \
-        push-containers push-generator push-receiver push-collector push-harness \
+.PHONY: build build-containers build-generator build-receiver build-collector \
+        push-containers push-generator push-receiver push-collector \
         test-local list clean tidy fmt vet
 
 # Output binary
@@ -18,7 +18,6 @@ LDFLAGS  := -s -w \
 GENERATOR_IMAGE := vmetric/bench-generator:latest
 RECEIVER_IMAGE  := vmetric/bench-receiver:latest
 COLLECTOR_IMAGE := vmetric/bench-collector:latest
-HARNESS_IMAGE   := vmetric/pipebench:latest
 
 # Set ATTEST=1 to emit SBOM + max-mode provenance (used when publishing to Docker Hub).
 # Requires the docker-container buildx driver; the default docker driver on GitHub
@@ -85,23 +84,7 @@ build-collector:
 		--load \
 		.
 
-# The harness image packages the orchestration CLI itself, with the
-# docker CLI + compose plugin baked in so downstream consumers (e.g.
-# virtualmetric-bench's vmetric-only regression tests) can run cases
-# with `docker run vmetric/pipebench` and never compile any Go.
-build-harness:
-	$(DOCKER_BUILD) \
-		-f containers/harness/Dockerfile \
-		-t $(HARNESS_IMAGE) \
-		--platform linux/amd64 \
-		--build-arg BUILDKIT_INLINE_CACHE=1 \
-		--build-arg VERSION=$(VERSION) \
-		--build-arg COMMIT=$(COMMIT) \
-		--build-arg BUILDDATE=$(BUILDDATE) \
-		--load \
-		.
-
-build-containers: build-generator build-receiver build-collector build-harness
+build-containers: build-generator build-receiver build-collector
 
 # ── Publish to Docker Hub ─────────────────────────────────────────────────────
 #
@@ -142,21 +125,7 @@ push-collector:
 		--push \
 		.
 
-push-harness:
-	$(DOCKER_BUILD) \
-		-f containers/harness/Dockerfile \
-		-t $(HARNESS_IMAGE) \
-		-t vmetric/pipebench:sha-$(COMMIT) \
-		--platform linux/amd64 \
-		$(ATTEST_FLAGS) \
-		--build-arg BUILDKIT_INLINE_CACHE=1 \
-		--build-arg VERSION=$(VERSION) \
-		--build-arg COMMIT=$(COMMIT) \
-		--build-arg BUILDDATE=$(BUILDDATE) \
-		--push \
-		.
-
-push-containers: push-generator push-receiver push-collector push-harness
+push-containers: push-generator push-receiver push-collector
 
 # ── End-to-end test ───────────────────────────────────────────────────────────
 
@@ -173,7 +142,7 @@ list: build
 clean:
 	rm -f $(BINARY)
 	$(BINARY) clean 2>/dev/null || true
-	docker rmi -f $(GENERATOR_IMAGE) $(RECEIVER_IMAGE) $(COLLECTOR_IMAGE) $(HARNESS_IMAGE) 2>/dev/null || true
+	docker rmi -f $(GENERATOR_IMAGE) $(RECEIVER_IMAGE) $(COLLECTOR_IMAGE) 2>/dev/null || true
 
 # ── Go tooling ────────────────────────────────────────────────────────────────
 
