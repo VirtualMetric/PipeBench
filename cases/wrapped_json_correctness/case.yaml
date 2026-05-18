@@ -3,7 +3,7 @@ type: correctness
 description: "Verifies JSON-in-string fields are parsed and re-emitted correctly"
 
 duration: 60s
-warmup: 10s
+warmup: 30s
 
 generator:
   mode: tcp

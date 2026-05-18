@@ -5,7 +5,7 @@ description: "Measures sustained throughput of a TCP-in to TCP-out pipeline with
 # Total test duration (after warmup)
 duration: 300s
 # Wait for the subject to be ready before the generator starts sending
-warmup: 10s
+warmup: 30s
 
 generator:
   mode: tcp

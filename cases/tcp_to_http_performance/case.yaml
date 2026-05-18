@@ -3,7 +3,7 @@ type: performance
 description: "Measures throughput of TCP-in to HTTP-out pipeline"
 
 duration: 60s
-warmup: 10s
+warmup: 30s
 
 generator:
   mode: tcp

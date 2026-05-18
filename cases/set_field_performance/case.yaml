@@ -3,7 +3,7 @@ type: performance
 description: "Measures baseline pipeline engine overhead: add one field per record using each subject's native transform"
 
 duration: 60s
-warmup: 10s
+warmup: 30s
 
 generator:
   mode: tcp

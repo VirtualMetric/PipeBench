@@ -3,7 +3,7 @@ type: persistence_restart_correctness
 description: "Verifies durable persistence across a subject restart: send logs, stop subject, start receiver, restart subject, verify all logs arrive"
 
 duration: 10s
-warmup: 10s
+warmup: 30s
 
 generator:
   mode: tcp

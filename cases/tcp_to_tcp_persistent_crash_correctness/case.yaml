@@ -3,7 +3,7 @@ type: persistence_crash_correctness
 description: "Verifies durable persistence across an ungraceful subject crash (SIGKILL): send logs, kill subject without grace, start receiver, restart subject, verify all logs arrive"
 
 duration: 10s
-warmup: 10s
+warmup: 30s
 
 generator:
   mode: tcp

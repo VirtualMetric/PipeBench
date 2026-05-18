@@ -3,7 +3,7 @@ type: performance
 description: "Measures throughput of syslog message parsing in the pipeline"
 
 duration: 60s
-warmup: 10s
+warmup: 30s
 
 generator:
   mode: tcp

@@ -3,7 +3,7 @@ type: correctness
 description: "Verifies no data loss during config reload via SIGHUP"
 
 duration: 60s
-warmup: 10s
+warmup: 30s
 
 generator:
   mode: tcp

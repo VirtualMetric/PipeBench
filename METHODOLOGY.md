@@ -56,7 +56,7 @@ You can override this per case:
 
 ```yaml
 duration: 60s
-warmup: 10s
+warmup: 30s
 drain_grace: 5s
 ```
 

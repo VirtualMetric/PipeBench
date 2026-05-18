@@ -4,7 +4,7 @@ description: "Measures throughput of a TCP-in to TCP-out pipeline with disk pers
 
 # Total test duration (after warmup)
 duration: 60s
-warmup: 10s
+warmup: 30s
 
 generator:
   mode: tcp
