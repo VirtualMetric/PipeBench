@@ -109,7 +109,7 @@ var Registry = map[string]Subject{
 	"splunk-hf": {
 		Name:       "splunk-hf",
 		Image:      "splunk/splunk",
-		Version:    "latest",
+		Version:    "10.2.3",
 		ConfigPath: "/opt/splunk/etc/apps/bench/local",
 		ConfigRW:   true,
 		Env: map[string]string{
@@ -122,7 +122,7 @@ var Registry = map[string]Subject{
 	"nxlog": {
 		Name:       "nxlog",
 		Image:      "nxlog/nxlog-ce",
-		Version:    "latest",
+		Version:    "3.2.2329",
 		ConfigPath: "/etc/nxlog/nxlog.conf",
 	},
 	"tenzir": {
@@ -165,7 +165,7 @@ var Registry = map[string]Subject{
 	"bindplane-agent": {
 		Name:       "bindplane-agent",
 		Image:      "observiq/bindplane-agent",
-		Version:    "latest",
+		Version:    "1.99.0",
 		ConfigPath: "/etc/otel/config.yaml",
 	},
 	"cribl-stream": {
@@ -183,7 +183,7 @@ var Registry = map[string]Subject{
 	"rotel": {
 		Name:       "rotel",
 		Image:      "streamfold/rotel",
-		Version:    "latest",
+		Version:    "v0.2.2",
 		ConfigPath: "/entrypoint.sh",
 		Entrypoint: []string{"/bin/sh", "/entrypoint.sh"},
 	},

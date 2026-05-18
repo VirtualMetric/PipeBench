@@ -72,22 +72,22 @@ After the test, the result is merged into a single per-(hardware, subject) JSON 
 
 | Name | Image | Version |
 | --- | --- | --- |
-| VirtualMetric DataStream | `vmetric/director` | `latest` |
+| VirtualMetric DataStream | `vmetric/director` | `2.0.0` |
 | Vector | `timberio/vector` | `0.54.0-alpine` |
 | Fluent Bit | `fluent/fluent-bit` | `5.0` |
 | Fluentd | `fluent/fluentd` | `v1.17-debian-1` |
 | Logstash | `docker.elastic.co/logstash/logstash` | `8.13.0` |
 | Filebeat | `docker.elastic.co/beats/filebeat` | `8.13.0` |
 | Telegraf | `telegraf` | `1.30-alpine` |
-| AxoSyslog | `ghcr.io/axoflow/axosyslog` | `4.24.0` |
-| NXLog CE | `nxlog/nxlog-ce` | `latest` |
+| AxoSyslog | `ghcr.io/axoflow/axosyslog` | `4.25.0` |
+| NXLog CE | `nxlog/nxlog-ce` | `3.2.2329` |
 | Tenzir | `ghcr.io/tenzir/tenzir` | `v5.30.0` |
-| Splunk Heavy Forwarder | `splunk/splunk` | `latest` |
+| Splunk Heavy Forwarder | `splunk/splunk` | `10.2.3` |
 | OpenTelemetry Collector (contrib) | `otel/opentelemetry-collector-contrib` | `0.149.0` |
 | Grafana Alloy | `grafana/alloy` | `v1.15.0` |
-| observIQ BindPlane Agent | `observiq/bindplane-agent` | `latest` |
+| observIQ BindPlane Agent | `observiq/bindplane-agent` | `1.99.0` |
 | Cribl Stream | `cribl/cribl` | `4.17.0` |
-| Streamfold Rotel | `streamfold/rotel` | `latest` |
+| Streamfold Rotel | `streamfold/rotel` | `v0.2.2` |
 
 Not every subject participates in every case — coverage depends on each tool's native capabilities. For example, only `vmetric`, `otel-collector`, `bindplane-agent`, and `cribl-stream` ship a first-party NetFlow v5 listener; OTLP cases skip subjects whose OTLP support is partial (e.g. Vector's OTLP sink is HTTP-only). Each `case.yaml` lists the subjects that case actually runs.
 
