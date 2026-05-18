@@ -4,7 +4,7 @@ tenzir:
       name: File tail to TCP
       restart-on-error: 5 seconds
       definition: |
-        from_file "/data/*.log", follow=true, watch=true {
+        from_file "/data/*.log", watch=true {
           read_lines
         }
         write_lines
