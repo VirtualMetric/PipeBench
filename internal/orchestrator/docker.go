@@ -753,7 +753,15 @@ func writeCompose(path string, cfg RunConfig) error {
 		CPULimit:          defaultStr(cfg.CPULimit, "1"),
 		MemLimit:          defaultStr(cfg.MemLimit, "1g"),
 		UseSharedData:     useSharedData,
-		DeferReceiver:     tc.Type == "persistence_correctness",
+		// DeferReceiver drops the `generator.depends_on: receiver` link
+		// so `UpServices("generator")` doesn't transitively start the
+		// receiver. Needed for any test where the subject must buffer
+		// or persist while the receiver is offline — without this, a
+		// fast subject forwards everything in real time and the
+		// restart/crash phase has nothing left to recover.
+		DeferReceiver: tc.Type == "persistence_correctness" ||
+			tc.Type == "persistence_restart_correctness" ||
+			tc.Type == "persistence_crash_correctness",
 		GeneratorImage:    cfg.GeneratorImage,
 		ReceiverImage:     cfg.ReceiverImage,
 		CollectorImage:    cfg.CollectorImage,
