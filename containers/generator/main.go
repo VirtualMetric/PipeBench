@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,7 +22,8 @@ import (
 )
 
 type config struct {
-	Mode        string        // tcp | file | http | udp_netflow_v5 | otlp
+	ID          string        // optional generator id (multi-generator mode)
+	Mode        string        // tcp | file | http | udp | udp_netflow_v5 | otlp
 	Target      string        // host:port or file path or URL
 	Rate        int           // lines/sec per connection, 0 = unlimited
 	Duration    time.Duration // 0 = run until total lines
@@ -31,12 +34,24 @@ type config struct {
 	Sequenced   bool  // embed SEQ=<n> in each line for correctness
 	Connections int   // parallel TCP/HTTP connections (default 1)
 	SeqOffset   int64 // starting sequence number — set per worker by the parallel dispatcher so global sequences don't overlap across workers (otherwise each worker emits 0..perWorker, breaking the receiver-side dedup check)
+	ConnOffset  int   // global offset added to connection IDs — set by the harness in multi-generator mode so CONN= values from different generators never collide downstream
 
 	// File-rotation knobs (file mode only). Empty RotateMode = disabled.
 	RotateMode    string // "create" | "copytruncate" | "truncate"
 	RotateAt      time.Duration
 	RotateQuiesce time.Duration
 	RotateSuffix  string
+
+	// TLS knobs (tcp mode only). Empty Cert/Key/CA paths trigger a
+	// best-effort lookup at the conventional /certs/client.{crt,key}
+	// and /certs/ca.crt paths the harness writes when it auto-generates
+	// certs. TLSInsecureSkipVerify disables hostname/chain checks.
+	TLS                bool
+	TLSCert            string
+	TLSKey             string
+	TLSCA              string
+	TLSInsecureVerify  bool
+	TLSMinVersion      string
 }
 
 type result struct {
@@ -104,6 +119,11 @@ func main() {
 		linesSent, bytesSent, err = runFile(cfg, &clock)
 	case "http":
 		linesSent, bytesSent, err = runHTTP(cfg, &clock)
+	case "udp":
+		// Plain newline-terminated UDP datagrams. One line per datagram.
+		// Used by topologies that want a UDP companion to TCP on the
+		// same listener (`enable_udp` style).
+		linesSent, bytesSent, err = runUDP(cfg, &clock)
 	case "udp_netflow_v5":
 		// "lines" here counts UDP datagrams sent. Each datagram carries
 		// netflowV5RecordsPer flow records, so the receiver should see
@@ -199,10 +219,19 @@ func readinessTarget(cfg config) (string, bool) {
 
 func loadConfig() config {
 	cfg := config{
+		ID:       os.Getenv("GENERATOR_ID"),
 		Mode:     getEnv("GENERATOR_MODE", "tcp"),
 		Target:   mustEnv("GENERATOR_TARGET"),
 		LineSize: getEnvInt("GENERATOR_LINE_SIZE", 256),
 		Format:   getEnv("GENERATOR_FORMAT", "raw"),
+
+		ConnOffset:        getEnvInt("GENERATOR_CONN_OFFSET", 0),
+		TLS:               getEnvBool("GENERATOR_TLS", false),
+		TLSCert:           os.Getenv("GENERATOR_TLS_CERT"),
+		TLSKey:            os.Getenv("GENERATOR_TLS_KEY"),
+		TLSCA:             os.Getenv("GENERATOR_TLS_CA"),
+		TLSInsecureVerify: getEnvBool("GENERATOR_TLS_INSECURE", false),
+		TLSMinVersion:     os.Getenv("GENERATOR_TLS_MIN_VERSION"),
 	}
 
 	cfg.Rate = getEnvInt("GENERATOR_RATE", 0)
@@ -262,6 +291,122 @@ func dialTCP(target string) (net.Conn, error) {
 	return nil, fmt.Errorf("tcp connect %s after %s: %w", target, timeout, err)
 }
 
+// dialMaybeTLS dials cfg.Target either as plain TCP (default) or wraps the
+// TCP connection in crypto/tls when cfg.TLS is set. Default cert/key/ca
+// paths fall back to /certs/client.crt etc., which is where the harness
+// auto-writes self-signed material for TLS-enabled runs. Returns the same
+// net.Conn type so callers don't need to branch on TLS.
+func dialMaybeTLS(cfg config) (net.Conn, error) {
+	if !cfg.TLS {
+		return dialTCP(cfg.Target)
+	}
+	tlsCfg, err := buildTLSConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("tls config: %w", err)
+	}
+	timeout := time.Duration(getEnvInt("GENERATOR_CONNECT_TIMEOUT", 120)) * time.Second
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	for time.Now().Before(deadline) {
+		conn, err := tls.DialWithDialer(dialer, "tcp", cfg.Target, tlsCfg)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		fmt.Fprintf(os.Stderr, "generator: tls connect %s: %v (retrying…)\n", cfg.Target, err)
+		time.Sleep(2 * time.Second)
+	}
+	return nil, fmt.Errorf("tls connect %s after %s: %w", cfg.Target, timeout, lastErr)
+}
+
+// buildTLSConfig assembles a *tls.Config from cfg, falling back to the
+// harness's conventional cert paths under /certs/ when none are explicit.
+// Defaults to system-default TLS versions; MinVersion accepts "1.0".."1.3".
+func buildTLSConfig(cfg config) (*tls.Config, error) {
+	certPath := cfg.TLSCert
+	keyPath := cfg.TLSKey
+	caPath := cfg.TLSCA
+	if certPath == "" {
+		certPath = "/certs/client.crt"
+	}
+	if keyPath == "" {
+		keyPath = "/certs/client.key"
+	}
+	if caPath == "" {
+		caPath = "/certs/ca.crt"
+	}
+
+	tlsCfg := &tls.Config{
+		InsecureSkipVerify: cfg.TLSInsecureVerify, //nolint:gosec — bench-only, opt-in
+	}
+
+	// Load CA if available; missing CA only matters when verification is
+	// on. We tolerate a missing file when InsecureSkipVerify is set.
+	if data, err := os.ReadFile(caPath); err == nil {
+		pool := x509.NewCertPool()
+		if ok := pool.AppendCertsFromPEM(data); ok {
+			tlsCfg.RootCAs = pool
+		}
+	} else if !cfg.TLSInsecureVerify {
+		return nil, fmt.Errorf("read CA %s: %w", caPath, err)
+	}
+
+	// Client cert is optional — only present when the server requires
+	// mutual TLS. Missing files are silently ignored.
+	if _, errC := os.Stat(certPath); errC == nil {
+		if _, errK := os.Stat(keyPath); errK == nil {
+			pair, err := tls.LoadX509KeyPair(certPath, keyPath)
+			if err == nil {
+				tlsCfg.Certificates = []tls.Certificate{pair}
+			} else {
+				fmt.Fprintf(os.Stderr, "generator: TLS client cert load (%s + %s): %v\n", certPath, keyPath, err)
+			}
+		}
+	}
+
+	switch strings.TrimSpace(cfg.TLSMinVersion) {
+	case "1.0":
+		tlsCfg.MinVersion = tls.VersionTLS10
+	case "1.1":
+		tlsCfg.MinVersion = tls.VersionTLS11
+	case "1.2":
+		tlsCfg.MinVersion = tls.VersionTLS12
+	case "1.3":
+		tlsCfg.MinVersion = tls.VersionTLS13
+	}
+	return tlsCfg, nil
+}
+
+// runUDP sends each generated line as a single UDP datagram. Caps each
+// datagram at 64 KiB minus IP+UDP overhead, but the harness's standard
+// 256-byte line size leaves plenty of room. No connection pooling — UDP
+// is stateless and the generator just writes to the dialed PacketConn.
+func runUDP(cfg config, clock *sendClock) (int64, int64, error) {
+	conn, err := net.Dial("udp", cfg.Target)
+	if err != nil {
+		return 0, 0, fmt.Errorf("udp dial %s: %w", cfg.Target, err)
+	}
+	defer conn.Close()
+	if cfg.Duration > 0 {
+		_ = conn.SetWriteDeadline(time.Now().Add(cfg.Duration + 5*time.Second))
+	}
+	return sendLinesConn(cfg, cfg.ConnOffset, clock, func(line []byte) error {
+		// Strip trailing newline so the datagram boundary frames the
+		// record (UDP is message-oriented; the receiver already knows
+		// where the record ends).
+		buf := line
+		if n := len(buf); n > 0 && buf[n-1] == '\n' {
+			buf = buf[:n-1]
+		}
+		_, werr := conn.Write(buf)
+		if isDurationTimeout(werr) {
+			return nil
+		}
+		return werr
+	})
+}
+
 func runTCP(cfg config, clock *sendClock) (int64, int64, error) {
 	if cfg.Connections <= 1 {
 		return runTCPSingle(cfg, clock)
@@ -281,7 +426,7 @@ func applyWriteDeadline(conn net.Conn, cfg config) {
 }
 
 func runTCPSingle(cfg config, clock *sendClock) (int64, int64, error) {
-	conn, err := dialTCP(cfg.Target)
+	conn, err := dialMaybeTLS(cfg)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -289,7 +434,7 @@ func runTCPSingle(cfg config, clock *sendClock) (int64, int64, error) {
 	applyWriteDeadline(conn, cfg)
 
 	w := bufio.NewWriterSize(conn, 256*1024)
-	sent, bytesSent, err := sendLinesConn(cfg, 0, clock, func(line []byte) error {
+	sent, bytesSent, err := sendLinesConn(cfg, cfg.ConnOffset, clock, func(line []byte) error {
 		_, werr := w.Write(line)
 		return werr
 	})
@@ -313,7 +458,7 @@ func runTCPParallel(cfg config, clock *sendClock) (int64, int64, error) {
 	var wg sync.WaitGroup
 
 	for i := 0; i < cfg.Connections; i++ {
-		conn, err := dialTCP(cfg.Target)
+		conn, err := dialMaybeTLS(cfg)
 		if err != nil {
 			return 0, 0, err
 		}
@@ -325,7 +470,7 @@ func runTCPParallel(cfg config, clock *sendClock) (int64, int64, error) {
 			defer conn.Close()
 
 			w := bufio.NewWriterSize(conn, 256*1024)
-			sent, bytes, err := sendLinesConn(cfg, id, clock, func(line []byte) error {
+			sent, bytes, err := sendLinesConn(cfg, id+cfg.ConnOffset, clock, func(line []byte) error {
 				_, werr := w.Write(line)
 				return werr
 			})

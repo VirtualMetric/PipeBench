@@ -14,6 +14,7 @@ PipeBench runs on Docker — local machine or single-node EC2. Follow [README-DO
 | [ADDING-SUBJECTS.md](ADDING-SUBJECTS.md) | How to add a new subject and submit comparable result files |
 | [REPRODUCING-RESULTS.md](REPRODUCING-RESULTS.md) | How to reproduce published results locally or on matching AWS hardware |
 | [REPORTING-MISTAKES.md](REPORTING-MISTAKES.md) | How to report unfair configs, bad results, broken tests, or documentation errors |
+| [FUTURE-CAPABILITIES.md](FUTURE-CAPABILITIES.md) | Additive, opt-in case-schema capabilities (multi-receiver, multi-generator, TLS, rate-ceiling, load-balance) prepared for future test cases |
 
 ## What this project does
 

@@ -32,6 +32,13 @@ type config struct {
 	ExpectedLines     int64  // 0 = don't check
 	RequiredSubstring string // empty = don't check; protocol-agnostic decode check
 	ValidateJSON      bool   // every emitted line must parse as JSON
+
+	// RecordArrivalTimes, when true, has the receiver capture the
+	// wall-clock arrival nanosecond of every record into an in-memory
+	// slice exposed at /arrival_times. Used by the harness's
+	// rate-ceiling validator (correctness.rate_ceiling) and nothing
+	// else; default off so existing perf runs are byte-identical.
+	RecordArrivalTimes bool
 }
 
 // connStats holds per-connection counters. We keep the running totals in a
@@ -45,7 +52,8 @@ type connStats struct {
 	bytes   atomic.Int64
 	firstNs atomic.Int64 // earliest line on this shard, unix nanos
 	lastNs  atomic.Int64 // latest line on this shard, unix nanos
-	_       [64 - 32]byte
+	parent  *counters    // back-ref so recordLine can also fan out to opt-in arrival-timestamp capture
+	_       [64 - 32 - 8]byte
 }
 
 // recordLine bumps line/byte counters and refreshes the receive-window
@@ -63,6 +71,9 @@ func (s *connStats) recordLine(byteCount int64) int64 {
 		s.lastNs.Store(now)
 	} else if n&0x3FF == 0 {
 		s.lastNs.Store(time.Now().UnixNano())
+	}
+	if s.parent != nil {
+		s.parent.recordArrival()
 	}
 	return n
 }
@@ -83,11 +94,45 @@ type counters struct {
 	mu     sync.RWMutex
 	shards []*connStats
 	Done   atomic.Bool
+
+	// arrivalTimes records per-record nanosecond arrival times when the
+	// harness opts in via RECEIVER_RECORD_ARRIVAL_TIMES. Single mutex
+	// protected — used only by rate-ceiling correctness cases which run
+	// at low rates (100 EPS-scale), so the contention is irrelevant.
+	// The slice is unbounded; cases that enable this should also bound
+	// the test duration via case.yaml.
+	arrivalMu    sync.Mutex
+	arrivalTimes []int64
+	recordTimes  bool
+}
+
+// recordArrival appends a wall-clock nanosecond timestamp when the
+// receiver is configured to track them. Inlined into the per-record hot
+// path so disabled callers pay a single atomic flag check.
+func (c *counters) recordArrival() {
+	if !c.recordTimes {
+		return
+	}
+	now := time.Now().UnixNano()
+	c.arrivalMu.Lock()
+	c.arrivalTimes = append(c.arrivalTimes, now)
+	c.arrivalMu.Unlock()
+}
+
+// snapshotArrivalTimes returns a copy of the recorded arrival timestamps
+// suitable for serving over /arrival_times. The caller holds the slice
+// past the lock; we copy so concurrent appends don't tear the response.
+func (c *counters) snapshotArrivalTimes() []int64 {
+	c.arrivalMu.Lock()
+	defer c.arrivalMu.Unlock()
+	out := make([]int64, len(c.arrivalTimes))
+	copy(out, c.arrivalTimes)
+	return out
 }
 
 // newShard registers and returns a fresh per-connection shard.
 func (c *counters) newShard() *connStats {
-	s := &connStats{}
+	s := &connStats{parent: c}
 	c.mu.Lock()
 	c.shards = append(c.shards, s)
 	c.mu.Unlock()
@@ -415,7 +460,7 @@ func hashLine(line []byte) string {
 
 func main() {
 	cfg := loadConfig()
-	cnt := &counters{}
+	cnt := &counters{recordTimes: cfg.RecordArrivalTimes}
 	val := newValidator()
 
 	// Start metrics HTTP server on a separate port
@@ -854,6 +899,19 @@ func serveMetrics(port string, cnt *counters, val *validator, cfg config) {
 		_, _ = w.Write([]byte("ok"))
 	})
 
+	// /arrival_times: returns a JSON array of per-record arrival
+	// nanosecond timestamps captured during the run. Empty array unless
+	// the receiver was started with RECEIVER_RECORD_ARRIVAL_TIMES=true.
+	// Consumed by the harness's rate-ceiling validator.
+	mux.HandleFunc("/arrival_times", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		ts := cnt.snapshotArrivalTimes()
+		if ts == nil {
+			ts = []int64{}
+		}
+		_ = json.NewEncoder(w).Encode(ts)
+	})
+
 	addr := ":" + port
 	srv := &http.Server{Addr: addr, Handler: mux}
 	if err := srv.ListenAndServe(); err != nil {
@@ -872,6 +930,7 @@ func loadConfig() config {
 		ExpectedLines:     int64(getEnvInt("RECEIVER_EXPECTED_LINES", 0)),
 		RequiredSubstring: getEnv("RECEIVER_REQUIRED_SUBSTRING", ""),
 		ValidateJSON:      getEnvBool("RECEIVER_VALIDATE_JSON", false),
+		RecordArrivalTimes: getEnvBool("RECEIVER_RECORD_ARRIVAL_TIMES", false),
 	}
 }
 

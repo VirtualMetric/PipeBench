@@ -40,12 +40,24 @@ type Orchestrator interface {
 	SubjectContainer() string
 
 	// ReceiverMetricsPort returns the local port where the receiver's /metrics
-	// endpoint is accessible (the host-mapped port for Docker).
+	// endpoint is accessible (the host-mapped port for Docker). In
+	// multi-receiver mode this returns the FIRST receiver's port; use
+	// ReceiverMetricsPorts() for the full map.
 	ReceiverMetricsPort() (int, func(), error)
+
+	// ReceiverMetricsPorts returns the per-receiver host-port map (id → port).
+	// Singular-receiver cases return a one-element map keyed "default".
+	ReceiverMetricsPorts() map[string]int
+
+	// GeneratorContainers returns the list of generator container names
+	// for this run. Singular-generator cases return a one-element slice.
+	GeneratorContainers() []string
 
 	// Logs returns the last N lines of logs for a named container.
 	Logs(name string, lines int) string
 
 	// GeneratorStdout returns the stdout of the generator container (the JSON result).
+	// In plural-generator mode this returns the concatenated stdout of every
+	// generator, separated by newlines.
 	GeneratorStdout() string
 }

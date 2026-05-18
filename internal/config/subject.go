@@ -14,6 +14,27 @@ type Subject struct {
 	Entrypoint []string          // optional entrypoint override
 	ConfigRW   bool              // mount config read-write (for tools that write state alongside config)
 	Env        map[string]string // default environment variables for the subject
+
+	// Capabilities is a free-form set of feature tags the subject is known
+	// to support end-to-end through PipeBench (e.g. "tls_tcp", "tls_syslog").
+	// The harness consults these when a case opts into a transport that
+	// not every subject implements — currently only `generator.tls.enabled`
+	// triggers a check. Subjects with no entry are assumed to lack the
+	// capability and the case fails fast with a clear error, which is
+	// safer than starting and silently producing zero ingest.
+	Capabilities []string
+}
+
+// HasCapability returns true when the subject declares the named capability.
+// The match is case-sensitive; capability names are kept lowercase by
+// convention.
+func (s Subject) HasCapability(name string) bool {
+	for _, c := range s.Capabilities {
+		if c == name {
+			return true
+		}
+	}
+	return false
 }
 
 // ConfigFile returns the expected filename (basename) of the subject config.

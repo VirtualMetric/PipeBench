@@ -173,6 +173,25 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		}
 	}
 
+	// TLS prep: when any generator opts into TLS, generate a self-signed
+	// CA + leaf cert set into <tmpDir>/certs and pass the path down to
+	// the orchestrator so it's bind-mounted into both the subject and the
+	// generator container(s). Subjects that don't declare tls_tcp in
+	// their Capabilities cause the case to fail fast (cleaner than
+	// starting and silently producing zero ingest).
+	tlsCertsHost := ""
+	if tlsRequested(tc) {
+		if !subject.HasCapability("tls_tcp") {
+			return results.RunResult{}, fmt.Errorf("subject %q does not declare TLS support (capability \"tls_tcp\")", subject.Name)
+		}
+		certsDir := filepath.Join(tmpDir, "certs")
+		path, err := orchestrator.GenerateTLSCerts(certsDir, []string{"subject", "localhost"})
+		if err != nil {
+			return results.RunResult{}, fmt.Errorf("generating TLS certs: %w", err)
+		}
+		tlsCertsHost = path
+	}
+
 	runCfg := orchestrator.RunConfig{
 		TestCase:         tc,
 		Subject:          subject,
@@ -186,6 +205,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		ExtraSubjectEnv:  extraEnv,
 		CPULimit:         r.opts.CPULimit,
 		MemLimit:         r.opts.MemLimit,
+		TLSCertsHost:     tlsCertsHost,
 	}
 
 	cr, err := orchestrator.NewComposeRunner(runCfg)
@@ -199,6 +219,19 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	cleanupContainers := []string{
 		"bench-generator", "bench-receiver", "bench-collector",
 		"bench-subject-" + subject.Name,
+	}
+	// Plural-mode containers (bench-generator-<id>, bench-receiver-<id>)
+	// need cleanup too, otherwise a re-run of the same case can collide.
+	for _, c := range cr.GeneratorContainers() {
+		cleanupContainers = append(cleanupContainers, c)
+	}
+	for _, name := range cr.ReceiverMetricsPorts() {
+		_ = name // ports, not names; container cleanup happens via Down() + explicit list below
+	}
+	if tc.MultiReceiver() {
+		for _, rc := range tc.Receivers {
+			cleanupContainers = append(cleanupContainers, "bench-receiver-"+rc.ID)
+		}
 	}
 	for _, c := range cleanupContainers {
 		_ = exec.Command("docker", "rm", "-f", c).Run()
@@ -249,36 +282,72 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	} else {
 		// Correctness tests need completeness rather than a fixed SLA window:
 		// wait until the receiver stops moving or the bounded drain timeout hits.
+		// In drain-aware mode (correctness.drain_seconds set) the timeout
+		// follows the case; otherwise the default 2-minute ceiling applies.
 		fmt.Println("  waiting for receiver to drain…")
 		const drainPoll = 5 * time.Second
-		const drainTimeout = 2 * time.Minute
+		drainTimeout := 2 * time.Minute
+		if tc.Correctness.DrainSeconds > 0 {
+			drainTimeout = time.Duration(tc.Correctness.DrainSeconds) * time.Second
+		}
+		quietWindow := parseDurationOr(tc.Correctness.DrainQuietWindow, 0)
+		// Convert quietWindow into a poll count (default behaviour:
+		// 12 stable polls of 5s = 60s, same as before).
+		quietPolls := 12
+		if quietWindow > 0 {
+			quietPolls = int(quietWindow / drainPoll)
+			if quietPolls < 1 {
+				quietPolls = 1
+			}
+		}
+		ports := orch.ReceiverMetricsPorts()
 		drainDeadline := time.Now().Add(drainTimeout)
 		var drainStable int
 		var drainLast int64
 		for time.Now().Before(drainDeadline) {
 			time.Sleep(drainPoll)
-			rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
-			if qerr != nil {
-				continue
+			var totalLines int64
+			if tc.MultiReceiver() {
+				agg, _, qerr := r.aggregateReceivers(ports, 10*time.Second)
+				if qerr != nil {
+					continue
+				}
+				totalLines = agg.LinesReceived
+			} else {
+				rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+				if qerr != nil {
+					continue
+				}
+				totalLines = rm.LinesReceived
 			}
-			fmt.Printf("    received: %s lines\n", formatCount(rm.LinesReceived))
-			if rm.LinesReceived == drainLast && rm.LinesReceived > 0 {
+			fmt.Printf("    received: %s lines\n", formatCount(totalLines))
+			if totalLines == drainLast && totalLines > 0 {
 				drainStable++
-				if drainStable >= 12 {
+				if drainStable >= quietPolls {
 					fmt.Println("    receiver stable — drain complete")
 					break
 				}
 			} else {
 				drainStable = 0
 			}
-			drainLast = rm.LinesReceived
+			drainLast = totalLines
 		}
 	}
 
-	// Fetch final metrics from receiver — this is the core result, so fail if unavailable.
-	recvMetrics, err := r.queryReceiverMetrics(metricsPort, 30*time.Second)
-	if err != nil {
-		return results.RunResult{}, fmt.Errorf("querying receiver metrics: %w", err)
+	// Fetch final metrics from receiver(s).
+	var recvMetrics ReceiverMetrics
+	var perReceiver []PerReceiverMetrics
+	if tc.MultiReceiver() {
+		ports := orch.ReceiverMetricsPorts()
+		recvMetrics, perReceiver, err = r.aggregateReceivers(ports, 30*time.Second)
+		if err != nil {
+			return results.RunResult{}, fmt.Errorf("querying receiver metrics: %w", err)
+		}
+	} else {
+		recvMetrics, err = r.queryReceiverMetrics(metricsPort, 30*time.Second)
+		if err != nil {
+			return results.RunResult{}, fmt.Errorf("querying receiver metrics: %w", err)
+		}
 	}
 
 	elapsed := time.Since(startTime).Seconds()
@@ -305,8 +374,9 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		fmt.Fprintf(os.Stderr, "  warning: stopping collector: %v\n", err)
 	}
 
-	// Parse generator output for lines_in / bytes_in
-	genStats := r.parseGeneratorStats(orch.GeneratorStdout())
+	// Parse generator output for lines_in / bytes_in. In multi-generator
+	// mode this sums every generator's stdout JSON blob.
+	genStats := r.aggregateGenerators(orch)
 
 	// Get system info (CPU cores, memory)
 	sysCPUs, sysMemMB := getSystemInfo()
@@ -347,9 +417,18 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	if rateDuration > 0 {
 		linesPerSec = float64(linesForRate) / rateDuration
 	}
+	// expected_multiplier scales the generator total for fan-out cases:
+	// with M receivers each seeing every record, the expected receiver
+	// total is lines_in * M. Defaults to 1 (no fan-out) so existing
+	// math is unchanged.
+	expectedMul := tc.Correctness.ExpectedMultiplier
+	if expectedMul < 1 {
+		expectedMul = 1
+	}
+	expectedOut := genStats.LinesSent * int64(expectedMul)
 	lossPct := 0.0
-	if genStats.LinesSent > 0 {
-		lossPct = 100.0 * (1.0 - float64(recvMetrics.LinesReceived)/float64(genStats.LinesSent))
+	if expectedOut > 0 {
+		lossPct = 100.0 * (1.0 - float64(recvMetrics.LinesReceived)/float64(expectedOut))
 		if lossPct < 0 {
 			lossPct = 0
 		}
@@ -398,6 +477,17 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		result.FailReason = strings.Join(recvMetrics.Errors, "; ")
 	}
 
+	// Per-receiver counts are persisted onto the result for multi-receiver
+	// runs (Feature C / E) so the UI and load-balance validator can see
+	// each sink. Empty for singular-receiver cases.
+	if len(perReceiver) > 0 {
+		pr := make(map[string]int64, len(perReceiver))
+		for _, m := range perReceiver {
+			pr[m.ID] = m.LinesReceived
+		}
+		result.PerReceiver = pr
+	}
+
 	// Plain correctness tests (type: correctness) typically don't enable
 	// validate_dedup/content, so the receiver leaves Passed=nil.
 	// Without a verdict, the UI renders ☠ even on a clean lines_in==
@@ -412,16 +502,78 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 				"expected loss <= %.2f%%, got %.2f%%",
 				tc.Correctness.ExpectedLossPct, lossPct))
 		}
-		if recvMetrics.LinesReceived > genStats.LinesSent {
+		if recvMetrics.LinesReceived > expectedOut {
 			passed = false
-			extra := recvMetrics.LinesReceived - genStats.LinesSent
+			extra := recvMetrics.LinesReceived - expectedOut
 			failReasons = append(failReasons, fmt.Sprintf(
-				"over-delivery: received %s lines but only %s were sent (%s extra/duplicate lines)",
-				formatCount(recvMetrics.LinesReceived), formatCount(genStats.LinesSent), formatCount(extra)))
+				"over-delivery: received %s lines but only %s were expected (%s extra/duplicate lines)",
+				formatCount(recvMetrics.LinesReceived), formatCount(expectedOut), formatCount(extra)))
 		}
 		result.Passed = &passed
 		if !passed {
 			result.FailReason = strings.Join(failReasons, "; ")
+		}
+	}
+
+	// Optional load-balance fairness check (Feature E). Disabled cases
+	// return Passed=true and the result has no LoadBalance key.
+	if tc.Correctness.LoadBalance.Enabled() && len(perReceiver) > 0 {
+		lb := applyLoadBalance(tc.Correctness.LoadBalance, perReceiver)
+		result.LoadBalance = map[string]any{
+			"min_share_ratio_observed": lb.MinShareRatioObserved,
+			"min_share_ratio_required": lb.MinShareRatioRequired,
+			"pass":                     lb.Passed,
+			"per_receiver_counts":      lb.PerReceiverCounts,
+		}
+		if !lb.Passed {
+			merged := false
+			if result.Passed != nil && !*result.Passed {
+				result.FailReason = result.FailReason + "; " + lb.FailureReason
+				merged = true
+			}
+			if !merged {
+				f := false
+				result.Passed = &f
+				result.FailReason = lb.FailureReason
+			}
+		}
+	}
+
+	// Optional rate-ceiling check (Feature D). Pulls per-record arrival
+	// timestamps from each receiver and slides a window across them. The
+	// timestamps endpoint is only populated when the case enables
+	// rate_ceiling, so the overhead is opt-in.
+	if tc.Correctness.RateCeiling.Enabled() {
+		ports := orch.ReceiverMetricsPorts()
+		// Merge timestamps from every receiver — multi-receiver fan-out
+		// or LB cases see the rate ceiling on the combined stream.
+		var all []int64
+		for _, port := range ports {
+			ts, terr := r.receiverTimestamps(port, 30*time.Second)
+			if terr != nil {
+				fmt.Fprintf(os.Stderr, "  warning: arrival_times unavailable on port %d: %v\n", port, terr)
+				continue
+			}
+			all = append(all, ts...)
+		}
+		rw := applyRateCeiling(tc.Correctness.RateCeiling, all)
+		result.RateWindow = map[string]any{
+			"max_observed_eps":      rw.MaxObservedEPS,
+			"overshoot_count":       rw.OvershootCount,
+			"first_overshoot_ns":    rw.FirstOvershootStartNs,
+			"pass":                  rw.Passed,
+		}
+		if !rw.Passed {
+			merged := false
+			if result.Passed != nil && !*result.Passed {
+				result.FailReason = result.FailReason + "; " + rw.FailureReason
+				merged = true
+			}
+			if !merged {
+				f := false
+				result.Passed = &f
+				result.FailReason = rw.FailureReason
+			}
 		}
 	}
 

@@ -53,6 +53,9 @@ services:
 {{- if .UseSharedData }}
       - "shared-data:/data"
 {{- end }}
+{{- if .TLSCertsHost }}
+      - "{{ .TLSCertsHost }}:/certs:ro"
+{{- end }}
 {{- if .SubjectUser }}
     user: "{{ .SubjectUser }}"
 {{- end }}
@@ -80,6 +83,66 @@ services:
 {{- end }}
     restart: "no"
 
+{{- if .Generators }}
+{{- range .Generators }}
+
+  generator-{{ .ID }}:
+    image: "{{ $.GeneratorImage }}"
+    container_name: "bench-generator-{{ .ID }}"
+    networks: [bench]
+    depends_on:
+      - subject
+{{- if not $.DeferReceiver }}
+{{- range $.Receivers }}
+      - receiver-{{ .ID }}
+{{- end }}
+{{- end }}
+{{- if $.UseSharedData }}
+    volumes:
+      - "shared-data:/data"
+    user: "0:0"
+{{- else if $.TLSCertsHost }}
+    volumes:
+      - "{{ $.TLSCertsHost }}:/certs:ro"
+{{- end }}
+    environment:
+      GENERATOR_ID: "{{ .ID }}"
+      GENERATOR_MODE: "{{ .Mode }}"
+      GENERATOR_TARGET: "{{ .Target }}"
+      GENERATOR_RATE: "{{ .Rate }}"
+      GENERATOR_DURATION: "{{ $.GenDuration }}"
+      GENERATOR_LINE_SIZE: "{{ .LineSize }}"
+      GENERATOR_FORMAT: "{{ .Format }}"
+      GENERATOR_WARMUP: "{{ $.GenWarmup }}"
+      GENERATOR_SEQUENCED: "{{ $.GenSequenced }}"
+      GENERATOR_CONNECTIONS: "{{ .Connections }}"
+      GENERATOR_CONN_OFFSET: "{{ .ConnOffset }}"
+{{- if .TotalLines }}
+      GENERATOR_TOTAL_LINES: "{{ .TotalLines }}"
+{{- end }}
+{{- if .TLSEnabled }}
+      GENERATOR_TLS: "true"
+{{- if .TLSCert }}
+      GENERATOR_TLS_CERT: "{{ .TLSCert }}"
+{{- end }}
+{{- if .TLSKey }}
+      GENERATOR_TLS_KEY: "{{ .TLSKey }}"
+{{- end }}
+{{- if .TLSCA }}
+      GENERATOR_TLS_CA: "{{ .TLSCA }}"
+{{- end }}
+      GENERATOR_TLS_INSECURE: "{{ .TLSInsecure }}"
+{{- if .TLSMinVersion }}
+      GENERATOR_TLS_MIN_VERSION: "{{ .TLSMinVersion }}"
+{{- end }}
+{{- end }}
+{{- range $k, $v := .Env }}
+      {{ $k }}: "{{ $v }}"
+{{- end }}
+    restart: "no"
+{{- end }}
+{{- else }}
+
   generator:
     image: "{{ .GeneratorImage }}"
     container_name: "bench-generator"
@@ -97,6 +160,9 @@ services:
     # default uid 10001 cannot write there, so override to root for these
     # runs. TCP/HTTP/OTLP/netflow runs leave the hardened uid in place.
     user: "0:0"
+{{- else if .TLSCertsHost }}
+    volumes:
+      - "{{ .TLSCertsHost }}:/certs:ro"
 {{- end }}
     environment:
       GENERATOR_MODE: "{{ .GenMode }}"
@@ -117,10 +183,55 @@ services:
       GENERATOR_ROTATE_QUIESCE: "{{ .GenRotateQuiesce }}"
       GENERATOR_ROTATE_ARCHIVE_SUFFIX: "{{ .GenRotateSuffix }}"
 {{- end }}
+{{- if .GenTLSEnabled }}
+      GENERATOR_TLS: "true"
+{{- if .GenTLSCert }}
+      GENERATOR_TLS_CERT: "{{ .GenTLSCert }}"
+{{- end }}
+{{- if .GenTLSKey }}
+      GENERATOR_TLS_KEY: "{{ .GenTLSKey }}"
+{{- end }}
+{{- if .GenTLSCA }}
+      GENERATOR_TLS_CA: "{{ .GenTLSCA }}"
+{{- end }}
+      GENERATOR_TLS_INSECURE: "{{ .GenTLSInsecure }}"
+{{- if .GenTLSMinVersion }}
+      GENERATOR_TLS_MIN_VERSION: "{{ .GenTLSMinVersion }}"
+{{- end }}
+{{- end }}
 {{- range $k, $v := .GenEnv }}
       {{ $k }}: "{{ $v }}"
 {{- end }}
     restart: "no"
+{{- end }}
+
+{{- if .Receivers }}
+{{- range .Receivers }}
+
+  receiver-{{ .ID }}:
+    image: "{{ $.ReceiverImage }}"
+    container_name: "bench-receiver-{{ .ID }}"
+    networks: [bench]
+    ports:
+      - "{{ .HostPort }}:9090"
+    environment:
+      RECEIVER_MODE: "{{ .Mode }}"
+      RECEIVER_LISTEN: "{{ .Listen }}"
+      RECEIVER_METRICS_PORT: "9090"
+      RECEIVER_VALIDATE_DEDUP: "{{ $.RecvValidateDedup }}"
+      RECEIVER_VALIDATE_CONTENT: "{{ $.RecvValidateContent }}"
+{{- if $.RecvRequiredSubstring }}
+      RECEIVER_REQUIRED_SUBSTRING: "{{ $.RecvRequiredSubstring }}"
+{{- end }}
+{{- if $.RecvValidateJSON }}
+      RECEIVER_VALIDATE_JSON: "true"
+{{- end }}
+{{- if $.RecvRecordArrival }}
+      RECEIVER_RECORD_ARRIVAL_TIMES: "true"
+{{- end }}
+    restart: "no"
+{{- end }}
+{{- else }}
 
   receiver:
     image: "{{ .ReceiverImage }}"
@@ -143,7 +254,11 @@ services:
 {{- if .RecvValidateJSON }}
       RECEIVER_VALIDATE_JSON: "true"
 {{- end }}
+{{- if .RecvRecordArrival }}
+      RECEIVER_RECORD_ARRIVAL_TIMES: "true"
+{{- end }}
     restart: "no"
+{{- end }}
 
   collector:
     image: "{{ .CollectorImage }}"
@@ -180,17 +295,32 @@ type RunConfig struct {
 	GeneratorImage   string
 	ReceiverImage    string
 	CollectorImage   string
-	ReceiverHostPort int
+	ReceiverHostPort int // base host port; in multi-receiver mode, +N for receiver N
 	ExtraSubjectEnv  map[string]string
 	CPULimit         string // e.g. "1", "4" — number of cores for subject
 	MemLimit         string // e.g. "1g", "16g" — memory limit for subject
 	DockerSocketGID  string // numeric gid owning /var/run/docker.sock; passed to collector via group_add so a non-root image can still read the socket
+	// TLSCertsHost, when non-empty, is the absolute host path holding
+	// ca.crt + server.crt/key + client.crt/key for a TLS-enabled run.
+	// The harness writes the certs there before `docker compose up`; the
+	// path is bind-mounted into the subject and every TLS-using generator
+	// at /certs:ro.
+	TLSCertsHost string
 }
 
 // ComposeRunner manages a docker compose lifecycle for one test run.
 type ComposeRunner struct {
 	cfg         RunConfig
 	composeFile string
+
+	// genServices / recvServices cache the compose service names so the
+	// runner can stop/inspect them without re-deriving from the case.
+	genServices    []string
+	genContainers  []string
+	recvServices   []string
+	recvContainers []string
+	// recvHostPorts maps receiver id → host port for the /metrics endpoint.
+	recvHostPorts map[string]int
 }
 
 // Ensure ComposeRunner implements Orchestrator.
@@ -211,7 +341,36 @@ func NewComposeRunner(cfg RunConfig) (*ComposeRunner, error) {
 		return nil, err
 	}
 
-	return &ComposeRunner{cfg: cfg, composeFile: composeFile}, nil
+	cr := &ComposeRunner{cfg: cfg, composeFile: composeFile}
+	cr.populateServiceNames()
+	return cr, nil
+}
+
+// populateServiceNames fills in the cached generator/receiver service and
+// container names so subsequent operations don't re-walk the case.
+func (r *ComposeRunner) populateServiceNames() {
+	tc := r.cfg.TestCase
+	if tc.MultiGenerator() {
+		for _, g := range tc.Generators {
+			r.genServices = append(r.genServices, "generator-"+g.ID)
+			r.genContainers = append(r.genContainers, "bench-generator-"+g.ID)
+		}
+	} else {
+		r.genServices = []string{"generator"}
+		r.genContainers = []string{"bench-generator"}
+	}
+	r.recvHostPorts = map[string]int{}
+	if tc.MultiReceiver() {
+		for i, rc := range tc.Receivers {
+			r.recvServices = append(r.recvServices, "receiver-"+rc.ID)
+			r.recvContainers = append(r.recvContainers, "bench-receiver-"+rc.ID)
+			r.recvHostPorts[rc.ID] = r.cfg.ReceiverHostPort + i
+		}
+	} else {
+		r.recvServices = []string{"receiver"}
+		r.recvContainers = []string{"bench-receiver"}
+		r.recvHostPorts["default"] = r.cfg.ReceiverHostPort
+	}
 }
 
 // dockerSocketGID is defined per-platform (docker_socket_gid_*.go). It returns
@@ -227,8 +386,35 @@ func (r *ComposeRunner) Up() error {
 
 // UpServices starts only the named compose services.
 func (r *ComposeRunner) UpServices(services ...string) error {
-	args := append([]string{"up", "-d", "--quiet-pull"}, services...)
+	resolved := r.resolveServiceAliases(services)
+	args := append([]string{"up", "-d", "--quiet-pull"}, resolved...)
 	return r.compose(args...)
+}
+
+// resolveServiceAliases expands the logical names "generator" and "receiver"
+// to the concrete plural service names when the case uses the plural form.
+// Other names are passed through unchanged. Lets existing callers like
+// `UpServices("generator")` keep working even after a case adopts plural
+// generators.
+func (r *ComposeRunner) resolveServiceAliases(names []string) []string {
+	tc := r.cfg.TestCase
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		switch n {
+		case "generator":
+			if tc.MultiGenerator() {
+				out = append(out, r.genServices...)
+				continue
+			}
+		case "receiver":
+			if tc.MultiReceiver() {
+				out = append(out, r.recvServices...)
+				continue
+			}
+		}
+		out = append(out, n)
+	}
+	return out
 }
 
 // StopServices sends SIGTERM to named services with the given grace timeout
@@ -238,7 +424,8 @@ func (r *ComposeRunner) StopServices(timeout time.Duration, services ...string) 
 	if secs < 0 {
 		secs = 0
 	}
-	args := append([]string{"stop", "-t", strconv.Itoa(secs)}, services...)
+	resolved := r.resolveServiceAliases(services)
+	args := append([]string{"stop", "-t", strconv.Itoa(secs)}, resolved...)
 	return r.compose(args...)
 }
 
@@ -246,7 +433,8 @@ func (r *ComposeRunner) StopServices(timeout time.Duration, services ...string) 
 // the process to clean up. Mirrors a crash scenario for persistence tests.
 // Uses `docker compose kill -s SIGKILL <svc>...`.
 func (r *ComposeRunner) KillServices(services ...string) error {
-	args := append([]string{"kill", "-s", "SIGKILL"}, services...)
+	resolved := r.resolveServiceAliases(services)
+	args := append([]string{"kill", "-s", "SIGKILL"}, resolved...)
 	return r.compose(args...)
 }
 
@@ -255,33 +443,49 @@ func (r *ComposeRunner) Down() error {
 	return r.compose("down", "-v", "--remove-orphans")
 }
 
-// WaitForGeneratorExit blocks until the generator container exits or timeout expires.
-// Returns an error if the generator exited with a non-zero status.
+// WaitForGeneratorExit blocks until ALL generator containers exit or the
+// timeout expires. In the singular case there's exactly one; in the plural
+// case every generator must finish before the run is considered "send-
+// complete". Returns the first non-zero exit code observed (if any).
 func (r *ComposeRunner) WaitForGeneratorExit(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	pending := append([]string(nil), r.genContainers...)
+	var firstErr error
 	for time.Now().Before(deadline) {
-		out, err := exec.Command("docker", "inspect", "--format={{.State.Status}}", "bench-generator").Output()
-		if err == nil {
+		var still []string
+		for _, name := range pending {
+			out, err := exec.Command("docker", "inspect", "--format={{.State.Status}}", name).Output()
+			if err != nil {
+				still = append(still, name)
+				continue
+			}
 			status := strings.TrimSpace(string(out))
 			if status == "exited" {
-				return r.checkGeneratorExitCode()
+				if cerr := r.checkExitCode(name); cerr != nil && firstErr == nil {
+					firstErr = cerr
+				}
+				continue
 			}
+			still = append(still, name)
 		}
+		if len(still) == 0 {
+			return firstErr
+		}
+		pending = still
 		time.Sleep(2 * time.Second)
 	}
-	return fmt.Errorf("generator did not exit within %s", timeout)
+	return fmt.Errorf("generator(s) did not exit within %s (still running: %v)", timeout, pending)
 }
 
-func (r *ComposeRunner) checkGeneratorExitCode() error {
-	out, err := exec.Command("docker", "inspect", "--format={{.State.ExitCode}}", "bench-generator").Output()
+func (r *ComposeRunner) checkExitCode(container string) error {
+	out, err := exec.Command("docker", "inspect", "--format={{.State.ExitCode}}", container).Output()
 	if err != nil {
-		return nil // can't check, assume OK
+		return nil
 	}
 	code := strings.TrimSpace(string(out))
 	if code != "0" {
-		// Grab the generator logs so the user can see what went wrong
-		logs, _ := exec.Command("docker", "logs", "--tail", "50", "bench-generator").CombinedOutput()
-		return fmt.Errorf("generator exited with code %s:\n%s", code, string(logs))
+		logs, _ := exec.Command("docker", "logs", "--tail", "50", container).CombinedOutput()
+		return fmt.Errorf("%s exited with code %s:\n%s", container, code, string(logs))
 	}
 	return nil
 }
@@ -335,15 +539,46 @@ func (r *ComposeRunner) SubjectContainer() string {
 }
 
 // ReceiverMetricsPort returns the host port where the receiver's /metrics
-// endpoint is already exposed via the compose port mapping.
+// endpoint is exposed. In the multi-receiver case this returns the first
+// receiver's port — call ReceiverMetricsPorts() instead when each receiver
+// is queried individually.
 func (r *ComposeRunner) ReceiverMetricsPort() (int, func(), error) {
 	return r.cfg.ReceiverHostPort, func() {}, nil
 }
 
-// GeneratorStdout returns the stdout of the generator container.
+// ReceiverMetricsPorts returns the per-receiver host port map (id → port).
+// For singular-receiver cases the map has one entry under id "default".
+func (r *ComposeRunner) ReceiverMetricsPorts() map[string]int {
+	out := make(map[string]int, len(r.recvHostPorts))
+	for k, v := range r.recvHostPorts {
+		out[k] = v
+	}
+	return out
+}
+
+// GeneratorContainers returns the names of all generator containers used
+// for this run (one in singular mode, N in plural mode). Used by the
+// runner when it needs to read each generator's stdout.
+func (r *ComposeRunner) GeneratorContainers() []string {
+	return append([]string(nil), r.genContainers...)
+}
+
+// GeneratorStdout returns the stdout of the (singular) generator container.
+// In plural-generator mode this returns the concatenation of every
+// generator's stdout, separated by newlines, so callers that aggregate by
+// summing fields across JSON objects still get every blob.
 func (r *ComposeRunner) GeneratorStdout() string {
-	out, _ := exec.Command("docker", "logs", "bench-generator").Output()
-	return string(out)
+	if len(r.genContainers) == 1 {
+		out, _ := exec.Command("docker", "logs", r.genContainers[0]).Output()
+		return string(out)
+	}
+	var b strings.Builder
+	for _, c := range r.genContainers {
+		out, _ := exec.Command("docker", "logs", c).Output()
+		b.Write(out)
+		b.WriteString("\n")
+	}
+	return b.String()
 }
 
 func (r *ComposeRunner) compose(args ...string) error {
@@ -352,6 +587,36 @@ func (r *ComposeRunner) compose(args ...string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// generatorTpl is the per-generator template data when the case uses the
+// plural `generators:` form.
+type generatorTpl struct {
+	ID            string
+	Mode          string
+	Target        string
+	Rate          int
+	TotalLines    int64
+	LineSize      int
+	Format        string
+	Connections   int
+	ConnOffset    int
+	Env           map[string]string
+	TLSEnabled    bool
+	TLSCert       string
+	TLSKey        string
+	TLSCA         string
+	TLSInsecure   string
+	TLSMinVersion string
+}
+
+// receiverTpl is the per-receiver template data when the case uses the
+// plural `receivers:` form.
+type receiverTpl struct {
+	ID       string
+	Mode     string
+	Listen   string
+	HostPort int
 }
 
 type composeVars struct {
@@ -389,6 +654,13 @@ type composeVars struct {
 	GenRotateAt       string
 	GenRotateQuiesce  string
 	GenRotateSuffix   string
+	GenTLSEnabled    bool
+	GenTLSCert       string
+	GenTLSKey        string
+	GenTLSCA         string
+	GenTLSInsecure   string
+	GenTLSMinVersion string
+
 	RecvMode              string
 	RecvListen            string
 	RecvValidateDedup     string
@@ -396,7 +668,19 @@ type composeVars struct {
 	RecvExpectedLines     int64
 	RecvRequiredSubstring string
 	RecvValidateJSON      bool
+	RecvRecordArrival     bool
 	DockerSocketGID       string
+
+	// Plural mode: when these slices are non-empty, the template emits
+	// generator-<id> / receiver-<id> services and skips the singular block.
+	Generators []generatorTpl
+	Receivers  []receiverTpl
+
+	// TLSCertsHost is the host directory holding the auto-generated cert
+	// material for TLS-enabled runs. Empty when no generator opts into
+	// TLS; non-empty triggers the /certs bind mount on subject and
+	// generators.
+	TLSCertsHost string
 }
 
 func writeCompose(path string, cfg RunConfig) error {
@@ -422,17 +706,17 @@ func writeCompose(path string, cfg RunConfig) error {
 	warmup := tc.WarmupOrDefault(10 * time.Second).String()
 	duration := tc.DurationOrDefault(2 * time.Minute).String()
 
-	genLineSize := tc.Generator.LineSize
-	if genLineSize == 0 {
-		genLineSize = 256
-	}
-	genFormat := tc.Generator.Format
-	if genFormat == "" {
-		genFormat = "raw"
-	}
-
 	// File-based tests need a shared volume between generator and subject.
 	useSharedData := tc.Generator.Mode == "file"
+	if tc.MultiGenerator() {
+		// In plural mode `tc.Generator` is unused; scan the list.
+		for _, g := range tc.Generators {
+			if g.Mode == "file" {
+				useSharedData = true
+				break
+			}
+		}
+	}
 
 	// When config source is a directory but ConfigPath points to a file,
 	// mount to the parent directory so all files in the config dir are available.
@@ -450,6 +734,9 @@ func writeCompose(path string, cfg RunConfig) error {
 	if s.Name == "logstash" && configIsDir {
 		configDst = "/usr/share/logstash/config"
 	}
+
+	sequenced := boolStr(tc.Correctness.ValidateDedup || tc.Correctness.ValidateContent)
+	tlsCertsHost := filepath.ToSlash(cfg.TLSCertsHost)
 
 	vars := composeVars{
 		SubjectImage:      s.ImageRef(),
@@ -471,12 +758,7 @@ func writeCompose(path string, cfg RunConfig) error {
 		ReceiverImage:     cfg.ReceiverImage,
 		CollectorImage:    cfg.CollectorImage,
 		ReceiverHostPort:  cfg.ReceiverHostPort,
-		GenMode:           tc.Generator.Mode,
-		GenTarget:         tc.Generator.Target,
-		GenRate:           tc.Generator.Rate,
 		GenDuration:       duration,
-		GenLineSize:       genLineSize,
-		GenFormat:         genFormat,
 		GenWarmup:         warmup,
 		// Sequenced lines (CONN=<id> SEQ=<n> ...) are only needed when the
 		// receiver runs a check that requires per-line uniqueness or a
@@ -485,22 +767,95 @@ func writeCompose(path string, cfg RunConfig) error {
 		// data into tests like wrapped_json_correctness whose generator
 		// format is "json"; those lines started with CONN= instead of {,
 		// silently failing JSON-parsing subjects (e.g. AxoSyslog).
-		GenSequenced:      boolStr(tc.Correctness.ValidateDedup || tc.Correctness.ValidateContent),
-		GenConnections:    resolveGeneratorConnections(tc.Generator.Connections),
-		GenTotalLines:     tc.Generator.TotalLines,
-		GenEnv:            tc.Generator.Env,
-		GenRotateMode:     tc.Generator.FileRotation.Mode,
-		GenRotateAt:       tc.Generator.FileRotation.At,
-		GenRotateQuiesce:  tc.Generator.FileRotation.Quiesce,
-		GenRotateSuffix:   tc.Generator.FileRotation.ArchiveSuffix,
-		RecvMode:              tc.Receiver.Mode,
-		RecvListen:            tc.Receiver.Listen,
-		RecvValidateDedup:     boolStr(tc.Correctness.ValidateDedup),
-		RecvValidateContent:   boolStr(tc.Correctness.ValidateContent),
-		RecvExpectedLines:     0,
-		RecvRequiredSubstring: tc.Correctness.RequiredSubstring,
-		RecvValidateJSON:      tc.Correctness.ValidateJSON,
+		GenSequenced: sequenced,
 		DockerSocketGID:       cfg.DockerSocketGID,
+		TLSCertsHost:          tlsCertsHost,
+
+		RecvValidateDedup:   boolStr(tc.Correctness.ValidateDedup),
+		RecvValidateContent: boolStr(tc.Correctness.ValidateContent),
+		RecvExpectedLines:   0,
+		RecvRequiredSubstring: tc.Correctness.RequiredSubstring,
+		RecvValidateJSON:    tc.Correctness.ValidateJSON,
+		// Arrival timestamp recording is opt-in via the rate_ceiling
+		// check; flipping it on unconditionally would burn memory in
+		// every performance run.
+		RecvRecordArrival: tc.Correctness.RateCeiling.Enabled(),
+	}
+
+	if tc.MultiGenerator() {
+		offset := 0
+		for _, g := range tc.Generators {
+			conns := resolveGeneratorConnections(g.Connections)
+			lineSize := g.LineSize
+			if lineSize == 0 {
+				lineSize = 256
+			}
+			format := g.Format
+			if format == "" {
+				format = "raw"
+			}
+			vars.Generators = append(vars.Generators, generatorTpl{
+				ID:            g.ID,
+				Mode:          g.Mode,
+				Target:        g.Target,
+				Rate:          g.Rate,
+				TotalLines:    g.TotalLines,
+				LineSize:      lineSize,
+				Format:        format,
+				Connections:   conns,
+				ConnOffset:    offset,
+				Env:           g.Env,
+				TLSEnabled:    g.TLS.Enabled,
+				TLSCert:       g.TLS.Cert,
+				TLSKey:        g.TLS.Key,
+				TLSCA:         g.TLS.CA,
+				TLSInsecure:   boolStr(g.TLS.InsecureSkipVerify),
+				TLSMinVersion: g.TLS.MinVersion,
+			})
+			offset += conns
+		}
+	} else {
+		g := tc.Generator
+		genLineSize := g.LineSize
+		if genLineSize == 0 {
+			genLineSize = 256
+		}
+		genFormat := g.Format
+		if genFormat == "" {
+			genFormat = "raw"
+		}
+		vars.GenMode = g.Mode
+		vars.GenTarget = g.Target
+		vars.GenRate = g.Rate
+		vars.GenLineSize = genLineSize
+		vars.GenFormat = genFormat
+		vars.GenConnections = resolveGeneratorConnections(g.Connections)
+		vars.GenTotalLines = g.TotalLines
+		vars.GenEnv = g.Env
+		vars.GenRotateMode = g.FileRotation.Mode
+		vars.GenRotateAt = g.FileRotation.At
+		vars.GenRotateQuiesce = g.FileRotation.Quiesce
+		vars.GenRotateSuffix = g.FileRotation.ArchiveSuffix
+		vars.GenTLSEnabled = g.TLS.Enabled
+		vars.GenTLSCert = g.TLS.Cert
+		vars.GenTLSKey = g.TLS.Key
+		vars.GenTLSCA = g.TLS.CA
+		vars.GenTLSInsecure = boolStr(g.TLS.InsecureSkipVerify)
+		vars.GenTLSMinVersion = g.TLS.MinVersion
+	}
+
+	if tc.MultiReceiver() {
+		for i, rc := range tc.Receivers {
+			vars.Receivers = append(vars.Receivers, receiverTpl{
+				ID:       rc.ID,
+				Mode:     rc.Mode,
+				Listen:   rc.Listen,
+				HostPort: cfg.ReceiverHostPort + i,
+			})
+		}
+	} else {
+		vars.RecvMode = tc.Receiver.Mode
+		vars.RecvListen = tc.Receiver.Listen
 	}
 
 	tmpl, err := template.New("compose").Parse(composeTemplate)
