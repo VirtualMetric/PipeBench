@@ -5,13 +5,13 @@ devices:
     name: file-bench
     type: file
     properties:
-      # Glob tail across /data/*.log so vmetric sees both the
+      # Glob tail across /data/*.log* so vmetric sees both the
       # archived input.log.1 (snapshot of the pre-truncate content)
       # and the live input.log (truncated then re-appended). The
       # reader's offset correlation across rotations forwards the
       # un-read tail of the archive without re-emitting content
       # already shipped from the live file.
-      path: "/data/*.log"
+      path: "/data/*.log*"
       poll_interval: 1
       start_date: -1
       ignore_time: true

@@ -1,6 +1,6 @@
 [sources.in]
 type = "file"
-include = ["/data/*.log"]
+include = ["/data/*.log*"]
 read_from = "beginning"
 
 [sinks.out]

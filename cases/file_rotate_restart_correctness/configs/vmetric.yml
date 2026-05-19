@@ -5,13 +5,13 @@ devices:
     name: file-bench
     type: file
     properties:
-      # Glob tail across /data/*.log so vmetric sees both the new
+      # Glob tail across /data/*.log* so vmetric sees both the new
       # input.log AND the archived input.log.1 after restart. Harness
       # SIGTERMs the subject mid-test; on restart vmetric reads its
       # per-file CacheInfo from /storage/cache and resumes from the
       # saved offset on each inode (the renamed archive + the new
       # live file).
-      path: "/data/*.log"
+      path: "/data/*.log*"
       poll_interval: 1
       # Cache must survive the SIGTERM/restart for resume to work;
       # leaving ignore_cache at default (false) is the whole point.

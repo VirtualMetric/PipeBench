@@ -6,7 +6,7 @@ devices:
       # Generator fans out across /data/input-0.log … /data/input-N.log.
       # Glob picks up every produced file so the file device runs one
       # reader goroutine per matched file (capped by file_log_concurrency).
-      path: "/data/*.log"
+      path: "/data/*.log*"
       # File device polls on a tick (not streaming tail). 1s minimizes the
       # gap between writes and reads for steady-state throughput.
       poll_interval: 1
