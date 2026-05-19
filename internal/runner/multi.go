@@ -205,6 +205,15 @@ type RateWindowResult struct {
 // Sample == "peak" the check only fails when the maximum across all
 // windows exceeds the threshold; with "every" (default) it fails on the
 // first overshoot.
+//
+// Before the sliding analysis, two unconditional gates catch the case
+// where the subject bypassed throttling and burst the entire payload in
+// well under one window: (1) delivery span shorter than `window`, which
+// makes a windowed analysis nonsense; (2) average EPS across the
+// delivery span over threshold. Without these, sub-second bursts either
+// land entirely inside skipWarmup (returning max=0) or produce a
+// single-window count near the ceiling (returning max≈ceiling), both
+// false PASSes.
 func applyRateCeiling(rc config.RateCeilingConfig, timestamps []int64) RateWindowResult {
 	if !rc.Enabled() || len(timestamps) == 0 {
 		return RateWindowResult{Passed: true}
@@ -218,14 +227,57 @@ func applyRateCeiling(rc config.RateCeilingConfig, timestamps []int64) RateWindo
 	tolerance := rc.Tolerance
 	threshold := rc.MaxEPS * (1.0 + tolerance)
 
-	// Bound the analysis to [first+skipWarmup, last-skipCooldown].
 	sort.Slice(timestamps, func(i, j int) bool { return timestamps[i] < timestamps[j] })
 	first := timestamps[0]
 	last := timestamps[len(timestamps)-1]
+	deliverySpan := time.Duration(last - first)
+
+	avgEPS := 0.0
+	if deliverySpan > 0 {
+		avgEPS = float64(len(timestamps)) / deliverySpan.Seconds()
+	}
+
+	// Gate 1: a rate_ceiling case implicitly expects throttling, so a
+	// delivery that completed faster than one window is a defect — the
+	// sliding analysis below cannot honestly evaluate it (no full window
+	// fits inside the receive band).
+	if deliverySpan < window {
+		return RateWindowResult{
+			MaxObservedEPS:        avgEPS,
+			OvershootCount:        1,
+			FirstOvershootStartNs: first,
+			Passed:                false,
+			FailureReason: fmt.Sprintf(
+				"delivery completed in %v, shorter than rate_ceiling.window (%v) — throttle bypassed (avg EPS %.2f, ceiling %.2f)",
+				deliverySpan.Round(time.Millisecond), window, avgEPS, threshold),
+		}
+	}
+
+	// Gate 2: avg EPS over the delivery span. Independent of windowing
+	// and skip_* framing, so it catches bursts that the slider misses
+	// because skipWarmup ate them or because count/window happened to
+	// land near the ceiling.
+	if avgEPS > threshold {
+		return RateWindowResult{
+			MaxObservedEPS:        avgEPS,
+			OvershootCount:        1,
+			FirstOvershootStartNs: first,
+			Passed:                false,
+			FailureReason: fmt.Sprintf(
+				"average EPS %.2f over %v exceeded ceiling %.2f (max_eps=%.2f tolerance=%.2f)",
+				avgEPS, deliverySpan.Round(time.Millisecond), threshold, rc.MaxEPS, tolerance),
+		}
+	}
+
+	// Bound the analysis to [first+skipWarmup, last-skipCooldown].
 	windowStart := first + skipWarmup.Nanoseconds()
 	windowEnd := last - skipCooldown.Nanoseconds()
 	if windowEnd <= windowStart {
-		return RateWindowResult{Passed: true}
+		// skipWarmup+skipCooldown swallow the entire receive band. The
+		// avg-EPS gate above already verified the bypass-bypass case;
+		// returning max=avgEPS surfaces a real number on the dashboard
+		// instead of zero.
+		return RateWindowResult{MaxObservedEPS: avgEPS, Passed: true}
 	}
 
 	// Sliding window via two indexes. For each starting position, count
