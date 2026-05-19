@@ -3,7 +3,7 @@ type: correctness
 description: "Verifies events survive subject restart when disk buffering is enabled"
 
 duration: 60s
-warmup: 30s
+warmup: 15s
 
 generator:
   mode: tcp

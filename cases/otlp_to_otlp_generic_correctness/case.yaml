@@ -16,7 +16,7 @@ duration: 60s
 #   - fluent-bit: ~1-2s
 # 30s gives the slowest subject (vmetric) full headroom plus slow
 # Docker image start.
-warmup: 30s
+warmup: 15s
 
 generator:
   mode: otlp

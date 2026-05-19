@@ -6,7 +6,7 @@ description: "End-to-end OTLP/Logs throughput head-to-head: rate at which each s
 # warmup so the listener finishes gRPC + HTTP socket bring-up, then
 # a measurement window long enough to amortize over GC / jitter.
 duration: 60s
-warmup: 30s
+warmup: 15s
 
 generator:
   mode: otlp

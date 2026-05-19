@@ -354,7 +354,7 @@ description: "Measures throughput of a TCP-in to TCP-out pipeline with no transf
 duration: 120s
 
 # Wait for subject to be ready before starting generator
-warmup: 30s
+warmup: 15s
 
 generator:
   mode: tcp                  # "tcp" | "file" | "http"

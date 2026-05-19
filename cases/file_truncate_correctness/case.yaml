@@ -3,7 +3,7 @@ type: correctness
 description: "Verifies no data loss when a log file is directly truncated"
 
 duration: 60s
-warmup: 30s
+warmup: 15s
 
 generator:
   mode: file

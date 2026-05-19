@@ -3,7 +3,7 @@ type: correctness
 description: "End-to-end OTLP/gRPC correctness head-to-head: each subject receives OTLP/gRPC and forwards as OTLP/gRPC. Validates the full receive→forward path is zero-loss across vmetric, otel-collector, rotel, fluent-bit, grafana-alloy, bindplane-agent, cribl-stream, and axosyslog. vector is excluded — its OTLP sink is HTTP-only as of 2026."
 
 duration: 60s
-warmup: 30s
+warmup: 15s
 
 generator:
   mode: otlp

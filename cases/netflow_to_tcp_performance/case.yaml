@@ -11,7 +11,7 @@ duration: 60s
 # up to ~22s before the UDP port is bound. Firing earlier yields
 # ICMP-port-unreachable on the first datagrams and skews the rate
 # measurement downward.
-warmup: 30s
+warmup: 15s
 
 generator:
   mode: udp_netflow_v5

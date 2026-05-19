@@ -6,7 +6,7 @@ description: "OTLP/HTTP receive→forward with one pipeline-stage transform per 
 # warmup so the listener finishes gRPC + HTTP socket bring-up, then
 # a measurement window long enough to amortize over GC / jitter.
 duration: 60s
-warmup: 30s
+warmup: 15s
 
 generator:
   mode: otlp

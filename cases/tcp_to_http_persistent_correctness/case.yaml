@@ -3,7 +3,7 @@ type: persistence_correctness
 description: "Verifies that logs sent while the HTTP receiver is down are persisted and delivered once the receiver starts"
 
 duration: 10s
-warmup: 30s
+warmup: 15s
 
 generator:
   mode: tcp

@@ -3,7 +3,7 @@ type: performance
 description: "Measures throughput of tailing a file and forwarding over TCP"
 
 duration: 60s
-warmup: 30s
+warmup: 15s
 
 generator:
   mode: file

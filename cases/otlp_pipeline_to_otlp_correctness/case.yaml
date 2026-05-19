@@ -3,7 +3,7 @@ type: correctness
 description: "OTLP/HTTP receive→forward with one pipeline-stage transform per record (add a static attribute). Validates the per-record decode → mutate → re-encode round-trip preserves the LogRecord body bytes. rotel is excluded — its built-in transform layer doesn't expose a portable add-attribute primitive."
 
 duration: 60s
-warmup: 30s
+warmup: 15s
 
 generator:
   mode: otlp

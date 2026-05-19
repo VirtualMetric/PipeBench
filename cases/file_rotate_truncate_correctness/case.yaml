@@ -3,7 +3,7 @@ type: correctness
 description: "Verifies no data loss when log files are rotated by truncation"
 
 duration: 60s
-warmup: 30s
+warmup: 15s
 
 generator:
   mode: file

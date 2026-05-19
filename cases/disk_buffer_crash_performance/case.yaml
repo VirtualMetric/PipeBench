@@ -3,7 +3,7 @@ type: performance
 description: "Measures throughput when every subject is in its strongest crash-safe disk-buffer mode (fsync per write / reliable / crash_resistance). Quantifies the EPS cost of zero-loss durability against the baseline disk_buffer_performance test."
 
 duration: 60s
-warmup: 30s
+warmup: 15s
 
 generator:
   mode: tcp

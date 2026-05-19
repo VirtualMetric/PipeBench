@@ -3,7 +3,7 @@ type: performance
 description: "Measures baseline overhead of receiving TCP with no output (blackhole sink)"
 
 duration: 60s
-warmup: 30s
+warmup: 15s
 
 generator:
   mode: tcp
