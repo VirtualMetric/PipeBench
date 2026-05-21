@@ -354,10 +354,12 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 
 	// The result cutoff has been captured. Stop the subject now as cleanup;
 	// lines flushed during this SIGTERM grace are intentionally outside the
-	// scored performance window.
+	// scored performance window. A failure here (e.g. stop timeout) must not
+	// discard the metrics already collected — the deferred Down() will force
+	// teardown regardless. Warn and continue, like the collector stop below.
 	fmt.Println("  stopping subject (SIGTERM, 5s grace)…")
 	if err := orch.StopServices(5*time.Second, "subject"); err != nil {
-		return results.RunResult{}, fmt.Errorf("stopping subject: %w", err)
+		fmt.Fprintf(os.Stderr, "  warning: stopping subject: %v\n", err)
 	}
 
 	// Copy the metrics CSV first (collector writes rows incrementally),
