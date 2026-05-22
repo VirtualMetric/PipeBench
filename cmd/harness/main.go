@@ -46,6 +46,7 @@ var (
 	cpuLimit         string
 	memLimit         string
 	hardware         string
+	drain            time.Duration
 )
 
 func main() {
@@ -217,6 +218,7 @@ func testCmd() *cobra.Command {
 				Timeout:          timeout,
 				CPULimit:         cpuLimit,
 				MemLimit:         memLimit,
+				Drain:            drain,
 			}
 
 			r := runner.New(opts)
@@ -325,6 +327,7 @@ func testCmd() *cobra.Command {
 	cmd.Flags().StringVarP(&configName, "config", "c", "default", "configuration name")
 	cmd.Flags().StringVar(&subjectVersion, "version", "", "subject image version tag (overrides registry default)")
 	cmd.Flags().BoolVar(&noCleanup, "no-cleanup", false, "leave containers running after test (for debugging)")
+	cmd.Flags().DurationVar(&drain, "drain", 0, "performance: wait up to this long for receiver to go idle (instead of fixed 5s grace), recompute EPS over the receiver window, and skip persisting the result — diagnostic only")
 	cmd.Flags().IntVar(&receiverHostPort, "receiver-port", 19001, "host port for receiver metrics endpoint")
 	cmd.Flags().DurationVar(&timeout, "timeout", 10*time.Minute, "maximum time to wait for test completion")
 	cmd.Flags().StringVar(&generatorImage, "generator-image", "vmetric/bench-generator:latest", "generator container image")

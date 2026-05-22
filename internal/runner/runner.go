@@ -38,6 +38,14 @@ type Options struct {
 	// Resource limits for the subject container
 	CPULimit string // e.g. "1", "4", "0.5" — number of cores
 	MemLimit string // e.g. "1g", "16g", "512m"
+
+	// Drain, when > 0, switches performance tests into diagnostic drain mode:
+	// after the generator exits we wait up to this long for the receiver to
+	// go idle (instead of the short fixed grace), recompute EPS over the
+	// receiver window (last_received − first_received), and skip persisting
+	// the result. Used to tell apart real data loss from "the test ended
+	// before the subject finished forwarding its queue."
+	Drain time.Duration
 }
 
 func (o *Options) applyDefaults() {
@@ -273,7 +281,47 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	}
 	defer stopPortFwd()
 
-	if tc.Type == "performance" {
+	if tc.Type == "performance" && r.opts.Drain > 0 {
+		// Diagnostic drain mode: poll the receiver until it goes idle (or the
+		// configured ceiling fires). Same pattern as the correctness path
+		// below, but bounded by --drain.
+		fmt.Printf("  drain mode: waiting up to %s for receiver to go idle…\n", r.opts.Drain)
+		const drainPoll = 5 * time.Second
+		const quietPolls = 6 // 30s stable window
+		ports := orch.ReceiverMetricsPorts()
+		drainDeadline := time.Now().Add(r.opts.Drain)
+		var drainStable int
+		var drainLast int64
+		drainStart := time.Now()
+		for time.Now().Before(drainDeadline) {
+			time.Sleep(drainPoll)
+			var totalLines int64
+			if tc.MultiReceiver() {
+				agg, _, qerr := r.aggregateReceivers(ports, 10*time.Second)
+				if qerr != nil {
+					continue
+				}
+				totalLines = agg.LinesReceived
+			} else {
+				rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+				if qerr != nil {
+					continue
+				}
+				totalLines = rm.LinesReceived
+			}
+			fmt.Printf("    received: %s lines\n", formatCount(totalLines))
+			if totalLines == drainLast && totalLines > 0 {
+				drainStable++
+				if drainStable >= quietPolls {
+					fmt.Printf("    receiver stable — drain complete after %s\n", time.Since(drainStart).Round(time.Second))
+					break
+				}
+			} else {
+				drainStable = 0
+			}
+			drainLast = totalLines
+		}
+	} else if tc.Type == "performance" {
 		drainGrace := tc.DrainGraceOrDefault(5 * time.Second)
 		if drainGrace > 0 {
 			fmt.Printf("  waiting post-send receive grace (%s)…\n", drainGrace)
@@ -390,6 +438,15 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		sendDuration = float64(genStats.DurationMs) / 1000.0
 	}
 	activeStartNs, activeEndNs, rateDuration := benchmarkWindow(genStats, recvMetrics, sendDuration)
+
+	// In drain mode, EPS reflects the receiver's actual active window so the
+	// number is "lines delivered / time the subject was actively delivering"
+	// rather than "lines delivered / send window" — that lets us tell apart
+	// real loss (subject dropped data) from queue tail (subject still
+	// forwarding when the fixed grace expired).
+	if r.opts.Drain > 0 && recvMetrics.LastReceivedNs > recvMetrics.FirstReceivedNs {
+		rateDuration = float64(recvMetrics.LastReceivedNs-recvMetrics.FirstReceivedNs) / 1e9
+	}
 
 	// Aggregate resource metrics over the active work window so averages are
 	// not diluted by cold start or post-cutoff idle samples.
@@ -589,12 +646,17 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		}
 	}
 
-	dir, err := r.store.Save(result, metricsCSVSrc)
-	if err != nil {
-		return result, fmt.Errorf("saving results: %w", err)
+	if r.opts.Drain > 0 {
+		// Drain mode is for local diagnosis only — do not overwrite the
+		// canonical results file the web UI consumes.
+		fmt.Println("  done. (drain mode — result not persisted)")
+	} else {
+		dir, err := r.store.Save(result, metricsCSVSrc)
+		if err != nil {
+			return result, fmt.Errorf("saving results: %w", err)
+		}
+		fmt.Printf("  done. results → %s\n", dir)
 	}
-
-	fmt.Printf("  done. results → %s\n", dir)
 	fmt.Printf("  throughput: %s lines/s\n", formatCount(int64(linesPerSec)))
 	fmt.Printf("  lines in: %s  lines out: %s  loss: %.2f%%\n",
 		formatCount(genStats.LinesSent), formatCount(recvMetrics.LinesReceived), lossPct)
