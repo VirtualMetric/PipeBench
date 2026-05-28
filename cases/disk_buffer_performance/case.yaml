@@ -24,8 +24,6 @@ subjects:
   - logstash
   - nxlog
   - axosyslog
-  - tenzir
-  - cribl-stream
 
 configurations:
   default:
