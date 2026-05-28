@@ -12,6 +12,7 @@ generator:
   total_lines: 25000
   line_size: 256
   format: raw
+  connections: 1
 
 receiver:
   mode: tcp
