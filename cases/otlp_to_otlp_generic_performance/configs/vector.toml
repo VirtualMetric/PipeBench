@@ -11,6 +11,14 @@
 
 [sources.otel_in]
 type = "opentelemetry"
+# Preserve the raw OTLP envelope (resourceLogs/scopeLogs/logRecords)
+# instead of flattening to Vector's native per-record event shape.
+# Without this, the `otlp` sink codec rejects every event with
+# "Log event does not contain OTLP top-level fields (resourceLogs
+# or resourceMetrics)" and silently drops the whole stream — 100%
+# loss. With it, the source→sink path is a native OTLP passthrough,
+# matching what otel-collector / fluent-bit / vmetric do.
+use_otlp_decoding = true
 
   [sources.otel_in.grpc]
   address = "0.0.0.0:4317"
@@ -27,9 +35,10 @@ inputs = ["otel_in.logs"]
   uri = "http://receiver:4318/v1/logs"
   method = "post"
   encoding.codec = "otlp"
-
-    [sinks.otel_out.protocol.request.headers]
-    Content-Type = "application/x-protobuf"
-
-  [sinks.otel_out.protocol.compression]
-  algorithm = "gzip"
+  # The `otlp` codec sets its own Content-Type (application/x-protobuf)
+  # and emits a bare ExportLogsServiceRequest protobuf body. Forcing
+  # the header or layering gzip compression on top makes Vector emit
+  # bytes the receiver decodes as "invalid wire-format" — so neither
+  # is set here, matching Vector's own opentelemetry-logs e2e fixture.
+  # (vmetric / otel-collector run gzip on their OTLP-out path; Vector
+  # 0.54's otlp codec can't, so this leg is uncompressed.)

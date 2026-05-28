@@ -1,14 +1,21 @@
 # vector → OTLP/HTTP head-to-head config with a single VRL remap
-# transform between source and sink that adds a static attribute
-# to every event. Vector's OTLP source decodes LogRecord attributes
-# under `.attributes`, so the remap targets that path — writing to
-# `.bench_marker` directly would put the field at event root and
-# the otlp-encoded sink would either drop it or relocate it,
-# making the transform's wire-cost shape incomparable to the
-# otel-collector / fluent-bit / vmetric variants.
+# transform between source and sink that adds a static attribute to
+# every LogRecord.
+#
+# `use_otlp_decoding = true` keeps the source's events in raw OTLP
+# envelope form (resourceLogs/scopeLogs/logRecords) so the `otlp`
+# sink codec can re-encode them — without it the codec drops every
+# event ("does not contain OTLP top-level fields") for 100% loss.
+# Because the events are now full OTLP envelopes (not Vector's flat
+# per-record shape), the marker can't be written to `.attributes`
+# directly; the remap walks down to each LogRecord and pushes a
+# bench_marker key onto its OTLP attribute array — the same per-
+# record decode → mutate → re-encode work the otel-collector /
+# fluent-bit / vmetric variants do.
 
 [sources.otel_in]
 type = "opentelemetry"
+use_otlp_decoding = true
 
   [sources.otel_in.grpc]
   address = "0.0.0.0:4317"
@@ -20,7 +27,19 @@ type = "opentelemetry"
 type = "remap"
 inputs = ["otel_in.logs"]
 source = '''
-.attributes.bench_marker = "pipeline"
+.resourceLogs = map_values(array!(.resourceLogs)) -> |rl| {
+  rl.scopeLogs = map_values(array!(rl.scopeLogs)) -> |sl| {
+    sl.logRecords = map_values(array!(sl.logRecords)) -> |lr| {
+      lr.attributes = push(array(lr.attributes) ?? [], {
+        "key": "bench_marker",
+        "value": { "stringValue": "pipeline" }
+      })
+      lr
+    }
+    sl
+  }
+  rl
+}
 '''
 
 [sinks.otel_out]
@@ -32,9 +51,7 @@ inputs = ["add_marker"]
   uri = "http://receiver:4318/v1/logs"
   method = "post"
   encoding.codec = "otlp"
-
-    [sinks.otel_out.protocol.request.headers]
-    Content-Type = "application/x-protobuf"
-
-  [sinks.otel_out.protocol.compression]
-  algorithm = "gzip"
+  # The `otlp` codec sets its own Content-Type and emits a bare
+  # ExportLogsServiceRequest protobuf body; forcing the header or
+  # layering gzip on top makes the receiver see "invalid wire-format"
+  # bytes, so neither is set (matches Vector's own otlp e2e fixture).
