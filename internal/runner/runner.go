@@ -468,8 +468,15 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	// input, which is what the test actually measures. Loss percentage
 	// stays based on lines_out vs lines_in, which is still correct
 	// (100% for blackhole — nothing comes out, by design).
+	//
+	// Gated on the case name containing "blackhole" so a real failure on a
+	// regular performance test (subject crashed, wire-format mismatch,
+	// receiver got 0 lines) doesn't silently report the generator's send
+	// rate as throughput — it should report 0 EPS so the summary row
+	// matches reality.
+	isBlackholeCase := strings.Contains(tc.Name, "blackhole")
 	linesForRate := recvMetrics.LinesReceived
-	if linesForRate == 0 && genStats.LinesSent > 0 {
+	if isBlackholeCase && linesForRate == 0 && genStats.LinesSent > 0 {
 		linesForRate = genStats.LinesSent
 	}
 	linesPerSec := 0.0
@@ -534,6 +541,21 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	}
 	if recvMetrics.Passed != nil && !*recvMetrics.Passed {
 		result.FailReason = strings.Join(recvMetrics.Errors, "; ")
+	}
+
+	// A performance test that delivered zero records while the generator
+	// successfully sent some is a catastrophic failure (subject crashed,
+	// wire-format mismatch, target endpoint wrong, …) — not a healthy
+	// 0-EPS run. Mark it FAIL so the summary status row doesn't claim
+	// OK on a 100%-loss outcome. Blackhole cases are excluded — 100%
+	// loss is the designed behavior there.
+	if tc.Type == "performance" && !isBlackholeCase &&
+		recvMetrics.LinesReceived == 0 && genStats.LinesSent > 0 {
+		f := false
+		result.Passed = &f
+		if result.FailReason == "" {
+			result.FailReason = "100% loss: subject delivered zero lines (likely crashed or rejected all input — check container logs)"
+		}
 	}
 
 	// Per-receiver counts are persisted onto the result for multi-receiver
