@@ -1,16 +1,16 @@
 inputs:
-  bench_tcp_in:
-    type: tcp
+  bench_syslog_in:
+    type: syslog
     host: 0.0.0.0
-    port: 9000
+    tcpPort: 9000
     disabled: false
-    tls:
-      disabled: true
+    maxBufferSize: 1000
+    ipWhitelistRegex: /.*/
+    timestampTimezone: local
+    singleMsgUdpPackets: false
     enableProxyHeader: false
-    staleChannelFlushMs: 10000
-    enableHeader: false
-    preprocess:
+    keepFieldsList: []
+    tls:
       disabled: true
     sendToRoutes: true
     pqEnabled: false
-    authType: manual
