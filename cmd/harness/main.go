@@ -82,6 +82,7 @@ func testCmd() *cobra.Command {
 		Short: "Run a test case against one or more subjects",
 		Example: `  harness test -t tcp_to_tcp_performance -s vector
   harness test -t tcp_to_tcp_performance -s vector --version 0.40.0
+  harness test -t tcp_to_tcp_performance,udp_to_udp_performance -s vector # multiple cases
   harness test -t tcp_to_tcp_performance                     # all subjects listed in case.yaml
   harness test -s vmetric --all-tests --hardware c7i.8xlarge # all tests for one subject
   harness test --all-subjects --all-tests --hardware c7i.2xlarge # every subject × every case it appears in`,
@@ -165,23 +166,37 @@ func testCmd() *cobra.Command {
 					fmt.Printf("--all-tests --all-subjects: %d (subject, case) run(s) queued across %d subject(s)\n", len(pairs), len(subjectsToLoop))
 				}
 			} else {
-				tc, err := config.LoadCase(casesDir, testName)
-				if err != nil {
-					return err
-				}
-				var subjects []config.Subject
-				if allSubjects {
-					for _, s := range config.Registry {
-						subjects = append(subjects, s)
+				// Support comma-separated test cases: -t a,b,c. Each named
+				// case is loaded and paired with the resolved subject set
+				// independently, so `-t a,b -s vector,fluent-bit` runs the
+				// full cross product of cases × subjects.
+				testNames := strings.Split(testName, ",")
+				for _, name := range testNames {
+					name = strings.TrimSpace(name)
+					if name == "" {
+						continue
 					}
-				} else {
-					subjects, err = resolveSubjects(tc, subjectName)
+					tc, err := config.LoadCase(casesDir, name)
 					if err != nil {
 						return err
 					}
+					var subjects []config.Subject
+					if allSubjects {
+						for _, s := range config.Registry {
+							subjects = append(subjects, s)
+						}
+					} else {
+						subjects, err = resolveSubjects(tc, subjectName)
+						if err != nil {
+							return err
+						}
+					}
+					for _, s := range subjects {
+						pairs = append(pairs, runPair{tc: tc, subject: s})
+					}
 				}
-				for _, s := range subjects {
-					pairs = append(pairs, runPair{tc: tc, subject: s})
+				if len(pairs) == 0 {
+					return fmt.Errorf("no (test, subject) pairs to run for -t %q", testName)
 				}
 			}
 
@@ -320,7 +335,7 @@ func testCmd() *cobra.Command {
 	// for unknown flags / missing required args (those happen before RunE).
 	cmd.SilenceUsage = true
 
-	cmd.Flags().StringVarP(&testName, "test", "t", "", "test case name (required unless --all-tests)")
+	cmd.Flags().StringVarP(&testName, "test", "t", "", "test case name(s), comma-separated for multiple (required unless --all-tests)")
 	cmd.Flags().StringVarP(&subjectName, "subject", "s", "", "subject to test (default: all subjects in case.yaml)")
 	cmd.Flags().BoolVar(&allSubjects, "all-subjects", false, "run against all registered subjects")
 	cmd.Flags().BoolVar(&allTests, "all-tests", false, "run every case where the -s subject appears in case.yaml (combine with --all-subjects to loop every subject)")
