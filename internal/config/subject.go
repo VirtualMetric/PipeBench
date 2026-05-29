@@ -52,8 +52,6 @@ func (s Subject) ConfigFile() string {
 		return "filebeat.yml"
 	case "telegraf":
 		return "telegraf.conf"
-	case "splunk-hf":
-		return "splunk-hf" // directory with inputs.conf + outputs.conf
 	case "nxlog":
 		return "nxlog.conf"
 	case "axosyslog":
@@ -126,19 +124,6 @@ var Registry = map[string]Subject{
 		Image:      "telegraf",
 		Version:    "1.30-alpine",
 		ConfigPath: "/etc/telegraf/telegraf.conf",
-	},
-	"splunk-hf": {
-		Name:       "splunk-hf",
-		Image:      "splunk/splunk",
-		Version:    "10.2.3",
-		ConfigPath: "/opt/splunk/etc/apps/bench/local",
-		ConfigRW:   true,
-		Env: map[string]string{
-			"SPLUNK_START_ARGS":    "--accept-license",
-			"SPLUNK_GENERAL_TERMS": "--accept-sgt-current-at-splunk-com",
-			"SPLUNK_PASSWORD":      "{{env:PASSWORD}}",
-			"SPLUNK_ROLE":          "splunk_heavy_forwarder",
-		},
 	},
 	"nxlog": {
 		Name:       "nxlog",
@@ -215,7 +200,7 @@ var Registry = map[string]Subject{
 func Lookup(name string) (Subject, error) {
 	s, ok := Registry[name]
 	if !ok {
-		return Subject{}, fmt.Errorf("unknown subject %q (available: vmetric, vector, fluent-bit, fluentd, logstash, filebeat, telegraf, splunk-hf, nxlog, axosyslog, tenzir, otel-collector, grafana-alloy, bindplane-agent, cribl-stream, rotel)", name)
+		return Subject{}, fmt.Errorf("unknown subject %q (available: vmetric, vector, fluent-bit, fluentd, logstash, filebeat, telegraf, nxlog, axosyslog, tenzir, otel-collector, grafana-alloy, bindplane-agent, cribl-stream, rotel)", name)
 	}
 	return s, nil
 }

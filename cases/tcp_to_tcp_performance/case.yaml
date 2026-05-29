@@ -28,7 +28,6 @@ subjects:
   - filebeat
   - cribl-stream
   - telegraf
-  - splunk-hf
   - nxlog
   - axosyslog
   - tenzir

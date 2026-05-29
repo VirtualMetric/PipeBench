@@ -1,23 +1,34 @@
 {
-  "generated_at": "2026-04-26T19:05:23.5449612Z",
+  "generated_at": "2026-05-29T07:35:56.0654545Z",
   "hardwares": [
-    "c6a.metal",
-    "c7i.16xlarge",
-    "c7i.24xlarge",
+    "c7i.large",
+    "c7i.xlarge",
     "c7i.2xlarge",
-    "c7i.4xlarge",
-    "c7i.8xlarge",
-    "c7i.xlarge"
+    "c7i.24xlarge"
   ],
   "subjects": [
     "axosyslog",
+    "bindplane-agent",
+    "cribl-stream",
+    "filebeat",
     "fluent-bit",
     "fluentd",
+    "grafana-alloy",
     "logstash",
+    "nxlog",
+    "otel-collector",
+    "rotel",
+    "telegraf",
+    "tenzir",
     "vector",
     "vmetric"
   ],
   "tests": [
+    {
+      "test": "disk_buffer_crash_performance",
+      "type": "performance",
+      "description": "Measures throughput when every subject is in its strongest crash-safe disk-buffer mode (fsync per write / reliable / crash_resistance). Quantifies the EPS cost of zero-loss durability against the baseline disk_buffer_performance test."
+    },
     {
       "test": "disk_buffer_performance",
       "type": "performance",
@@ -34,6 +45,11 @@
       "description": "Verifies no data loss when log files are rotated by creating a new file"
     },
     {
+      "test": "file_rotate_restart_correctness",
+      "type": "persistence_file_restart_correctness",
+      "description": "Verifies that a file-tail subject can recover when it's offline across a rotation: subject reads partway, gets SIGTERM'd, generator rotates the log file (create mode) and writes more events to the new file while subject is offline, then subject restarts and must catch up on the un-read tail of input.log.1 + the new input.log without re-emitting anything already forwarded. A subject that only watches /data/input.log by path (no glob, no persistent state) will lose every un-read pre-rotation event in input.log.1 — that's the case this test catches."
+    },
+    {
       "test": "file_rotate_truncate_correctness",
       "type": "correctness",
       "description": "Verifies no data loss when log files are rotated by truncation"
@@ -47,6 +63,41 @@
       "test": "file_truncate_correctness",
       "type": "correctness",
       "description": "Verifies no data loss when a log file is directly truncated"
+    },
+    {
+      "test": "netflow_to_tcp_performance",
+      "type": "performance",
+      "description": "Measures the rate at which a NetFlow v5 listener can decode binary records and forward them as TCP lines."
+    },
+    {
+      "test": "otlp_grpc_to_otlp_grpc_correctness",
+      "type": "correctness",
+      "description": "End-to-end OTLP/gRPC correctness head-to-head: each subject receives OTLP/gRPC and forwards as OTLP/gRPC. Validates the full receive→forward path is zero-loss across vmetric, otel-collector, rotel, fluent-bit, grafana-alloy, bindplane-agent, cribl-stream, and axosyslog. vector is excluded — its OTLP sink is HTTP-only as of 2026."
+    },
+    {
+      "test": "otlp_grpc_to_otlp_grpc_performance",
+      "type": "performance",
+      "description": "End-to-end OTLP/gRPC throughput head-to-head: each subject receives OTLP/gRPC on 4317 and forwards as OTLP/gRPC. Isolates per-protocol overhead vs. the HTTP+protobuf generic case. vector is excluded — its OTLP sink is HTTP-only as of 2026."
+    },
+    {
+      "test": "otlp_pipeline_to_otlp_correctness",
+      "type": "correctness",
+      "description": "OTLP/HTTP receive→forward with one pipeline-stage transform per record (add a static attribute). Validates the per-record decode → mutate → re-encode round-trip preserves the LogRecord body bytes. rotel is excluded — its built-in transform layer doesn't expose a portable add-attribute primitive."
+    },
+    {
+      "test": "otlp_pipeline_to_otlp_performance",
+      "type": "performance",
+      "description": "OTLP/HTTP receive→forward with one pipeline-stage transform per record (add a static attribute). Measures the per-record decode → mutate → re-encode cost on top of the generic case. rotel is excluded — its built-in transform layer doesn't expose a portable add-attribute primitive (Python processor mount would be required, which we don't ship)."
+    },
+    {
+      "test": "otlp_to_otlp_generic_correctness",
+      "type": "correctness",
+      "description": "End-to-end OTLP/Logs correctness head-to-head: each subject receives OTLP/HTTP+protobuf and forwards via OTLP/HTTP+protobuf. Verifies the full receive→forward path and zero-loss across vmetric, vector, fluent-bit, otel-collector, rotel, grafana-alloy, bindplane-agent, and cribl-stream."
+    },
+    {
+      "test": "otlp_to_otlp_generic_performance",
+      "type": "performance",
+      "description": "End-to-end OTLP/Logs throughput head-to-head: rate at which each subject can receive OTLP/HTTP+protobuf and forward it as OTLP/HTTP+protobuf. vmetric vs. rotel vs. otel-collector vs. vector vs. fluent-bit vs. grafana-alloy vs. bindplane-agent vs. cribl-stream."
     },
     {
       "test": "real_world_1_performance",
@@ -109,6 +160,11 @@
       "description": "Verifies that logs sent while the receiver is down are persisted and delivered once the receiver starts"
     },
     {
+      "test": "tcp_to_tcp_persistent_crash_correctness",
+      "type": "persistence_crash_correctness",
+      "description": "Verifies durable persistence across an ungraceful subject crash (SIGKILL): send logs, kill subject without grace, start receiver, restart subject, verify all logs arrive"
+    },
+    {
       "test": "tcp_to_tcp_persistent_performance",
       "type": "performance",
       "description": "Measures throughput of a TCP-in to TCP-out pipeline with disk persistence enabled"
@@ -125,32 +181,21 @@
     }
   ],
   "by_hardware": {
-    "c6a.metal": {
-      "subjects": [
-        "axosyslog",
-        "fluent-bit",
-        "fluentd",
-        "logstash",
-        "vector",
-        "vmetric"
-      ]
-    },
-    "c7i.16xlarge": {
-      "subjects": [
-        "axosyslog",
-        "fluent-bit",
-        "fluentd",
-        "logstash",
-        "vector",
-        "vmetric"
-      ]
-    },
     "c7i.24xlarge": {
       "subjects": [
         "axosyslog",
+        "bindplane-agent",
+        "cribl-stream",
+        "filebeat",
         "fluent-bit",
         "fluentd",
+        "grafana-alloy",
         "logstash",
+        "nxlog",
+        "otel-collector",
+        "rotel",
+        "telegraf",
+        "tenzir",
         "vector",
         "vmetric"
       ]
@@ -158,29 +203,37 @@
     "c7i.2xlarge": {
       "subjects": [
         "axosyslog",
+        "bindplane-agent",
+        "cribl-stream",
+        "filebeat",
         "fluent-bit",
         "fluentd",
+        "grafana-alloy",
         "logstash",
+        "nxlog",
+        "otel-collector",
+        "rotel",
+        "telegraf",
+        "tenzir",
         "vector",
         "vmetric"
       ]
     },
-    "c7i.4xlarge": {
+    "c7i.large": {
       "subjects": [
         "axosyslog",
+        "bindplane-agent",
+        "cribl-stream",
+        "filebeat",
         "fluent-bit",
         "fluentd",
+        "grafana-alloy",
         "logstash",
-        "vector",
-        "vmetric"
-      ]
-    },
-    "c7i.8xlarge": {
-      "subjects": [
-        "axosyslog",
-        "fluent-bit",
-        "fluentd",
-        "logstash",
+        "nxlog",
+        "otel-collector",
+        "rotel",
+        "telegraf",
+        "tenzir",
         "vector",
         "vmetric"
       ]
@@ -188,9 +241,18 @@
     "c7i.xlarge": {
       "subjects": [
         "axosyslog",
+        "bindplane-agent",
+        "cribl-stream",
+        "filebeat",
         "fluent-bit",
         "fluentd",
+        "grafana-alloy",
         "logstash",
+        "nxlog",
+        "otel-collector",
+        "rotel",
+        "telegraf",
+        "tenzir",
         "vector",
         "vmetric"
       ]

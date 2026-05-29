@@ -104,7 +104,6 @@ Run the same test against each subject on the same machine:
 ./bin/harness test -t tcp_to_tcp_performance -s axosyslog        --hardware c7i.4xlarge
 ./bin/harness test -t tcp_to_tcp_performance -s nxlog            --hardware c7i.4xlarge
 ./bin/harness test -t tcp_to_tcp_performance -s tenzir           --hardware c7i.4xlarge
-./bin/harness test -t tcp_to_tcp_performance -s splunk-hf        --hardware c7i.4xlarge
 ./bin/harness test -t tcp_to_tcp_performance -s otel-collector   --hardware c7i.4xlarge
 ./bin/harness test -t tcp_to_tcp_performance -s grafana-alloy    --hardware c7i.4xlarge
 ./bin/harness test -t tcp_to_tcp_performance -s bindplane-agent  --hardware c7i.4xlarge

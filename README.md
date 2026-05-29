@@ -1,6 +1,6 @@
 # PipeBench — Data Pipeline Benchmark
 
-A containerized benchmarking and correctness testing framework for data pipeline tools. Compare **VirtualMetric DataStream**, **Vector**, **Fluent Bit**, **Fluentd**, **Logstash**, **Filebeat**, **Telegraf**, **AxoSyslog**, **NXLog**, **Tenzir**, **Splunk Heavy Forwarder**, **OpenTelemetry Collector**, **Grafana Alloy**, **observIQ BindPlane Agent**, **Cribl Stream**, and **Streamfold Rotel** side by side. Everything runs in Docker — clone the repo, build the harness and helper images, and reproduce any published result on the same hardware tier with one command.
+A containerized benchmarking and correctness testing framework for data pipeline tools. Compare **VirtualMetric DataStream**, **Vector**, **Fluent Bit**, **Fluentd**, **Logstash**, **Filebeat**, **Telegraf**, **AxoSyslog**, **NXLog**, **Tenzir**, **OpenTelemetry Collector**, **Grafana Alloy**, **BindPlane Agent**, **Cribl Stream**, and **Streamfold Rotel** side by side. Everything runs in Docker — clone the repo, build the harness and helper images, and reproduce any published result on the same hardware tier with one command.
 
 ## Getting started
 
@@ -83,10 +83,9 @@ After the test, the result is merged into a single per-(hardware, subject) JSON 
 | AxoSyslog | `ghcr.io/axoflow/axosyslog` | `4.25.0` |
 | NXLog CE | `nxlog/nxlog-ce` | `3.2.2329` |
 | Tenzir | `ghcr.io/tenzir/tenzir` | `v5.30.0` |
-| Splunk Heavy Forwarder | `splunk/splunk` | `10.2.3` |
 | OpenTelemetry Collector (contrib) | `otel/opentelemetry-collector-contrib` | `0.149.0` |
 | Grafana Alloy | `grafana/alloy` | `v1.15.0` |
-| observIQ BindPlane Agent | `observiq/bindplane-agent` | `1.99.0` |
+| BindPlane Agent | `observiq/bindplane-agent` | `1.99.0` |
 | Cribl Stream | `cribl/cribl` | `4.17.0` |
 | Streamfold Rotel | `streamfold/rotel` | `v0.2.2` |
 

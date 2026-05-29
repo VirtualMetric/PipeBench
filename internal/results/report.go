@@ -13,47 +13,62 @@ import (
 	"time"
 )
 
-// hardwareSortKey parses an AWS-style instance name (e.g. "c7i.2xlarge")
-// into a (family, sizeRank) tuple suitable for sort comparisons. Sizes
-// are ordered by their multiplier: xlarge=1, 2xlarge=2, 4xlarge=4, …,
-// with `metal` ranked above all numeric sizes within its family.
-// Anything that doesn't look like "<family>.<size>" gets a synthetic
-// family that sorts to the end (e.g. "custom", "local-win").
-func hardwareSortKey(name string) (family string, rank int) {
+// Bare-metal SKUs whose vCPU count can't be derived from the size suffix.
+// Mirrors HARDWARE_CORES_METAL in web/index.html.
+var hardwareCoresMetal = map[string]int{
+	"c6a.metal":      192,
+	"c7i.metal-24xl": 96,
+	"c7i.metal-48xl": 192,
+}
+
+// hardwareCores parses the vCPU count from an AWS-style instance name
+// (e.g. "c7i.2xlarge" → 8). Returns ok=false for tiers whose size can't
+// be derived (custom, local-*, malformed names).
+func hardwareCores(name string) (cores int, ok bool) {
+	if c, found := hardwareCoresMetal[name]; found {
+		return c, true
+	}
 	i := strings.LastIndex(name, ".")
 	if i < 0 {
-		// Non-AWS-shaped names (custom, local-win, etc.) sort last.
-		return "~" + name, 0
+		return 0, false
 	}
-	family = name[:i]
 	size := name[i+1:]
 	switch size {
+	case "large":
+		return 2, true
 	case "xlarge":
-		return family, 1
-	case "metal":
-		return family, 9999
+		return 4, true
 	}
 	if strings.HasSuffix(size, "xlarge") {
 		if n, err := strconv.Atoi(strings.TrimSuffix(size, "xlarge")); err == nil {
-			return family, n
+			return n * 4, true
 		}
 	}
-	// Unknown size token: keep deterministic but order it after the
-	// known numeric sizes within the same family.
-	return family, 10000
+	return 0, false
 }
 
-// sortHardwares orders AWS-style instance names so that, within a family,
-// sizes go xlarge → 2xlarge → 4xlarge → … → metal. Across families it's
-// alphabetical by family. Names without a dot (custom, local-*) trail.
+// sortHardwares orders AWS-style instance names by ascending vCPU count
+// (c7i.large=2 first, then c7i.xlarge=4, then 2xlarge=8, … then
+// c6a.metal=192). Tiers with the same core count tie-break by name.
+// Tiers whose size can't be parsed (custom, local-*) trail at the end,
+// also alphabetically.
 func sortHardwares(names []string) {
 	sort.SliceStable(names, func(i, j int) bool {
-		fi, ri := hardwareSortKey(names[i])
-		fj, rj := hardwareSortKey(names[j])
-		if fi != fj {
-			return fi < fj
+		ci, oki := hardwareCores(names[i])
+		cj, okj := hardwareCores(names[j])
+		if oki && okj {
+			if ci != cj {
+				return ci < cj
+			}
+			return names[i] < names[j]
 		}
-		return ri < rj
+		if oki {
+			return true
+		}
+		if okj {
+			return false
+		}
+		return names[i] < names[j]
 	})
 }
 

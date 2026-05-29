@@ -27,7 +27,6 @@ subjects:
   - tenzir
   - axosyslog
   - nxlog
-  - splunk-hf
   - bindplane-agent
 
 configurations:
