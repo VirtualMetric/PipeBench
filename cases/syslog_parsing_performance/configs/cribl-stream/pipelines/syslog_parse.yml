@@ -1,6 +1,0 @@
-id: syslog_parse
-conf:
-  output: default
-  groups: {}
-  asyncFuncTimeout: 1000
-  functions: []
