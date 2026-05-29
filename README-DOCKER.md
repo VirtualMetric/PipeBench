@@ -213,7 +213,7 @@ For correctness tests, the table shows PASS/FAIL instead of throughput:
 
 ## Tuning load generation
 
-The generator opens parallel TCP (or HTTP) connections to push data into the subject. The number of connections is set per test case in `case.yaml`:
+The generator opens parallel TCP (or HTTP) connections to push data into the subject. The connection count is set per test case in `case.yaml`:
 
 ```yaml
 generator:
@@ -221,23 +221,22 @@ generator:
   target: "subject:9000"
   rate: 0           # 0 = unlimited (as fast as possible)
   line_size: 256
-  connections: 4    # parallel TCP connections
+  # connections: omitted → defaults to 3× the host CPU count
 ```
 
-All TCP-based performance tests default to `connections: 4`. You can change this to match your hardware and the subject under test:
+When `connections` is **omitted** (the default for performance tests), the harness scales it with the host: **3× the number of CPU cores**. On a 4-core box that is 12 connections; on a 32-core box, 96; on a 192-core `c6a.metal`, 576. The subjects run their own per-listener worker pools sized to the CPU count, so feeding them ~3× more connections than cores keeps those pools saturated rather than starved. To pin an exact count regardless of host, set `connections:` explicitly:
 
-| connections | When to use |
+| `connections` | When to use |
 | --- | --- |
-| `1` | Correctness tests, low-throughput subjects, single-core machines |
-| `4` | Default for performance tests. Good baseline for most subjects. |
-| `8` | High-performance subjects (Vector) on 4+ core machines |
-| `16+` | Stress testing. Saturates even the fastest subjects on large machines. |
+| _(omitted)_ | Default for performance tests — `3× CPU cores`, scales with the host |
+| `1` | Correctness/persistence tests where a single stream or strict ordering matters |
+| explicit `N` | Reproducibility across heterogeneous hosts, or to deliberately stress/limit a subject |
 
 Each connection runs in its own goroutine with a 256KB write buffer, so the generator itself uses minimal CPU per connection. The bottleneck should always be the subject, not the generator.
 
-To change the connection count, edit the `connections` field in the test case YAML under `cases/<test_name>/case.yaml`. The change takes effect on the next `harness test` run — no rebuild needed.
+To override the connection count, add or edit the `connections` field in the test case YAML under `cases/<test_name>/case.yaml`. The change takes effect on the next `harness test` run — no rebuild needed.
 
-The `rate` field controls lines per second **per connection**. Setting `rate: 1000` with `connections: 4` produces 4,000 lines/sec total. Setting `rate: 0` (the default for performance tests) means each connection pushes as fast as the TCP stack allows.
+The `rate` field controls lines per second **per connection**. Setting `rate: 1000` with 4 connections produces 4,000 lines/sec total. Setting `rate: 0` (the default for performance tests) means each connection pushes as fast as the TCP stack allows.
 
 ---
 
@@ -366,9 +365,9 @@ Make sure no other heavy processes are running. For fair benchmarking, a machine
 
 ## Available tests
 
-### Performance tests (14)
+### Performance tests (17)
 
-These measure throughput, CPU, memory, and I/O while each subject processes data at maximum speed for 2 minutes.
+These measure throughput, CPU, memory, and I/O while each subject processes data at maximum speed for 60 seconds. The two `_5min_` variants run for 5 minutes to capture sustained behavior.
 
 | Test | What it does |
 | --- | --- |
@@ -385,8 +384,12 @@ These measure throughput, CPU, memory, and I/O while each subject processes data
 | `syslog_parsing_performance` | TCP in, parse syslog message, TCP out |
 | `set_field_performance` | TCP in, add one field via native transform, TCP out |
 | `real_world_1_performance` | Parse, filter, and route (mixed pipeline) |
+| `netflow_to_tcp_performance` | NetFlow v5 over UDP in, decoded records as TCP lines out |
+| `otlp_to_otlp_generic_performance` | OTLP/HTTP+protobuf in, OTLP/HTTP+protobuf out (no transforms) |
+| `otlp_grpc_to_otlp_grpc_performance` | OTLP/gRPC end-to-end (isolates protocol cost vs. HTTP+protobuf) |
+| `otlp_pipeline_to_otlp_performance` | OTLP/HTTP in, OTLP/HTTP out with one add-attribute transform per record |
 
-### Correctness tests (9)
+### Correctness tests (14)
 
 These verify data integrity — no lost, duplicated, or reordered events. The generator embeds sequence numbers in each line, and the receiver validates them.
 
@@ -398,10 +401,14 @@ These verify data integrity — no lost, duplicated, or reordered events. The ge
 | `tcp_to_tcp_persistent_crash_correctness` | Same as above, but the subject is SIGKILL'd (no graceful flush) |
 | `tcp_to_http_persistent_correctness` | Persistence correctness with an HTTP receiver as the target |
 | `file_rotate_create_correctness` | New-file log rotation handled without loss |
+| `file_rotate_restart_correctness` | File-tail subject recovers across a rotation it was offline for: read partway, SIGTERM, log rotated (create mode) with more events written while offline, restart, catch up without re-emitting |
 | `file_rotate_truncate_correctness` | Truncation-based log rotation handled correctly |
 | `file_truncate_correctness` | Direct file truncation handled correctly |
 | `sighup_correctness` | Config reload via SIGHUP without data loss |
 | `wrapped_json_correctness` | JSON-in-string fields parsed correctly |
+| `otlp_to_otlp_generic_correctness` | OTLP/HTTP+protobuf round-trip preserves every LogRecord body |
+| `otlp_grpc_to_otlp_grpc_correctness` | OTLP/gRPC round-trip preserves every LogRecord body |
+| `otlp_pipeline_to_otlp_correctness` | OTLP/HTTP round-trip with one add-attribute transform preserves every body |
 
 ---
 

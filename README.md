@@ -61,6 +61,7 @@ After the test, the result is merged into a single per-(hardware, subject) JSON 
 | `tcp_to_tcp_persistent_crash_correctness` | Same as above, but the subject is SIGKILL'd (no graceful flush — only fsync'd writes survive) |
 | `tcp_to_http_persistent_correctness` | Persistence correctness with an HTTP receiver as the target |
 | `file_rotate_create_correctness` | New-file log rotation handled without loss |
+| `file_rotate_restart_correctness` | File-tail subject recovers across a rotation it was offline for: read partway, SIGTERM, log rotated (create mode) and more events written while offline, restart, catch up without re-emitting |
 | `file_rotate_truncate_correctness` | Truncation-based log rotation handled correctly |
 | `file_truncate_correctness` | Direct file truncation handled correctly |
 | `sighup_correctness` | Config reload via SIGHUP without data loss |
@@ -106,7 +107,7 @@ PipeBench/
     receiver/            Receives output, counts lines, validates correctness
     collector/           Polls Docker stats API, writes metrics CSV
     vmetric/             Dockerfile + pre-built binary for the VirtualMetric Director subject
-  cases/                 29 test cases (16 performance + 13 correctness), each with per-subject configs
+  cases/                 31 test cases (17 performance + 14 correctness), each with per-subject configs
   web/                   Static PipeBench UI (single HTML + per-(hardware, subject) JSON under web/results/)
 ```
 
