@@ -22,7 +22,6 @@ subjects:
   - fluent-bit
   - fluentd
   - logstash
-  - nxlog
   - axosyslog
 
 configurations:

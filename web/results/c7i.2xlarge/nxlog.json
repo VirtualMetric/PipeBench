@@ -5,36 +5,6 @@
   "generated_at": "2026-05-29T00:16:33.871549455Z",
   "results": [
     {
-      "test": "disk_buffer_crash_performance",
-      "config": "default",
-      "timestamp": "2026-05-28T23:29:25.846029763Z",
-      "duration_secs": 61.181263848,
-      "first_sent_ns": 1780010966266689057,
-      "last_sent_ns": 1780011027189974249,
-      "first_received_ns": 1780010966267044876,
-      "last_received_ns": 1780011027447952905,
-      "lines_in": 8478384,
-      "lines_out": 8338999,
-      "bytes_in": 2178944688,
-      "bytes_out": 2143122743,
-      "lines_per_sec": 136299.88129564602,
-      "loss_percent": 1.6440043291268691,
-      "avg_cpu_percent": 251.93335074355255,
-      "max_cpu_percent": 263.03011703511055,
-      "avg_mem_mb": 34.056577620967744,
-      "max_mem_mb": 37.3828125,
-      "disk_read_bytes": 0,
-      "disk_write_bytes": 0,
-      "net_recv_bytes": 2634030612,
-      "net_send_bytes": 2633356515,
-      "io_throughput_avg_bytes_per_sec": 169915713.77419356,
-      "load_avg_1": 0,
-      "load_avg_5": 0,
-      "load_avg_15": 0,
-      "system_cpus": 8,
-      "system_mem_mb": 15699
-    },
-    {
       "test": "disk_buffer_performance",
       "config": "default",
       "timestamp": "2026-05-28T23:30:34.831617502Z",
@@ -94,7 +64,7 @@
       "system_cpus": 8,
       "system_mem_mb": 15699,
       "passed": false,
-      "fail_reason": "expected loss \u003c= 0.00%, got 0.04%"
+      "fail_reason": "expected loss <= 0.00%, got 0.04%"
     },
     {
       "test": "file_rotate_create_correctness",
@@ -371,7 +341,7 @@
       "system_cpus": 8,
       "system_mem_mb": 15699,
       "passed": false,
-      "fail_reason": "expected loss \u003c= 0.00%, got 0.02%"
+      "fail_reason": "expected loss <= 0.00%, got 0.02%"
     },
     {
       "test": "syslog_parsing_performance",
@@ -519,7 +489,7 @@
       "load_avg_5": 0,
       "load_avg_15": 0,
       "passed": false,
-      "fail_reason": "expected loss \u003c= 0.00%, got 88.04% (86,210 of 97,920 lines lost)"
+      "fail_reason": "expected loss <= 0.00%, got 88.04% (86,210 of 97,920 lines lost)"
     },
     {
       "test": "tcp_to_tcp_5min_performance",
@@ -609,7 +579,7 @@
       "load_avg_5": 0,
       "load_avg_15": 0,
       "passed": false,
-      "fail_reason": "expected loss \u003c= 0.00%, got 88.04% (86,210 of 97,920 lines lost)"
+      "fail_reason": "expected loss <= 0.00%, got 88.04% (86,210 of 97,920 lines lost)"
     },
     {
       "test": "tcp_to_tcp_persistent_crash_correctness",
@@ -637,7 +607,7 @@
       "load_avg_5": 0,
       "load_avg_15": 0,
       "passed": false,
-      "fail_reason": "expected loss \u003c= 0.00%, got 100.00% (7,140 of 7,140 lines lost)"
+      "fail_reason": "expected loss <= 0.00%, got 100.00% (7,140 of 7,140 lines lost)"
     },
     {
       "test": "tcp_to_tcp_persistent_performance",
@@ -697,7 +667,7 @@
       "load_avg_5": 0,
       "load_avg_15": 0,
       "passed": false,
-      "fail_reason": "expected loss \u003c= 0.00%, got 99.90% (99,860 of 99,960 lines lost)"
+      "fail_reason": "expected loss <= 0.00%, got 99.90% (99,860 of 99,960 lines lost)"
     },
     {
       "test": "wrapped_json_correctness",

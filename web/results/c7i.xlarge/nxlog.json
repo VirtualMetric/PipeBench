@@ -5,36 +5,6 @@
   "generated_at": "2026-05-29T00:08:10.590978021Z",
   "results": [
     {
-      "test": "disk_buffer_crash_performance",
-      "config": "default",
-      "timestamp": "2026-05-28T23:23:12.854839023Z",
-      "duration_secs": 60.282129717,
-      "first_sent_ns": 1780010593310046923,
-      "last_sent_ns": 1780010653518546333,
-      "first_received_ns": 1780010593310393420,
-      "last_received_ns": 1780010653592176640,
-      "lines_in": 8895564,
-      "lines_out": 8853035,
-      "bytes_in": 2286159948,
-      "bytes_out": 2275229995,
-      "lines_per_sec": 146860.02371783127,
-      "loss_percent": 0.4780922266424015,
-      "avg_cpu_percent": 258.7005636739988,
-      "max_cpu_percent": 261.716,
-      "avg_mem_mb": 19.946614583333332,
-      "max_mem_mb": 21.9921875,
-      "disk_read_bytes": 0,
-      "disk_write_bytes": 0,
-      "net_recv_bytes": 2714509904,
-      "net_send_bytes": 2715508527,
-      "io_throughput_avg_bytes_per_sec": 181000614.36666667,
-      "load_avg_1": 0,
-      "load_avg_5": 0,
-      "load_avg_15": 0,
-      "system_cpus": 4,
-      "system_mem_mb": 7774
-    },
-    {
       "test": "disk_buffer_performance",
       "config": "default",
       "timestamp": "2026-05-28T23:24:21.785235243Z",
@@ -517,7 +487,7 @@
       "load_avg_5": 0,
       "load_avg_15": 0,
       "passed": false,
-      "fail_reason": "expected loss \u003c= 0.00%, got 87.94% (43,056 of 48,960 lines lost)"
+      "fail_reason": "expected loss <= 0.00%, got 87.94% (43,056 of 48,960 lines lost)"
     },
     {
       "test": "tcp_to_tcp_5min_performance",
@@ -607,7 +577,7 @@
       "load_avg_5": 0,
       "load_avg_15": 0,
       "passed": false,
-      "fail_reason": "expected loss \u003c= 0.00%, got 87.75% (43,858 of 49,980 lines lost)"
+      "fail_reason": "expected loss <= 0.00%, got 87.75% (43,858 of 49,980 lines lost)"
     },
     {
       "test": "tcp_to_tcp_persistent_crash_correctness",
@@ -637,7 +607,7 @@
       "load_avg_5": 0,
       "load_avg_15": 0,
       "passed": false,
-      "fail_reason": "expected loss \u003c= 0.00%, got 93.53% (6,678 of 7,140 lines lost)"
+      "fail_reason": "expected loss <= 0.00%, got 93.53% (6,678 of 7,140 lines lost)"
     },
     {
       "test": "tcp_to_tcp_persistent_performance",
@@ -697,7 +667,7 @@
       "load_avg_5": 0,
       "load_avg_15": 0,
       "passed": false,
-      "fail_reason": "expected loss \u003c= 0.00%, got 98.88% (49,419 of 49,980 lines lost)"
+      "fail_reason": "expected loss <= 0.00%, got 98.88% (49,419 of 49,980 lines lost)"
     },
     {
       "test": "wrapped_json_correctness",
