@@ -12,9 +12,17 @@ framing.method = "newline_delimited"
 type = "remap"
 inputs = ["in"]
 source = '''
+del(.host)
+del(.port)
+del(.source_type)
+del(.timestamp)
 .message = replace(string!(.message), r'CONN=\d+', "CONN=***")
 '''
 
+# JSON encoding so the masked message lands on the wire inside a labeled
+# envelope (matching fluent-bit and vmetric). Without it the sink emits the
+# raw .message text only, which makes vector's wire bytes ~3× lighter than
+# the JSON-emitting subjects and skews per-record cost comparisons.
 [sinks.out]
 type = "socket"
 mode = "tcp"
@@ -22,7 +30,7 @@ inputs = ["mask"]
 address = "receiver:9001"
 
 [sinks.out.encoding]
-codec = "text"
+codec = "json"
 
 [sinks.out.framing]
 method = "newline_delimited"

@@ -3,17 +3,21 @@ type = "socket"
 mode = "tcp"
 address = "0.0.0.0:9000"
 
-# VRL passthrough — measures scripting engine overhead
+# Add one labeled string field via VRL — same shape as every other subject.
 [transforms.script]
 type = "remap"
 inputs = ["in"]
 source = '''
-.processed = true
+.processed_by = "vector-pipeline"
 '''
 
+# JSON encoding so the new field actually reaches the wire. With the previous
+# "text" codec the sink emits only .message and the added field is dropped,
+# making the benchmark measure VRL execution but not the cost of writing the
+# new field — not comparable to the other subjects.
 [sinks.out]
 type = "socket"
 mode = "tcp"
 inputs = ["script"]
 address = "receiver:9001"
-encoding.codec = "text"
+encoding.codec = "json"

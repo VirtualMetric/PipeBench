@@ -10,9 +10,14 @@ source = '''
 . = parse_syslog!(.message)
 '''
 
+# JSON encoding so the parsed structured record reaches the wire. With the
+# previous "text" codec the sink emits only .message, throwing away every
+# parsed field — the test measured parse cost but not the cost of writing
+# the parsed result, so vector's wire bytes were ~14× lighter than fluent-bit
+# or vmetric for the same workload.
 [sinks.out]
 type = "socket"
 mode = "tcp"
 inputs = ["parse"]
 address = "receiver:9001"
-encoding.codec = "text"
+encoding.codec = "json"

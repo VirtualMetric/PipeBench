@@ -7,5 +7,5 @@ tenzir:
         load_tcp "0.0.0.0:9000"
         read_lines
         this.processed_by = "tenzir-pipeline"
-        write_lines
+        write_ndjson
         save_tcp "receiver:9001"

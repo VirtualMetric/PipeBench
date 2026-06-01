@@ -6,6 +6,6 @@ tenzir:
       definition: |
         load_tcp "0.0.0.0:9000"
         read_lines
-        this.line = this.line.replace(r"CONN=\d+", "CONN=***")
-        write_lines
+        this.line = this.line.replace_regex(r"CONN=\d+", "CONN=***")
+        write_ndjson
         save_tcp "receiver:9001"
