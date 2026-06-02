@@ -4,6 +4,7 @@
     "c7i.large",
     "c7i.xlarge",
     "c7i.2xlarge",
+    "c7i.4xlarge",
     "c7i.24xlarge"
   ],
   "subjects": [
@@ -181,6 +182,24 @@
   ],
   "by_hardware": {
     "c7i.24xlarge": {
+      "subjects": [
+        "axosyslog",
+        "bindplane-agent",
+        "cribl-stream",
+        "filebeat",
+        "fluent-bit",
+        "fluentd",
+        "grafana-alloy",
+        "logstash",
+        "nxlog",
+        "otel-collector",
+        "rotel",
+        "telegraf",
+        "vector",
+        "vmetric"
+      ]
+    },
+    "c7i.4xlarge": {
       "subjects": [
         "axosyslog",
         "bindplane-agent",
