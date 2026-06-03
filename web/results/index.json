@@ -5,6 +5,9 @@
     "c7i.xlarge",
     "c7i.2xlarge",
     "c7i.4xlarge",
+    "c7i.8xlarge",
+    "c7i.12xlarge",
+    "c7i.16xlarge",
     "c7i.24xlarge"
   ],
   "subjects": [
@@ -182,6 +185,60 @@
   ],
   "by_hardware": {
     "c7i.24xlarge": {
+      "subjects": [
+        "axosyslog",
+        "bindplane-agent",
+        "cribl-stream",
+        "filebeat",
+        "fluent-bit",
+        "fluentd",
+        "grafana-alloy",
+        "logstash",
+        "nxlog",
+        "otel-collector",
+        "rotel",
+        "telegraf",
+        "vector",
+        "vmetric"
+      ]
+    },
+    "c7i.16xlarge": {
+      "subjects": [
+        "axosyslog",
+        "bindplane-agent",
+        "cribl-stream",
+        "filebeat",
+        "fluent-bit",
+        "fluentd",
+        "grafana-alloy",
+        "logstash",
+        "nxlog",
+        "otel-collector",
+        "rotel",
+        "telegraf",
+        "vector",
+        "vmetric"
+      ]
+    },
+    "c7i.12xlarge": {
+      "subjects": [
+        "axosyslog",
+        "bindplane-agent",
+        "cribl-stream",
+        "filebeat",
+        "fluent-bit",
+        "fluentd",
+        "grafana-alloy",
+        "logstash",
+        "nxlog",
+        "otel-collector",
+        "rotel",
+        "telegraf",
+        "vector",
+        "vmetric"
+      ]
+    },
+    "c7i.8xlarge": {
       "subjects": [
         "axosyslog",
         "bindplane-agent",
