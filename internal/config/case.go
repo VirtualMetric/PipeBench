@@ -185,14 +185,26 @@ type GeneratorConfig struct {
 	// downstream receiver. Required when used inside `generators:`; ignored
 	// for the singular `generator:` form (the container is always
 	// `bench-generator` there).
-	ID          string            `yaml:"id"`
-	Mode        string            `yaml:"mode"`        // "tcp" | "file" | "http" | "udp" | "udp_netflow_v5" | "otlp"
-	Target      string            `yaml:"target"`      // "subject:9000" or file path
-	Rate        int               `yaml:"rate"`        // lines/sec per connection, 0 = unlimited
-	TotalLines  int64             `yaml:"total_lines"` // total lines to send, 0 = use duration
-	LineSize    int               `yaml:"line_size"`   // bytes per line
-	Format      string            `yaml:"format"`      // "raw" | "syslog" | "json"
-	Connections int               `yaml:"connections"` // parallel connections (default 1)
+	ID          string `yaml:"id"`
+	Mode        string `yaml:"mode"`        // "tcp" | "file" | "http" | "udp" | "udp_netflow_v5" | "otlp"
+	Target      string `yaml:"target"`      // "subject:9000" or file path
+	Rate        int    `yaml:"rate"`        // lines/sec per connection, 0 = unlimited
+	TotalLines  int64  `yaml:"total_lines"` // total lines to send, 0 = use duration
+	LineSize    int    `yaml:"line_size"`   // bytes per line
+	Format      string `yaml:"format"`      // "raw" | "syslog" | "json"
+	Connections int    `yaml:"connections"` // parallel connections (default 1)
+	// SampleFile replays a fixed input file instead of synthesizing lines.
+	// Path is relative to the case directory (e.g. "input/sample.cef"). When
+	// set, the generator sends the file's lines verbatim, cycling to reach
+	// total_lines/duration — `format` no longer drives line content. The
+	// harness bind-mounts the file into the generator container at /input.
+	// Honored in both the singular `generator:` and plural `generators:` forms
+	// (each plural generator gets its own bind mount + GENERATOR_SAMPLE_FILE).
+	SampleFile string `yaml:"sample_file"`
+	// RewriteTimestamp, with SampleFile, rewrites each replayed line's leading
+	// RFC3164 syslog date ("Mmm _d hh:mm:ss") to the current time at send so
+	// records aren't dropped as stale. No effect without SampleFile.
+	RewriteTimestamp bool `yaml:"rewrite_timestamp"`
 	// Env is mode-specific extra env passed straight through to the
 	// generator container (e.g. GENERATOR_OTLP_TRANSPORT=grpc). Lets a
 	// case dial in transport variants without growing GeneratorConfig
@@ -302,8 +314,8 @@ type CorrectnessConfig struct {
 	// the receiver stays quiet for DrainQuietWindow. Useful for cases that
 	// validate throttled output draining a queue (the receiver is still
 	// arriving long after the generator is done).
-	DrainSeconds      int    `yaml:"drain_seconds"`
-	DrainQuietWindow  string `yaml:"drain_quiet_window"`
+	DrainSeconds     int    `yaml:"drain_seconds"`
+	DrainQuietWindow string `yaml:"drain_quiet_window"`
 
 	// RateCeiling validates a per-window EPS ceiling on the receive side.
 	// Empty MaxEPS = check disabled.
@@ -338,9 +350,9 @@ func (r RateCeilingConfig) Enabled() bool { return r.MaxEPS > 0 }
 // every receiver in the case. The check is skipped when total counts are
 // below MinSampleSize (small samples produce spurious imbalance).
 type LoadBalanceConfig struct {
-	Receivers      []string `yaml:"receivers"`
-	MinShareRatio  float64  `yaml:"min_share_ratio"`
-	MinSampleSize  int64    `yaml:"min_sample_size"`
+	Receivers     []string `yaml:"receivers"`
+	MinShareRatio float64  `yaml:"min_share_ratio"`
+	MinSampleSize int64    `yaml:"min_sample_size"`
 }
 
 // Enabled reports whether the load-balance fairness check should run.

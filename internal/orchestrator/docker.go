@@ -100,13 +100,20 @@ services:
       - receiver-{{ .ID }}
 {{- end }}
 {{- end }}
+{{- if or $.UseSharedData $.TLSCertsHost .SampleFileHost }}
+    volumes:
 {{- if $.UseSharedData }}
-    volumes:
       - "shared-data:/data"
-    user: "0:0"
-{{- else if $.TLSCertsHost }}
-    volumes:
+{{- end }}
+{{- if $.TLSCertsHost }}
       - "{{ $.TLSCertsHost }}:/certs:ro"
+{{- end }}
+{{- if .SampleFileHost }}
+      - "{{ .SampleFileHost }}:{{ .SampleFileDst }}:ro"
+{{- end }}
+{{- end }}
+{{- if $.UseSharedData }}
+    user: "0:0"
 {{- end }}
     environment:
       GENERATOR_ID: "{{ .ID }}"
@@ -122,6 +129,12 @@ services:
       GENERATOR_CONN_OFFSET: "{{ .ConnOffset }}"
 {{- if .TotalLines }}
       GENERATOR_TOTAL_LINES: "{{ .TotalLines }}"
+{{- end }}
+{{- if .SampleFile }}
+      GENERATOR_SAMPLE_FILE: "{{ .SampleFile }}"
+{{- end }}
+{{- if .RewriteTimestamp }}
+      GENERATOR_REWRITE_TIMESTAMP: "true"
 {{- end }}
 {{- if .TLSEnabled }}
       GENERATOR_TLS: "true"
@@ -155,17 +168,24 @@ services:
 {{- if not .DeferReceiver }}
       - receiver
 {{- end }}
-{{- if .UseSharedData }}
+{{- if or .UseSharedData .TLSCertsHost .GenSampleFileHost }}
     volumes:
+{{- if .UseSharedData }}
       - "shared-data:/data"
+{{- end }}
+{{- if .TLSCertsHost }}
+      - "{{ .TLSCertsHost }}:/certs:ro"
+{{- end }}
+{{- if .GenSampleFileHost }}
+      - "{{ .GenSampleFileHost }}:{{ .GenSampleFileDst }}:ro"
+{{- end }}
+{{- end }}
+{{- if .UseSharedData }}
     # File-mode tests need the generator to create /data/input.log on the
     # shared volume, which is initialized as root:root 0755. The image's
     # default uid 10001 cannot write there, so override to root for these
     # runs. TCP/HTTP/OTLP/netflow runs leave the hardened uid in place.
     user: "0:0"
-{{- else if .TLSCertsHost }}
-    volumes:
-      - "{{ .TLSCertsHost }}:/certs:ro"
 {{- end }}
     environment:
       GENERATOR_MODE: "{{ .GenMode }}"
@@ -179,6 +199,12 @@ services:
       GENERATOR_CONNECTIONS: "{{ .GenConnections }}"
 {{- if .GenTotalLines }}
       GENERATOR_TOTAL_LINES: "{{ .GenTotalLines }}"
+{{- end }}
+{{- if .GenSampleFile }}
+      GENERATOR_SAMPLE_FILE: "{{ .GenSampleFile }}"
+{{- end }}
+{{- if .GenRewriteTimestamp }}
+      GENERATOR_REWRITE_TIMESTAMP: "true"
 {{- end }}
 {{- if .GenRotateMode }}
       GENERATOR_ROTATE_MODE: "{{ .GenRotateMode }}"
@@ -294,6 +320,7 @@ type RunConfig struct {
 	Subject          config.Subject
 	ConfigName       string
 	ConfigSrcPath    string // absolute path to the subject config file on host
+	CaseDir          string // absolute path to the case directory on host (locates generator sample_file, etc.)
 	TmpDir           string // temp dir for this run
 	GeneratorImage   string
 	ReceiverImage    string
@@ -611,6 +638,14 @@ type generatorTpl struct {
 	TLSCA         string
 	TLSInsecure   string
 	TLSMinVersion string
+	// Sample-file replay (see GeneratorConfig.SampleFile). SampleFileHost is
+	// the host path bind-mounted read-only at SampleFileDst; SampleFile is the
+	// in-container path passed via GENERATOR_SAMPLE_FILE. Each plural generator
+	// is its own container, so SampleFileDst can be the same path across them.
+	SampleFile       string
+	SampleFileHost   string
+	SampleFileDst    string
+	RewriteTimestamp bool
 }
 
 // receiverTpl is the per-receiver template data when the case uses the
@@ -657,12 +692,20 @@ type composeVars struct {
 	GenRotateAt       string
 	GenRotateQuiesce  string
 	GenRotateSuffix   string
-	GenTLSEnabled    bool
-	GenTLSCert       string
-	GenTLSKey        string
-	GenTLSCA         string
-	GenTLSInsecure   string
-	GenTLSMinVersion string
+	GenTLSEnabled     bool
+	GenTLSCert        string
+	GenTLSKey         string
+	GenTLSCA          string
+	GenTLSInsecure    string
+	GenTLSMinVersion  string
+
+	// Sample-file replay (singular generator only). GenSampleFileHost is the
+	// host path bind-mounted read-only at GenSampleFileDst; GenSampleFile is
+	// the in-container path handed to the generator via GENERATOR_SAMPLE_FILE.
+	GenSampleFile       string
+	GenSampleFileHost   string
+	GenSampleFileDst    string
+	GenRewriteTimestamp bool
 
 	RecvMode              string
 	RecvListen            string
@@ -765,12 +808,12 @@ func writeCompose(path string, cfg RunConfig) error {
 		DeferReceiver: tc.Type == "persistence_correctness" ||
 			tc.Type == "persistence_restart_correctness" ||
 			tc.Type == "persistence_crash_correctness",
-		GeneratorImage:    cfg.GeneratorImage,
-		ReceiverImage:     cfg.ReceiverImage,
-		CollectorImage:    cfg.CollectorImage,
-		ReceiverHostPort:  cfg.ReceiverHostPort,
-		GenDuration:       duration,
-		GenWarmup:         warmup,
+		GeneratorImage:   cfg.GeneratorImage,
+		ReceiverImage:    cfg.ReceiverImage,
+		CollectorImage:   cfg.CollectorImage,
+		ReceiverHostPort: cfg.ReceiverHostPort,
+		GenDuration:      duration,
+		GenWarmup:        warmup,
 		// Sequenced lines (CONN=<id> SEQ=<n> ...) are only needed when the
 		// receiver runs a check that requires per-line uniqueness or a
 		// known prefix structure — dedup or content validation. The
@@ -778,15 +821,15 @@ func writeCompose(path string, cfg RunConfig) error {
 		// data into tests like wrapped_json_correctness whose generator
 		// format is "json"; those lines started with CONN= instead of {,
 		// silently failing JSON-parsing subjects (e.g. AxoSyslog).
-		GenSequenced: sequenced,
-		DockerSocketGID:       cfg.DockerSocketGID,
-		TLSCertsHost:          tlsCertsHost,
+		GenSequenced:    sequenced,
+		DockerSocketGID: cfg.DockerSocketGID,
+		TLSCertsHost:    tlsCertsHost,
 
-		RecvValidateDedup:   boolStr(tc.Correctness.ValidateDedup),
-		RecvValidateContent: boolStr(tc.Correctness.ValidateContent),
-		RecvExpectedLines:   0,
+		RecvValidateDedup:     boolStr(tc.Correctness.ValidateDedup),
+		RecvValidateContent:   boolStr(tc.Correctness.ValidateContent),
+		RecvExpectedLines:     0,
 		RecvRequiredSubstring: tc.Correctness.RequiredSubstring,
-		RecvValidateJSON:    tc.Correctness.ValidateJSON,
+		RecvValidateJSON:      tc.Correctness.ValidateJSON,
 		// Arrival timestamp recording is opt-in via the rate_ceiling
 		// check; flipping it on unconditionally would burn memory in
 		// every performance run.
@@ -805,23 +848,34 @@ func writeCompose(path string, cfg RunConfig) error {
 			if format == "" {
 				format = "raw"
 			}
+			// Sample-file replay (same wiring as the singular path).
+			sampleFile, sampleHost, sampleDst := "", "", ""
+			if g.SampleFile != "" && cfg.CaseDir != "" {
+				sampleHost = filepath.ToSlash(filepath.Join(cfg.CaseDir, g.SampleFile))
+				sampleDst = "/input/" + filepath.Base(g.SampleFile)
+				sampleFile = sampleDst
+			}
 			vars.Generators = append(vars.Generators, generatorTpl{
-				ID:            g.ID,
-				Mode:          g.Mode,
-				Target:        g.Target,
-				Rate:          g.Rate,
-				TotalLines:    g.TotalLines,
-				LineSize:      lineSize,
-				Format:        format,
-				Connections:   conns,
-				ConnOffset:    offset,
-				Env:           g.Env,
-				TLSEnabled:    g.TLS.Enabled,
-				TLSCert:       g.TLS.Cert,
-				TLSKey:        g.TLS.Key,
-				TLSCA:         g.TLS.CA,
-				TLSInsecure:   boolStr(g.TLS.InsecureSkipVerify),
-				TLSMinVersion: g.TLS.MinVersion,
+				ID:               g.ID,
+				Mode:             g.Mode,
+				Target:           g.Target,
+				Rate:             g.Rate,
+				TotalLines:       g.TotalLines,
+				LineSize:         lineSize,
+				Format:           format,
+				Connections:      conns,
+				ConnOffset:       offset,
+				Env:              g.Env,
+				TLSEnabled:       g.TLS.Enabled,
+				TLSCert:          g.TLS.Cert,
+				TLSKey:           g.TLS.Key,
+				TLSCA:            g.TLS.CA,
+				TLSInsecure:      boolStr(g.TLS.InsecureSkipVerify),
+				TLSMinVersion:    g.TLS.MinVersion,
+				SampleFile:       sampleFile,
+				SampleFileHost:   sampleHost,
+				SampleFileDst:    sampleDst,
+				RewriteTimestamp: g.RewriteTimestamp,
 			})
 			offset += conns
 		}
@@ -853,6 +907,16 @@ func writeCompose(path string, cfg RunConfig) error {
 		vars.GenTLSCA = g.TLS.CA
 		vars.GenTLSInsecure = boolStr(g.TLS.InsecureSkipVerify)
 		vars.GenTLSMinVersion = g.TLS.MinVersion
+
+		// Sample-file replay: bind-mount the case's input file into the
+		// generator and point GENERATOR_SAMPLE_FILE at it. Path in case.yaml
+		// is relative to the case directory.
+		if g.SampleFile != "" && cfg.CaseDir != "" {
+			vars.GenSampleFileHost = filepath.ToSlash(filepath.Join(cfg.CaseDir, g.SampleFile))
+			vars.GenSampleFileDst = "/input/" + filepath.Base(g.SampleFile)
+			vars.GenSampleFile = vars.GenSampleFileDst
+			vars.GenRewriteTimestamp = g.RewriteTimestamp
+		}
 	}
 
 	if tc.MultiReceiver() {

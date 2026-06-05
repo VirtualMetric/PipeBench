@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,7 +31,14 @@ type config struct {
 	TotalLines  int64         // 0 = use duration
 	LineSize    int           // bytes per line
 	Format      string        // raw | syslog | json
-	Warmup      time.Duration
+	// SampleFile, when non-empty, replays this file's lines verbatim (cycling
+	// to reach TotalLines/Duration) instead of synthesizing them; Format then
+	// no longer drives line content.
+	SampleFile string
+	// RewriteTimestamp rewrites each replayed line's leading RFC3164 syslog
+	// date ("Mmm _d hh:mm:ss") to the current time at send. Sample-file only.
+	RewriteTimestamp bool
+	Warmup           time.Duration
 	Sequenced   bool  // embed SEQ=<n> in each line for correctness
 	Connections int   // parallel TCP/HTTP connections (default 1)
 	SeqOffset   int64 // starting sequence number — set per worker by the parallel dispatcher so global sequences don't overlap across workers (otherwise each worker emits 0..perWorker, breaking the receiver-side dedup check)
@@ -248,6 +256,9 @@ func loadConfig() config {
 		os.Exit(1)
 	}
 	cfg.Duration = d
+
+	cfg.SampleFile = os.Getenv("GENERATOR_SAMPLE_FILE")
+	cfg.RewriteTimestamp = getEnvBool("GENERATOR_REWRITE_TIMESTAMP", false)
 
 	cfg.Sequenced = getEnvBool("GENERATOR_SEQUENCED", false)
 	cfg.Connections = getEnvInt("GENERATOR_CONNECTIONS", 1)
@@ -819,9 +830,28 @@ func sendLines(cfg config, clock *sendClock, write func([]byte) error) (int64, i
 // sendLinesConn is like sendLines but tags sequenced lines with the connection id
 // so duplicates across connections can be distinguished.
 func sendLinesConn(cfg config, connID int, clock *sendClock, write func([]byte) error) (int64, int64, error) {
-	// Pre-generate a template line for performance tests.
-	// For sequenced (correctness) mode, each line is unique.
-	templateLine := generateLine(cfg.LineSize, cfg.Format)
+	// Sample-file replay: load the file's lines once and send them verbatim,
+	// cycling to reach TotalLines/Duration. Takes precedence over sequenced /
+	// timestamped synthesis — you can't inject SEQ= into a real CEF record
+	// without corrupting it.
+	var sampleLines [][]byte
+	if cfg.SampleFile != "" {
+		var lerr error
+		sampleLines, lerr = loadSampleLines(cfg.SampleFile)
+		if lerr != nil {
+			return 0, 0, lerr
+		}
+		if len(sampleLines) == 0 {
+			return 0, 0, fmt.Errorf("sample file %q contains no lines", cfg.SampleFile)
+		}
+	}
+
+	// Pre-generate a template line for performance tests (skipped in
+	// sample-file mode). For sequenced (correctness) mode, each line is unique.
+	var templateLine []byte
+	if len(sampleLines) == 0 {
+		templateLine = generateLine(cfg.LineSize, cfg.Format)
+	}
 
 	// Pre-allocate a reusable line buffer for sequenced mode so we don't
 	// regenerate random padding on every line (the old path ran rand.Intn
@@ -830,7 +860,7 @@ func sendLinesConn(cfg config, connID int, clock *sendClock, write func([]byte) 
 	// Last byte is reserved for '\n' so the hot-loop write callback can
 	// skip a per-line append-newline allocation.
 	var seqBuf []byte
-	if cfg.Sequenced {
+	if cfg.Sequenced && len(sampleLines) == 0 {
 		seqBuf = make([]byte, cfg.LineSize+1)
 		copy(seqBuf, randString(cfg.LineSize))
 		seqBuf[cfg.LineSize] = '\n'
@@ -902,12 +932,16 @@ func sendLinesConn(cfg config, connID int, clock *sendClock, write func([]byte) 
 		}
 
 		var line []byte
-		if cfg.Sequenced {
+		switch {
+		case len(sampleLines) > 0:
+			// Replay the sample, cycling through its lines.
+			line = sampleLine(sampleLines[int(linesSent%int64(len(sampleLines)))], cfg.RewriteTimestamp)
+		case cfg.Sequenced:
 			line = writeSequencedPrefix(seqBuf, connID, linesSent)
-		} else if linesSent%1000 == 0 {
+		case linesSent%1000 == 0:
 			// Sample every 1000th line with a timestamp for latency measurement
 			line = generateTimestampedLine(cfg.LineSize, cfg.Format)
-		} else {
+		default:
 			line = templateLine
 		}
 
@@ -998,6 +1032,58 @@ func writeSequencedPrefix(buf []byte, connID int, seq int64) []byte {
 	// trailing '\n' the caller pre-stamped at buf[len(buf)-1].
 	copy(buf, prefix)
 	return buf
+}
+
+// loadSampleLines reads a replay file into newline-free lines, dropping blank
+// lines and any trailing newline. Each line is copied so the caller can rewrite
+// it (e.g. the timestamp) without aliasing the shared file buffer.
+func loadSampleLines(path string) ([][]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read sample file %q: %w", path, err)
+	}
+	var lines [][]byte
+	for _, raw := range bytes.Split(data, []byte("\n")) {
+		raw = bytes.TrimRight(raw, "\r")
+		if len(raw) == 0 {
+			continue
+		}
+		cp := make([]byte, len(raw))
+		copy(cp, raw)
+		lines = append(lines, cp)
+	}
+	return lines, nil
+}
+
+// rfc3164TSRe matches the leading RFC3164 syslog header date — "Mmm _d
+// hh:mm:ss" (space-padded day, e.g. "May 14 10:30:32" or "May  4 09:00:00") —
+// anchored to the start of the line after an optional "<PRI>". Submatch 1 is
+// the date span. Anchoring (rather than first-match-anywhere) means a
+// date-shaped substring in the message body — e.g. inside a CEF field — is
+// never touched; only the genuine header date is rewritten.
+var rfc3164TSRe = regexp.MustCompile(`^(?:<\d+>)?([A-Z][a-z]{2} [ 0-9]\d \d{2}:\d{2}:\d{2})`)
+
+// sampleLine returns src with a trailing '\n' appended. When rewriteTS is set
+// it rewrites only the leading RFC3164 header date (preserving any "<PRI>")
+// to the current time so replayed records aren't aged out by the subject.
+// src is never mutated.
+func sampleLine(src []byte, rewriteTS bool) []byte {
+	if rewriteTS {
+		// loc = [matchStart, matchEnd, group1Start, group1End]
+		if loc := rfc3164TSRe.FindSubmatchIndex(src); loc != nil {
+			start, end := loc[2], loc[3]
+			now := time.Now().Format("Jan _2 15:04:05")
+			out := make([]byte, 0, start+len(now)+(len(src)-end)+1)
+			out = append(out, src[:start]...)
+			out = append(out, now...)
+			out = append(out, src[end:]...)
+			return append(out, '\n')
+		}
+	}
+	out := make([]byte, len(src)+1)
+	copy(out, src)
+	out[len(src)] = '\n'
+	return out
 }
 
 // generateLine returns a `size`-byte line with a trailing '\n' already

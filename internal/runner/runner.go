@@ -131,7 +131,9 @@ func (r *Runner) applySubjectOverrides(subject config.Subject) config.Subject {
 	if r.opts.SubjectImage != "" {
 		subject = subject.WithImage(r.opts.SubjectImage)
 	}
-	subject = r.applySubjectOverrides(subject)
+	if r.opts.SubjectVersion != "" {
+		subject = subject.WithVersion(r.opts.SubjectVersion)
+	}
 	return subject
 }
 
@@ -217,6 +219,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		Subject:          subject,
 		ConfigName:       configName,
 		ConfigSrcPath:    configSrc,
+		CaseDir:          filepath.Join(r.opts.CasesDir, tc.Name),
 		TmpDir:           tmpDir,
 		GeneratorImage:   r.opts.GeneratorImage,
 		ReceiverImage:    r.opts.ReceiverImage,
@@ -811,6 +814,7 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 		Subject:          subject,
 		ConfigName:       configName,
 		ConfigSrcPath:    configSrc,
+		CaseDir:          filepath.Join(r.opts.CasesDir, tc.Name),
 		TmpDir:           tmpDir,
 		GeneratorImage:   r.opts.GeneratorImage,
 		ReceiverImage:    r.opts.ReceiverImage,
@@ -1074,6 +1078,7 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 		Subject:          subject,
 		ConfigName:       configName,
 		ConfigSrcPath:    configSrc,
+		CaseDir:          filepath.Join(r.opts.CasesDir, tc.Name),
 		TmpDir:           tmpDir,
 		GeneratorImage:   r.opts.GeneratorImage,
 		ReceiverImage:    r.opts.ReceiverImage,
@@ -1361,6 +1366,7 @@ func (r *Runner) runPersistenceFileRestartCorrectness(tc *config.TestCase, subje
 		Subject:          subject,
 		ConfigName:       configName,
 		ConfigSrcPath:    configSrc,
+		CaseDir:          filepath.Join(r.opts.CasesDir, tc.Name),
 		TmpDir:           tmpDir,
 		GeneratorImage:   r.opts.GeneratorImage,
 		ReceiverImage:    r.opts.ReceiverImage,
