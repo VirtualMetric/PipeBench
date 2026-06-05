@@ -210,3 +210,9 @@ func (s Subject) WithVersion(v string) Subject {
 	s.Version = v
 	return s
 }
+
+// WithImage returns a copy of the Subject with the image repository overridden.
+func (s Subject) WithImage(img string) Subject {
+	s.Image = img
+	return s
+}

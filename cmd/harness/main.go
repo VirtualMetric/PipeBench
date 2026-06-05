@@ -37,6 +37,7 @@ var (
 	typeFilter       string
 	configName       string
 	subjectVersion   string
+	subjectImage     string
 	noCleanup        bool
 	receiverHostPort int
 	timeout          time.Duration
@@ -227,6 +228,7 @@ func testCmd() *cobra.Command {
 				ReceiverImage:    receiverImage,
 				CollectorImage:   collectorImage,
 				SubjectVersion:   subjectVersion,
+				SubjectImage:     subjectImage,
 				ConfigName:       configName,
 				NoCleanup:        noCleanup,
 				ReceiverHostPort: receiverHostPort,
@@ -341,6 +343,7 @@ func testCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&allTests, "all-tests", false, "run every case where the -s subject appears in case.yaml (combine with --all-subjects to loop every subject)")
 	cmd.Flags().StringVarP(&configName, "config", "c", "default", "configuration name")
 	cmd.Flags().StringVar(&subjectVersion, "version", "", "subject image version tag (overrides registry default)")
+	cmd.Flags().StringVar(&subjectImage, "image", "", "subject image repository, e.g. \"myco/director\" (overrides registry default; combine with --version to pin the tag)")
 	cmd.Flags().BoolVar(&noCleanup, "no-cleanup", false, "leave containers running after test (for debugging)")
 	cmd.Flags().DurationVar(&drain, "drain", 0, "performance: wait up to this long for receiver to go idle (instead of fixed 5s grace), recompute EPS over the receiver window, and skip persisting the result — diagnostic only")
 	cmd.Flags().IntVar(&receiverHostPort, "receiver-port", 19001, "host port for receiver metrics endpoint")

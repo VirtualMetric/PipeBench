@@ -27,6 +27,8 @@ type Options struct {
 	CollectorImage string
 	// Override subject version (empty = use registry default)
 	SubjectVersion string
+	// Override subject image repository (empty = use registry default)
+	SubjectImage string
 	// Override configuration name (empty = "default")
 	ConfigName string
 	// Skip teardown — leave containers running (useful for debugging)
@@ -121,6 +123,18 @@ func New(opts Options) *Runner {
 	}
 }
 
+// applySubjectOverrides returns the subject with the CLI image/version
+// overrides applied. Each override is independent: an empty value leaves the
+// registry default in place, so callers can override the image, the version,
+// both, or neither.
+func (r *Runner) applySubjectOverrides(subject config.Subject) config.Subject {
+	if r.opts.SubjectImage != "" {
+		subject = subject.WithImage(r.opts.SubjectImage)
+	}
+	subject = r.applySubjectOverrides(subject)
+	return subject
+}
+
 // Run executes the test and returns the persisted result.
 func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
 	if tc.Type == "persistence_correctness" {
@@ -138,10 +152,8 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 
 	configName := r.opts.ConfigName
 
-	// Resolve subject version override
-	if r.opts.SubjectVersion != "" {
-		subject = subject.WithVersion(r.opts.SubjectVersion)
-	}
+	// Resolve subject image/version overrides (empty = registry default)
+	subject = r.applySubjectOverrides(subject)
 
 	fmt.Printf("→ test=%s  subject=%s  version=%s  config=%s\n",
 		tc.Name, subject.Name, subject.Version, configName)
@@ -757,9 +769,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 //  6. Verify: all logs should arrive with 0% loss
 func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
 	configName := r.opts.ConfigName
-	if r.opts.SubjectVersion != "" {
-		subject = subject.WithVersion(r.opts.SubjectVersion)
-	}
+	subject = r.applySubjectOverrides(subject)
 
 	fmt.Printf("→ test=%s  subject=%s  version=%s  config=%s\n",
 		tc.Name, subject.Name, subject.Version, configName)
@@ -1022,9 +1032,7 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 //  7. Drain and verify all logs arrive with 0% loss, 0 duplicates
 func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject config.Subject, crash bool) (results.RunResult, error) {
 	configName := r.opts.ConfigName
-	if r.opts.SubjectVersion != "" {
-		subject = subject.WithVersion(r.opts.SubjectVersion)
-	}
+	subject = r.applySubjectOverrides(subject)
 
 	fmt.Printf("→ test=%s  subject=%s  version=%s  config=%s\n",
 		tc.Name, subject.Name, subject.Version, configName)
@@ -1314,9 +1322,7 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 // un-read pre-rotation events are lost.
 func (r *Runner) runPersistenceFileRestartCorrectness(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
 	configName := r.opts.ConfigName
-	if r.opts.SubjectVersion != "" {
-		subject = subject.WithVersion(r.opts.SubjectVersion)
-	}
+	subject = r.applySubjectOverrides(subject)
 
 	fmt.Printf("→ test=%s  subject=%s  version=%s  config=%s\n",
 		tc.Name, subject.Name, subject.Version, configName)
