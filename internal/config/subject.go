@@ -156,36 +156,6 @@ var Registry = map[string]Subject{
 		ConfigRW:     true,
 		Capabilities: []string{"tls_tcp"},
 	},
-	// Pipeline-test variant: launches the director with NO -config-path, so it
-	// scans the mounted config DIRECTORY (/app/config) recursively and loads
-	// every config it finds into memory at boot — unlike "vmetric" single-file
-	// mode, which reads one file and skips disk pipeline definitions. Cases
-	// that exercise pipeline configuration use `subjects: [vmetric-pipeline]`;
-	// the harness mounts the case's configs/ dir directly (no per-case
-	// subfolder needed).
-	//
-	// The image (namles/vmetric-pipeline, built from Dockerfile.pipeline) is
-	// self-contained: it BAKES the pipeline-definitions tree at
-	// /app/package/definitions (ms_azure + siblings), a default /app/vmetric.yml
-	// service config (node id + logging), the binary at /director (same
-	// Entrypoint as the stock `vmetric` subject), and a writable /app Root.
-	// Interim personal-namespace image until the change lands in the official
-	// vmetric/director release.
-	//
-	// FolderScan marks this as a folder-scan subject: the harness mounts the
-	// case's configs/ DIRECTORY at /app/config (not a single file). The
-	// pipeline definitions are baked into the image, so nothing is mounted
-	// for them.
-	"vmetric-pipeline": {
-		Name:         "vmetric-pipeline",
-		Image:        "namles/vmetric-pipeline",
-		Version:      "2.0.1",
-		ConfigPath:   "/app/config",
-		Entrypoint:   []string{"/director"},
-		Command:      []string{},
-		ConfigRW:     true,
-		Capabilities: []string{"tls_tcp"},
-	},
 	"otel-collector": {
 		Name:       "otel-collector",
 		Image:      "otel/opentelemetry-collector-contrib",
