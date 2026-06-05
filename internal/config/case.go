@@ -185,14 +185,25 @@ type GeneratorConfig struct {
 	// downstream receiver. Required when used inside `generators:`; ignored
 	// for the singular `generator:` form (the container is always
 	// `bench-generator` there).
-	ID          string            `yaml:"id"`
-	Mode        string            `yaml:"mode"`        // "tcp" | "file" | "http" | "udp" | "udp_netflow_v5" | "otlp"
-	Target      string            `yaml:"target"`      // "subject:9000" or file path
-	Rate        int               `yaml:"rate"`        // lines/sec per connection, 0 = unlimited
-	TotalLines  int64             `yaml:"total_lines"` // total lines to send, 0 = use duration
-	LineSize    int               `yaml:"line_size"`   // bytes per line
-	Format      string            `yaml:"format"`      // "raw" | "syslog" | "json"
-	Connections int               `yaml:"connections"` // parallel connections (default 1)
+	ID          string `yaml:"id"`
+	Mode        string `yaml:"mode"`        // "tcp" | "file" | "http" | "udp" | "udp_netflow_v5" | "otlp"
+	Target      string `yaml:"target"`      // "subject:9000" or file path
+	Rate        int    `yaml:"rate"`        // lines/sec per connection, 0 = unlimited
+	TotalLines  int64  `yaml:"total_lines"` // total lines to send, 0 = use duration
+	LineSize    int    `yaml:"line_size"`   // bytes per line
+	Format      string `yaml:"format"`      // "raw" | "syslog" | "json" | "cef"
+	Connections int    `yaml:"connections"` // parallel connections (default 1)
+
+	// SampleFile, when set, is a path (relative to the case directory) to a
+	// log sample the generator replays verbatim instead of emitting
+	// synthetic lines — needed when the subject's pipeline only does
+	// meaningful work on real input (e.g. ms_azure normalizing Fortinet
+	// CEF). The harness bind-mounts the file into the generator container.
+	SampleFile string `yaml:"sample_file"`
+	// RewriteTimestamp, when true, makes the generator rewrite the RFC3164
+	// syslog-header date in each replayed sample line to the current time,
+	// so records aren't aged out by time-windowed pipeline logic.
+	RewriteTimestamp bool `yaml:"rewrite_timestamp"`
 	// Env is mode-specific extra env passed straight through to the
 	// generator container (e.g. GENERATOR_OTLP_TRANSPORT=grpc). Lets a
 	// case dial in transport variants without growing GeneratorConfig
@@ -302,8 +313,8 @@ type CorrectnessConfig struct {
 	// the receiver stays quiet for DrainQuietWindow. Useful for cases that
 	// validate throttled output draining a queue (the receiver is still
 	// arriving long after the generator is done).
-	DrainSeconds      int    `yaml:"drain_seconds"`
-	DrainQuietWindow  string `yaml:"drain_quiet_window"`
+	DrainSeconds     int    `yaml:"drain_seconds"`
+	DrainQuietWindow string `yaml:"drain_quiet_window"`
 
 	// RateCeiling validates a per-window EPS ceiling on the receive side.
 	// Empty MaxEPS = check disabled.
@@ -338,9 +349,9 @@ func (r RateCeilingConfig) Enabled() bool { return r.MaxEPS > 0 }
 // every receiver in the case. The check is skipped when total counts are
 // below MinSampleSize (small samples produce spurious imbalance).
 type LoadBalanceConfig struct {
-	Receivers      []string `yaml:"receivers"`
-	MinShareRatio  float64  `yaml:"min_share_ratio"`
-	MinSampleSize  int64    `yaml:"min_sample_size"`
+	Receivers     []string `yaml:"receivers"`
+	MinShareRatio float64  `yaml:"min_share_ratio"`
+	MinSampleSize int64    `yaml:"min_sample_size"`
 }
 
 // Enabled reports whether the load-balance fairness check should run.

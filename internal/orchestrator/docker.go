@@ -155,17 +155,24 @@ services:
 {{- if not .DeferReceiver }}
       - receiver
 {{- end }}
-{{- if .UseSharedData }}
+{{- if or .UseSharedData .TLSCertsHost .GenSampleHost }}
     volumes:
+{{- if .UseSharedData }}
       - "shared-data:/data"
+{{- end }}
+{{- if .TLSCertsHost }}
+      - "{{ .TLSCertsHost }}:/certs:ro"
+{{- end }}
+{{- if .GenSampleHost }}
+      - "{{ .GenSampleHost }}:{{ .GenSampleMount }}:ro"
+{{- end }}
+{{- end }}
+{{- if .UseSharedData }}
     # File-mode tests need the generator to create /data/input.log on the
     # shared volume, which is initialized as root:root 0755. The image's
     # default uid 10001 cannot write there, so override to root for these
     # runs. TCP/HTTP/OTLP/netflow runs leave the hardened uid in place.
     user: "0:0"
-{{- else if .TLSCertsHost }}
-    volumes:
-      - "{{ .TLSCertsHost }}:/certs:ro"
 {{- end }}
     environment:
       GENERATOR_MODE: "{{ .GenMode }}"
@@ -174,6 +181,10 @@ services:
       GENERATOR_DURATION: "{{ .GenDuration }}"
       GENERATOR_LINE_SIZE: "{{ .GenLineSize }}"
       GENERATOR_FORMAT: "{{ .GenFormat }}"
+{{- if .GenSampleHost }}
+      GENERATOR_SAMPLE_FILE: "{{ .GenSampleMount }}"
+      GENERATOR_REWRITE_TIMESTAMP: "{{ .GenRewriteTimestamp }}"
+{{- end }}
       GENERATOR_WARMUP: "{{ .GenWarmup }}"
       GENERATOR_SEQUENCED: "{{ .GenSequenced }}"
       GENERATOR_CONNECTIONS: "{{ .GenConnections }}"
@@ -309,6 +320,12 @@ type RunConfig struct {
 	// path is bind-mounted into the subject and every TLS-using generator
 	// at /certs:ro.
 	TLSCertsHost string
+
+	// GeneratorSampleHost, when non-empty, is the absolute host path of the
+	// log sample file the (singular) generator replays. Set by the runner
+	// from the case's generator.sample_file; bind-mounted into the
+	// generator container.
+	GeneratorSampleHost string
 }
 
 // ComposeRunner manages a docker compose lifecycle for one test run.
@@ -663,6 +680,13 @@ type composeVars struct {
 	GenTLSCA         string
 	GenTLSInsecure   string
 	GenTLSMinVersion string
+	// Sample-replay (singular generator): when GenSampleHost is set the
+	// host sample file is bind-mounted at GenSampleMount and the generator
+	// replays it instead of synthetic lines (rewriting the syslog timestamp
+	// when GenRewriteTimestamp == "true").
+	GenSampleHost       string
+	GenSampleMount      string
+	GenRewriteTimestamp string
 
 	RecvMode              string
 	RecvListen            string
@@ -853,6 +877,11 @@ func writeCompose(path string, cfg RunConfig) error {
 		vars.GenTLSCA = g.TLS.CA
 		vars.GenTLSInsecure = boolStr(g.TLS.InsecureSkipVerify)
 		vars.GenTLSMinVersion = g.TLS.MinVersion
+		if cfg.GeneratorSampleHost != "" {
+			vars.GenSampleHost = filepath.ToSlash(cfg.GeneratorSampleHost)
+			vars.GenSampleMount = "/generator-input/" + filepath.Base(cfg.GeneratorSampleHost)
+			vars.GenRewriteTimestamp = boolStr(g.RewriteTimestamp)
+		}
 	}
 
 	if tc.MultiReceiver() {

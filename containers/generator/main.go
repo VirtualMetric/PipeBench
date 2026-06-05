@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,6 +53,14 @@ type config struct {
 	TLSCA              string
 	TLSInsecureVerify  bool
 	TLSMinVersion      string
+
+	// Sample replay: when SampleLine is non-nil the generator sends it
+	// verbatim (one record per "line") instead of synthetic padding —
+	// loaded from GENERATOR_SAMPLE_FILE. RewriteTimestamp rewrites the
+	// RFC3164 syslog-header date to "now" on each send so records aren't
+	// aged out by time-windowed pipeline logic.
+	SampleLine       []byte
+	RewriteTimestamp bool
 }
 
 type result struct {
@@ -259,6 +268,22 @@ func loadConfig() config {
 	w, err := time.ParseDuration(warmupStr)
 	if err == nil {
 		cfg.Warmup = w
+	}
+
+	// Sample-replay mode: load a verbatim log sample to send instead of
+	// synthetic lines (e.g. a Fortinet CEF record the subject's pipeline
+	// must normalize). Overrides Format. One record per file (trailing
+	// newline trimmed; the send loop re-adds '\n').
+	if sf := os.Getenv("GENERATOR_SAMPLE_FILE"); sf != "" {
+		data, err := os.ReadFile(sf)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "generator: cannot read GENERATOR_SAMPLE_FILE %q: %v\n", sf, err)
+			os.Exit(1)
+		}
+		cfg.SampleLine = []byte(strings.TrimRight(string(data), "\r\n"))
+		cfg.RewriteTimestamp = getEnvBool("GENERATOR_REWRITE_TIMESTAMP", false)
+		fmt.Fprintf(os.Stderr, "generator: sample-replay from %s (%d bytes, rewrite_timestamp=%v)\n",
+			sf, len(cfg.SampleLine), cfg.RewriteTimestamp)
 	}
 
 	cfg.RotateMode = strings.ToLower(strings.TrimSpace(os.Getenv("GENERATOR_ROTATE_MODE")))
@@ -902,7 +927,17 @@ func sendLinesConn(cfg config, connID int, clock *sendClock, write func([]byte) 
 		}
 
 		var line []byte
-		if cfg.Sequenced {
+		if cfg.SampleLine != nil {
+			// Sample-replay: send the loaded record verbatim (optionally
+			// with the syslog header date rewritten to now), '\n'-framed.
+			s := cfg.SampleLine
+			if cfg.RewriteTimestamp {
+				s = rewriteSyslogTimestamp(s, time.Now())
+			}
+			line = make([]byte, 0, len(s)+1)
+			line = append(line, s...)
+			line = append(line, '\n')
+		} else if cfg.Sequenced {
 			line = writeSequencedPrefix(seqBuf, connID, linesSent)
 		} else if linesSent%1000 == 0 {
 			// Sample every 1000th line with a timestamp for latency measurement
@@ -1030,6 +1065,26 @@ func generateLine(size int, format string) []byte {
 		b[size] = '\n'
 		return b
 	}
+}
+
+// rfc3164TimestampRe matches the RFC3164 syslog-header date "MMM D HH:MM:SS"
+// (e.g. "May 14 10:30:32") so sample-replay can refresh it to the send time.
+var rfc3164TimestampRe = regexp.MustCompile(`[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}`)
+
+// rewriteSyslogTimestamp replaces the first RFC3164 timestamp in line with
+// `now`, returning a new slice. If no timestamp matches, line is returned
+// unchanged. Keeps records from being aged out by time-windowed pipelines.
+func rewriteSyslogTimestamp(line []byte, now time.Time) []byte {
+	loc := rfc3164TimestampRe.FindIndex(line)
+	if loc == nil {
+		return line
+	}
+	ts := []byte(now.Format("Jan _2 15:04:05"))
+	out := make([]byte, 0, len(line)-(loc[1]-loc[0])+len(ts))
+	out = append(out, line[:loc[0]]...)
+	out = append(out, ts...)
+	out = append(out, line[loc[1]:]...)
+	return out
 }
 
 const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 "

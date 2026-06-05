@@ -122,6 +122,25 @@ func New(opts Options) *Runner {
 }
 
 // Run executes the test and returns the persisted result.
+// generatorSampleHost returns the absolute host path of the log sample the
+// (singular) generator should replay, resolved from the case's
+// generator.sample_file (relative to the case dir), or "" when unset or
+// missing. Bind-mounted into the generator container by the orchestrator.
+func (r *Runner) generatorSampleHost(tc *config.TestCase) string {
+	sf := tc.Generator.SampleFile
+	if sf == "" {
+		return ""
+	}
+	p, err := filepath.Abs(filepath.Join(r.opts.CasesDir, tc.Name, sf))
+	if err != nil {
+		return ""
+	}
+	if _, err := os.Stat(p); err != nil {
+		return ""
+	}
+	return p
+}
+
 func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
 	if tc.Type == "persistence_correctness" {
 		return r.runPersistenceCorrectness(tc, subject)
@@ -214,6 +233,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		CPULimit:         r.opts.CPULimit,
 		MemLimit:         r.opts.MemLimit,
 		TLSCertsHost:     tlsCertsHost,
+		GeneratorSampleHost: r.generatorSampleHost(tc),
 	}
 
 	cr, err := orchestrator.NewComposeRunner(runCfg)
