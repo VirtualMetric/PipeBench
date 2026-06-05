@@ -1,6 +1,9 @@
 package config
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // Subject describes a benchmarked tool and its container configuration.
 type Subject struct {
@@ -208,5 +211,20 @@ func Lookup(name string) (Subject, error) {
 // WithVersion returns a copy of the Subject with the version overridden.
 func (s Subject) WithVersion(v string) Subject {
 	s.Version = v
+	return s
+}
+
+// WithImage returns a copy of the Subject with the image name overridden.
+// The override accepts an optional ":tag" suffix; when present the tag is
+// split off into Version so ImageRef() still produces a single "image:tag"
+// reference. This lets a caller point a subject at an alternate build of the
+// same tool (e.g. a locally built image) without disturbing the Name-keyed
+// config/capability plumbing, which all keys off Name, not the image.
+func (s Subject) WithImage(image string) Subject {
+	if i := strings.LastIndex(image, ":"); i >= 0 && !strings.Contains(image[i+1:], "/") {
+		s.Version = image[i+1:]
+		image = image[:i]
+	}
+	s.Image = image
 	return s
 }

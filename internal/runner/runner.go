@@ -27,6 +27,10 @@ type Options struct {
 	CollectorImage string
 	// Override subject version (empty = use registry default)
 	SubjectVersion string
+	// Override subject image name (empty = use registry default). May include
+	// an optional ":tag" suffix, which is split into the version. Lets a run
+	// target an alternate build of the same tool without changing its Name.
+	SubjectImage string
 	// Override configuration name (empty = "default")
 	ConfigName string
 	// Skip teardown — leave containers running (useful for debugging)
@@ -157,13 +161,16 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 
 	configName := r.opts.ConfigName
 
-	// Resolve subject version override
+	// Resolve subject image/version overrides
+	if r.opts.SubjectImage != "" {
+		subject = subject.WithImage(r.opts.SubjectImage)
+	}
 	if r.opts.SubjectVersion != "" {
 		subject = subject.WithVersion(r.opts.SubjectVersion)
 	}
 
-	fmt.Printf("→ test=%s  subject=%s  version=%s  config=%s\n",
-		tc.Name, subject.Name, subject.Version, configName)
+	fmt.Printf("→ test=%s  subject=%s  image=%s  version=%s  config=%s\n",
+		tc.Name, subject.Name, subject.Image, subject.Version, configName)
 
 	// Locate subject config file — must be absolute for Docker bind mounts.
 	configSrc, err := tc.ConfigFilePath(r.opts.CasesDir, configName, subject)
@@ -777,12 +784,15 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 //  6. Verify: all logs should arrive with 0% loss
 func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
 	configName := r.opts.ConfigName
+	if r.opts.SubjectImage != "" {
+		subject = subject.WithImage(r.opts.SubjectImage)
+	}
 	if r.opts.SubjectVersion != "" {
 		subject = subject.WithVersion(r.opts.SubjectVersion)
 	}
 
-	fmt.Printf("→ test=%s  subject=%s  version=%s  config=%s\n",
-		tc.Name, subject.Name, subject.Version, configName)
+	fmt.Printf("→ test=%s  subject=%s  image=%s  version=%s  config=%s\n",
+		tc.Name, subject.Name, subject.Image, subject.Version, configName)
 
 	configSrc, err := tc.ConfigFilePath(r.opts.CasesDir, configName, subject)
 	if err != nil {
@@ -1042,12 +1052,15 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 //  7. Drain and verify all logs arrive with 0% loss, 0 duplicates
 func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject config.Subject, crash bool) (results.RunResult, error) {
 	configName := r.opts.ConfigName
+	if r.opts.SubjectImage != "" {
+		subject = subject.WithImage(r.opts.SubjectImage)
+	}
 	if r.opts.SubjectVersion != "" {
 		subject = subject.WithVersion(r.opts.SubjectVersion)
 	}
 
-	fmt.Printf("→ test=%s  subject=%s  version=%s  config=%s\n",
-		tc.Name, subject.Name, subject.Version, configName)
+	fmt.Printf("→ test=%s  subject=%s  image=%s  version=%s  config=%s\n",
+		tc.Name, subject.Name, subject.Image, subject.Version, configName)
 
 	configSrc, err := tc.ConfigFilePath(r.opts.CasesDir, configName, subject)
 	if err != nil {
@@ -1334,12 +1347,15 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 // un-read pre-rotation events are lost.
 func (r *Runner) runPersistenceFileRestartCorrectness(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
 	configName := r.opts.ConfigName
+	if r.opts.SubjectImage != "" {
+		subject = subject.WithImage(r.opts.SubjectImage)
+	}
 	if r.opts.SubjectVersion != "" {
 		subject = subject.WithVersion(r.opts.SubjectVersion)
 	}
 
-	fmt.Printf("→ test=%s  subject=%s  version=%s  config=%s\n",
-		tc.Name, subject.Name, subject.Version, configName)
+	fmt.Printf("→ test=%s  subject=%s  image=%s  version=%s  config=%s\n",
+		tc.Name, subject.Name, subject.Image, subject.Version, configName)
 
 	configSrc, err := tc.ConfigFilePath(r.opts.CasesDir, configName, subject)
 	if err != nil {
