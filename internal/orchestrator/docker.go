@@ -144,7 +144,7 @@ services:
 {{- end }}
     restart: "no"
 {{- end }}
-{{- else }}
+{{- else if .EmitGenerator }}
 
   generator:
     image: "{{ .GeneratorImage }}"
@@ -286,6 +286,24 @@ services:
       COLLECTOR_INTERVAL_SECS: "1"
       COLLECTOR_OUTPUT: "/results/metrics.csv"
     restart: "no"
+{{- range .Endpoints }}
+
+  {{ .Name }}:
+    image: "{{ .Image }}"
+    container_name: "bench-{{ .Name }}"
+    hostname: "{{ .Name }}"
+    networks: [bench]
+{{- if .Command }}
+    command: {{ .Command }}
+{{- end }}
+{{- if .Env }}
+    environment:
+{{- range $k, $v := .Env }}
+      {{ $k }}: "{{ $v }}"
+{{- end }}
+{{- end }}
+    restart: "no"
+{{- end }}
 `
 
 // RunConfig holds parameters for a single test run.
@@ -358,10 +376,12 @@ func (r *ComposeRunner) populateServiceNames() {
 			r.genServices = append(r.genServices, "generator-"+g.ID)
 			r.genContainers = append(r.genContainers, "bench-generator-"+g.ID)
 		}
-	} else {
+	} else if tc.HasGenerator() {
 		r.genServices = []string{"generator"}
 		r.genContainers = []string{"bench-generator"}
 	}
+	// else: no generator configured — leave the lists empty so nothing waits
+	// on or queries a generator container that the compose never renders.
 	r.recvHostPorts = map[string]int{}
 	if tc.MultiReceiver() {
 		for i, rc := range tc.Receivers {
@@ -622,6 +642,15 @@ type receiverTpl struct {
 	HostPort int
 }
 
+// endpointTpl is the per-endpoint template data for the auxiliary containers
+// declared via a case's `endpoints:` list.
+type endpointTpl struct {
+	Name    string
+	Image   string
+	Env     map[string]string
+	Command string // pre-formatted YAML list, empty = use the image's default
+}
+
 type composeVars struct {
 	SubjectImage      string
 	SubjectContainer  string
@@ -638,25 +667,29 @@ type composeVars struct {
 	MemLimit          string
 	UseSharedData     bool
 	DeferReceiver     bool
-	GeneratorImage    string
-	ReceiverImage     string
-	CollectorImage    string
-	ReceiverHostPort  int
-	GenMode           string
-	GenTarget         string
-	GenRate           int
-	GenDuration       string
-	GenLineSize       int
-	GenFormat         string
-	GenWarmup         string
-	GenSequenced      string
-	GenConnections    int
-	GenTotalLines     int64
-	GenEnv            map[string]string
-	GenRotateMode     string
-	GenRotateAt       string
-	GenRotateQuiesce  string
-	GenRotateSuffix   string
+	// EmitGenerator gates the singular `generator:` service. False when the
+	// case configures no generator (data is driven by the subject/endpoints),
+	// so the template renders no generator at all.
+	EmitGenerator    bool
+	GeneratorImage   string
+	ReceiverImage    string
+	CollectorImage   string
+	ReceiverHostPort int
+	GenMode          string
+	GenTarget        string
+	GenRate          int
+	GenDuration      string
+	GenLineSize      int
+	GenFormat        string
+	GenWarmup        string
+	GenSequenced     string
+	GenConnections   int
+	GenTotalLines    int64
+	GenEnv           map[string]string
+	GenRotateMode    string
+	GenRotateAt      string
+	GenRotateQuiesce string
+	GenRotateSuffix  string
 	GenTLSEnabled    bool
 	GenTLSCert       string
 	GenTLSKey        string
@@ -678,6 +711,10 @@ type composeVars struct {
 	// generator-<id> / receiver-<id> services and skips the singular block.
 	Generators []generatorTpl
 	Receivers  []receiverTpl
+
+	// Endpoints are auxiliary containers (a case's `endpoints:` list) emitted
+	// as their own services after the collector.
+	Endpoints []endpointTpl
 
 	// TLSCertsHost is the host directory holding the auto-generated cert
 	// material for TLS-enabled runs. Empty when no generator opts into
@@ -765,12 +802,12 @@ func writeCompose(path string, cfg RunConfig) error {
 		DeferReceiver: tc.Type == "persistence_correctness" ||
 			tc.Type == "persistence_restart_correctness" ||
 			tc.Type == "persistence_crash_correctness",
-		GeneratorImage:    cfg.GeneratorImage,
-		ReceiverImage:     cfg.ReceiverImage,
-		CollectorImage:    cfg.CollectorImage,
-		ReceiverHostPort:  cfg.ReceiverHostPort,
-		GenDuration:       duration,
-		GenWarmup:         warmup,
+		GeneratorImage:   cfg.GeneratorImage,
+		ReceiverImage:    cfg.ReceiverImage,
+		CollectorImage:   cfg.CollectorImage,
+		ReceiverHostPort: cfg.ReceiverHostPort,
+		GenDuration:      duration,
+		GenWarmup:        warmup,
 		// Sequenced lines (CONN=<id> SEQ=<n> ...) are only needed when the
 		// receiver runs a check that requires per-line uniqueness or a
 		// known prefix structure — dedup or content validation. The
@@ -778,15 +815,15 @@ func writeCompose(path string, cfg RunConfig) error {
 		// data into tests like wrapped_json_correctness whose generator
 		// format is "json"; those lines started with CONN= instead of {,
 		// silently failing JSON-parsing subjects (e.g. AxoSyslog).
-		GenSequenced: sequenced,
-		DockerSocketGID:       cfg.DockerSocketGID,
-		TLSCertsHost:          tlsCertsHost,
+		GenSequenced:    sequenced,
+		DockerSocketGID: cfg.DockerSocketGID,
+		TLSCertsHost:    tlsCertsHost,
 
-		RecvValidateDedup:   boolStr(tc.Correctness.ValidateDedup),
-		RecvValidateContent: boolStr(tc.Correctness.ValidateContent),
-		RecvExpectedLines:   0,
+		RecvValidateDedup:     boolStr(tc.Correctness.ValidateDedup),
+		RecvValidateContent:   boolStr(tc.Correctness.ValidateContent),
+		RecvExpectedLines:     0,
 		RecvRequiredSubstring: tc.Correctness.RequiredSubstring,
-		RecvValidateJSON:    tc.Correctness.ValidateJSON,
+		RecvValidateJSON:      tc.Correctness.ValidateJSON,
 		// Arrival timestamp recording is opt-in via the rate_ceiling
 		// check; flipping it on unconditionally would burn memory in
 		// every performance run.
@@ -827,6 +864,7 @@ func writeCompose(path string, cfg RunConfig) error {
 		}
 	} else {
 		g := tc.Generator
+		vars.EmitGenerator = g.Mode != "" || g.Target != ""
 		genLineSize := g.LineSize
 		if genLineSize == 0 {
 			genLineSize = 256
@@ -867,6 +905,27 @@ func writeCompose(path string, cfg RunConfig) error {
 	} else {
 		vars.RecvMode = tc.Receiver.Mode
 		vars.RecvListen = tc.Receiver.Listen
+	}
+
+	for _, ep := range tc.Endpoints {
+		// Compose interpolates "$" in the compose file ($VAR, ${VAR}, $(...)),
+		// which would corrupt an endpoint's inline shell command. Escape "$" to
+		// "$$" so compose passes a literal "$" through to the container shell —
+		// case authors write normal shell ($(date), ${VAR}) and it Just Works.
+		cmd := make([]string, len(ep.Command))
+		for i, c := range ep.Command {
+			cmd[i] = strings.ReplaceAll(c, "$", "$$")
+		}
+		env := map[string]string{}
+		for k, v := range ep.Env {
+			env[k] = strings.ReplaceAll(v, "$", "$$")
+		}
+		vars.Endpoints = append(vars.Endpoints, endpointTpl{
+			Name:    ep.Name,
+			Image:   ep.Image,
+			Env:     env,
+			Command: formatYAMLList(cmd),
+		})
 	}
 
 	tmpl, err := template.New("compose").Parse(composeTemplate)

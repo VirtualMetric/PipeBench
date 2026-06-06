@@ -34,9 +34,38 @@ type TestCase struct {
 	Generators []GeneratorConfig `yaml:"generators"`
 	Receivers  []ReceiverConfig  `yaml:"receivers"`
 
+	// Endpoints are auxiliary containers added to the test topology — hosts the
+	// subject connects to or acts on (e.g. an SSH target the director deploys an
+	// agent onto), as opposed to a generator (input) or receiver (output). Each
+	// becomes its own service on the bench network; Name doubles as the compose
+	// service name, container hostname, and network alias, so the subject config
+	// can reach the endpoint by Name. A case may run with no generator when it
+	// drives data purely through endpoints.
+	Endpoints []Endpoint `yaml:"endpoints"`
+
 	Subjects       []string                 `yaml:"subjects"`
 	Configurations map[string]Configuration `yaml:"configurations"`
 	Correctness    CorrectnessConfig        `yaml:"correctness"`
+}
+
+// Endpoint is an auxiliary container in the test topology (see
+// TestCase.Endpoints). It's a host the subject reaches on the bench network —
+// not a generator or receiver.
+type Endpoint struct {
+	// Name is the compose service name, container hostname, and bench-network
+	// alias. The subject config references the endpoint by this name (e.g. a
+	// device address). Must be unique and must not collide with the reserved
+	// service names (subject, generator, receiver, collector).
+	Name string `yaml:"name"`
+	// Image is the container image to run.
+	Image string `yaml:"image"`
+	// Env is extra environment passed to the container (optional).
+	Env map[string]string `yaml:"env"`
+	// Command overrides the image's default command (optional). Write it as
+	// normal shell — "$" (e.g. $(date), ${VAR}) is passed literally to the
+	// container; the harness escapes it so docker-compose interpolation leaves
+	// it alone.
+	Command []string `yaml:"command"`
 }
 
 // DurationOrDefault parses the Duration field, returning defaultVal on empty/error.
@@ -145,6 +174,15 @@ func (tc *TestCase) MultiGenerator() bool { return len(tc.Generators) > 0 }
 // MultiReceiver reports whether the case uses the plural `receivers:` form.
 func (tc *TestCase) MultiReceiver() bool { return len(tc.Receivers) > 0 }
 
+// HasGenerator reports whether the case configures any traffic generator —
+// either the singular `generator:` or the plural `generators:` form. A case
+// with neither drives data through the subject another way (e.g. an endpoint
+// the subject collects from); the harness then renders no generator service
+// and does not gate the run on a generator exiting.
+func (tc *TestCase) HasGenerator() bool {
+	return tc.MultiGenerator() || tc.Generator.Mode != "" || tc.Generator.Target != ""
+}
+
 // Validate runs structural checks that don't depend on runtime state.
 // Returns an error for cases where the singular and plural forms are both
 // set (ambiguous) or where required IDs on plural entries are missing.
@@ -175,6 +213,25 @@ func (tc *TestCase) Validate() error {
 		}
 		ids[r.ID] = struct{}{}
 	}
+	// Endpoints: require name+image, unique, and not colliding with the fixed
+	// service names the compose template always emits.
+	reserved := map[string]struct{}{"subject": {}, "generator": {}, "receiver": {}, "collector": {}}
+	epNames := map[string]struct{}{}
+	for i, e := range tc.Endpoints {
+		if e.Name == "" {
+			return fmt.Errorf("case %q: endpoints[%d] missing required `name`", tc.Name, i)
+		}
+		if e.Image == "" {
+			return fmt.Errorf("case %q: endpoint %q missing required `image`", tc.Name, e.Name)
+		}
+		if _, bad := reserved[e.Name]; bad {
+			return fmt.Errorf("case %q: endpoint name %q is reserved", tc.Name, e.Name)
+		}
+		if _, dup := epNames[e.Name]; dup {
+			return fmt.Errorf("case %q: duplicate endpoint name %q", tc.Name, e.Name)
+		}
+		epNames[e.Name] = struct{}{}
+	}
 	return nil
 }
 
@@ -185,14 +242,14 @@ type GeneratorConfig struct {
 	// downstream receiver. Required when used inside `generators:`; ignored
 	// for the singular `generator:` form (the container is always
 	// `bench-generator` there).
-	ID          string            `yaml:"id"`
-	Mode        string            `yaml:"mode"`        // "tcp" | "file" | "http" | "udp" | "udp_netflow_v5" | "otlp"
-	Target      string            `yaml:"target"`      // "subject:9000" or file path
-	Rate        int               `yaml:"rate"`        // lines/sec per connection, 0 = unlimited
-	TotalLines  int64             `yaml:"total_lines"` // total lines to send, 0 = use duration
-	LineSize    int               `yaml:"line_size"`   // bytes per line
-	Format      string            `yaml:"format"`      // "raw" | "syslog" | "json"
-	Connections int               `yaml:"connections"` // parallel connections (default 1)
+	ID          string `yaml:"id"`
+	Mode        string `yaml:"mode"`        // "tcp" | "file" | "http" | "udp" | "udp_netflow_v5" | "otlp"
+	Target      string `yaml:"target"`      // "subject:9000" or file path
+	Rate        int    `yaml:"rate"`        // lines/sec per connection, 0 = unlimited
+	TotalLines  int64  `yaml:"total_lines"` // total lines to send, 0 = use duration
+	LineSize    int    `yaml:"line_size"`   // bytes per line
+	Format      string `yaml:"format"`      // "raw" | "syslog" | "json"
+	Connections int    `yaml:"connections"` // parallel connections (default 1)
 	// Env is mode-specific extra env passed straight through to the
 	// generator container (e.g. GENERATOR_OTLP_TRANSPORT=grpc). Lets a
 	// case dial in transport variants without growing GeneratorConfig
@@ -297,13 +354,22 @@ type CorrectnessConfig struct {
 	// stays honest.
 	ExpectedMultiplier int `yaml:"expected_multiplier"`
 
+	// MinReceived is the minimum number of records the receiver must observe
+	// for a case with NO generator to pass (the subject produces data on its
+	// own — e.g. an agentless deploy that collects from an endpoint and
+	// forwards to the receiver). With no generator there's no line count to
+	// derive loss/over-delivery from, so the verdict is simply
+	// "LinesReceived >= MinReceived" (default 1) AND the receiver didn't flag a
+	// content failure. Ignored when the case has a generator.
+	MinReceived int64 `yaml:"min_received"`
+
 	// DrainSeconds extends how long the harness waits for backlog to
 	// arrive after the generator(s) stop. The case still finishes early if
 	// the receiver stays quiet for DrainQuietWindow. Useful for cases that
 	// validate throttled output draining a queue (the receiver is still
 	// arriving long after the generator is done).
-	DrainSeconds      int    `yaml:"drain_seconds"`
-	DrainQuietWindow  string `yaml:"drain_quiet_window"`
+	DrainSeconds     int    `yaml:"drain_seconds"`
+	DrainQuietWindow string `yaml:"drain_quiet_window"`
 
 	// RateCeiling validates a per-window EPS ceiling on the receive side.
 	// Empty MaxEPS = check disabled.
@@ -338,9 +404,9 @@ func (r RateCeilingConfig) Enabled() bool { return r.MaxEPS > 0 }
 // every receiver in the case. The check is skipped when total counts are
 // below MinSampleSize (small samples produce spurious imbalance).
 type LoadBalanceConfig struct {
-	Receivers      []string `yaml:"receivers"`
-	MinShareRatio  float64  `yaml:"min_share_ratio"`
-	MinSampleSize  int64    `yaml:"min_sample_size"`
+	Receivers     []string `yaml:"receivers"`
+	MinShareRatio float64  `yaml:"min_share_ratio"`
+	MinSampleSize int64    `yaml:"min_sample_size"`
 }
 
 // Enabled reports whether the load-balance fairness check should run.
