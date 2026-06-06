@@ -261,6 +261,12 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	_ = orch.Down()
 
 	startTime := time.Now()
+	// Hard wall on total runtime. applyDefaults() guarantees Timeout > 0.
+	// In generator mode WaitForGeneratorExit is already capped by Timeout;
+	// the generator-less path and the drain loops below have no send phase
+	// to bound them, so clamp their waits/deadlines to this so a run never
+	// overruns Options.Timeout.
+	runDeadline := startTime.Add(r.opts.Timeout)
 
 	fmt.Println("  starting containers…")
 	if err := orch.Up(); err != nil {
@@ -295,8 +301,14 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		// There's no send phase to wait on — give the subject a brief head start,
 		// then fall through to the receiver-drain loop, which waits for data to
 		// arrive and stabilize (bounded by correctness.drain_seconds).
-		fmt.Printf("  no generator — letting the subject run (head start %s)…\n", warmup)
-		time.Sleep(warmup)
+		headStart := warmup
+		if rem := time.Until(runDeadline); rem < headStart {
+			headStart = rem
+		}
+		fmt.Printf("  no generator — letting the subject run (head start %s)…\n", headStart)
+		if headStart > 0 {
+			time.Sleep(headStart)
+		}
 	}
 
 	metricsPort, stopPortFwd, err := orch.ReceiverMetricsPort()
@@ -314,6 +326,9 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		const quietPolls = 6 // 30s stable window
 		ports := orch.ReceiverMetricsPorts()
 		drainDeadline := time.Now().Add(r.opts.Drain)
+		if drainDeadline.After(runDeadline) {
+			drainDeadline = runDeadline
+		}
 		var drainStable int
 		var drainLast int64
 		drainStart := time.Now()
@@ -347,6 +362,9 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		}
 	} else if tc.Type == "performance" {
 		drainGrace := tc.DrainGraceOrDefault(5 * time.Second)
+		if rem := time.Until(runDeadline); rem < drainGrace {
+			drainGrace = rem
+		}
 		if drainGrace > 0 {
 			fmt.Printf("  waiting post-send receive grace (%s)…\n", drainGrace)
 			time.Sleep(drainGrace)
@@ -374,6 +392,9 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		}
 		ports := orch.ReceiverMetricsPorts()
 		drainDeadline := time.Now().Add(drainTimeout)
+		if drainDeadline.After(runDeadline) {
+			drainDeadline = runDeadline
+		}
 		var drainStable int
 		var drainLast int64
 		for time.Now().Before(drainDeadline) {

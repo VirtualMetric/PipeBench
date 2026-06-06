@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -226,6 +227,12 @@ func (tc *TestCase) Validate() error {
 		}
 		if _, bad := reserved[e.Name]; bad {
 			return fmt.Errorf("case %q: endpoint name %q is reserved", tc.Name, e.Name)
+		}
+		// Plural generators/receivers render dynamic compose services named
+		// `generator-<id>` / `receiver-<id>`. An endpoint sharing that prefix
+		// would collide with those service names, so reject it too.
+		if strings.HasPrefix(e.Name, "generator-") || strings.HasPrefix(e.Name, "receiver-") {
+			return fmt.Errorf("case %q: endpoint name %q is reserved (collides with dynamic generator-/receiver- service names)", tc.Name, e.Name)
 		}
 		if _, dup := epNames[e.Name]; dup {
 			return fmt.Errorf("case %q: duplicate endpoint name %q", tc.Name, e.Name)

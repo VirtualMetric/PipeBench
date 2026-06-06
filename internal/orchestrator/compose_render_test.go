@@ -219,10 +219,13 @@ func TestComposeRendersEndpoints(t *testing.T) {
 // required name+image, no reserved names, no duplicates.
 func TestValidateRejectsBadEndpoints(t *testing.T) {
 	bad := map[string][]config.Endpoint{
-		"reserved name": {{Name: "collector", Image: "x"}},
-		"missing image": {{Name: "ep1"}},
-		"missing name":  {{Image: "x"}},
-		"duplicate":     {{Name: "ep1", Image: "x"}, {Name: "ep1", Image: "y"}},
+		"reserved name":               {{Name: "collector", Image: "x"}},
+		"missing image":               {{Name: "ep1"}},
+		"missing name":                {{Image: "x"}},
+		"duplicate":                   {{Name: "ep1", Image: "x"}, {Name: "ep1", Image: "y"}},
+		"dynamic generator collision": {{Name: "generator-1", Image: "x"}},
+		"dynamic generator named id":  {{Name: "generator-xyz", Image: "x"}},
+		"dynamic receiver collision":  {{Name: "receiver-42", Image: "x"}},
 	}
 	for label, eps := range bad {
 		tc := &config.TestCase{Name: "bad", Endpoints: eps}
