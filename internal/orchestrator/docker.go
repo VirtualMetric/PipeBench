@@ -729,6 +729,29 @@ type composeVars struct {
 	TLSCertsHost string
 }
 
+// resolveSampleHost resolves a generator's case-relative sample_file to the
+// host path bind-mounted into the generator container, returning the
+// forward-slashed host path and the in-container destination. It fails fast
+// rather than silently skipping the mount: a missing case directory or a
+// missing/non-regular file would otherwise leave GENERATOR_SAMPLE_FILE
+// pointing at a path that was never mounted, so compose rendering must not
+// proceed with an unresolved sample_file. sample_file is validated to be a
+// safe case-relative path at config load time (see config.validateSampleFile).
+func resolveSampleHost(caseDir, sampleFile string) (host, dst string, err error) {
+	if caseDir == "" {
+		return "", "", fmt.Errorf("sample_file %q set but case directory is empty", sampleFile)
+	}
+	hostPath := filepath.Join(caseDir, sampleFile)
+	info, statErr := os.Stat(hostPath)
+	if statErr != nil {
+		return "", "", fmt.Errorf("sample_file %q: %w", sampleFile, statErr)
+	}
+	if !info.Mode().IsRegular() {
+		return "", "", fmt.Errorf("sample_file %q is not a regular file", hostPath)
+	}
+	return filepath.ToSlash(hostPath), "/input/" + filepath.Base(sampleFile), nil
+}
+
 func writeCompose(path string, cfg RunConfig) error {
 	tc := cfg.TestCase
 	s := cfg.Subject
@@ -850,10 +873,14 @@ func writeCompose(path string, cfg RunConfig) error {
 			}
 			// Sample-file replay (same wiring as the singular path).
 			sampleFile, sampleHost, sampleDst := "", "", ""
-			if g.SampleFile != "" && cfg.CaseDir != "" {
-				sampleHost = filepath.ToSlash(filepath.Join(cfg.CaseDir, g.SampleFile))
-				sampleDst = "/input/" + filepath.Base(g.SampleFile)
-				sampleFile = sampleDst
+			if g.SampleFile != "" {
+				host, dst, err := resolveSampleHost(cfg.CaseDir, g.SampleFile)
+				if err != nil {
+					return err
+				}
+				sampleHost = host
+				sampleDst = dst
+				sampleFile = dst
 			}
 			vars.Generators = append(vars.Generators, generatorTpl{
 				ID:               g.ID,
@@ -911,10 +938,14 @@ func writeCompose(path string, cfg RunConfig) error {
 		// Sample-file replay: bind-mount the case's input file into the
 		// generator and point GENERATOR_SAMPLE_FILE at it. Path in case.yaml
 		// is relative to the case directory.
-		if g.SampleFile != "" && cfg.CaseDir != "" {
-			vars.GenSampleFileHost = filepath.ToSlash(filepath.Join(cfg.CaseDir, g.SampleFile))
-			vars.GenSampleFileDst = "/input/" + filepath.Base(g.SampleFile)
-			vars.GenSampleFile = vars.GenSampleFileDst
+		if g.SampleFile != "" {
+			host, dst, err := resolveSampleHost(cfg.CaseDir, g.SampleFile)
+			if err != nil {
+				return err
+			}
+			vars.GenSampleFileHost = host
+			vars.GenSampleFileDst = dst
+			vars.GenSampleFile = dst
 			vars.GenRewriteTimestamp = g.RewriteTimestamp
 		}
 	}

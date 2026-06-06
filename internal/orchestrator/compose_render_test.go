@@ -186,6 +186,9 @@ func TestSingularComposeRendersSampleFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(tmp)
+	// writeCompose now resolves and verifies the sample file on disk, so the
+	// case-relative input must actually exist.
+	writeSampleFile(t, tmp, "input/sample.cef")
 	composePath := filepath.Join(tmp, "compose.yaml")
 	cfg := RunConfig{
 		TestCase: tc, Subject: subj, ConfigName: "default",
@@ -231,6 +234,8 @@ func TestPluralComposeRendersSampleFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(tmp)
+	// The opted-in generator's sample file must exist on disk for writeCompose.
+	writeSampleFile(t, tmp, "input/a.cef")
 	composePath := filepath.Join(tmp, "compose.yaml")
 	cfg := RunConfig{
 		TestCase: tc, Subject: subj, ConfigName: "default",
@@ -256,6 +261,19 @@ func TestPluralComposeRendersSampleFile(t *testing.T) {
 	}
 	if n := strings.Count(out, "GENERATOR_REWRITE_TIMESTAMP:"); n != 1 {
 		t.Errorf("expected exactly 1 GENERATOR_REWRITE_TIMESTAMP, got %d:\n%s", n, out)
+	}
+}
+
+// writeSampleFile creates a non-empty sample file at caseDir/relPath
+// (creating parent dirs) so writeCompose's sample-file existence check passes.
+func writeSampleFile(t *testing.T, caseDir, relPath string) {
+	t.Helper()
+	full := filepath.Join(caseDir, relPath)
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(full, []byte("sample line\n"), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }
 

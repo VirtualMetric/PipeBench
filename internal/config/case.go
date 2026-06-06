@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -165,6 +166,11 @@ func (tc *TestCase) Validate() error {
 		}
 		ids[g.ID] = struct{}{}
 	}
+	for _, g := range tc.AllGenerators() {
+		if err := validateSampleFile(tc.Name, g.SampleFile); err != nil {
+			return err
+		}
+	}
 	ids = map[string]struct{}{}
 	for i, r := range tc.Receivers {
 		if r.ID == "" {
@@ -174,6 +180,25 @@ func (tc *TestCase) Validate() error {
 			return fmt.Errorf("case %q: duplicate receiver id %q", tc.Name, r.ID)
 		}
 		ids[r.ID] = struct{}{}
+	}
+	return nil
+}
+
+// validateSampleFile rejects sample_file paths that are absolute or escape the
+// case directory. The orchestrator builds the host bind-mount path by joining
+// the case directory with this value (see writeCompose); an absolute path or
+// one containing ".." segments would let a case mount an arbitrary host file
+// into the generator container. The path is required to stay case-relative.
+func validateSampleFile(caseName, sampleFile string) error {
+	if sampleFile == "" {
+		return nil
+	}
+	if filepath.IsAbs(sampleFile) {
+		return fmt.Errorf("case %q: sample_file %q must be a case-relative path, not absolute", caseName, sampleFile)
+	}
+	cleaned := filepath.Clean(sampleFile)
+	if cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("case %q: sample_file %q must not escape the case directory", caseName, sampleFile)
 	}
 	return nil
 }

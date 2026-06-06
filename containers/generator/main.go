@@ -35,6 +35,11 @@ type config struct {
 	// to reach TotalLines/Duration) instead of synthesizing them; Format then
 	// no longer drives line content.
 	SampleFile string
+	// SampleLines holds the sample file's lines, preloaded once at startup
+	// (see main) so the N parallel connection workers reuse the same buffers
+	// instead of each re-reading and re-parsing the file. Populated only when
+	// SampleFile is set.
+	SampleLines [][]byte
 	// RewriteTimestamp rewrites each replayed line's leading RFC3164 syslog
 	// date ("Mmm _d hh:mm:ss") to the current time at send. Sample-file only.
 	RewriteTimestamp bool
@@ -108,6 +113,22 @@ func (sc *sendClock) Bounds() (first, last int64) {
 
 func main() {
 	cfg := loadConfig()
+
+	// Sample-file replay: load and parse the file once here so the parallel
+	// connection workers (sendLinesConn) reuse the same line buffers instead
+	// of each re-reading the file. Empty-file validation happens here too.
+	if cfg.SampleFile != "" {
+		lines, err := loadSampleLines(cfg.SampleFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "generator error: %v\n", err)
+			os.Exit(1)
+		}
+		if len(lines) == 0 {
+			fmt.Fprintf(os.Stderr, "generator error: sample file %q contains no lines\n", cfg.SampleFile)
+			os.Exit(1)
+		}
+		cfg.SampleLines = lines
+	}
 
 	if cfg.Warmup > 0 {
 		waitForWarmup(cfg)
@@ -830,21 +851,12 @@ func sendLines(cfg config, clock *sendClock, write func([]byte) error) (int64, i
 // sendLinesConn is like sendLines but tags sequenced lines with the connection id
 // so duplicates across connections can be distinguished.
 func sendLinesConn(cfg config, connID int, clock *sendClock, write func([]byte) error) (int64, int64, error) {
-	// Sample-file replay: load the file's lines once and send them verbatim,
-	// cycling to reach TotalLines/Duration. Takes precedence over sequenced /
-	// timestamped synthesis — you can't inject SEQ= into a real CEF record
-	// without corrupting it.
-	var sampleLines [][]byte
-	if cfg.SampleFile != "" {
-		var lerr error
-		sampleLines, lerr = loadSampleLines(cfg.SampleFile)
-		if lerr != nil {
-			return 0, 0, lerr
-		}
-		if len(sampleLines) == 0 {
-			return 0, 0, fmt.Errorf("sample file %q contains no lines", cfg.SampleFile)
-		}
-	}
+	// Sample-file replay: send the preloaded lines verbatim, cycling to reach
+	// TotalLines/Duration. Takes precedence over sequenced / timestamped
+	// synthesis — you can't inject SEQ= into a real CEF record without
+	// corrupting it. Lines are loaded once at startup (see main) and shared
+	// across all connection workers, so we just read them here.
+	sampleLines := cfg.SampleLines
 
 	// Pre-generate a template line for performance tests (skipped in
 	// sample-file mode). For sequenced (correctness) mode, each line is unique.
