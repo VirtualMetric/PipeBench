@@ -54,8 +54,6 @@ services:
     depends_on:
       redpanda-init:
         condition: service_completed_successfully
-      receiver:
-        condition: service_started
 {{- end }}
     volumes:
       - "{{ .ConfigSrc }}:{{ .ConfigDst }}{{ .ConfigMountOpts }}"

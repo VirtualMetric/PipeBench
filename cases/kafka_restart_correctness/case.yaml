@@ -1,0 +1,41 @@
+name: kafka_restart_correctness
+type: kafka_restart_correctness
+description: "Graceful-restart (SIGTERM) durability: subject consumes from Kafka while the receiver is down, is stopped, restarted, and must deliver every record"
+
+duration: 30s
+# The subject (Kafka consumer) reads from LATEST, so it must have joined the
+# group before the generator produces — warmup must exceed the director's
+# startup (~15-21s). Phase 1 starts the subject; the generator's warmup then
+# holds production until the consumer is subscribed.
+warmup: 30s
+
+kafka:
+  topic: bench
+  partitions: 1
+
+generator:
+  mode: kafka
+  target: "redpanda:9092"
+  format: json
+  rate: 0
+  line_size: 256
+  connections: 1
+  total_lines: 2000
+  kafka_batch: 1
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+subjects:
+  - vmetric
+
+correctness:
+  # At-least-once: every produced record must reach the receiver after the
+  # restart (0% loss). Duplicates from recovery are allowed (over-delivery is
+  # reported, not failed — see the runner's kafka handling).
+  expected_loss_pct: 0.0
+
+configurations:
+  default:
+    description: "Consume from Kafka with crash_resistance; SIGTERM the subject, restart, verify no loss"

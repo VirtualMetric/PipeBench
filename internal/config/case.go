@@ -262,6 +262,14 @@ func (tc *TestCase) IsCorrectnessType() bool {
 	return tc.Type == "correctness" || tc.Type == "kafka_correctness"
 }
 
+// IsKafkaType reports whether the case drives the subject through a Kafka
+// topology (any `kafka_*` type). Kafka consumption is at-least-once: crash and
+// restart recovery can legitimately re-deliver records, so the verdict must
+// allow over-delivery (duplicates) while still forbidding loss.
+func (tc *TestCase) IsKafkaType() bool {
+	return strings.HasPrefix(tc.Type, "kafka_")
+}
+
 // Validate runs structural checks that don't depend on runtime state.
 // Returns an error for cases where the singular and plural forms are both
 // set (ambiguous) or where required IDs on plural entries are missing.
@@ -323,7 +331,7 @@ func (tc *TestCase) Validate() error {
 		epNames[e.Name] = struct{}{}
 	}
 	// Kafka types require the broker block + a generator producing in kafka mode.
-	if tc.Type == "kafka_performance" || tc.Type == "kafka_correctness" {
+	if tc.IsKafkaType() {
 		if tc.Kafka == nil {
 			return fmt.Errorf("case %q: type %q requires a `kafka:` block", tc.Name, tc.Type)
 		}
