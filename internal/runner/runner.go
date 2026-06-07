@@ -214,11 +214,20 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		tlsCertsHost = path
 	}
 
+	// CaseDir must be absolute: the orchestrator turns it into a host bind
+	// mount for sample_file replay, and Docker resolves relative bind paths
+	// against the compose file's directory (the temp dir), not our cwd.
+	caseDir, err := filepath.Abs(filepath.Join(r.opts.CasesDir, tc.Name))
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("resolving case directory: %w", err)
+	}
+
 	runCfg := orchestrator.RunConfig{
 		TestCase:         tc,
 		Subject:          subject,
 		ConfigName:       configName,
 		ConfigSrcPath:    configSrc,
+		CaseDir:          caseDir,
 		TmpDir:           tmpDir,
 		GeneratorImage:   r.opts.GeneratorImage,
 		ReceiverImage:    r.opts.ReceiverImage,
@@ -866,11 +875,20 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 		}
 	}
 
+	// CaseDir must be absolute: the orchestrator turns it into a host bind
+	// mount for sample_file replay, and Docker resolves relative bind paths
+	// against the compose file's directory (the temp dir), not our cwd.
+	caseDir, err := filepath.Abs(filepath.Join(r.opts.CasesDir, tc.Name))
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("resolving case directory: %w", err)
+	}
+
 	runCfg := orchestrator.RunConfig{
 		TestCase:         tc,
 		Subject:          subject,
 		ConfigName:       configName,
 		ConfigSrcPath:    configSrc,
+		CaseDir:          caseDir,
 		TmpDir:           tmpDir,
 		GeneratorImage:   r.opts.GeneratorImage,
 		ReceiverImage:    r.opts.ReceiverImage,
@@ -1129,11 +1147,20 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 		}
 	}
 
+	// CaseDir must be absolute: the orchestrator turns it into a host bind
+	// mount for sample_file replay, and Docker resolves relative bind paths
+	// against the compose file's directory (the temp dir), not our cwd.
+	caseDir, err := filepath.Abs(filepath.Join(r.opts.CasesDir, tc.Name))
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("resolving case directory: %w", err)
+	}
+
 	runCfg := orchestrator.RunConfig{
 		TestCase:         tc,
 		Subject:          subject,
 		ConfigName:       configName,
 		ConfigSrcPath:    configSrc,
+		CaseDir:          caseDir,
 		TmpDir:           tmpDir,
 		GeneratorImage:   r.opts.GeneratorImage,
 		ReceiverImage:    r.opts.ReceiverImage,
@@ -1416,11 +1443,20 @@ func (r *Runner) runPersistenceFileRestartCorrectness(tc *config.TestCase, subje
 		}
 	}
 
+	// CaseDir must be absolute: the orchestrator turns it into a host bind
+	// mount for sample_file replay, and Docker resolves relative bind paths
+	// against the compose file's directory (the temp dir), not our cwd.
+	caseDir, err := filepath.Abs(filepath.Join(r.opts.CasesDir, tc.Name))
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("resolving case directory: %w", err)
+	}
+
 	runCfg := orchestrator.RunConfig{
 		TestCase:         tc,
 		Subject:          subject,
 		ConfigName:       configName,
 		ConfigSrcPath:    configSrc,
+		CaseDir:          caseDir,
 		TmpDir:           tmpDir,
 		GeneratorImage:   r.opts.GeneratorImage,
 		ReceiverImage:    r.opts.ReceiverImage,

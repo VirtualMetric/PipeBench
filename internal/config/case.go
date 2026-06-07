@@ -204,6 +204,11 @@ func (tc *TestCase) Validate() error {
 		}
 		ids[g.ID] = struct{}{}
 	}
+	for _, g := range tc.AllGenerators() {
+		if err := validateSampleFile(tc.Name, g.SampleFile); err != nil {
+			return err
+		}
+	}
 	ids = map[string]struct{}{}
 	for i, r := range tc.Receivers {
 		if r.ID == "" {
@@ -242,6 +247,25 @@ func (tc *TestCase) Validate() error {
 	return nil
 }
 
+// validateSampleFile rejects sample_file paths that are absolute or escape the
+// case directory. The orchestrator builds the host bind-mount path by joining
+// the case directory with this value (see writeCompose); an absolute path or
+// one containing ".." segments would let a case mount an arbitrary host file
+// into the generator container. The path is required to stay case-relative.
+func validateSampleFile(caseName, sampleFile string) error {
+	if sampleFile == "" {
+		return nil
+	}
+	if filepath.IsAbs(sampleFile) {
+		return fmt.Errorf("case %q: sample_file %q must be a case-relative path, not absolute", caseName, sampleFile)
+	}
+	cleaned := filepath.Clean(sampleFile)
+	if cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("case %q: sample_file %q must not escape the case directory", caseName, sampleFile)
+	}
+	return nil
+}
+
 type GeneratorConfig struct {
 	// ID is only meaningful in the plural `generators:` form. It names the
 	// docker-compose service (`generator-<id>`) and, in sequenced/correctness
@@ -257,6 +281,18 @@ type GeneratorConfig struct {
 	LineSize    int    `yaml:"line_size"`   // bytes per line
 	Format      string `yaml:"format"`      // "raw" | "syslog" | "json"
 	Connections int    `yaml:"connections"` // parallel connections (default 1)
+	// SampleFile replays a fixed input file instead of synthesizing lines.
+	// Path is relative to the case directory (e.g. "input/sample.cef"). When
+	// set, the generator sends the file's lines verbatim, cycling to reach
+	// total_lines/duration — `format` no longer drives line content. The
+	// harness bind-mounts the file into the generator container at /input.
+	// Honored in both the singular `generator:` and plural `generators:` forms
+	// (each plural generator gets its own bind mount + GENERATOR_SAMPLE_FILE).
+	SampleFile string `yaml:"sample_file"`
+	// RewriteTimestamp, with SampleFile, rewrites each replayed line's leading
+	// RFC3164 syslog date ("Mmm _d hh:mm:ss") to the current time at send so
+	// records aren't dropped as stale. No effect without SampleFile.
+	RewriteTimestamp bool `yaml:"rewrite_timestamp"`
 	// Env is mode-specific extra env passed straight through to the
 	// generator container (e.g. GENERATOR_OTLP_TRANSPORT=grpc). Lets a
 	// case dial in transport variants without growing GeneratorConfig

@@ -162,6 +162,121 @@ func TestValidateRejectsBothForms(t *testing.T) {
 	}
 }
 
+// TestSingularComposeRendersSampleFile verifies the singular generator's
+// sample_file replay wiring: the input file is bind-mounted read-only at
+// /input/<base> and GENERATOR_SAMPLE_FILE / GENERATOR_REWRITE_TIMESTAMP are set.
+func TestSingularComposeRendersSampleFile(t *testing.T) {
+	tc := &config.TestCase{
+		Name:     "smoke-sample",
+		Type:     "correctness",
+		Duration: "10s",
+		Generator: config.GeneratorConfig{
+			Mode:             "tcp",
+			Target:           "subject:9000",
+			Format:           "cef",
+			SampleFile:       "input/sample.cef",
+			RewriteTimestamp: true,
+			TotalLines:       10,
+		},
+		Receiver: config.ReceiverConfig{Mode: "tcp", Listen: ":9001"},
+	}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.1", ConfigPath: "/config.yml"}
+	tmp, err := os.MkdirTemp("", "compose-sample-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmp)
+	// writeCompose now resolves and verifies the sample file on disk, so the
+	// case-relative input must actually exist.
+	writeSampleFile(t, tmp, "input/sample.cef")
+	composePath := filepath.Join(tmp, "compose.yaml")
+	cfg := RunConfig{
+		TestCase: tc, Subject: subj, ConfigName: "default",
+		ConfigSrcPath: composePath, CaseDir: tmp, TmpDir: tmp,
+		GeneratorImage: "img-gen", ReceiverImage: "img-recv", CollectorImage: "img-coll",
+		ReceiverHostPort: 19001,
+	}
+	if err := writeCompose(composePath, cfg); err != nil {
+		t.Fatalf("writeCompose: %v", err)
+	}
+	data, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(data)
+	wantHost := filepath.ToSlash(filepath.Join(tmp, "input/sample.cef"))
+	mustContain(t, out, wantHost+":/input/sample.cef:ro")
+	mustContain(t, out, "GENERATOR_SAMPLE_FILE: \"/input/sample.cef\"")
+	mustContain(t, out, "GENERATOR_REWRITE_TIMESTAMP: \"true\"")
+}
+
+// TestPluralComposeRendersSampleFile verifies per-generator sample_file replay
+// in the plural form: the generator that opts in gets its own bind mount +
+// GENERATOR_SAMPLE_FILE, and the one that doesn't gets neither (per-generator
+// gating, not a global flag).
+func TestPluralComposeRendersSampleFile(t *testing.T) {
+	tc := &config.TestCase{
+		Name:     "smoke-plural-sample",
+		Type:     "correctness",
+		Duration: "10s",
+		Generators: []config.GeneratorConfig{
+			{ID: "src-a", Mode: "tcp", Target: "subject:9000", Format: "cef", SampleFile: "input/a.cef", RewriteTimestamp: true, Connections: 1, TotalLines: 10},
+			{ID: "src-b", Mode: "tcp", Target: "subject:9000", Format: "raw", Connections: 1},
+		},
+		Receivers: []config.ReceiverConfig{{ID: "sink", Mode: "tcp", Listen: ":9001"}},
+	}
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.1", ConfigPath: "/config.yml"}
+	tmp, err := os.MkdirTemp("", "compose-plural-sample-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmp)
+	// The opted-in generator's sample file must exist on disk for writeCompose.
+	writeSampleFile(t, tmp, "input/a.cef")
+	composePath := filepath.Join(tmp, "compose.yaml")
+	cfg := RunConfig{
+		TestCase: tc, Subject: subj, ConfigName: "default",
+		ConfigSrcPath: composePath, CaseDir: tmp, TmpDir: tmp,
+		GeneratorImage: "img-gen", ReceiverImage: "img-recv", CollectorImage: "img-coll",
+		ReceiverHostPort: 19001,
+	}
+	if err := writeCompose(composePath, cfg); err != nil {
+		t.Fatalf("writeCompose: %v", err)
+	}
+	data, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(data)
+	wantHost := filepath.ToSlash(filepath.Join(tmp, "input/a.cef"))
+	mustContain(t, out, wantHost+":/input/a.cef:ro")
+	mustContain(t, out, "GENERATOR_SAMPLE_FILE: \"/input/a.cef\"")
+	mustContain(t, out, "GENERATOR_REWRITE_TIMESTAMP: \"true\"")
+	// Per-generator gating: src-b opted out, so exactly one of each appears.
+	if n := strings.Count(out, "GENERATOR_SAMPLE_FILE:"); n != 1 {
+		t.Errorf("expected exactly 1 GENERATOR_SAMPLE_FILE, got %d:\n%s", n, out)
+	}
+	if n := strings.Count(out, "GENERATOR_REWRITE_TIMESTAMP:"); n != 1 {
+		t.Errorf("expected exactly 1 GENERATOR_REWRITE_TIMESTAMP, got %d:\n%s", n, out)
+	}
+}
+
+// writeSampleFile creates a non-empty sample file at caseDir/relPath
+// (creating parent dirs) so writeCompose's sample-file existence check passes.
+func writeSampleFile(t *testing.T, caseDir, relPath string) {
+	t.Helper()
+	full := filepath.Join(caseDir, relPath)
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(full, []byte("sample line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestComposeRendersEndpoints verifies a case's `endpoints:` list renders as
 // extra services on the bench network — name → service/container/hostname —
 // with optional env and command, alongside the usual subject/generator/receiver.
