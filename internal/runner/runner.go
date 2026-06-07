@@ -73,20 +73,20 @@ func (o *Options) applyDefaults() {
 
 // ReceiverMetrics is the JSON response from the receiver's /metrics endpoint.
 type ReceiverMetrics struct {
-	LinesReceived   int64    `json:"lines_received"`
-	BytesReceived   int64    `json:"bytes_received"`
-	Done            bool     `json:"done"`
-	FirstReceivedNs int64    `json:"first_received_ns"`
-	LastReceivedNs  int64    `json:"last_received_ns"`
-	Passed          *bool    `json:"passed,omitempty"`
-	Errors          []string `json:"errors,omitempty"`
-	UniqueLines     int64    `json:"unique_lines,omitempty"`
-	Duplicates      int64    `json:"duplicates,omitempty"`
-	MalformedLines  int64    `json:"malformed_lines,omitempty"`
-	InvalidJSONLines int64   `json:"invalid_json_lines,omitempty"`
-	LatencyP50Ms    float64  `json:"latency_p50_ms,omitempty"`
-	LatencyP95Ms    float64  `json:"latency_p95_ms,omitempty"`
-	LatencyP99Ms    float64  `json:"latency_p99_ms,omitempty"`
+	LinesReceived    int64    `json:"lines_received"`
+	BytesReceived    int64    `json:"bytes_received"`
+	Done             bool     `json:"done"`
+	FirstReceivedNs  int64    `json:"first_received_ns"`
+	LastReceivedNs   int64    `json:"last_received_ns"`
+	Passed           *bool    `json:"passed,omitempty"`
+	Errors           []string `json:"errors,omitempty"`
+	UniqueLines      int64    `json:"unique_lines,omitempty"`
+	Duplicates       int64    `json:"duplicates,omitempty"`
+	MalformedLines   int64    `json:"malformed_lines,omitempty"`
+	InvalidJSONLines int64    `json:"invalid_json_lines,omitempty"`
+	LatencyP50Ms     float64  `json:"latency_p50_ms,omitempty"`
+	LatencyP95Ms     float64  `json:"latency_p95_ms,omitempty"`
+	LatencyP99Ms     float64  `json:"latency_p99_ms,omitempty"`
 }
 
 // GeneratorResult is the JSON output from the generator container.
@@ -270,6 +270,12 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	_ = orch.Down()
 
 	startTime := time.Now()
+	// Hard wall on total runtime. applyDefaults() guarantees Timeout > 0.
+	// In generator mode WaitForGeneratorExit is already capped by Timeout;
+	// the generator-less path and the drain loops below have no send phase
+	// to bound them, so clamp their waits/deadlines to this so a run never
+	// overruns Options.Timeout.
+	runDeadline := startTime.Add(r.opts.Timeout)
 
 	fmt.Println("  starting containers…")
 	if err := orch.Up(); err != nil {
@@ -288,14 +294,30 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	// Wait for the generator to finish (duration + warmup + buffer)
 	duration := tc.DurationOrDefault(2 * time.Minute)
 	warmup := tc.WarmupOrDefault(10 * time.Second)
-	genTimeout := duration + warmup + 2*time.Minute
-	if genTimeout > r.opts.Timeout {
-		genTimeout = r.opts.Timeout
-	}
+	if tc.HasGenerator() {
+		genTimeout := duration + warmup + 2*time.Minute
+		if genTimeout > r.opts.Timeout {
+			genTimeout = r.opts.Timeout
+		}
 
-	fmt.Printf("  waiting for generator (up to %s)…\n", genTimeout)
-	if err := orch.WaitForGeneratorExit(genTimeout); err != nil {
-		return results.RunResult{}, fmt.Errorf("waiting for generator: %w", err)
+		fmt.Printf("  waiting for generator (up to %s)…\n", genTimeout)
+		if err := orch.WaitForGeneratorExit(genTimeout); err != nil {
+			return results.RunResult{}, fmt.Errorf("waiting for generator: %w", err)
+		}
+	} else {
+		// No generator: the subject drives data on its own (e.g. an agentless
+		// deploy that collects from an endpoint and forwards to the receiver).
+		// There's no send phase to wait on — give the subject a brief head start,
+		// then fall through to the receiver-drain loop, which waits for data to
+		// arrive and stabilize (bounded by correctness.drain_seconds).
+		headStart := warmup
+		if rem := time.Until(runDeadline); rem < headStart {
+			headStart = rem
+		}
+		fmt.Printf("  no generator — letting the subject run (head start %s)…\n", headStart)
+		if headStart > 0 {
+			time.Sleep(headStart)
+		}
 	}
 
 	metricsPort, stopPortFwd, err := orch.ReceiverMetricsPort()
@@ -313,6 +335,9 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		const quietPolls = 6 // 30s stable window
 		ports := orch.ReceiverMetricsPorts()
 		drainDeadline := time.Now().Add(r.opts.Drain)
+		if drainDeadline.After(runDeadline) {
+			drainDeadline = runDeadline
+		}
 		var drainStable int
 		var drainLast int64
 		drainStart := time.Now()
@@ -346,6 +371,9 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		}
 	} else if tc.Type == "performance" {
 		drainGrace := tc.DrainGraceOrDefault(5 * time.Second)
+		if rem := time.Until(runDeadline); rem < drainGrace {
+			drainGrace = rem
+		}
 		if drainGrace > 0 {
 			fmt.Printf("  waiting post-send receive grace (%s)…\n", drainGrace)
 			time.Sleep(drainGrace)
@@ -373,6 +401,9 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		}
 		ports := orch.ReceiverMetricsPorts()
 		drainDeadline := time.Now().Add(drainTimeout)
+		if drainDeadline.After(runDeadline) {
+			drainDeadline = runDeadline
+		}
 		var drainStable int
 		var drainLast int64
 		for time.Now().Before(drainDeadline) {
@@ -599,7 +630,34 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	// validate_dedup runs with zero received lines reported PASSED: the
 	// dedup check trivially passes over an empty set, so the receiver set
 	// Passed=true and the loss check below was skipped entirely.
-	if tc.Type == "correctness" {
+	if tc.Type == "correctness" && !tc.HasGenerator() {
+		// No generator: there's no expected line count to derive loss or
+		// over-delivery from, so those guards don't apply. Success = the subject
+		// delivered at least MinReceived records to the receiver (default 1) and
+		// the receiver didn't flag a content failure (JSON/dedup/etc.).
+		minRecv := tc.Correctness.MinReceived
+		if minRecv <= 0 {
+			minRecv = 1
+		}
+		recvOK := result.Passed == nil || *result.Passed
+		gotEnough := recvMetrics.LinesReceived >= minRecv
+		var failReasons []string
+		if result.FailReason != "" {
+			failReasons = append(failReasons, result.FailReason)
+		}
+		if !gotEnough {
+			failReasons = append(failReasons, fmt.Sprintf(
+				"expected >= %s received records, got %s",
+				formatCount(minRecv), formatCount(recvMetrics.LinesReceived)))
+		}
+		passed := gotEnough && recvOK
+		result.Passed = &passed
+		if passed {
+			result.FailReason = ""
+		} else {
+			result.FailReason = strings.Join(failReasons, "; ")
+		}
+	} else if tc.Type == "correctness" {
 		lossOK := lossPct <= tc.Correctness.ExpectedLossPct
 		overOK := recvMetrics.LinesReceived <= expectedOut
 		recvOK := result.Passed == nil || *result.Passed
@@ -672,10 +730,10 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		}
 		rw := applyRateCeiling(tc.Correctness.RateCeiling, all)
 		result.RateWindow = map[string]any{
-			"max_observed_eps":      rw.MaxObservedEPS,
-			"overshoot_count":       rw.OvershootCount,
-			"first_overshoot_ns":    rw.FirstOvershootStartNs,
-			"pass":                  rw.Passed,
+			"max_observed_eps":   rw.MaxObservedEPS,
+			"overshoot_count":    rw.OvershootCount,
+			"first_overshoot_ns": rw.FirstOvershootStartNs,
+			"pass":               rw.Passed,
 		}
 		if !rw.Passed {
 			merged := false
@@ -1341,10 +1399,10 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 //     /data/input.log while the subject is offline.
 //  5. Generator finishes.
 //  6. Restart subject. To pass, it must:
-//        - read the un-read tail of input.log.1 (events written between its
-//          last forwarded byte and the rotation point)
-//        - read the new input.log from offset 0 (post-rotation events)
-//        - NOT re-forward anything already sent before SIGTERM
+//     - read the un-read tail of input.log.1 (events written between its
+//     last forwarded byte and the rotation point)
+//     - read the new input.log from offset 0 (post-rotation events)
+//     - NOT re-forward anything already sent before SIGTERM
 //
 // This catches subjects whose file source watches a single path with no
 // persistent state — they can't see input.log.1 after restart, so all

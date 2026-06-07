@@ -277,6 +277,173 @@ func writeSampleFile(t *testing.T, caseDir, relPath string) {
 	}
 }
 
+// TestComposeRendersEndpoints verifies a case's `endpoints:` list renders as
+// extra services on the bench network — name → service/container/hostname —
+// with optional env and command, alongside the usual subject/generator/receiver.
+func TestComposeRendersEndpoints(t *testing.T) {
+	tc := &config.TestCase{
+		Name:      "smoke-endpoint",
+		Type:      "correctness",
+		Duration:  "30s",
+		Generator: config.GeneratorConfig{Mode: "tcp", Target: "subject:9000", Rate: 10, LineSize: 64, Format: "raw"},
+		Receiver:  config.ReceiverConfig{Mode: "tcp", Listen: ":9001"},
+		Endpoints: []config.Endpoint{
+			{
+				Name:    "linuxcontainer",
+				Image:   "vmetric/bench-sshd-endpoint:latest",
+				Env:     map[string]string{"SEED_INTERVAL": "5"},
+				Command: []string{"/usr/sbin/sshd", "-D", "-e"},
+			},
+		},
+	}
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.1", ConfigPath: "/config.yml"}
+	tmp, err := os.MkdirTemp("", "compose-endpoint-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmp)
+	composePath := filepath.Join(tmp, "compose.yaml")
+	cfg := RunConfig{
+		TestCase: tc, Subject: subj, ConfigName: "default",
+		ConfigSrcPath: composePath, TmpDir: tmp,
+		GeneratorImage: "img-gen", ReceiverImage: "img-recv", CollectorImage: "img-coll",
+		ReceiverHostPort: 19001,
+	}
+	if err := writeCompose(composePath, cfg); err != nil {
+		t.Fatalf("writeCompose: %v", err)
+	}
+	data, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(data)
+	mustContain(t, out, "  linuxcontainer:\n")
+	mustContain(t, out, "container_name: \"bench-linuxcontainer\"")
+	mustContain(t, out, "hostname: \"linuxcontainer\"")
+	mustContain(t, out, "image: \"vmetric/bench-sshd-endpoint:latest\"")
+	mustContain(t, out, "SEED_INTERVAL: \"5\"")
+	mustContain(t, out, "command: [\"/usr/sbin/sshd\", \"-D\", \"-e\"]")
+	// Endpoint is a peer, not a generator/receiver alias.
+	mustNotContain(t, out, "container_name: \"bench-generator-linuxcontainer\"")
+}
+
+// TestValidateRejectsBadEndpoints covers the endpoint validation rules:
+// required name+image, no reserved names, no duplicates.
+func TestValidateRejectsBadEndpoints(t *testing.T) {
+	bad := map[string][]config.Endpoint{
+		"reserved name":               {{Name: "collector", Image: "x"}},
+		"missing image":               {{Name: "ep1"}},
+		"missing name":                {{Image: "x"}},
+		"duplicate":                   {{Name: "ep1", Image: "x"}, {Name: "ep1", Image: "y"}},
+		"dynamic generator collision": {{Name: "generator-1", Image: "x"}},
+		"dynamic generator named id":  {{Name: "generator-xyz", Image: "x"}},
+		"dynamic receiver collision":  {{Name: "receiver-42", Image: "x"}},
+	}
+	for label, eps := range bad {
+		tc := &config.TestCase{Name: "bad", Endpoints: eps}
+		if err := tc.Validate(); err == nil {
+			t.Errorf("%s: expected validation error, got nil", label)
+		}
+	}
+}
+
+// TestComposeOmitsGeneratorWhenNone verifies that a case with endpoints and no
+// generator renders no generator service at all — subject + receiver +
+// collector + endpoint only. This is the topology agentless-deploy cases use.
+func TestComposeOmitsGeneratorWhenNone(t *testing.T) {
+	tc := &config.TestCase{
+		Name:     "no-gen",
+		Type:     "correctness",
+		Duration: "60s",
+		Receiver: config.ReceiverConfig{Mode: "tcp", Listen: ":9001"},
+		Endpoints: []config.Endpoint{
+			{Name: "linuxcontainer", Image: "alpine:3.22", Command: []string{"sh", "-c", "sshd -D -e"}},
+		},
+	}
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if tc.HasGenerator() {
+		t.Fatal("HasGenerator() should be false with no generator config")
+	}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.1", ConfigPath: "/config.yml"}
+	tmp, err := os.MkdirTemp("", "compose-nogen-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmp)
+	composePath := filepath.Join(tmp, "compose.yaml")
+	cfg := RunConfig{
+		TestCase: tc, Subject: subj, ConfigName: "default",
+		ConfigSrcPath: composePath, TmpDir: tmp,
+		GeneratorImage: "img-gen", ReceiverImage: "img-recv", CollectorImage: "img-coll",
+		ReceiverHostPort: 19001,
+	}
+	if err := writeCompose(composePath, cfg); err != nil {
+		t.Fatalf("writeCompose: %v", err)
+	}
+	data, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(data)
+	// No generator service of any form.
+	mustNotContain(t, out, "  generator:\n")
+	mustNotContain(t, out, "bench-generator")
+	mustNotContain(t, out, "GENERATOR_MODE")
+	// Endpoint, receiver, and collector are present.
+	mustContain(t, out, "  linuxcontainer:\n")
+	mustContain(t, out, "  receiver:\n")
+	mustContain(t, out, "  collector:\n")
+}
+
+// TestEndpointCommandDollarEscaping verifies "$" in an endpoint command/env is
+// escaped to "$$" so docker-compose interpolation passes a literal "$" to the
+// container shell (otherwise $(date)/${VAR} would be eaten by compose).
+func TestEndpointCommandDollarEscaping(t *testing.T) {
+	tc := &config.TestCase{
+		Name:     "ep-esc",
+		Type:     "correctness",
+		Duration: "10s",
+		Receiver: config.ReceiverConfig{Mode: "tcp", Listen: ":9001"},
+		Endpoints: []config.Endpoint{{
+			Name:    "ep",
+			Image:   "alpine:3.22",
+			Env:     map[string]string{"FOO": "a$b"},
+			Command: []string{"sh", "-c", "echo $(date) ${FOO}"},
+		}},
+	}
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.1", ConfigPath: "/config.yml"}
+	tmp, err := os.MkdirTemp("", "compose-esc-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmp)
+	composePath := filepath.Join(tmp, "compose.yaml")
+	cfg := RunConfig{
+		TestCase: tc, Subject: subj, ConfigName: "default",
+		ConfigSrcPath: composePath, TmpDir: tmp,
+		GeneratorImage: "img-gen", ReceiverImage: "img-recv", CollectorImage: "img-coll",
+		ReceiverHostPort: 19001,
+	}
+	if err := writeCompose(composePath, cfg); err != nil {
+		t.Fatalf("writeCompose: %v", err)
+	}
+	data, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(data)
+	mustContain(t, out, `echo $$(date) $${FOO}`)
+	mustContain(t, out, `FOO: "a$$b"`)
+}
+
 func mustContain(t *testing.T, hay, needle string) {
 	t.Helper()
 	if !strings.Contains(hay, needle) {

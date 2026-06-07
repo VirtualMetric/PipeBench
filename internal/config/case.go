@@ -35,9 +35,38 @@ type TestCase struct {
 	Generators []GeneratorConfig `yaml:"generators"`
 	Receivers  []ReceiverConfig  `yaml:"receivers"`
 
+	// Endpoints are auxiliary containers added to the test topology — hosts the
+	// subject connects to or acts on (e.g. an SSH target the director deploys an
+	// agent onto), as opposed to a generator (input) or receiver (output). Each
+	// becomes its own service on the bench network; Name doubles as the compose
+	// service name, container hostname, and network alias, so the subject config
+	// can reach the endpoint by Name. A case may run with no generator when it
+	// drives data purely through endpoints.
+	Endpoints []Endpoint `yaml:"endpoints"`
+
 	Subjects       []string                 `yaml:"subjects"`
 	Configurations map[string]Configuration `yaml:"configurations"`
 	Correctness    CorrectnessConfig        `yaml:"correctness"`
+}
+
+// Endpoint is an auxiliary container in the test topology (see
+// TestCase.Endpoints). It's a host the subject reaches on the bench network —
+// not a generator or receiver.
+type Endpoint struct {
+	// Name is the compose service name, container hostname, and bench-network
+	// alias. The subject config references the endpoint by this name (e.g. a
+	// device address). Must be unique and must not collide with the reserved
+	// service names (subject, generator, receiver, collector).
+	Name string `yaml:"name"`
+	// Image is the container image to run.
+	Image string `yaml:"image"`
+	// Env is extra environment passed to the container (optional).
+	Env map[string]string `yaml:"env"`
+	// Command overrides the image's default command (optional). Write it as
+	// normal shell — "$" (e.g. $(date), ${VAR}) is passed literally to the
+	// container; the harness escapes it so docker-compose interpolation leaves
+	// it alone.
+	Command []string `yaml:"command"`
 }
 
 // DurationOrDefault parses the Duration field, returning defaultVal on empty/error.
@@ -146,6 +175,15 @@ func (tc *TestCase) MultiGenerator() bool { return len(tc.Generators) > 0 }
 // MultiReceiver reports whether the case uses the plural `receivers:` form.
 func (tc *TestCase) MultiReceiver() bool { return len(tc.Receivers) > 0 }
 
+// HasGenerator reports whether the case configures any traffic generator —
+// either the singular `generator:` or the plural `generators:` form. A case
+// with neither drives data through the subject another way (e.g. an endpoint
+// the subject collects from); the harness then renders no generator service
+// and does not gate the run on a generator exiting.
+func (tc *TestCase) HasGenerator() bool {
+	return tc.MultiGenerator() || tc.Generator.Mode != "" || tc.Generator.Target != ""
+}
+
 // Validate runs structural checks that don't depend on runtime state.
 // Returns an error for cases where the singular and plural forms are both
 // set (ambiguous) or where required IDs on plural entries are missing.
@@ -180,6 +218,31 @@ func (tc *TestCase) Validate() error {
 			return fmt.Errorf("case %q: duplicate receiver id %q", tc.Name, r.ID)
 		}
 		ids[r.ID] = struct{}{}
+	}
+	// Endpoints: require name+image, unique, and not colliding with the fixed
+	// service names the compose template always emits.
+	reserved := map[string]struct{}{"subject": {}, "generator": {}, "receiver": {}, "collector": {}}
+	epNames := map[string]struct{}{}
+	for i, e := range tc.Endpoints {
+		if e.Name == "" {
+			return fmt.Errorf("case %q: endpoints[%d] missing required `name`", tc.Name, i)
+		}
+		if e.Image == "" {
+			return fmt.Errorf("case %q: endpoint %q missing required `image`", tc.Name, e.Name)
+		}
+		if _, bad := reserved[e.Name]; bad {
+			return fmt.Errorf("case %q: endpoint name %q is reserved", tc.Name, e.Name)
+		}
+		// Plural generators/receivers render dynamic compose services named
+		// `generator-<id>` / `receiver-<id>`. An endpoint sharing that prefix
+		// would collide with those service names, so reject it too.
+		if strings.HasPrefix(e.Name, "generator-") || strings.HasPrefix(e.Name, "receiver-") {
+			return fmt.Errorf("case %q: endpoint name %q is reserved (collides with dynamic generator-/receiver- service names)", tc.Name, e.Name)
+		}
+		if _, dup := epNames[e.Name]; dup {
+			return fmt.Errorf("case %q: duplicate endpoint name %q", tc.Name, e.Name)
+		}
+		epNames[e.Name] = struct{}{}
 	}
 	return nil
 }
@@ -333,6 +396,15 @@ type CorrectnessConfig struct {
 	// after summing). Set explicitly in fan-out cases so loss accounting
 	// stays honest.
 	ExpectedMultiplier int `yaml:"expected_multiplier"`
+
+	// MinReceived is the minimum number of records the receiver must observe
+	// for a case with NO generator to pass (the subject produces data on its
+	// own — e.g. an agentless deploy that collects from an endpoint and
+	// forwards to the receiver). With no generator there's no line count to
+	// derive loss/over-delivery from, so the verdict is simply
+	// "LinesReceived >= MinReceived" (default 1) AND the receiver didn't flag a
+	// content failure. Ignored when the case has a generator.
+	MinReceived int64 `yaml:"min_received"`
 
 	// DrainSeconds extends how long the harness waits for backlog to
 	// arrive after the generator(s) stop. The case still finishes early if
