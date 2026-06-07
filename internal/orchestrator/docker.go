@@ -168,7 +168,7 @@ services:
     image: "{{ .GeneratorImage }}"
     container_name: "bench-generator"
     networks: [bench]
-{{- if .KafkaEnabled }}
+{{- if eq .GenMode "kafka" }}
     depends_on:
       redpanda-init:
         condition: service_completed_successfully
