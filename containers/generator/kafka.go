@@ -24,61 +24,74 @@ import (
 // "lines" counts records (not Kafka messages), exactly like the OTLP mode
 // counts LogRecords — so the harness's lines-sent vs lines-received comparison
 // stays meaningful: a subject that splits the array re-emits one record per
-// object. The franz-go client is goroutine-safe and shared across the
-// cfg.Connections producer workers; counts/bytes are accumulated from the
-// produce acknowledgements so a record only counts once Kafka accepts it.
+// object. Each of the cfg.Connections producer workers runs its OWN franz-go
+// client; counts/bytes are accumulated from the produce acknowledgements so a
+// record only counts once Kafka accepts it.
 func runKafka(cfg config, clock *sendClock) (int64, int64, error) {
-	client, err := newKafkaClient(cfg)
-	if err != nil {
-		return 0, 0, err
+	conns := cfg.Connections
+	if conns < 1 {
+		conns = 1
 	}
-	defer client.Close()
 
 	var ackedLines, ackedBytes atomic.Int64
 	var firstErr error
 	var errOnce sync.Once
 	setErr := func(e error) { errOnce.Do(func() { firstErr = e }) }
 
-	// produce enqueues one Kafka message carrying `records` JSON objects. The
-	// promise fires on ack; the value slice is owned by the client until then,
-	// so callers must hand it a fresh copy (see kafkaWorker).
-	produce := func(value []byte, records int64) {
-		client.Produce(context.Background(), &kgo.Record{Topic: cfg.KafkaTopic, Value: value},
-			func(_ *kgo.Record, perr error) {
-				if perr != nil {
-					setErr(perr)
-					return
-				}
-				ackedLines.Add(records)
-				ackedBytes.Add(int64(len(value)))
-			})
-		clock.RecordSend()
-	}
+	// One franz-go client per connection. A single shared client funnels every
+	// worker's records through one buffer and one set of broker connections;
+	// when the topic has multiple partitions the records batch thinner and
+	// produce throughput sags (measured: ~1.6M rec/s across 4 partitions vs
+	// ~2.1M to a single partition). Independent clients give each worker its own
+	// buffer and in-flight pipeline, so produce scales with connections — and
+	// the subject's consumer, not the generator, stays the bottleneck.
+	runWorker := func(connID int) {
+		client, err := newKafkaClient(cfg)
+		if err != nil {
+			setErr(err)
+			return
+		}
+		defer client.Close()
 
-	conns := cfg.Connections
-	if conns < 1 {
-		conns = 1
+		// produce enqueues one Kafka message carrying `records` JSON objects.
+		// The promise fires on ack; the value slice is owned by the client until
+		// then, so callers must hand it a fresh copy (see kafkaWorker).
+		produce := func(value []byte, records int64) {
+			client.Produce(context.Background(), &kgo.Record{Topic: cfg.KafkaTopic, Value: value},
+				func(_ *kgo.Record, perr error) {
+					if perr != nil {
+						setErr(perr)
+						return
+					}
+					ackedLines.Add(records)
+					ackedBytes.Add(int64(len(value)))
+				})
+			clock.RecordSend()
+		}
+
+		kafkaWorker(cfg, connID, produce)
+
+		// Block until every buffered record is acked (or errored) so the counts
+		// reflect what Kafka actually accepted.
+		if err := client.Flush(context.Background()); err != nil {
+			setErr(err)
+		}
 	}
 
 	if conns == 1 {
-		kafkaWorker(cfg, 0, produce)
+		runWorker(0)
 	} else {
 		var wg sync.WaitGroup
 		for i := 0; i < conns; i++ {
 			wg.Add(1)
 			go func(id int) {
 				defer wg.Done()
-				kafkaWorker(cfg, id+cfg.ConnOffset, produce)
-			}(i)
+				runWorker(id)
+			}(i + cfg.ConnOffset)
 		}
 		wg.Wait()
 	}
 
-	// Block until every buffered record is acked (or errored) so the counts
-	// below reflect what Kafka actually accepted.
-	if err := client.Flush(context.Background()); err != nil {
-		setErr(err)
-	}
 	return ackedLines.Load(), ackedBytes.Load(), firstErr
 }
 
@@ -151,6 +164,9 @@ func newKafkaClient(cfg config) (*kgo.Client, error) {
 		kgo.DefaultProduceTopic(cfg.KafkaTopic),
 		kgo.AllowAutoTopicCreation(),
 		kgo.ProducerLinger(5 * time.Millisecond),
+		// Deep buffer so a fast producer goroutine isn't throttled waiting on
+		// acks — Produce only blocks once this many records are unacked.
+		kgo.MaxBufferedRecords(500_000),
 	}
 	client, err := kgo.NewClient(opts...)
 	if err != nil {
