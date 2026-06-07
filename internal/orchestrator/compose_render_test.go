@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/VirtualMetric/PipeBench/internal/config"
+	"gopkg.in/yaml.v3"
 )
 
 // TestSingularComposeRendersClean verifies an existing singular-form
@@ -35,7 +36,7 @@ func TestSingularComposeRendersClean(t *testing.T) {
 	subj := config.Subject{
 		Name:       "vmetric",
 		Image:      "vmetric/director",
-		Version:    "2.0.1",
+		Version:    "2.0.2",
 		ConfigPath: "/config.yml",
 	}
 	tmp, err := os.MkdirTemp("", "compose-test-")
@@ -105,7 +106,7 @@ func TestPluralComposeRenders(t *testing.T) {
 	subj := config.Subject{
 		Name:       "vmetric",
 		Image:      "vmetric/director",
-		Version:    "2.0.1",
+		Version:    "2.0.2",
 		ConfigPath: "/config.yml",
 	}
 	tmp, err := os.MkdirTemp("", "compose-plural-test-")
@@ -180,7 +181,7 @@ func TestSingularComposeRendersSampleFile(t *testing.T) {
 		},
 		Receiver: config.ReceiverConfig{Mode: "tcp", Listen: ":9001"},
 	}
-	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.1", ConfigPath: "/config.yml"}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.2", ConfigPath: "/config.yml"}
 	tmp, err := os.MkdirTemp("", "compose-sample-")
 	if err != nil {
 		t.Fatal(err)
@@ -228,7 +229,7 @@ func TestPluralComposeRendersSampleFile(t *testing.T) {
 	if err := tc.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
-	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.1", ConfigPath: "/config.yml"}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.2", ConfigPath: "/config.yml"}
 	tmp, err := os.MkdirTemp("", "compose-plural-sample-")
 	if err != nil {
 		t.Fatal(err)
@@ -299,7 +300,7 @@ func TestComposeRendersEndpoints(t *testing.T) {
 	if err := tc.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
-	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.1", ConfigPath: "/config.yml"}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.2", ConfigPath: "/config.yml"}
 	tmp, err := os.MkdirTemp("", "compose-endpoint-")
 	if err != nil {
 		t.Fatal(err)
@@ -369,7 +370,7 @@ func TestComposeOmitsGeneratorWhenNone(t *testing.T) {
 	if tc.HasGenerator() {
 		t.Fatal("HasGenerator() should be false with no generator config")
 	}
-	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.1", ConfigPath: "/config.yml"}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.2", ConfigPath: "/config.yml"}
 	tmp, err := os.MkdirTemp("", "compose-nogen-")
 	if err != nil {
 		t.Fatal(err)
@@ -419,7 +420,7 @@ func TestEndpointCommandDollarEscaping(t *testing.T) {
 	if err := tc.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
-	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.1", ConfigPath: "/config.yml"}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.2", ConfigPath: "/config.yml"}
 	tmp, err := os.MkdirTemp("", "compose-esc-")
 	if err != nil {
 		t.Fatal(err)
@@ -442,6 +443,123 @@ func TestEndpointCommandDollarEscaping(t *testing.T) {
 	out := string(data)
 	mustContain(t, out, `echo $$(date) $${FOO}`)
 	mustContain(t, out, `FOO: "a$$b"`)
+}
+
+// TestComposeRendersKafka verifies a kafka case renders the redpanda broker +
+// one-shot redpanda-init, wires the generator to produce to redpanda:9092 with
+// the topic/batch env, and gates the generator and subject on redpanda-init
+// completing.
+func TestComposeRendersKafka(t *testing.T) {
+	tc := &config.TestCase{
+		Name:     "kafka-smoke",
+		Type:     "kafka_performance",
+		Duration: "30s",
+		Kafka:    &config.KafkaConfig{Topic: "bench", Partitions: 3},
+		Generator: config.GeneratorConfig{
+			Mode: "kafka", Target: "redpanda:9092", Format: "json", KafkaBatch: 10,
+		},
+		Receiver: config.ReceiverConfig{Mode: "tcp", Listen: ":9001"},
+	}
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.2", ConfigPath: "/config.yml"}
+	tmp, err := os.MkdirTemp("", "compose-kafka-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmp)
+	composePath := filepath.Join(tmp, "compose.yaml")
+	cfg := RunConfig{
+		TestCase: tc, Subject: subj, ConfigName: "default",
+		ConfigSrcPath: composePath, TmpDir: tmp,
+		GeneratorImage: "img-gen", ReceiverImage: "img-recv", CollectorImage: "img-coll",
+		ReceiverHostPort: 19001,
+	}
+	if err := writeCompose(composePath, cfg); err != nil {
+		t.Fatalf("writeCompose: %v", err)
+	}
+	data, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(data)
+	// The whole rendered compose (including the new redpanda services) must be
+	// valid YAML — guards the template indentation of the kafka block.
+	var parsed map[string]any
+	if err := yaml.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("rendered compose is not valid YAML: %v\n%s", err, out)
+	}
+	// Broker + init services.
+	mustContain(t, out, "  redpanda:\n")
+	mustContain(t, out, "container_name: \"bench-redpanda\"")
+	mustContain(t, out, "PLAINTEXT://redpanda:9092") // advertised as the service name, not 127.0.0.1
+	mustContain(t, out, "  redpanda-init:\n")
+	mustContain(t, out, "rpk topic create bench -p 3")
+	mustContain(t, out, "condition: service_completed_successfully")
+	// Generator produces to the broker with the topic/batch env.
+	mustContain(t, out, "GENERATOR_TARGET: \"redpanda:9092\"")
+	mustContain(t, out, "GENERATOR_KAFKA_TOPIC: \"bench\"")
+	mustContain(t, out, "GENERATOR_KAFKA_BATCH: \"10\"")
+}
+
+// TestComposeOmitsKafkaByDefault guards existing (non-kafka) cases: no redpanda
+// service or kafka wiring should appear when the case has no `kafka:` block.
+func TestComposeOmitsKafkaByDefault(t *testing.T) {
+	tc := &config.TestCase{
+		Name:      "plain-tcp",
+		Type:      "performance",
+		Duration:  "30s",
+		Generator: config.GeneratorConfig{Mode: "tcp", Target: "subject:9000", Rate: 10, LineSize: 64, Format: "raw"},
+		Receiver:  config.ReceiverConfig{Mode: "tcp", Listen: ":9001"},
+	}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.2", ConfigPath: "/config.yml"}
+	tmp, err := os.MkdirTemp("", "compose-nokafka-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmp)
+	composePath := filepath.Join(tmp, "compose.yaml")
+	cfg := RunConfig{
+		TestCase: tc, Subject: subj, ConfigName: "default",
+		ConfigSrcPath: composePath, TmpDir: tmp,
+		GeneratorImage: "img-gen", ReceiverImage: "img-recv", CollectorImage: "img-coll",
+		ReceiverHostPort: 19001,
+	}
+	if err := writeCompose(composePath, cfg); err != nil {
+		t.Fatalf("writeCompose: %v", err)
+	}
+	data, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(data)
+	mustNotContain(t, out, "redpanda")
+	mustNotContain(t, out, "GENERATOR_KAFKA_TOPIC")
+	mustNotContain(t, out, "service_completed_successfully")
+}
+
+// TestValidateRejectsBadKafka covers the kafka-type validation rules: the
+// kafka block is required and the generator must run in kafka mode.
+func TestValidateRejectsBadKafka(t *testing.T) {
+	cases := map[string]*config.TestCase{
+		"missing kafka block": {
+			Name: "x", Type: "kafka_performance",
+			Generator: config.GeneratorConfig{Mode: "kafka", Target: "redpanda:9092"},
+			Receiver:  config.ReceiverConfig{Mode: "tcp", Listen: ":9001"},
+		},
+		"wrong generator mode": {
+			Name: "x", Type: "kafka_correctness",
+			Kafka:     &config.KafkaConfig{Topic: "bench"},
+			Generator: config.GeneratorConfig{Mode: "tcp", Target: "subject:9000"},
+			Receiver:  config.ReceiverConfig{Mode: "tcp", Listen: ":9001"},
+		},
+	}
+	for label, tc := range cases {
+		if err := tc.Validate(); err == nil {
+			t.Errorf("%s: expected validation error, got nil", label)
+		}
+	}
 }
 
 func mustContain(t *testing.T, hay, needle string) {

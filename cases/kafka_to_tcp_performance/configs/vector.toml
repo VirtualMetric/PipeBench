@@ -1,0 +1,17 @@
+# Consume from the Kafka topic and forward each message verbatim to the TCP
+# receiver. Default (bytes) decoding puts the raw message payload in `.message`;
+# the text codec emits it as one newline-terminated line — so one Kafka message
+# (one JSON object at kafka_batch=1) becomes exactly one received line.
+[sources.in]
+type = "kafka"
+bootstrap_servers = "redpanda:9092"
+group_id = "bench"
+topics = ["bench"]
+auto_offset_reset = "earliest"
+
+[sinks.out]
+type = "socket"
+mode = "tcp"
+inputs = ["in"]
+address = "receiver:9001"
+encoding.codec = "text"

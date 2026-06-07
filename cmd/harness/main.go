@@ -362,11 +362,16 @@ func testCmd() *cobra.Command {
 // matchesTypeFilter reports whether a case's type: field satisfies the
 // --type filter. "correctness" is treated as a family match — it also
 // accepts "persistence_correctness" and "persistence_restart_correctness"
-// so users can run every correctness-style test in one command.
-// Other filter values require an exact match.
+// (and "kafka_correctness") so users can run every correctness-style test in
+// one command. "kafka" is likewise a family — it matches both
+// "kafka_performance" and "kafka_correctness". Other filter values require an
+// exact match.
 func matchesTypeFilter(caseType, filter string) bool {
 	if filter == "correctness" {
 		return strings.Contains(caseType, "correctness")
+	}
+	if filter == "kafka" {
+		return strings.Contains(caseType, "kafka")
 	}
 	return caseType == filter
 }

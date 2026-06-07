@@ -1,0 +1,47 @@
+name: kafka_to_tcp_performance
+type: kafka_performance
+description: "Generator produces JSON to Kafka (Redpanda); subject consumes from Kafka and forwards to TCP"
+
+duration: 60s
+# The director reads from LATEST, so the consumer must be joined before the
+# generator floods the topic, or it measures only the tail. Warmup must exceed
+# the director's startup (~15-21s).
+warmup: 35s
+
+# Adds a Redpanda (Kafka-compatible) broker to the topology. The harness
+# renders a `redpanda` service + a one-shot `redpanda-init` that creates the
+# topic; the generator (mode: kafka) produces to it and the subject consumes.
+kafka:
+  topic: bench
+  partitions: 1
+  # image: redpandadata/redpanda:latest   # default
+  # memory: "1G"                            # default
+  # smp: 1                                  # default
+
+generator:
+  mode: kafka
+  target: "redpanda:9092"
+  format: json
+  rate: 0          # unlimited — measure max sustainable throughput
+  line_size: 256
+  connections: 4
+  # kafka_batch packs N JSON records per Kafka message: 1 = one JSON object
+  # per message, N>1 = a JSON array of N objects per message. Raising this
+  # only yields matching record counts at the receiver for subjects that
+  # split a JSON array into N events (e.g. logstash codec=>json); see
+  # kafka_to_tcp_correctness for the clean 1:1 (batch=1) loss-accounted run.
+  kafka_batch: 1
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+subjects:
+  - vmetric
+  - vector
+  - fluent-bit
+  - logstash
+
+configurations:
+  default:
+    description: "Consume from Kafka topic `bench`, forward to the TCP receiver"

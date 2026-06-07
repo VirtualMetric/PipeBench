@@ -326,7 +326,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	}
 	defer stopPortFwd()
 
-	if tc.Type == "performance" && r.opts.Drain > 0 {
+	if tc.IsPerformanceType() && r.opts.Drain > 0 {
 		// Diagnostic drain mode: poll the receiver until it goes idle (or the
 		// configured ceiling fires). Same pattern as the correctness path
 		// below, but bounded by --drain.
@@ -369,7 +369,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 			}
 			drainLast = totalLines
 		}
-	} else if tc.Type == "performance" {
+	} else if tc.IsPerformanceType() {
 		drainGrace := tc.DrainGraceOrDefault(5 * time.Second)
 		if rem := time.Until(runDeadline); rem < drainGrace {
 			drainGrace = rem
@@ -603,7 +603,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	// 0-EPS run. Mark it FAIL so the summary status row doesn't claim
 	// OK on a 100%-loss outcome. Blackhole cases are excluded — 100%
 	// loss is the designed behavior there.
-	if tc.Type == "performance" && !isBlackholeCase &&
+	if tc.IsPerformanceType() && !isBlackholeCase &&
 		recvMetrics.LinesReceived == 0 && genStats.LinesSent > 0 {
 		f := false
 		result.Passed = &f
@@ -630,7 +630,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	// validate_dedup runs with zero received lines reported PASSED: the
 	// dedup check trivially passes over an empty set, so the receiver set
 	// Passed=true and the loss check below was skipped entirely.
-	if tc.Type == "correctness" && !tc.HasGenerator() {
+	if tc.IsCorrectnessType() && !tc.HasGenerator() {
 		// No generator: there's no expected line count to derive loss or
 		// over-delivery from, so those guards don't apply. Success = the subject
 		// delivered at least MinReceived records to the receiver (default 1) and
@@ -657,7 +657,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		} else {
 			result.FailReason = strings.Join(failReasons, "; ")
 		}
-	} else if tc.Type == "correctness" {
+	} else if tc.IsCorrectnessType() {
 		lossOK := lossPct <= tc.Correctness.ExpectedLossPct
 		overOK := recvMetrics.LinesReceived <= expectedOut
 		recvOK := result.Passed == nil || *result.Passed

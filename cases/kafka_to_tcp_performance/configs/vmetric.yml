@@ -1,0 +1,26 @@
+# Kafka consumer device per https://vdocs.virtualmetric.com/configuration/devices/mq/kafka
+# Consume topic `bench` from the redpanda broker and forward verbatim to the
+# TCP receiver. The director's kafka device has no offset-reset knob, so the
+# generator waits out its `warmup` before producing — giving this consumer time
+# to join the group and be positioned before the first record is sent.
+devices:
+  - id: 1
+    name: kafka-bench
+    type: kafka
+    properties:
+      address: "redpanda"
+      port: 9092
+      topic: "bench"
+      group: "bench"
+targets:
+  - name: tcp-target-bench
+    type: tcp
+    properties:
+      address: "receiver"
+      port: 9001
+routes:
+  - name: kafka-to-tcp-bench
+    devices:
+      - name: kafka-bench
+    targets:
+      - name: tcp-target-bench
