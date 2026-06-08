@@ -38,6 +38,11 @@ correctness:
   # Give the device time to drain the topic and forward the split backlog.
   drain_seconds: 30
 
+# vmetric-only by design: this case tests packing N events into one Kafka
+# message as a JSON array on the PRODUCER side (batch_mode: json_array on the
+# kafka target). vector/fluent-bit/logstash kafka outputs emit one message per
+# event and have no equivalent array-packing mode, so for them this would just
+# be the plain round-trip already covered by tcp_to_kafka_to_tcp_correctness.
 subjects:
   - vmetric
 

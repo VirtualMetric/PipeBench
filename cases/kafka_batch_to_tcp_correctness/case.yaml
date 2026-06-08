@@ -36,8 +36,14 @@ receiver:
   mode: tcp
   listen: ":9001"
 
+# Only subjects that split a JSON array into one event per element (1:1 record
+# count) are listed: vmetric (split_mode: json_array), logstash (codec=>json),
+# and vector (json decoding). fluent-bit is intentionally excluded — its kafka
+# input cannot split an array message into N records, so it would under-deliver.
 subjects:
   - vmetric
+  - vector
+  - logstash
 
 configurations:
   default:

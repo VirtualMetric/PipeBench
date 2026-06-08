@@ -24,8 +24,15 @@ receiver:
   mode: tcp
   listen: ":9001"
 
+# All four subjects round-trip TCP -> Kafka -> TCP in one pipeline. This is a
+# throughput run (rate: 0 flood), so loss is informational — slower subjects
+# (e.g. logstash) will shed records under the flood; the EPS is the measure.
+# The lossless 1:1 check lives in tcp_to_kafka_to_tcp_correctness.
 subjects:
   - vmetric
+  - vector
+  - fluent-bit
+  - logstash
 
 configurations:
   default:

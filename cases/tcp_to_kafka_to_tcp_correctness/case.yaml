@@ -17,7 +17,12 @@ kafka:
 generator:
   mode: tcp
   target: "subject:9000"
-  rate: 0
+  # Paced (not a flood). A correctness run must be lossless for every subject;
+  # at rate: 0 the burst overruns slower subjects' TCP input (e.g. logstash on
+  # the JVM, doing double work in the round-trip) and they drop records before
+  # the generator closes the connection. 200/s round-trips cleanly everywhere.
+  # Max throughput is measured separately by tcp_to_kafka_to_tcp_performance.
+  rate: 200
   line_size: 256
   format: raw
   connections: 1
@@ -29,6 +34,9 @@ receiver:
 
 subjects:
   - vmetric
+  - vector
+  - fluent-bit
+  - logstash
 
 correctness:
   # Every TCP record must survive the Kafka round-trip and arrive at the TCP

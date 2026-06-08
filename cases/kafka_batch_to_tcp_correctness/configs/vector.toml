@@ -1,0 +1,20 @@
+# Consume the Kafka topic and forward to the TCP receiver, splitting batched
+# JSON-array messages into individual events. The generator packs 10 JSON
+# objects per Kafka message as an array ([{...},...]); Vector's `json` decoding
+# emits one event per top-level array element, so the receiver sees one line
+# per original record (2000) — the count only reconciles because the array is
+# split. (Without json decoding the whole array would be one event.)
+[sources.in]
+type = "kafka"
+bootstrap_servers = "redpanda:9092"
+group_id = "bench"
+topics = ["bench"]
+auto_offset_reset = "earliest"
+decoding.codec = "json"
+
+[sinks.out]
+type = "socket"
+mode = "tcp"
+inputs = ["in"]
+address = "receiver:9001"
+encoding.codec = "json"
