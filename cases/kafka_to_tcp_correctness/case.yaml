@@ -36,11 +36,21 @@ receiver:
   mode: tcp
   listen: ":9001"
 
+# Subjects whose pinned image consumes Kafka and forwards to the TCP receiver
+# with exact 1:1 counts. Excluded: axosyslog (image exposes no kafka source
+# driver), cribl-stream (re-emits ~26 duplicate events per run — at-least-once
+# on the tcpjson output), filebeat (no plain-TCP output), and fluentd/nxlog/
+# rotel (no Kafka in their pinned images).
 subjects:
   - vmetric
   - vector
   - fluent-bit
   - logstash
+  - otel-collector
+  - bindplane-agent
+  - grafana-alloy
+  - tenzir
+  - telegraf
 
 configurations:
   default:

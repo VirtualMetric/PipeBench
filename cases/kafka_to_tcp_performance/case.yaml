@@ -46,11 +46,20 @@ receiver:
   mode: tcp
   listen: ":9001"
 
+# Same Kafka-capable roster as kafka_to_tcp_correctness. The partitions=8 /
+# workers=8 tuning above is vmetric-specific (its device parallelises across
+# partitions); the other subjects consume the topic with their own default
+# consumer and still produce an EPS figure.
 subjects:
   - vmetric
   - vector
   - fluent-bit
   - logstash
+  - otel-collector
+  - bindplane-agent
+  - grafana-alloy
+  - tenzir
+  - telegraf
 
 configurations:
   default:

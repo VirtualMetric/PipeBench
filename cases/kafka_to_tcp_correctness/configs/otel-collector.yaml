@@ -1,0 +1,30 @@
+# Consume the Kafka topic and forward each record to the TCP receiver. The
+# kafka receiver (contrib) reads raw message bytes as a log body (encoding:
+# text); the syslog exporter writes one rfc3164 line per record to the TCP
+# receiver, so one Kafka message (one JSON object at kafka_batch=1) becomes one
+# received line.
+receivers:
+  kafka:
+    brokers: ["redpanda:9092"]
+    group_id: "bench"
+    initial_offset: "earliest"
+    # v0.142+: topic -> topics (plural list) + encoding, under the per-signal block.
+    logs:
+      topics:
+        - "bench"
+      encoding: "raw"
+
+exporters:
+  syslog:
+    endpoint: "receiver"
+    port: 9001
+    network: "tcp"
+    protocol: "rfc3164"
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    logs:
+      receivers: [kafka]
+      exporters: [syslog]
