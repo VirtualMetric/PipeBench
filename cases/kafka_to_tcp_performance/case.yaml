@@ -50,6 +50,11 @@ receiver:
 # workers=8 tuning above is vmetric-specific (its device parallelises across
 # partitions); the other subjects consume the topic with their own default
 # consumer and still produce an EPS figure.
+#
+# cribl-stream is included HERE but not in kafka_to_tcp_correctness: it re-emits
+# ~26 duplicate events per run (at-least-once on the tcpjson output), which
+# fails an exact-count correctness check but is irrelevant to a throughput
+# measurement (loss is informational here). It sustains ~940K EPS.
 subjects:
   - vmetric
   - vector
@@ -60,6 +65,7 @@ subjects:
   - grafana-alloy
   - tenzir
   - telegraf
+  - cribl-stream
 
 configurations:
   default:

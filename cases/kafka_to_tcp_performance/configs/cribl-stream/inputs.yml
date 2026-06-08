@@ -1,0 +1,15 @@
+inputs:
+  bench_kafka_in:
+    type: kafka
+    disabled: false
+    brokers:
+      - redpanda:9092
+    topics:
+      - bench
+    groupId: bench
+    autoOffsetReset: earliest
+    sendToRoutes: true
+    pqEnabled: false
+    authType: manual
+    tls:
+      disabled: true
