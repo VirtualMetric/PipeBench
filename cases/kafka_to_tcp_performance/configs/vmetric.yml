@@ -12,6 +12,10 @@ devices:
       port: 9092
       topic: "bench"
       group: "bench"
+      # 8 consumer workers — each joins the group as its own franz-go member, so
+      # the 8 topic partitions (kafka.partitions in case.yaml) are consumed in
+      # parallel. Default is NumCPU/4; pinning 8 matches the partition count.
+      workers: 8
 targets:
   - name: tcp-target-bench
     type: tcp

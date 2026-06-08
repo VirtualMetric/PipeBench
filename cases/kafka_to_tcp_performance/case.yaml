@@ -13,10 +13,17 @@ warmup: 35s
 # topic; the generator (mode: kafka) produces to it and the subject consumes.
 kafka:
   topic: bench
-  partitions: 1
+  # 8 partitions so the consumer's 8 workers (group members) each own one
+  # partition and consume in parallel. This is the path to max EPS now that the
+  # VMFL write buffers are pre-sized (no growslice doubling) — ~3.3M EPS vs
+  # ~1.9M on a single partition. Pair with device `workers: 8` (configs/vmetric.yml).
+  partitions: 8
   # image: redpandadata/redpanda:latest   # default
-  # memory: "1G"                            # default
-  # smp: 1                                  # default
+  # Give Redpanda enough shards + per-shard memory to NOT be the bottleneck at
+  # multi-million EPS (≥1 GB/shard — smp=8/2G segfaults). At the smp=1/1G
+  # defaults the single-core broker caps multi-partition throughput.
+  memory: "6G"
+  smp: 6
 
 generator:
   mode: kafka
@@ -24,7 +31,10 @@ generator:
   format: json
   rate: 0          # unlimited — measure max sustainable throughput
   line_size: 256
-  connections: 4
+  # One franz-go client per connection (see containers/generator/kafka.go).
+  # 8 independent producers spread across the 8 partitions produce ~8M rec/s,
+  # fast enough that the subject's consumer — not the generator — is the limit.
+  connections: 8
   # kafka_batch packs N JSON records per Kafka message: 1 = one JSON object
   # per message, N>1 = a JSON array of N objects per message. Raising this
   # only yields matching record counts at the receiver for subjects that
