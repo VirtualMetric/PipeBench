@@ -503,6 +503,83 @@ func TestComposeRendersKafka(t *testing.T) {
 	mustContain(t, out, "GENERATOR_KAFKA_BATCH: \"10\"")
 }
 
+// TestGeneratorConnectionsKafkaCorrectness verifies the kafka producer is held
+// to a single connection for correctness cases — so it publishes exactly
+// total_lines records rather than connections×total_lines — while other modes
+// and kafka performance cases keep the default 3×NumCPU scaling.
+func TestGeneratorConnectionsKafkaCorrectness(t *testing.T) {
+	scaled := resolveGeneratorConnections(0) // host default (3×NumCPU)
+	if scaled <= 1 {
+		t.Fatalf("test host resolved %d connections; expected >1 for a meaningful comparison", scaled)
+	}
+	tests := []struct {
+		name string
+		typ  string
+		mode string
+		want int
+	}{
+		{"kafka correctness → 1 conn", "kafka_correctness", "kafka", 1},
+		{"kafka performance → scaled", "kafka_performance", "kafka", scaled},
+		{"tcp correctness → scaled", "correctness", "tcp", scaled},
+		{"tcp performance → scaled", "performance", "tcp", scaled},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tc := &config.TestCase{Type: tt.typ}
+			if got := generatorConnections(tc, tt.mode, 0); got != tt.want {
+				t.Fatalf("generatorConnections(type=%q, mode=%q)=%d, want %d", tt.typ, tt.mode, got, tt.want)
+			}
+		})
+	}
+	// An explicit connections: value is intentionally overridden for kafka
+	// correctness — any value > 1 reintroduces the per-connection multiplication.
+	tc := &config.TestCase{Type: "kafka_correctness"}
+	if got := generatorConnections(tc, "kafka", 8); got != 1 {
+		t.Fatalf("kafka correctness with explicit 8 conns = %d, want 1", got)
+	}
+}
+
+// TestComposeKafkaCorrectnessSingleConnection guards the render wiring: a
+// kafka_correctness case must emit GENERATOR_CONNECTIONS: "1" so the topic
+// receives exactly total_lines records (the bug where 84 conns × 1000 lines
+// produced 84,000 and made a 0% loss verdict impossible).
+func TestComposeKafkaCorrectnessSingleConnection(t *testing.T) {
+	tc := &config.TestCase{
+		Name:     "kafka-correctness-smoke",
+		Type:     "kafka_correctness",
+		Duration: "10s",
+		Kafka:    &config.KafkaConfig{Topic: "bench", Partitions: 1},
+		Generator: config.GeneratorConfig{
+			Mode: "kafka", Target: "redpanda:9092", Format: "json", Rate: 100, TotalLines: 1000, KafkaBatch: 1,
+		},
+		Receiver: config.ReceiverConfig{Mode: "tcp", Listen: ":9001"},
+	}
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.2", ConfigPath: "/config.yml"}
+	tmp, err := os.MkdirTemp("", "compose-kafka-corr-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmp)
+	composePath := filepath.Join(tmp, "compose.yaml")
+	cfg := RunConfig{
+		TestCase: tc, Subject: subj, ConfigName: "default",
+		ConfigSrcPath: composePath, TmpDir: tmp,
+		GeneratorImage: "img-gen", ReceiverImage: "img-recv", CollectorImage: "img-coll",
+		ReceiverHostPort: 19001,
+	}
+	if err := writeCompose(composePath, cfg); err != nil {
+		t.Fatalf("writeCompose: %v", err)
+	}
+	data, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustContain(t, string(data), "GENERATOR_CONNECTIONS: \"1\"")
+}
+
 // TestComposeOmitsKafkaByDefault guards existing (non-kafka) cases: no redpanda
 // service or kafka wiring should appear when the case has no `kafka:` block.
 func TestComposeOmitsKafkaByDefault(t *testing.T) {
