@@ -1,6 +1,6 @@
 # Consume the Kafka topic and forward each record to the TCP receiver.
 # bindplane-agent is an OpenTelemetry distro, so this mirrors otel-collector:
-# kafka receiver (encoding: text) -> syslog exporter (rfc3164/tcp), one received
+# kafka receiver (encoding: raw) -> syslog exporter (rfc3164/tcp), one received
 # line per Kafka message.
 receivers:
   kafka:

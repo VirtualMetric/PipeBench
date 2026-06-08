@@ -1651,6 +1651,16 @@ func (r *Runner) runKafkaInflightCrash(tc *config.TestCase, subject config.Subje
 	if !passed {
 		result.FailReason = strings.Join(errors, "; ")
 	}
+
+	// Persist the result like every other run path — Run's contract is to
+	// return the *persisted* result, so without this the in-flight crash
+	// run never lands in the results store (and never reaches the report).
+	dir, err := r.store.Save(result, "")
+	if err != nil {
+		return result, fmt.Errorf("saving results: %w", err)
+	}
+	fmt.Printf("  done. results → %s\n", dir)
+
 	return result, nil
 }
 
