@@ -44,9 +44,72 @@ type TestCase struct {
 	// drives data purely through endpoints.
 	Endpoints []Endpoint `yaml:"endpoints"`
 
+	// Kafka, when set, adds a Redpanda (Kafka-compatible) broker to the test
+	// topology: the harness renders a `redpanda` service plus a one-shot
+	// `redpanda-init` that creates the topic, and the generator (mode: kafka)
+	// produces to it while the subject consumes from it. Used by the
+	// kafka_performance / kafka_correctness types.
+	Kafka *KafkaConfig `yaml:"kafka"`
+
 	Subjects       []string                 `yaml:"subjects"`
 	Configurations map[string]Configuration `yaml:"configurations"`
 	Correctness    CorrectnessConfig        `yaml:"correctness"`
+}
+
+// KafkaConfig configures the in-topology Redpanda broker (see TestCase.Kafka).
+// All fields are optional; the orchestrator applies the defaults noted below.
+type KafkaConfig struct {
+	// Image is the Redpanda container image (default
+	// "redpandadata/redpanda:latest").
+	Image string `yaml:"image"`
+	// Topic is the Kafka topic the generator produces to and the subject
+	// consumes from (default "bench"). It doubles as the value the generator
+	// gets via GENERATOR_KAFKA_TOPIC.
+	Topic string `yaml:"topic"`
+	// Partitions is the topic partition count created by redpanda-init
+	// (default 1).
+	Partitions int `yaml:"partitions"`
+	// Memory is the Redpanda --memory allotment (default "1G").
+	Memory string `yaml:"memory"`
+	// SMP is the Redpanda --smp core count (default 1).
+	SMP int `yaml:"smp"`
+}
+
+// KafkaImageOrDefault etc. centralize the broker defaults so the orchestrator
+// and any caller render the same values.
+func (k *KafkaConfig) KafkaImageOrDefault() string {
+	if k != nil && k.Image != "" {
+		return k.Image
+	}
+	return "redpandadata/redpanda:latest"
+}
+
+func (k *KafkaConfig) TopicOrDefault() string {
+	if k != nil && k.Topic != "" {
+		return k.Topic
+	}
+	return "bench"
+}
+
+func (k *KafkaConfig) PartitionsOrDefault() int {
+	if k != nil && k.Partitions > 0 {
+		return k.Partitions
+	}
+	return 1
+}
+
+func (k *KafkaConfig) MemoryOrDefault() string {
+	if k != nil && k.Memory != "" {
+		return k.Memory
+	}
+	return "1G"
+}
+
+func (k *KafkaConfig) SMPOrDefault() int {
+	if k != nil && k.SMP > 0 {
+		return k.SMP
+	}
+	return 1
 }
 
 // Endpoint is an auxiliary container in the test topology (see
@@ -184,6 +247,29 @@ func (tc *TestCase) HasGenerator() bool {
 	return tc.MultiGenerator() || tc.Generator.Mode != "" || tc.Generator.Target != ""
 }
 
+// UsesKafka reports whether the case adds a Redpanda broker to the topology.
+func (tc *TestCase) UsesKafka() bool { return tc.Kafka != nil }
+
+// IsPerformanceType reports whether the case is scored as a throughput test —
+// the plain `performance` type or the Kafka variant `kafka_performance`.
+func (tc *TestCase) IsPerformanceType() bool {
+	return tc.Type == "performance" || tc.Type == "kafka_performance"
+}
+
+// IsCorrectnessType reports whether the case is scored as a plain
+// (non-persistence) correctness test — `correctness` or `kafka_correctness`.
+func (tc *TestCase) IsCorrectnessType() bool {
+	return tc.Type == "correctness" || tc.Type == "kafka_correctness"
+}
+
+// IsKafkaType reports whether the case drives the subject through a Kafka
+// topology (any `kafka_*` type). Kafka consumption is at-least-once: crash and
+// restart recovery can legitimately re-deliver records, so the verdict must
+// allow over-delivery (duplicates) while still forbidding loss.
+func (tc *TestCase) IsKafkaType() bool {
+	return strings.HasPrefix(tc.Type, "kafka_")
+}
+
 // Validate runs structural checks that don't depend on runtime state.
 // Returns an error for cases where the singular and plural forms are both
 // set (ambiguous) or where required IDs on plural entries are missing.
@@ -244,6 +330,24 @@ func (tc *TestCase) Validate() error {
 		}
 		epNames[e.Name] = struct{}{}
 	}
+	// Kafka types require the broker block + a generator producing in kafka mode.
+	if tc.IsKafkaType() {
+		if tc.Kafka == nil {
+			return fmt.Errorf("case %q: type %q requires a `kafka:` block", tc.Name, tc.Type)
+		}
+		gens := tc.AllGenerators()
+		if len(gens) == 0 {
+			return fmt.Errorf("case %q: type %q requires a generator with `mode: kafka`", tc.Name, tc.Type)
+		}
+		for _, g := range gens {
+			if g.Mode != "kafka" {
+				return fmt.Errorf("case %q: type %q requires generator mode \"kafka\", got %q", tc.Name, tc.Type, g.Mode)
+			}
+			if g.KafkaBatch < 0 {
+				return fmt.Errorf("case %q: kafka_batch must be >= 1 (0/unset defaults to 1), got %d", tc.Name, g.KafkaBatch)
+			}
+		}
+	}
 	return nil
 }
 
@@ -274,8 +378,8 @@ type GeneratorConfig struct {
 	// for the singular `generator:` form (the container is always
 	// `bench-generator` there).
 	ID          string `yaml:"id"`
-	Mode        string `yaml:"mode"`        // "tcp" | "file" | "http" | "udp" | "udp_netflow_v5" | "otlp"
-	Target      string `yaml:"target"`      // "subject:9000" or file path
+	Mode        string `yaml:"mode"`        // "tcp" | "file" | "http" | "udp" | "udp_netflow_v5" | "otlp" | "kafka"
+	Target      string `yaml:"target"`      // "subject:9000", file path, or "redpanda:9092" (kafka)
 	Rate        int    `yaml:"rate"`        // lines/sec per connection, 0 = unlimited
 	TotalLines  int64  `yaml:"total_lines"` // total lines to send, 0 = use duration
 	LineSize    int    `yaml:"line_size"`   // bytes per line
@@ -293,6 +397,11 @@ type GeneratorConfig struct {
 	// RFC3164 syslog date ("Mmm _d hh:mm:ss") to the current time at send so
 	// records aren't dropped as stale. No effect without SampleFile.
 	RewriteTimestamp bool `yaml:"rewrite_timestamp"`
+	// KafkaBatch (kafka mode only) packs N JSON records per Kafka message:
+	// 1 = one JSON object per message, N>1 = a JSON array of N objects per
+	// message. Defaults to 1 in the generator when unset. Lets a case compare
+	// how a subject handles per-message vs batched-array ingestion.
+	KafkaBatch int `yaml:"kafka_batch"`
 	// Env is mode-specific extra env passed straight through to the
 	// generator container (e.g. GENERATOR_OTLP_TRANSPORT=grpc). Lets a
 	// case dial in transport variants without growing GeneratorConfig

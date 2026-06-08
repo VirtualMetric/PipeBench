@@ -50,6 +50,11 @@ services:
     image: "{{ .SubjectImage }}"
     container_name: "{{ .SubjectContainer }}"
     networks: [bench]
+{{- if .KafkaEnabled }}
+    depends_on:
+      redpanda-init:
+        condition: service_completed_successfully
+{{- end }}
     volumes:
       - "{{ .ConfigSrc }}:{{ .ConfigDst }}{{ .ConfigMountOpts }}"
       - "{{ .TmpDir }}:/results"
@@ -163,10 +168,16 @@ services:
     image: "{{ .GeneratorImage }}"
     container_name: "bench-generator"
     networks: [bench]
+{{- if and (eq .GenMode "kafka") .KafkaEnabled }}
+    depends_on:
+      redpanda-init:
+        condition: service_completed_successfully
+{{- else }}
     depends_on:
       - subject
 {{- if not .DeferReceiver }}
       - receiver
+{{- end }}
 {{- end }}
 {{- if or .UseSharedData .TLSCertsHost .GenSampleFileHost }}
     volumes:
@@ -205,6 +216,10 @@ services:
 {{- end }}
 {{- if .GenRewriteTimestamp }}
       GENERATOR_REWRITE_TIMESTAMP: "true"
+{{- end }}
+{{- if .KafkaEnabled }}
+      GENERATOR_KAFKA_TOPIC: "{{ .KafkaTopic }}"
+      GENERATOR_KAFKA_BATCH: "{{ .GenKafkaBatch }}"
 {{- end }}
 {{- if .GenRotateMode }}
       GENERATOR_ROTATE_MODE: "{{ .GenRotateMode }}"
@@ -328,6 +343,51 @@ services:
       {{ $k }}: "{{ $v }}"
 {{- end }}
 {{- end }}
+    restart: "no"
+{{- end }}
+{{- if .KafkaEnabled }}
+
+  redpanda:
+    image: "{{ .KafkaImage }}"
+    container_name: "bench-redpanda"
+    hostname: "redpanda"
+    networks: [bench]
+    command:
+      - redpanda
+      - start
+      - "--mode"
+      - "dev-container"
+      - "--smp"
+      - "{{ .KafkaSMP }}"
+      - "--memory"
+      - "{{ .KafkaMemory }}"
+      - "--kafka-addr"
+      - "PLAINTEXT://0.0.0.0:9092"
+      - "--advertise-kafka-addr"
+      - "PLAINTEXT://redpanda:9092"
+      - "--set"
+      - "redpanda.auto_create_topics_enabled=true"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+    restart: "no"
+
+  # One-shot: wait for the broker, create the topic with the requested
+  # partition count, then exit 0. Generator and subject gate on this
+  # completing so neither races topic auto-creation.
+  redpanda-init:
+    image: "{{ .KafkaImage }}"
+    container_name: "bench-redpanda-init"
+    networks: [bench]
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "rpk topic create {{ .KafkaTopic }} -p {{ .KafkaPartitions }} --brokers redpanda:9092 || rpk topic describe {{ .KafkaTopic }} --brokers redpanda:9092"
     restart: "no"
 {{- end }}
 `
@@ -740,6 +800,17 @@ type composeVars struct {
 	GenSampleFileDst    string
 	GenRewriteTimestamp bool
 
+	// Kafka (Redpanda) topology. KafkaEnabled gates the redpanda + redpanda-init
+	// services and the generator/subject depends_on wiring. GenKafkaBatch is the
+	// singular generator's records-per-message packing.
+	KafkaEnabled    bool
+	KafkaImage      string
+	KafkaTopic      string
+	KafkaPartitions int
+	KafkaMemory     string
+	KafkaSMP        int
+	GenKafkaBatch   int
+
 	RecvMode              string
 	RecvListen            string
 	RecvValidateDedup     string
@@ -986,6 +1057,21 @@ func writeCompose(path string, cfg RunConfig) error {
 			vars.GenSampleFile = dst
 			vars.GenRewriteTimestamp = g.RewriteTimestamp
 		}
+		vars.GenKafkaBatch = g.KafkaBatch
+		if vars.GenKafkaBatch < 1 {
+			vars.GenKafkaBatch = 1
+		}
+	}
+
+	// Kafka (Redpanda) broker: render the redpanda + redpanda-init services and
+	// wire the generator/subject depends_on. Defaults centralized on KafkaConfig.
+	if tc.Kafka != nil {
+		vars.KafkaEnabled = true
+		vars.KafkaImage = tc.Kafka.KafkaImageOrDefault()
+		vars.KafkaTopic = tc.Kafka.TopicOrDefault()
+		vars.KafkaPartitions = tc.Kafka.PartitionsOrDefault()
+		vars.KafkaMemory = tc.Kafka.MemoryOrDefault()
+		vars.KafkaSMP = tc.Kafka.SMPOrDefault()
 	}
 
 	if tc.MultiReceiver() {

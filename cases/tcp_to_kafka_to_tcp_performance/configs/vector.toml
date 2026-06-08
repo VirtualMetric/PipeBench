@@ -1,0 +1,33 @@
+# Round-trip through Kafka in ONE Vector instance:
+#   tcp_in (TCP :9000) -> kafka_out (Kafka sink -> topic bench)
+#   kafka_in (Kafka source <- topic bench) -> tcp_out (TCP -> receiver:9001)
+# Vector routes strictly by explicit `inputs`, so the two pipelines never cross
+# (tcp_in feeds only kafka_out; kafka_in feeds only tcp_out) — no fan-out loop.
+# Records flow TCP -> Kafka -> TCP, 1:1.
+[sources.tcp_in]
+type = "socket"
+mode = "tcp"
+address = "0.0.0.0:9000"
+framing.method = "newline_delimited"
+decoding.codec = "bytes"
+
+[sinks.kafka_out]
+type = "kafka"
+inputs = ["tcp_in"]
+bootstrap_servers = "redpanda:9092"
+topic = "bench"
+encoding.codec = "text"
+
+[sources.kafka_in]
+type = "kafka"
+bootstrap_servers = "redpanda:9092"
+group_id = "bench"
+topics = ["bench"]
+auto_offset_reset = "earliest"
+
+[sinks.tcp_out]
+type = "socket"
+mode = "tcp"
+inputs = ["kafka_in"]
+address = "receiver:9001"
+encoding.codec = "text"

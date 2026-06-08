@@ -1,0 +1,51 @@
+name: tcp_to_kafka_batch_to_tcp_correctness
+type: correctness
+description: "Round-trips records through Kafka with the TARGET in json_array batch mode (up to 100 events packed into one Kafka message) and the DEVICE splitting arrays back into individual events. Exercises Kafka target batching + device array-splitting + multi-route in one director."
+
+duration: 30s
+# The internal Kafka device reads from LATEST, so it must join the topic before
+# the Kafka target starts writing. The generator's warmup holds TCP input until
+# the subject (and its Kafka device) is fully up (~15-21s startup).
+warmup: 30s
+
+# Renders a Redpanda broker + topic-init. Generator/receiver are plain TCP; the
+# Kafka hop (target batches, device splits) happens entirely inside the subject.
+kafka:
+  topic: bench
+  partitions: 1
+
+generator:
+  mode: tcp
+  target: "subject:9000"
+  rate: 0
+  line_size: 256
+  # JSON objects (not raw) so the target can pack them into a VALID JSON array
+  # ([{...},{...}]); the device then splits that array back into objects.
+  format: json
+  connections: 1
+  total_lines: 2000
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+correctness:
+  # Every record must survive: tcp-in -> kafka-out (buffered into json_array
+  # messages, up to 100 events each) -> kafka-in (each array split back into
+  # events) -> tcp-out. Count is preserved 1:1 (0% loss) only if the target
+  # batches AND the device splits correctly.
+  expected_loss_pct: 0.0
+  # Give the device time to drain the topic and forward the split backlog.
+  drain_seconds: 30
+
+# vmetric-only by design: this case tests packing N events into one Kafka
+# message as a JSON array on the PRODUCER side (batch_mode: json_array on the
+# kafka target). vector/fluent-bit/logstash kafka outputs emit one message per
+# event and have no equivalent array-packing mode, so for them this would just
+# be the plain round-trip already covered by tcp_to_kafka_to_tcp_correctness.
+subjects:
+  - vmetric
+
+configurations:
+  default:
+    description: "TCP in -> Kafka target (json_array batch) -> Kafka device (split) -> TCP out, two routes in one director"

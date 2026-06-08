@@ -1,0 +1,72 @@
+name: kafka_to_tcp_performance
+type: kafka_performance
+description: "Generator produces JSON to Kafka (Redpanda); subject consumes from Kafka and forwards to TCP"
+
+duration: 60s
+# The director reads from LATEST, so the consumer must be joined before the
+# generator floods the topic, or it measures only the tail. Warmup must exceed
+# the director's startup (~15-21s).
+warmup: 35s
+
+# Adds a Redpanda (Kafka-compatible) broker to the topology. The harness
+# renders a `redpanda` service + a one-shot `redpanda-init` that creates the
+# topic; the generator (mode: kafka) produces to it and the subject consumes.
+kafka:
+  topic: bench
+  # 8 partitions so the consumer's 8 workers (group members) each own one
+  # partition and consume in parallel. This is the path to max EPS now that the
+  # VMFL write buffers are pre-sized (no growslice doubling) — ~3.3M EPS vs
+  # ~1.9M on a single partition. Pair with device `workers: 8` (configs/vmetric.yml).
+  partitions: 8
+  # image: redpandadata/redpanda:latest   # default
+  # Give Redpanda enough shards + per-shard memory to NOT be the bottleneck at
+  # multi-million EPS (≥1 GB/shard — smp=8/2G segfaults). At the smp=1/1G
+  # defaults the single-core broker caps multi-partition throughput.
+  memory: "6G"
+  smp: 6
+
+generator:
+  mode: kafka
+  target: "redpanda:9092"
+  format: json
+  rate: 0          # unlimited — measure max sustainable throughput
+  line_size: 256
+  # One franz-go client per connection (see containers/generator/kafka.go).
+  # 8 independent producers spread across the 8 partitions produce ~8M rec/s,
+  # fast enough that the subject's consumer — not the generator — is the limit.
+  connections: 8
+  # kafka_batch packs N JSON records per Kafka message: 1 = one JSON object
+  # per message, N>1 = a JSON array of N objects per message. Raising this
+  # only yields matching record counts at the receiver for subjects that
+  # split a JSON array into N events (e.g. logstash codec=>json); see
+  # kafka_to_tcp_correctness for the clean 1:1 (batch=1) loss-accounted run.
+  kafka_batch: 1
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+# Same Kafka-capable roster as kafka_to_tcp_correctness. The partitions=8 /
+# workers=8 tuning above is vmetric-specific (its device parallelises across
+# partitions); the other subjects consume the topic with their own default
+# consumer and still produce an EPS figure.
+#
+# cribl-stream is included HERE but not in kafka_to_tcp_correctness: it re-emits
+# ~26 duplicate events per run (at-least-once on the tcpjson output), which
+# fails an exact-count correctness check but is irrelevant to a throughput
+# measurement (loss is informational here). It sustains ~940K EPS.
+subjects:
+  - vmetric
+  - vector
+  - fluent-bit
+  - logstash
+  - otel-collector
+  - bindplane-agent
+  - grafana-alloy
+  - tenzir
+  - telegraf
+  - cribl-stream
+
+configurations:
+  default:
+    description: "Consume from Kafka topic `bench`, forward to the TCP receiver"

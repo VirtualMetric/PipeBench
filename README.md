@@ -74,7 +74,7 @@ After the test, the result is merged into a single per-(hardware, subject) JSON 
 
 | Name | Image | Version |
 | --- | --- | --- |
-| VirtualMetric DataStream | `vmetric/director` | `2.0.1` |
+| VirtualMetric DataStream | `vmetric/director` | `2.0.2` |
 | Vector | `timberio/vector` | `0.54.0-alpine` |
 | Fluent Bit | `fluent/fluent-bit` | `5.0` |
 | Fluentd | `fluent/fluentd` | `v1.17-debian-1` |

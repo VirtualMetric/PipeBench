@@ -151,6 +151,24 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	if tc.Type == "persistence_file_restart_correctness" {
 		return r.runPersistenceFileRestartCorrectness(tc, subject)
 	}
+	// Kafka crash/restart correctness reuses the shutdown flow: produce to
+	// the broker while the receiver is down (the subject consumes from Kafka
+	// and buffers to its crash-resistant queue), kill/stop the subject, bring
+	// the receiver up, restart the subject, and verify every record is
+	// delivered. Restart = SIGTERM (graceful), crash = SIGKILL.
+	if tc.Type == "kafka_restart_correctness" {
+		return r.runPersistenceShutdownCorrectness(tc, subject, false)
+	}
+	if tc.Type == "kafka_crash_correctness" {
+		return r.runPersistenceShutdownCorrectness(tc, subject, true)
+	}
+	// Kafka in-flight crash: receiver stays UP and records flow to it; the
+	// subject is SIGKILLed mid-delivery to exercise the at-least-once
+	// over-delivery window (delivered-but-uncommitted records re-delivered on
+	// restart). Verifies no loss; reports duplicates.
+	if tc.Type == "kafka_inflight_crash_correctness" {
+		return r.runKafkaInflightCrash(tc, subject)
+	}
 
 	configName := r.opts.ConfigName
 
@@ -326,7 +344,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	}
 	defer stopPortFwd()
 
-	if tc.Type == "performance" && r.opts.Drain > 0 {
+	if tc.IsPerformanceType() && r.opts.Drain > 0 {
 		// Diagnostic drain mode: poll the receiver until it goes idle (or the
 		// configured ceiling fires). Same pattern as the correctness path
 		// below, but bounded by --drain.
@@ -369,7 +387,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 			}
 			drainLast = totalLines
 		}
-	} else if tc.Type == "performance" {
+	} else if tc.IsPerformanceType() {
 		drainGrace := tc.DrainGraceOrDefault(5 * time.Second)
 		if rem := time.Until(runDeadline); rem < drainGrace {
 			drainGrace = rem
@@ -603,7 +621,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	// 0-EPS run. Mark it FAIL so the summary status row doesn't claim
 	// OK on a 100%-loss outcome. Blackhole cases are excluded — 100%
 	// loss is the designed behavior there.
-	if tc.Type == "performance" && !isBlackholeCase &&
+	if tc.IsPerformanceType() && !isBlackholeCase &&
 		recvMetrics.LinesReceived == 0 && genStats.LinesSent > 0 {
 		f := false
 		result.Passed = &f
@@ -630,7 +648,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	// validate_dedup runs with zero received lines reported PASSED: the
 	// dedup check trivially passes over an empty set, so the receiver set
 	// Passed=true and the loss check below was skipped entirely.
-	if tc.Type == "correctness" && !tc.HasGenerator() {
+	if tc.IsCorrectnessType() && !tc.HasGenerator() {
 		// No generator: there's no expected line count to derive loss or
 		// over-delivery from, so those guards don't apply. Success = the subject
 		// delivered at least MinReceived records to the receiver (default 1) and
@@ -657,7 +675,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		} else {
 			result.FailReason = strings.Join(failReasons, "; ")
 		}
-	} else if tc.Type == "correctness" {
+	} else if tc.IsCorrectnessType() {
 		lossOK := lossPct <= tc.Correctness.ExpectedLossPct
 		overOK := recvMetrics.LinesReceived <= expectedOut
 		recvOK := result.Passed == nil || *result.Passed
@@ -1016,10 +1034,18 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 			formatCount(genStats.LinesSent-recvMetrics.LinesReceived), formatCount(genStats.LinesSent)))
 	}
 	if recvMetrics.LinesReceived > genStats.LinesSent {
-		passed = false
 		extra := recvMetrics.LinesReceived - genStats.LinesSent
-		errors = append(errors, fmt.Sprintf("over-delivery: received %s lines but only %s were sent (%s extra/duplicate lines)",
-			formatCount(recvMetrics.LinesReceived), formatCount(genStats.LinesSent), formatCount(extra)))
+		if tc.IsKafkaType() {
+			// Kafka is at-least-once: crash/restart recovery may re-consume
+			// uncommitted offsets and re-deliver records already buffered. That
+			// is correct behavior — duplicates, never loss — so over-delivery
+			// is informational here, not a failure.
+			fmt.Printf("  note: over-delivery of %s lines (at-least-once duplicates from recovery — not a failure)\n", formatCount(extra))
+		} else {
+			passed = false
+			errors = append(errors, fmt.Sprintf("over-delivery: received %s lines but only %s were sent (%s extra/duplicate lines)",
+				formatCount(recvMetrics.LinesReceived), formatCount(genStats.LinesSent), formatCount(extra)))
+		}
 	}
 	if tc.Correctness.ValidateDedup && recvMetrics.Duplicates > 0 {
 		passed = false
@@ -1305,10 +1331,18 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 			formatCount(genStats.LinesSent-recvMetrics.LinesReceived), formatCount(genStats.LinesSent)))
 	}
 	if recvMetrics.LinesReceived > genStats.LinesSent {
-		passed = false
 		extra := recvMetrics.LinesReceived - genStats.LinesSent
-		errors = append(errors, fmt.Sprintf("over-delivery: received %s lines but only %s were sent (%s extra/duplicate lines)",
-			formatCount(recvMetrics.LinesReceived), formatCount(genStats.LinesSent), formatCount(extra)))
+		if tc.IsKafkaType() {
+			// Kafka is at-least-once: crash/restart recovery may re-consume
+			// uncommitted offsets and re-deliver records already buffered. That
+			// is correct behavior — duplicates, never loss — so over-delivery
+			// is informational here, not a failure.
+			fmt.Printf("  note: over-delivery of %s lines (at-least-once duplicates from recovery — not a failure)\n", formatCount(extra))
+		} else {
+			passed = false
+			errors = append(errors, fmt.Sprintf("over-delivery: received %s lines but only %s were sent (%s extra/duplicate lines)",
+				formatCount(recvMetrics.LinesReceived), formatCount(genStats.LinesSent), formatCount(extra)))
+		}
 	}
 	if tc.Correctness.ValidateDedup && recvMetrics.Duplicates > 0 {
 		passed = false
@@ -1381,6 +1415,251 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 		fmt.Fprintf(os.Stderr, "\n  --- subject ---\n%s", orch.Logs("subject", 30))
 		fmt.Fprintf(os.Stderr, "\n  --- receiver ---\n%s", orch.Logs("receiver", 30))
 	}
+
+	return result, nil
+}
+
+// runKafkaInflightCrash crashes the subject WHILE it is actively delivering
+// consumed Kafka records to the receiver (the receiver stays UP the whole
+// time), unlike the persistence flow which buffers with the receiver down.
+// This exercises the at-least-once over-delivery window: records that were
+// delivered to the target but whose offset commit had not yet fired are
+// re-consumed on restart and re-delivered. The kill is timed to land
+// mid-stream — once the receiver has seen ~half the records.
+//
+// Verdict: no loss (every produced record must arrive — loss <=
+// expected_loss_pct); duplicates are measured and reported, not failed,
+// because at-least-once permits them.
+func (r *Runner) runKafkaInflightCrash(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
+	configName := r.opts.ConfigName
+	subject = r.applySubjectOverrides(subject)
+
+	fmt.Printf("→ test=%s  subject=%s  version=%s  config=%s\n",
+		tc.Name, subject.Name, subject.Version, configName)
+
+	configSrc, err := tc.ConfigFilePath(r.opts.CasesDir, configName, subject)
+	if err != nil {
+		return results.RunResult{}, err
+	}
+	configSrc, err = filepath.Abs(configSrc)
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("resolving config path: %w", err)
+	}
+
+	tmpDir, err := os.MkdirTemp("", "bench-"+tc.Name+"-")
+	if err != nil {
+		return results.RunResult{}, err
+	}
+	if err := os.Chmod(tmpDir, 0o777); err != nil {
+		return results.RunResult{}, fmt.Errorf("chmod tmpdir: %w", err)
+	}
+	defer func() {
+		if !r.opts.NoCleanup {
+			os.RemoveAll(tmpDir)
+		}
+	}()
+
+	caseDir, err := filepath.Abs(filepath.Join(r.opts.CasesDir, tc.Name))
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("resolving case directory: %w", err)
+	}
+
+	extraEnv := map[string]string{}
+	if cfg, ok := tc.Configurations[configName]; ok {
+		for k, v := range cfg.Env {
+			extraEnv[k] = v
+		}
+	}
+
+	runCfg := orchestrator.RunConfig{
+		TestCase:         tc,
+		Subject:          subject,
+		ConfigName:       configName,
+		ConfigSrcPath:    configSrc,
+		CaseDir:          caseDir,
+		TmpDir:           tmpDir,
+		GeneratorImage:   r.opts.GeneratorImage,
+		ReceiverImage:    r.opts.ReceiverImage,
+		CollectorImage:   r.opts.CollectorImage,
+		ReceiverHostPort: r.opts.ReceiverHostPort,
+		ExtraSubjectEnv:  extraEnv,
+		CPULimit:         r.opts.CPULimit,
+		MemLimit:         r.opts.MemLimit,
+	}
+
+	orch, err := orchestrator.NewComposeRunner(runCfg)
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("compose setup: %w", err)
+	}
+
+	for _, c := range []string{"bench-generator", "bench-receiver", "bench-collector", "bench-subject-" + subject.Name} {
+		_ = exec.Command("docker", "rm", "-f", c).Run()
+	}
+	_ = orch.Down()
+
+	startTime := time.Now()
+	defer func() {
+		if !r.opts.NoCleanup {
+			fmt.Println("  tearing down…")
+			_ = orch.Down()
+		}
+	}()
+
+	n := tc.Generator.TotalLines
+	if n <= 0 {
+		return results.RunResult{}, fmt.Errorf("kafka_inflight_crash requires generator.total_lines > 0")
+	}
+	mid := n / 2
+
+	// Everything up, receiver INCLUDED — data will be flowing to the target.
+	fmt.Println("  starting all services (receiver UP throughout)…")
+	if err := orch.Up(); err != nil {
+		return results.RunResult{}, fmt.Errorf("starting services: %w", err)
+	}
+
+	metricsPort, stopPortFwd, err := orch.ReceiverMetricsPort()
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("setting up receiver access: %w", err)
+	}
+	defer stopPortFwd()
+
+	// Wait until the receiver has seen ~half the records, then SIGKILL the
+	// subject mid-delivery.
+	fmt.Printf("  waiting for mid-delivery (receiver >= %s of %s)…\n", formatCount(mid), formatCount(n))
+	crashed := false
+	crashDeadline := time.Now().Add(r.opts.Timeout)
+	for time.Now().Before(crashDeadline) {
+		rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+		if qerr == nil {
+			fmt.Printf("    received: %s\n", formatCount(rm.LinesReceived))
+			if rm.LinesReceived >= mid {
+				fmt.Println("  mid-delivery reached — SIGKILL subject (no graceful shutdown)…")
+				if err := orch.KillServices("subject"); err != nil {
+					return results.RunResult{}, fmt.Errorf("killing subject: %w", err)
+				}
+				crashed = true
+				break
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if !crashed {
+		return results.RunResult{}, fmt.Errorf("subject never reached mid-delivery (%s) before timeout", formatCount(mid))
+	}
+
+	// Restart — it should re-consume the uncommitted offsets and deliver the rest.
+	time.Sleep(3 * time.Second)
+	fmt.Println("  restarting subject (replays uncommitted offsets)…")
+	if err := orch.UpServices("subject"); err != nil {
+		return results.RunResult{}, fmt.Errorf("restarting subject: %w", err)
+	}
+
+	// The generator produces to Kafka independently of the subject; collect
+	// its final count.
+	duration := tc.DurationOrDefault(60 * time.Second)
+	warmup := tc.WarmupOrDefault(30 * time.Second)
+	genTimeout := duration + warmup + 2*time.Minute
+	if genTimeout > r.opts.Timeout {
+		genTimeout = r.opts.Timeout
+	}
+	if err := orch.WaitForGeneratorExit(genTimeout); err != nil {
+		fmt.Printf("  (generator wait: %v)\n", err)
+	}
+	genStats := r.parseGeneratorStats(orch.GeneratorStdout())
+	fmt.Printf("  generator sent %s lines\n", formatCount(genStats.LinesSent))
+
+	// Drain until the receiver count stabilizes.
+	drainTimeout := 3 * time.Minute
+	fmt.Printf("  draining (up to %s)…\n", drainTimeout)
+	var lastCount int64
+	stableRounds := 0
+	drainDeadline := time.Now().Add(drainTimeout)
+	for time.Now().Before(drainDeadline) {
+		time.Sleep(5 * time.Second)
+		rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+		if qerr != nil {
+			continue
+		}
+		fmt.Printf("    received: %s / %s\n", formatCount(rm.LinesReceived), formatCount(genStats.LinesSent))
+		if rm.LinesReceived == lastCount && rm.LinesReceived > 0 {
+			stableRounds++
+			if stableRounds >= 6 {
+				fmt.Println("    receiver stable — drained")
+				break
+			}
+		} else {
+			stableRounds = 0
+		}
+		lastCount = rm.LinesReceived
+	}
+
+	recvMetrics, err := r.queryReceiverMetrics(metricsPort, 30*time.Second)
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("querying receiver metrics: %w", err)
+	}
+
+	elapsed := time.Since(startTime).Seconds()
+	lossPct := 0.0
+	if genStats.LinesSent > 0 {
+		lossPct = 100.0 * (1.0 - float64(recvMetrics.LinesReceived)/float64(genStats.LinesSent))
+		if lossPct < 0 {
+			lossPct = 0
+		}
+	}
+
+	passed := lossPct <= tc.Correctness.ExpectedLossPct
+	var errors []string
+	if !passed {
+		errors = append(errors, fmt.Sprintf("expected loss <= %.2f%%, got %.2f%% (%s of %s lines lost)",
+			tc.Correctness.ExpectedLossPct, lossPct,
+			formatCount(genStats.LinesSent-recvMetrics.LinesReceived), formatCount(genStats.LinesSent)))
+	}
+	if recvMetrics.LinesReceived > genStats.LinesSent {
+		extra := recvMetrics.LinesReceived - genStats.LinesSent
+		overPct := 100.0 * float64(extra) / float64(genStats.LinesSent)
+		fmt.Printf("  over-delivery: %s duplicate lines (%.2f%%) — at-least-once, expected for a mid-delivery crash\n",
+			formatCount(extra), overPct)
+	}
+
+	fmt.Printf("  lines sent: %s  lines received: %s  loss: %.2f%%\n",
+		formatCount(genStats.LinesSent), formatCount(recvMetrics.LinesReceived), lossPct)
+	if passed {
+		fmt.Println("  kafka in-flight crash correctness: PASSED ✓")
+	} else {
+		fmt.Println("  kafka in-flight crash correctness: FAILED ✗")
+	}
+
+	result := results.RunResult{
+		TestName:        tc.Name,
+		Config:          configName,
+		Subject:         subject.Name,
+		Version:         subject.Version,
+		Hardware:        hardwareID(),
+		Timestamp:       startTime,
+		DurationSec:     elapsed,
+		FirstSentNs:     genStats.FirstSentNs,
+		LastSentNs:      genStats.LastSentNs,
+		FirstReceivedNs: recvMetrics.FirstReceivedNs,
+		LastReceivedNs:  recvMetrics.LastReceivedNs,
+		LinesIn:         genStats.LinesSent,
+		LinesOut:        recvMetrics.LinesReceived,
+		BytesIn:         genStats.BytesSent,
+		BytesOut:        recvMetrics.BytesReceived,
+		LossPercent:     lossPct,
+		Passed:          &passed,
+	}
+	if !passed {
+		result.FailReason = strings.Join(errors, "; ")
+	}
+
+	// Persist the result like every other run path — Run's contract is to
+	// return the *persisted* result, so without this the in-flight crash
+	// run never lands in the results store (and never reaches the report).
+	dir, err := r.store.Save(result, "")
+	if err != nil {
+		return result, fmt.Errorf("saving results: %w", err)
+	}
+	fmt.Printf("  done. results → %s\n", dir)
 
 	return result, nil
 }

@@ -5,7 +5,10 @@ devices:
     properties:
       address: "0.0.0.0"
       otlp_grpc_status: true
-      otlp_http_status: true
+      # HTTP disabled so this case truly isolates the gRPC ingress path: a
+      # regression serving HTTP instead of gRPC fails (nothing bound on 4318)
+      # instead of silently passing on an always-open listener.
+      otlp_http_status: false
       otlp_logs_status: true
       otlp_metrics_status: false
       otlp_traces_status: false

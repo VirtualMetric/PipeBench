@@ -1,0 +1,13 @@
+# Consume the Kafka topic and forward each record to the TCP receiver. The
+# load_kafka operator reads raw message bytes; read_line keeps one event per
+# message and write_line emits the raw payload, so one Kafka message (one JSON
+# object at kafka_batch=1) becomes one received line.
+tenzir:
+  pipelines:
+    kafka-to-tcp:
+      name: Kafka to TCP
+      restart-on-error: 5 seconds
+      definition: |
+        from_kafka "bench", options={"bootstrap.servers": "redpanda:9092", "group.id": "bench", "auto.offset.reset": "earliest"}
+        write_ndjson
+        save_tcp "receiver:9001"

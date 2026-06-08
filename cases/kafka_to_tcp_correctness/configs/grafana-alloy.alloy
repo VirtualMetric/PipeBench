@@ -1,0 +1,26 @@
+// Consume the Kafka topic and forward each record to the TCP receiver. Alloy
+// wraps OpenTelemetry components: the kafka receiver (encoding: text) feeds the
+// syslog exporter (rfc3164/tcp), one received line per Kafka message.
+otelcol.receiver.kafka "in" {
+  brokers          = ["redpanda:9092"]
+  protocol_version = "2.0.0"
+  group_id         = "bench"
+  initial_offset   = "earliest"
+  logs {
+    topics   = ["bench"]
+    encoding = "raw"
+  }
+  output {
+    logs = [otelcol.exporter.syslog.out.input]
+  }
+}
+
+otelcol.exporter.syslog "out" {
+  endpoint = "receiver"
+  port     = 9001
+  network  = "tcp"
+  protocol = "rfc3164"
+  tls {
+    insecure = true
+  }
+}

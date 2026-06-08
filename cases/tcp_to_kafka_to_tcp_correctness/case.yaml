@@ -1,0 +1,49 @@
+name: tcp_to_kafka_to_tcp_correctness
+type: correctness
+description: "Round-trips records through Kafka inside one vmetric instance with TWO routes: TCP device -> Kafka target (write), then Kafka device -> TCP target (read). Exercises the Kafka target AND device plus multi-route in a single director."
+
+duration: 30s
+# The internal Kafka device reads from LATEST, so it must have joined the topic
+# before the Kafka target starts writing. The generator's warmup holds TCP
+# input until the subject (and its Kafka device) is fully up (~15-21s startup).
+warmup: 30s
+
+# Renders a Redpanda broker + topic-init. The generator/receiver are plain TCP;
+# the Kafka hop happens entirely inside the subject (target writes, device reads).
+kafka:
+  topic: bench
+  partitions: 1
+
+generator:
+  mode: tcp
+  target: "subject:9000"
+  # Paced (not a flood). A correctness run must be lossless for every subject;
+  # at rate: 0 the burst overruns slower subjects' TCP input (e.g. logstash on
+  # the JVM, doing double work in the round-trip) and they drop records before
+  # the generator closes the connection. 200/s round-trips cleanly everywhere.
+  # Max throughput is measured separately by tcp_to_kafka_to_tcp_performance.
+  rate: 200
+  line_size: 256
+  format: raw
+  connections: 1
+  total_lines: 2000
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+subjects:
+  - vmetric
+  - vector
+  - fluent-bit
+  - logstash
+
+correctness:
+  # Every TCP record must survive the Kafka round-trip and arrive at the TCP
+  # receiver (0% loss). batch_mode defaults to "individual" (one record per
+  # Kafka message), so the count is preserved 1:1.
+  expected_loss_pct: 0.0
+
+configurations:
+  default:
+    description: "TCP in -> Kafka target -> Kafka device -> TCP out, two routes in one director"

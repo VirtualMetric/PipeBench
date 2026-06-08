@@ -23,14 +23,14 @@ import (
 )
 
 type config struct {
-	ID          string        // optional generator id (multi-generator mode)
-	Mode        string        // tcp | file | http | udp | udp_netflow_v5 | otlp
-	Target      string        // host:port or file path or URL
-	Rate        int           // lines/sec per connection, 0 = unlimited
-	Duration    time.Duration // 0 = run until total lines
-	TotalLines  int64         // 0 = use duration
-	LineSize    int           // bytes per line
-	Format      string        // raw | syslog | json
+	ID         string        // optional generator id (multi-generator mode)
+	Mode       string        // tcp | file | http | udp | udp_netflow_v5 | otlp
+	Target     string        // host:port or file path or URL
+	Rate       int           // lines/sec per connection, 0 = unlimited
+	Duration   time.Duration // 0 = run until total lines
+	TotalLines int64         // 0 = use duration
+	LineSize   int           // bytes per line
+	Format     string        // raw | syslog | json
 	// SampleFile, when non-empty, replays this file's lines verbatim (cycling
 	// to reach TotalLines/Duration) instead of synthesizing them; Format then
 	// no longer drives line content.
@@ -44,10 +44,10 @@ type config struct {
 	// date ("Mmm _d hh:mm:ss") to the current time at send. Sample-file only.
 	RewriteTimestamp bool
 	Warmup           time.Duration
-	Sequenced   bool  // embed SEQ=<n> in each line for correctness
-	Connections int   // parallel TCP/HTTP connections (default 1)
-	SeqOffset   int64 // starting sequence number — set per worker by the parallel dispatcher so global sequences don't overlap across workers (otherwise each worker emits 0..perWorker, breaking the receiver-side dedup check)
-	ConnOffset  int   // global offset added to connection IDs — set by the harness in multi-generator mode so CONN= values from different generators never collide downstream
+	Sequenced        bool  // embed SEQ=<n> in each line for correctness
+	Connections      int   // parallel TCP/HTTP connections (default 1)
+	SeqOffset        int64 // starting sequence number — set per worker by the parallel dispatcher so global sequences don't overlap across workers (otherwise each worker emits 0..perWorker, breaking the receiver-side dedup check)
+	ConnOffset       int   // global offset added to connection IDs — set by the harness in multi-generator mode so CONN= values from different generators never collide downstream
 
 	// File-rotation knobs (file mode only). Empty RotateMode = disabled.
 	RotateMode    string // "create" | "copytruncate" | "truncate"
@@ -59,12 +59,19 @@ type config struct {
 	// best-effort lookup at the conventional /certs/client.{crt,key}
 	// and /certs/ca.crt paths the harness writes when it auto-generates
 	// certs. TLSInsecureSkipVerify disables hostname/chain checks.
-	TLS                bool
-	TLSCert            string
-	TLSKey             string
-	TLSCA              string
-	TLSInsecureVerify  bool
-	TLSMinVersion      string
+	TLS               bool
+	TLSCert           string
+	TLSKey            string
+	TLSCA             string
+	TLSInsecureVerify bool
+	TLSMinVersion     string
+
+	// Kafka knobs (kafka mode only). Target holds the seed broker(s). KafkaTopic
+	// is the topic to produce to. KafkaBatch packs N JSON records per Kafka
+	// message: 1 = one JSON object per message, N>1 = a JSON array of N objects
+	// per message.
+	KafkaTopic string
+	KafkaBatch int
 }
 
 type result struct {
@@ -165,6 +172,11 @@ func main() {
 		// comparison stays meaningful: the receiver sees one TCP line
 		// per decoded record.
 		linesSent, bytesSent, err = runOTLPLogs(cfg, &clock)
+	case "kafka":
+		// Produce JSON records to a Kafka topic. "lines" counts records (not
+		// messages); GENERATOR_KAFKA_BATCH packs 1 (one object) or N (a JSON
+		// array of N objects) records per message.
+		linesSent, bytesSent, err = runKafka(cfg, &clock)
 	default:
 		fmt.Fprintf(os.Stderr, "generator: unknown mode %q\n", cfg.Mode)
 		os.Exit(1)
@@ -280,6 +292,12 @@ func loadConfig() config {
 
 	cfg.SampleFile = os.Getenv("GENERATOR_SAMPLE_FILE")
 	cfg.RewriteTimestamp = getEnvBool("GENERATOR_REWRITE_TIMESTAMP", false)
+
+	cfg.KafkaTopic = getEnv("GENERATOR_KAFKA_TOPIC", "bench")
+	cfg.KafkaBatch = getEnvInt("GENERATOR_KAFKA_BATCH", 1)
+	if cfg.KafkaBatch < 1 {
+		cfg.KafkaBatch = 1
+	}
 
 	cfg.Sequenced = getEnvBool("GENERATOR_SEQUENCED", false)
 	cfg.Connections = getEnvInt("GENERATOR_CONNECTIONS", 1)

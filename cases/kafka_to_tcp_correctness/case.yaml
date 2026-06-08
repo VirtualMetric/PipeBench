@@ -1,0 +1,63 @@
+name: kafka_to_tcp_correctness
+type: kafka_correctness
+description: "Every JSON record produced to Kafka must be consumed by the subject and forwarded to TCP (no loss)"
+
+duration: 120s
+# The director's kafka consumer reads from the LATEST offset (no offset-reset
+# config — see KAFKA_TESTS.md), so it only receives records produced AFTER it
+# has joined the group. The director takes ~15-21s to start its consumer, so
+# the generator must wait past that before producing or the burst is missed.
+warmup: 35s
+
+kafka:
+  topic: bench
+  partitions: 1
+
+generator:
+  mode: kafka
+  target: "redpanda:9092"
+  format: json
+  # Paced stream (not a flood) so the run exercises sustained consumption
+  # across many fetch batches + buffer rotations — the path that tripped the
+  # semaphore panic. The director reads from LATEST, so warmup must exceed its
+  # startup (~15-21s) to ensure the consumer has joined before the first record.
+  rate: 200
+  line_size: 256
+  connections: 1
+  # Send a fixed number of records and exit, so loss accounting is exact.
+  total_lines: 2000
+  # One JSON object per Kafka message → every subject emits exactly one event
+  # per message, so received records == sent records (clean 1:1 loss check).
+  # Raising kafka_batch packs a JSON array per message, which only stays 1:1
+  # for subjects that split arrays into events (e.g. logstash).
+  kafka_batch: 1
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+# Subjects whose pinned image consumes Kafka and forwards to the TCP receiver
+# with exact 1:1 counts. Excluded: axosyslog (image exposes no kafka source
+# driver), cribl-stream (re-emits ~26 duplicate events per run — at-least-once
+# on the tcpjson output), filebeat (no plain-TCP output), and fluentd/nxlog/
+# rotel (no Kafka in their pinned images).
+subjects:
+  - vmetric
+  - vector
+  - fluent-bit
+  - logstash
+  - otel-collector
+  - bindplane-agent
+  - grafana-alloy
+  - tenzir
+  - telegraf
+
+configurations:
+  default:
+    description: "Consume from Kafka topic `bench`, forward every record to the TCP receiver"
+
+correctness:
+  expected_loss_pct: 0
+  # After the generator stops, give the subject time to drain the topic and
+  # forward the backlog before the verdict is taken.
+  drain_seconds: 60

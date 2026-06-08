@@ -1,0 +1,39 @@
+name: tcp_to_kafka_to_tcp_performance
+type: performance
+description: "Throughput of the Kafka round-trip inside one vmetric instance with TWO routes: TCP device -> Kafka target (write) and Kafka device -> TCP target (read). Measures end-to-end EPS through TCP -> Kafka -> TCP."
+
+duration: 60s
+# The internal Kafka device reads from LATEST, so warmup must exceed the
+# subject's startup (~15-21s) to ensure the device has joined the topic before
+# the Kafka target begins writing.
+warmup: 30s
+
+kafka:
+  topic: bench
+  partitions: 1
+
+generator:
+  mode: tcp
+  target: "subject:9000"
+  rate: 0          # unlimited — measure max sustainable round-trip throughput
+  line_size: 256
+  format: raw
+  connections: 4
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+# All four subjects round-trip TCP -> Kafka -> TCP in one pipeline. This is a
+# throughput run (rate: 0 flood), so loss is informational — slower subjects
+# (e.g. logstash) will shed records under the flood; the EPS is the measure.
+# The lossless 1:1 check lives in tcp_to_kafka_to_tcp_correctness.
+subjects:
+  - vmetric
+  - vector
+  - fluent-bit
+  - logstash
+
+configurations:
+  default:
+    description: "TCP in -> Kafka target -> Kafka device -> TCP out, two routes; measure EPS"

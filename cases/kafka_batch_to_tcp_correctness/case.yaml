@@ -1,0 +1,56 @@
+name: kafka_batch_to_tcp_correctness
+type: kafka_correctness
+description: "Generator packs 10 JSON objects per Kafka message as a JSON array; vmetric's Kafka device must split each array back into individual events (split_mode: json_array) and forward every record to TCP. Tests the device's batch/array parsing — received records == sent records only if the split works."
+
+duration: 120s
+# The director's Kafka consumer reads from the LATEST offset (no offset-reset
+# knob — see KAFKA_TESTS.md), so it only receives records produced AFTER it has
+# joined the group. The director takes ~15-21s to start its consumer, so the
+# generator must wait past that before producing or the burst is missed.
+warmup: 35s
+
+kafka:
+  topic: bench
+  partitions: 1
+
+generator:
+  mode: kafka
+  target: "redpanda:9092"
+  format: json
+  # Paced stream (not a flood) so the run exercises sustained consumption across
+  # many fetch batches + buffer rotations.
+  rate: 200
+  line_size: 256
+  connections: 1
+  # Fixed record count so loss accounting is exact: 2000 records / 10-per-message
+  # = 200 Kafka messages, each a JSON array of 10 objects.
+  total_lines: 2000
+  # Pack 10 JSON objects per Kafka message as a JSON array ([{...},...]). The
+  # device must split them back into 10 events (split_mode: json_array in
+  # configs/vmetric.yml), so received records == sent records (2000) only if the
+  # array-split works. With kafka_batch: 1 (the kafka_to_tcp_correctness case)
+  # no splitting is needed; this case specifically exercises array parsing.
+  kafka_batch: 10
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+# Only subjects that split a JSON array into one event per element (1:1 record
+# count) are listed: vmetric (split_mode: json_array), logstash (codec=>json),
+# and vector (json decoding). fluent-bit is intentionally excluded — its kafka
+# input cannot split an array message into N records, so it would under-deliver.
+subjects:
+  - vmetric
+  - vector
+  - logstash
+
+configurations:
+  default:
+    description: "Consume JSON-array batch messages from Kafka, split into events, forward to TCP"
+
+correctness:
+  expected_loss_pct: 0
+  # After the generator stops, give the device time to drain the topic and
+  # forward the split backlog before the verdict is taken.
+  drain_seconds: 60

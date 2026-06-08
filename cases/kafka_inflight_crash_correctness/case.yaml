@@ -1,0 +1,42 @@
+name: kafka_inflight_crash_correctness
+type: kafka_inflight_crash_correctness
+description: "Hard-crash (SIGKILL) the subject WHILE it is delivering consumed Kafka records to a LIVE receiver; verify no loss. Exercises the at-least-once over-delivery window (duplicates allowed, measured)."
+
+duration: 30s
+# The subject (Kafka consumer) reads from LATEST, so warmup must exceed its
+# startup (~15-21s) to ensure the consumer has joined before the generator
+# produces.
+warmup: 30s
+
+kafka:
+  topic: bench
+  partitions: 1
+
+generator:
+  mode: kafka
+  target: "redpanda:9092"
+  format: json
+  # Paced (not a flood) so delivery streams to the receiver over time and the
+  # SIGKILL can be timed to land mid-delivery (when the receiver has seen ~half).
+  rate: 1000
+  line_size: 256
+  connections: 1
+  total_lines: 20000
+  kafka_batch: 1
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+subjects:
+  - vmetric
+
+correctness:
+  # No loss: every produced record must eventually arrive. Over-delivery
+  # (duplicates from re-consuming delivered-but-uncommitted offsets) is measured
+  # and reported, not failed — at-least-once permits it.
+  expected_loss_pct: 0.0
+
+configurations:
+  default:
+    description: "Receiver up throughout; SIGKILL the subject mid-delivery, restart, verify no loss"
