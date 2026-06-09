@@ -1,0 +1,33 @@
+persistent_storage:
+  status: true
+devices:
+  - id: 1
+    name: otel-bench
+    type: otel
+    properties:
+      address: "0.0.0.0"
+      # gRPC disabled so this case isolates the HTTP ingress path: a regression
+      # serving gRPC instead of HTTP fails (nothing bound on 4317) instead of
+      # silently passing on an always-open listener.
+      otlp_grpc_status: false
+      otlp_http_status: true
+      # Metrics-only case: logs + traces explicitly off.
+      otlp_logs_status: false
+      otlp_metrics_status: true
+      otlp_traces_status: false
+
+targets:
+  - name: otlp-target-bench
+    type: otlp
+    properties:
+      url: "http://receiver:4318"
+      path: "/v1/metrics"
+      format: "protobuf"
+      compression: true
+
+routes:
+  - name: otel-to-otlp-bench
+    devices:
+      - name: otel-bench
+    targets:
+      - name: otlp-target-bench

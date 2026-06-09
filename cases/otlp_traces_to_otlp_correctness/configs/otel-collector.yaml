@@ -1,0 +1,28 @@
+# otel-collector → OTLP/HTTP traces head-to-head config (the oracle
+# subject for the traces signal).
+#
+# Receivers: otlp — both gRPC (4317) and HTTP (4318) endpoints.
+# Exporters: otlphttp — forwards to the bench receiver's /v1/traces
+# endpoint (otlphttp appends the per-signal path automatically).
+#
+# Pipeline: traces only. The case sends spans only, so we don't
+# register logs/metrics pipelines — keeps the dispatch path narrow.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+exporters:
+  otlphttp:
+    endpoint: http://receiver:4318
+    compression: gzip
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [otlphttp]

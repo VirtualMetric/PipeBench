@@ -1,0 +1,40 @@
+name: otlp_traces_to_otlp_correctness
+type: correctness
+description: "End-to-end OTLP/Traces correctness head-to-head: each subject receives OTLP/HTTP+protobuf spans and forwards via OTLP/HTTP+protobuf. Verifies the full receive→forward path and zero-loss for the traces signal across vmetric and otel-collector."
+
+duration: 60s
+warmup: 15s
+
+generator:
+  mode: otlp
+  target: "subject:4318"
+  rate: 0
+  # 500 spans (5 batches of 100) — enough to catch decode bugs without
+  # taking long to run.
+  total_lines: 500
+  format: raw
+  env:
+    # Drive the traces signal. The generator emits one span per record
+    # named "TRACE-<seq>" with valid unique trace/span ids, so the
+    # receiver counts one line ("span_name=TRACE-<seq>") per record.
+    GENERATOR_OTLP_SIGNAL: traces
+
+receiver:
+  mode: otlp
+  listen: ":4318"
+
+subjects:
+  - vmetric
+  - otel-collector
+
+correctness:
+  validate_order: false
+  # Globally-unique "TRACE-<seq>" span names across workers let
+  # hash-dedup catch both span loss AND duplicate delivery — every
+  # span must arrive exactly once.
+  validate_dedup: true
+  expected_loss_pct: 0.0
+  # The OTLP receiver emits "span_name=TRACE-<seq>" per span, so a
+  # subject that decoded + forwarded OTLP traces correctly sees every
+  # line contain "TRACE-".
+  required_substring: "TRACE-"
