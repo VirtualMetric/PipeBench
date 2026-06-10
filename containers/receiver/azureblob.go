@@ -11,6 +11,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azqueue"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azqueue/queueerror"
 )
 
 // receiveAzureBlob polls an Azure Blob container (Azurite in the bench
@@ -112,7 +113,7 @@ func runAzureInit() {
 		}
 		for {
 			_, err := queueClient.CreateQueue(ctx, name, nil)
-			if err == nil || strings.Contains(err.Error(), "QueueAlreadyExists") {
+			if err == nil || queueerror.HasCode(err, queueerror.QueueAlreadyExists) {
 				break
 			}
 			if time.Now().After(deadline) {
