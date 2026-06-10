@@ -348,6 +348,9 @@ func (tc *TestCase) Validate() error {
 			}
 		}
 	}
+	if tc.Correctness.MaxOverDeliveryPct < 0 {
+		return fmt.Errorf("case %q: max_overdelivery_pct must be non-negative, got %.2f", tc.Name, tc.Correctness.MaxOverDeliveryPct)
+	}
 	return nil
 }
 
@@ -522,6 +525,15 @@ type CorrectnessConfig struct {
 	// arriving long after the generator is done).
 	DrainSeconds     int    `yaml:"drain_seconds"`
 	DrainQuietWindow string `yaml:"drain_quiet_window"`
+
+	// MaxOverDeliveryPct caps duplicate re-delivery as a percentage of
+	// lines sent. Enforced by case types that verify source
+	// acknowledgments actually persisted (kafka_offset_commit_restart:
+	// a clean restart after full delivery must resume from committed
+	// offsets, not re-consume the topic). Zero = strict, no
+	// over-delivery allowed. Ignored by case types that don't document
+	// it — at-least-once types deliberately tolerate duplicates.
+	MaxOverDeliveryPct float64 `yaml:"max_overdelivery_pct"`
 
 	// RateCeiling validates a per-window EPS ceiling on the receive side.
 	// Empty MaxEPS = check disabled.
