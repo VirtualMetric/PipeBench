@@ -523,6 +523,15 @@ type CorrectnessConfig struct {
 	DrainSeconds     int    `yaml:"drain_seconds"`
 	DrainQuietWindow string `yaml:"drain_quiet_window"`
 
+	// MaxOverDeliveryPct caps duplicate re-delivery as a percentage of
+	// lines sent. Enforced by case types that verify source
+	// acknowledgments actually persisted (kafka_offset_commit_restart:
+	// a clean restart after full delivery must resume from committed
+	// offsets, not re-consume the topic). Zero = strict, no
+	// over-delivery allowed. Ignored by case types that don't document
+	// it — at-least-once types deliberately tolerate duplicates.
+	MaxOverDeliveryPct float64 `yaml:"max_overdelivery_pct"`
+
 	// RateCeiling validates a per-window EPS ceiling on the receive side.
 	// Empty MaxEPS = check disabled.
 	RateCeiling RateCeilingConfig `yaml:"rate_ceiling"`
