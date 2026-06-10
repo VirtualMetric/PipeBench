@@ -127,7 +127,7 @@ PipeBench/
     receiver/            Receives output, counts lines, validates correctness
     collector/           Polls Docker stats API, writes metrics CSV
     vmetric/             Dockerfile + pre-built binary for the VirtualMetric Director subject
-  cases/                 31 test cases (17 performance + 14 correctness), each with per-subject configs
+  cases/                 51 test cases (27 performance + 24 correctness), each with per-subject configs
   web/                   Static PipeBench UI (single HTML + per-(hardware, subject) JSON under web/results/)
 ```
 
