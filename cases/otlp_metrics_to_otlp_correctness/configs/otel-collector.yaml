@@ -1,0 +1,31 @@
+# otel-collector → OTLP/HTTP metrics head-to-head config (the oracle
+# subject for the metrics signal).
+#
+# Receivers: otlp — both gRPC (4317) and HTTP (4318) endpoints.
+# Exporters: otlphttp — forwards to the bench receiver's /v1/metrics
+# endpoint (otlphttp appends the per-signal path automatically).
+#
+# Pipeline: metrics only. The case sends metrics only, so we don't
+# register logs/traces pipelines — keeps the dispatch path narrow.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+exporters:
+  otlphttp:
+    endpoint: http://receiver:4318
+    compression: gzip
+    # Default request encoding is protobuf; matches what every other
+    # subject's OTLP-out path emits, so head-to-head numbers measure
+    # the same wire format.
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      exporters: [otlphttp]

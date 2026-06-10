@@ -1,5 +1,25 @@
 package main
 
+// OTLP/Logs, OTLP/Metrics, and OTLP/Traces over OTLP/gRPC,
+// OTLP/HTTP+protobuf, and OTLP/HTTP+JSON.
+//
+// Signal is picked by GENERATOR_OTLP_SIGNAL (logs|metrics|traces,
+// default logs); transport by GENERATOR_OTLP_TRANSPORT. Logs support
+// all three transports; metrics and traces are HTTP-only (the cases
+// driving them isolate the HTTP ingress path, and the receiver counts
+// datapoints/spans identically regardless of transport). The send
+// loop, rate limiter, and batch reuse are shared across all three
+// signals via the signalBatch interface — only the per-record fill
+// (LogRecord body vs metric name vs span name) differs.
+//
+// Each emitted record carries a per-signal token embedding the global
+// seq so the bench receiver's required_substring + hash-dedup checks
+// work uniformly: "OTEL-<seq>" in a LogRecord body, "METRIC-<seq>" as
+// a metric name (one Gauge datapoint each), "TRACE-<seq>" as a span
+// name. One generator "line" maps to one LogRecord / one metric
+// datapoint / one span, so the harness's lines-sent vs lines-received
+// comparison stays meaningful.
+//
 // OTLP/Logs over OTLP/gRPC, OTLP/HTTP+protobuf, and OTLP/HTTP+JSON.
 //
 // Patterned after streamfold/otel-loadgen (Apache 2.0) — the upstream
@@ -35,6 +55,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net/http"
@@ -52,9 +73,13 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
+	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
+	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
+	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
+	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 )
 
 // otlpRecordsPerBatch is the LogRecord count per ExportLogsServiceRequest
@@ -67,10 +92,20 @@ import (
 // affects throughput pacing only, not correctness.
 const otlpRecordsPerBatch = 100
 
-// runOTLPLogs sends OTLP/Logs to the configured target. mode picks the
-// transport: "grpc" → OTLP/gRPC on the otlp_target_grpc endpoint;
-// "http_proto" / "http_json" → OTLP/HTTP on the otlp_target_http
-// endpoint with the matching Content-Type.
+// otlpSignal identifies which OTLP signal a run generates.
+type otlpSignal int
+
+const (
+	signalLogs otlpSignal = iota
+	signalMetrics
+	signalTraces
+)
+
+// runOTLP sends OTLP to the configured target. GENERATOR_OTLP_SIGNAL
+// picks the signal (logs|metrics|traces, default logs);
+// GENERATOR_OTLP_TRANSPORT picks the transport. Logs may use gRPC or
+// HTTP; metrics and traces are HTTP-only (gRPC metric/trace generation
+// is intentionally out of scope — requesting it fails fast).
 //
 // When cfg.Connections > 1, fans out N goroutines, each running an
 // independent send loop. Without this fan-out a single OTLP generator
@@ -80,35 +115,76 @@ const otlpRecordsPerBatch = 100
 // same fan-out — we mirror its shape so the bench harness's
 // auto-scaled GENERATOR_CONNECTIONS just works.
 //
-// Returns (records_sent, bytes_sent, err). Records — not requests —
-// is the reported unit; see the package-level comment for why.
-func runOTLPLogs(cfg config, clock *sendClock) (int64, int64, error) {
+// Returns (records_sent, bytes_sent, err). Records — LogRecords for
+// logs, metric datapoints for metrics, spans for traces — is the
+// reported unit; see the package-level comment for why.
+func runOTLP(cfg config, clock *sendClock) (int64, int64, error) {
 	transport := strings.ToLower(getEnv("GENERATOR_OTLP_TRANSPORT", "http_proto"))
-	if cfg.Connections <= 1 {
-		return runOTLPLogsSingle(cfg, clock, transport)
-	}
-	return runOTLPLogsParallel(cfg, clock, transport)
-}
+	signal := strings.ToLower(getEnv("GENERATOR_OTLP_SIGNAL", "logs"))
 
-// runOTLPLogsSingle dispatches to the right transport with one
-// goroutine driving the send loop.
-func runOTLPLogsSingle(cfg config, clock *sendClock, transport string) (int64, int64, error) {
-	switch transport {
-	case "grpc":
-		return runOTLPLogsGRPC(cfg, clock)
-	case "http_proto", "http_json":
-		return runOTLPLogsHTTP(cfg, clock, transport)
+	switch signal {
+	case "logs":
+		return runOTLPSignal(cfg, clock, transport, signalLogs)
+	case "metrics":
+		if transport == "grpc" {
+			return 0, 0, fmt.Errorf("generator: otlp metrics signal is http-only (got transport %q; want http_proto | http_json)", transport)
+		}
+		return runOTLPSignal(cfg, clock, transport, signalMetrics)
+	case "traces":
+		if transport == "grpc" {
+			return 0, 0, fmt.Errorf("generator: otlp traces signal is http-only (got transport %q; want http_proto | http_json)", transport)
+		}
+		return runOTLPSignal(cfg, clock, transport, signalTraces)
 	default:
-		return 0, 0, fmt.Errorf("generator: unknown otlp transport %q (want grpc | http_proto | http_json)", transport)
+		return 0, 0, fmt.Errorf("generator: unknown otlp signal %q (want logs | metrics | traces)", signal)
 	}
 }
 
-// runOTLPLogsParallel runs N independent send loops concurrently and
-// aggregates their counters. Each goroutine partitions its TotalLines
+// runOTLPSignal drives one signal end to end, fanning out across
+// cfg.Connections workers when > 1.
+func runOTLPSignal(cfg config, clock *sendClock, transport string, signal otlpSignal) (int64, int64, error) {
+	single := func(wc config) (int64, int64, error) {
+		return runOTLPSignalSingle(wc, clock, transport, signal)
+	}
+	if cfg.Connections <= 1 {
+		return single(cfg)
+	}
+	return runOTLPParallel(cfg, single)
+}
+
+// runOTLPSignalSingle dispatches one goroutine to the right transport
+// + signal batch. Logs honor grpc/http_proto/http_json; metrics and
+// traces are HTTP-only (the caller has already rejected grpc).
+func runOTLPSignalSingle(cfg config, clock *sendClock, transport string, signal otlpSignal) (int64, int64, error) {
+	switch signal {
+	case signalLogs:
+		switch transport {
+		case "grpc":
+			return runOTLPLogsGRPC(cfg, clock)
+		case "http_proto", "http_json":
+			return runOTLPHTTP(cfg, clock, transport, "/v1/logs",
+				newOTLPBatch(buildResource(), buildScope(), otlpRecordsPerBatch))
+		default:
+			return 0, 0, fmt.Errorf("generator: unknown otlp transport %q (want grpc | http_proto | http_json)", transport)
+		}
+	case signalMetrics:
+		return runOTLPHTTP(cfg, clock, transport, "/v1/metrics",
+			newOTLPMetricBatch(buildResource(), buildScope(), otlpRecordsPerBatch))
+	case signalTraces:
+		return runOTLPHTTP(cfg, clock, transport, "/v1/traces",
+			newOTLPTraceBatch(buildResource(), buildScope(), otlpRecordsPerBatch))
+	default:
+		return 0, 0, fmt.Errorf("generator: unknown otlp signal %d", signal)
+	}
+}
+
+// runOTLPParallel runs N independent send loops concurrently and
+// aggregates their counters. `single` drives one worker given its
+// partitioned workerCfg. Each goroutine partitions its TotalLines
 // and Duration share evenly (TotalLines/N records per worker; same
 // Duration for all). On error the first goroutine's error wins; the
 // rest still complete so the partial-batch counters are accurate.
-func runOTLPLogsParallel(cfg config, clock *sendClock, transport string) (int64, int64, error) {
+func runOTLPParallel(cfg config, single func(config) (int64, int64, error)) (int64, int64, error) {
 	var totalLines, totalBytes atomic.Int64
 	var firstErr error
 	var errOnce sync.Once
@@ -132,7 +208,7 @@ func runOTLPLogsParallel(cfg config, clock *sendClock, transport string) (int64,
 	// Track the running offset across workers so SeqOffset is unique
 	// per worker AND contiguous over the whole batch — every emitted
 	// record gets a globally unique seq, which lets the receiver run
-	// proper hash-dedup validation on OTLP-mode bodies.
+	// proper hash-dedup validation on OTLP-mode payloads.
 	var nextOffset int64
 	for i := 0; i < cfg.Connections; i++ {
 		wg.Add(1)
@@ -146,9 +222,9 @@ func runOTLPLogsParallel(cfg config, clock *sendClock, transport string) (int64,
 			}
 		}
 		nextOffset += workerCfg.TotalLines
-		go func(id int) {
+		go func(id int, wc config) {
 			defer wg.Done()
-			sent, bytes, err := runOTLPLogsSingle(workerCfg, clock, transport)
+			sent, bytes, err := single(wc)
 			totalLines.Add(sent)
 			totalBytes.Add(bytes)
 			if err != nil {
@@ -156,7 +232,7 @@ func runOTLPLogsParallel(cfg config, clock *sendClock, transport string) (int64,
 			}
 			fmt.Fprintf(os.Stderr, "generator: otlp worker %d done: records=%d bytes=%d\n",
 				id, sent, bytes)
-		}(i)
+		}(i, workerCfg)
 	}
 
 	wg.Wait()
@@ -219,27 +295,29 @@ func runOTLPLogsGRPC(cfg config, clock *sendClock) (int64, int64, error) {
 	return otlpDriveLoop(cfg, clock, batch, send)
 }
 
-// runOTLPLogsHTTP drives the OTLP/HTTP path. variant is "http_proto"
-// (application/x-protobuf) or "http_json" (application/json). Body
-// is always gzip-compressed — that's what otel-loadgen and rotel
-// emit by default and the steady-state path the receiver is tuned
-// for.
+// runOTLPHTTP drives the OTLP/HTTP path for any signal. variant is
+// "http_proto" (application/x-protobuf) or "http_json"
+// (application/json). signalPath is the OTLP path appended when the
+// target carries no explicit /v1/ path ("/v1/logs", "/v1/metrics",
+// "/v1/traces"). batch is the per-worker reusable proto tree the
+// drive loop mutates in place. Body is always gzip-compressed —
+// that's what otel-loadgen and rotel emit by default and the
+// steady-state path the receiver is tuned for.
 //
 // Per-worker allocation profile: one preallocated proto tree (the
-// otlpBatch — N records reused across iterations), one reusable
+// signalBatch — N records reused across iterations), one reusable
 // proto.Marshal output buffer (proto.MarshalOptions.MarshalAppend),
 // one bytes.Buffer for the gzip output, one gzip.Writer (Reset
 // between batches). Steady state is ~N small string allocations per
-// batch (the per-record "OTEL-<seq>" body) plus the http.Request
-// struct that net/http requires per call. Everything else stays in
-// place.
-func runOTLPLogsHTTP(cfg config, clock *sendClock, variant string) (int64, int64, error) {
+// batch (the per-record seq token) plus the http.Request struct that
+// net/http requires per call. Everything else stays in place.
+func runOTLPHTTP(cfg config, clock *sendClock, variant, signalPath string, batch signalBatch) (int64, int64, error) {
 	url := cfg.Target
 	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
 		url = "http://" + url
 	}
 	if !strings.Contains(url[7:], "/v1/") {
-		url = strings.TrimRight(url, "/") + "/v1/logs"
+		url = strings.TrimRight(url, "/") + signalPath
 	}
 
 	contentType := "application/x-protobuf"
@@ -278,11 +356,10 @@ func runOTLPLogsHTTP(cfg config, clock *sendClock, variant string) (int64, int64
 		},
 	}
 
-	batch := newOTLPBatch(buildResource(), buildScope(), otlpRecordsPerBatch)
-
 	// Per-worker reusable I/O buffers. Sized lazily — first batch
 	// grows them to whatever proto.Marshal + gzip emit, after which
 	// MarshalAppend / gzip.Reset use the existing capacity.
+	msg := batch.protoMsg()
 	var marshalBuf []byte
 	gzipBuf := new(bytes.Buffer)
 	gzipWriter := gzip.NewWriter(gzipBuf)
@@ -296,9 +373,9 @@ func runOTLPLogsHTTP(cfg config, clock *sendClock, variant string) (int64, int64
 		// steady-state allocs here drop to zero.
 		var err error
 		if variant == "http_json" {
-			marshalBuf, err = protojsonOpts.MarshalAppend(marshalBuf[:0], batch.msg)
+			marshalBuf, err = protojsonOpts.MarshalAppend(marshalBuf[:0], msg)
 		} else {
-			marshalBuf, err = protoOpts.MarshalAppend(marshalBuf[:0], batch.msg)
+			marshalBuf, err = protoOpts.MarshalAppend(marshalBuf[:0], msg)
 		}
 		if err != nil {
 			return 0, fmt.Errorf("marshal: %w", err)
@@ -345,18 +422,36 @@ func runOTLPLogsHTTP(cfg config, clock *sendClock, variant string) (int64, int64
 	return otlpDriveLoop(cfg, clock, batch, send)
 }
 
-// otlpDriveLoop is the shared send loop for both gRPC and HTTP. It
-// reuses one preallocated proto tree (the otlpBatch) across every
-// iteration — only the per-record body string and seq attribute
-// change, the rest of the proto structs stay in place. Compared
-// with the earlier "build a fresh tree per batch" path this drops
-// per-batch allocations from ~3*N + scope/resource down to ~N
-// strings, which is the dominant cost saver on the generator side.
+// signalBatch is the per-worker reusable proto tree for one OTLP
+// signal. The drive loop owns the iteration; the batch owns how a
+// record is laid out and mutated:
 //
-// Rate is enforced at LogRecord granularity — same convention as
+//   - protoMsg returns the message send() marshals.
+//   - prepare trims the batch's repeated field to `count` records so
+//     a short final batch (total_lines running out) serializes only
+//     that subset.
+//   - fillRecord mutates record i in place for sequence `seq` and
+//     timestamp `now` — swapping a LogRecord body, a metric name +
+//     datapoint, or a span name + ids, without allocating fresh
+//     proto structs.
+type signalBatch interface {
+	protoMsg() proto.Message
+	prepare(count int)
+	fillRecord(i int, seq int64, now uint64)
+}
+
+// otlpDriveLoop is the shared send loop for every OTLP signal and
+// transport. It reuses one preallocated proto tree (the signalBatch)
+// across every iteration — only the per-record fields change, the
+// rest of the proto structs stay in place. Compared with the earlier
+// "build a fresh tree per batch" path this drops per-batch
+// allocations from ~3*N + scope/resource down to ~N strings, which is
+// the dominant cost saver on the generator side.
+//
+// Rate is enforced at record granularity — same convention as
 // runNetflowV5 — so "1000 records/sec" with 100-record batches
 // fires 10 batches/sec, paced by a per-record ticker.
-func otlpDriveLoop(cfg config, clock *sendClock, batch *otlpBatch, send func() (int, error)) (int64, int64, error) {
+func otlpDriveLoop(cfg config, clock *sendClock, batch signalBatch, send func() (int, error)) (int64, int64, error) {
 	var deadline time.Time
 	if cfg.Duration > 0 {
 		deadline = time.Now().Add(cfg.Duration)
@@ -393,7 +488,7 @@ func otlpDriveLoop(cfg config, clock *sendClock, batch *otlpBatch, send func() (
 
 		// Trim the batch to batchN records (no-op when batchN ==
 		// preallocated capacity, which is the common case).
-		recs := batch.prepare(batchN)
+		batch.prepare(batchN)
 
 		// Per-record fill: mutate the existing proto structs
 		// rather than allocating fresh ones. Single timestamp for
@@ -406,15 +501,7 @@ func otlpDriveLoop(cfg config, clock *sendClock, batch *otlpBatch, send func() (
 				<-rateLimiter
 			}
 			seq := cfg.SeqOffset + linesSent + int64(i)
-			seqStr := strconv.FormatInt(seq, 10)
-			rec := recs[i]
-			rec.TimeUnixNano = now
-			rec.ObservedTimeUnixNano = now
-			// Body and the loadgen.seq attribute are pre-allocated
-			// AnyValue/KeyValue trees — we only swap the
-			// StringValue field on the leaf, no new struct allocs.
-			rec.Body.Value.(*commonpb.AnyValue_StringValue).StringValue = "OTEL-" + seqStr
-			rec.Attributes[0].Value.Value.(*commonpb.AnyValue_StringValue).StringValue = seqStr
+			batch.fillRecord(i, seq, now)
 		}
 
 		n, err := send()
@@ -473,15 +560,28 @@ func newOTLPBatch(resource *resourcepb.Resource, scope *commonpb.Instrumentation
 	}
 }
 
-// prepare returns a slice of `count` LogRecord pointers ready to be
-// mutated in-place. Trims the proto's ScopeLogs.LogRecords slice to
-// match — proto.Marshal serializes only that subset.
-func (b *otlpBatch) prepare(count int) []*logspb.LogRecord {
+func (b *otlpBatch) protoMsg() proto.Message { return b.msg }
+
+// prepare trims the proto's ScopeLogs.LogRecords slice to `count` —
+// proto.Marshal serializes only that subset.
+func (b *otlpBatch) prepare(count int) {
 	if count > len(b.records) {
 		count = len(b.records)
 	}
 	b.msg.ResourceLogs[0].ScopeLogs[0].LogRecords = b.records[:count]
-	return b.records[:count]
+}
+
+// fillRecord stamps record i with the batch timestamp and the
+// "OTEL-<seq>" body + loadgen.seq attribute. Body and the attribute
+// are pre-allocated AnyValue/KeyValue trees — we only swap the
+// StringValue field on the leaf, no new struct allocs.
+func (b *otlpBatch) fillRecord(i int, seq int64, now uint64) {
+	seqStr := strconv.FormatInt(seq, 10)
+	rec := b.records[i]
+	rec.TimeUnixNano = now
+	rec.ObservedTimeUnixNano = now
+	rec.Body.Value.(*commonpb.AnyValue_StringValue).StringValue = "OTEL-" + seqStr
+	rec.Attributes[0].Value.Value.(*commonpb.AnyValue_StringValue).StringValue = seqStr
 }
 
 // preallocLogRecord builds one LogRecord with the proto sub-trees
@@ -542,4 +642,135 @@ func stringAttr(k, v string) *commonpb.KeyValue {
 			Value: &commonpb.AnyValue_StringValue{StringValue: v},
 		},
 	}
+}
+
+// otlpMetricBatch is the per-worker reusable proto tree for the
+// metrics signal. One ResourceMetrics → one ScopeMetrics → N Metrics,
+// each a Gauge holding exactly one NumberDataPoint. The Gauge/
+// NumberDataPoint structs are preallocated; fillRecord only swaps the
+// metric name and the datapoint value/timestamps.
+//
+// One Gauge datapoint per Metric, with a unique metric name per seq,
+// is deliberate: the OTLP exporter on the subject side re-merges
+// metric datapoints *by name* within each (resource, scope) bucket,
+// so reusing names would collapse datapoints and undercount. Unique
+// "METRIC-<seq>" names keep one datapoint per record end to end, and
+// the bench receiver emits one line ("metric_name=METRIC-<seq>") per
+// datapoint — so its required_substring "METRIC-" and hash-dedup
+// checks line up with the logs path exactly.
+type otlpMetricBatch struct {
+	msg     *colmetricspb.ExportMetricsServiceRequest
+	metrics []*metricspb.Metric
+	points  []*metricspb.NumberDataPoint
+}
+
+func newOTLPMetricBatch(resource *resourcepb.Resource, scope *commonpb.InstrumentationScope, capacity int) *otlpMetricBatch {
+	metrics := make([]*metricspb.Metric, capacity)
+	points := make([]*metricspb.NumberDataPoint, capacity)
+	for i := range metrics {
+		dp := &metricspb.NumberDataPoint{
+			Value: &metricspb.NumberDataPoint_AsDouble{AsDouble: 0},
+		}
+		points[i] = dp
+		metrics[i] = &metricspb.Metric{
+			Data: &metricspb.Metric_Gauge{
+				Gauge: &metricspb.Gauge{DataPoints: []*metricspb.NumberDataPoint{dp}},
+			},
+		}
+	}
+	return &otlpMetricBatch{
+		msg: &colmetricspb.ExportMetricsServiceRequest{
+			ResourceMetrics: []*metricspb.ResourceMetrics{{
+				Resource: resource,
+				ScopeMetrics: []*metricspb.ScopeMetrics{{
+					Scope:   scope,
+					Metrics: metrics,
+				}},
+			}},
+		},
+		metrics: metrics,
+		points:  points,
+	}
+}
+
+func (b *otlpMetricBatch) protoMsg() proto.Message { return b.msg }
+
+func (b *otlpMetricBatch) prepare(count int) {
+	if count > len(b.metrics) {
+		count = len(b.metrics)
+	}
+	b.msg.ResourceMetrics[0].ScopeMetrics[0].Metrics = b.metrics[:count]
+}
+
+func (b *otlpMetricBatch) fillRecord(i int, seq int64, now uint64) {
+	seqStr := strconv.FormatInt(seq, 10)
+	b.metrics[i].Name = "METRIC-" + seqStr
+	dp := b.points[i]
+	dp.StartTimeUnixNano = now
+	dp.TimeUnixNano = now
+	// Mutate the preallocated wrapper's leaf — no per-record alloc.
+	dp.Value.(*metricspb.NumberDataPoint_AsDouble).AsDouble = float64(seq)
+}
+
+// otlpTraceBatch is the per-worker reusable proto tree for the traces
+// signal. One ResourceSpans → one ScopeSpans → N Spans. trace/span id
+// byte slices are preallocated (16 and 8 bytes); fillRecord only
+// swaps the span name, timestamps, and id bytes.
+//
+// Spans pass through the subject's pipeline as-is (no merge step like
+// metrics), so the only correctness requirement is a unique name per
+// seq — the bench receiver emits one line ("span_name=TRACE-<seq>")
+// per span, matching required_substring "TRACE-" and hash-dedup. The
+// ids are still populated with valid, unique, non-zero values so the
+// span is spec-valid and the subject's decode→re-encode never drops
+// it for a malformed/zero id.
+type otlpTraceBatch struct {
+	msg   *coltracepb.ExportTraceServiceRequest
+	spans []*tracepb.Span
+}
+
+func newOTLPTraceBatch(resource *resourcepb.Resource, scope *commonpb.InstrumentationScope, capacity int) *otlpTraceBatch {
+	spans := make([]*tracepb.Span, capacity)
+	for i := range spans {
+		spans[i] = &tracepb.Span{
+			TraceId: make([]byte, 16),
+			SpanId:  make([]byte, 8),
+			Kind:    tracepb.Span_SPAN_KIND_INTERNAL,
+		}
+	}
+	return &otlpTraceBatch{
+		msg: &coltracepb.ExportTraceServiceRequest{
+			ResourceSpans: []*tracepb.ResourceSpans{{
+				Resource: resource,
+				ScopeSpans: []*tracepb.ScopeSpans{{
+					Scope: scope,
+					Spans: spans,
+				}},
+			}},
+		},
+		spans: spans,
+	}
+}
+
+func (b *otlpTraceBatch) protoMsg() proto.Message { return b.msg }
+
+func (b *otlpTraceBatch) prepare(count int) {
+	if count > len(b.spans) {
+		count = len(b.spans)
+	}
+	b.msg.ResourceSpans[0].ScopeSpans[0].Spans = b.spans[:count]
+}
+
+func (b *otlpTraceBatch) fillRecord(i int, seq int64, now uint64) {
+	span := b.spans[i]
+	span.Name = "TRACE-" + strconv.FormatInt(seq, 10)
+	span.StartTimeUnixNano = now
+	span.EndTimeUnixNano = now
+	// Derive a unique, non-zero 16-byte trace id + 8-byte span id from
+	// seq. The high 8 trace-id bytes are offset by a constant so even
+	// seq 0 yields an all-non-zero 16-byte id; span id is seq+1 so it
+	// is never the all-zero (invalid) value either.
+	binary.BigEndian.PutUint64(span.TraceId[0:8], uint64(seq))
+	binary.BigEndian.PutUint64(span.TraceId[8:16], uint64(seq)+0x9e3779b97f4a7c15)
+	binary.BigEndian.PutUint64(span.SpanId, uint64(seq)+1)
 }

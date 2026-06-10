@@ -1,0 +1,23 @@
+name: otlp_traces_to_otlp_performance
+type: performance
+description: "End-to-end OTLP/Traces throughput head-to-head: rate at which each subject can receive OTLP/HTTP+protobuf spans and forward them as OTLP/HTTP+protobuf. vmetric vs. otel-collector."
+
+duration: 60s
+warmup: 15s
+
+generator:
+  mode: otlp
+  target: "subject:4318"
+  rate: 0
+  format: raw
+  env:
+    # One span per record ("TRACE-<seq>", valid unique trace/span ids).
+    GENERATOR_OTLP_SIGNAL: traces
+
+receiver:
+  mode: otlp
+  listen: ":4318"
+
+subjects:
+  - vmetric
+  - otel-collector

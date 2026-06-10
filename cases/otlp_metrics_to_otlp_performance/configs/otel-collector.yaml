@@ -1,0 +1,22 @@
+# otel-collector → OTLP/HTTP metrics head-to-head config (oracle
+# subject). Receives OTLP on gRPC+HTTP, forwards metrics to the bench
+# receiver's /v1/metrics endpoint via otlphttp.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+exporters:
+  otlphttp:
+    endpoint: http://receiver:4318
+    compression: gzip
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      exporters: [otlphttp]
