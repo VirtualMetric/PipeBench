@@ -9,6 +9,11 @@ devices:
       # container_name doubles as the storage queue polled for BlobCreated
       # events (the generator enqueues them).
       container_name: "bench-in"
+      # timeout is BOTH the dequeue poll interval and the queue visibility
+      # timeout. The 60s default would schedule the first poll after a short
+      # bench run already ended.
+      timeout: 2
+      batch_size: 32
 targets:
   - name: tcp-target-bench
     type: tcp
