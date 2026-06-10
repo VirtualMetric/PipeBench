@@ -1,0 +1,25 @@
+# Vector configuration for s3_to_tcp_performance — aws_s3 source driven by
+# S3→SQS bucket notifications (LocalStack), TCP sink passthrough.
+# Credentials/region come from the harness-injected AWS_* environment.
+
+[sources.in]
+type = "aws_s3"
+region = "us-east-1"
+endpoint = "http://localstack:4566"
+force_path_style = true
+
+[sources.in.sqs]
+queue_url = "http://localstack:4566/000000000000/bench-events"
+poll_secs = 1
+
+[sinks.out]
+type = "socket"
+mode = "tcp"
+inputs = ["in"]
+address = "receiver:9001"
+
+[sinks.out.encoding]
+codec = "text"
+
+[sinks.out.framing]
+method = "newline_delimited"

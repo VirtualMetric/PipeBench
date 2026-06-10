@@ -562,6 +562,175 @@ func TestValidateRejectsBadKafka(t *testing.T) {
 	}
 }
 
+// TestComposeRendersAWS verifies an `aws:` case renders the LocalStack
+// service with the rendered init script mounted, gates subject + cloud
+// receiver on its healthcheck, and injects emulator env where needed.
+func TestComposeRendersAWS(t *testing.T) {
+	tc := &config.TestCase{
+		Name:     "aws-smoke",
+		Type:     "performance",
+		Duration: "30s",
+		AWS: &config.AWSConfig{
+			Buckets: []string{"bench-in"},
+			Queues:  []string{"bench-events"},
+			BucketNotifications: []config.AWSBucketNotification{
+				{Bucket: "bench-in", Queue: "bench-events"},
+			},
+		},
+		Generator: config.GeneratorConfig{
+			Mode: "s3", Target: "http://localstack:4566", Rate: 100, Format: "json",
+			Env: map[string]string{"GENERATOR_S3_BUCKET": "bench-in"},
+		},
+		Receiver: config.ReceiverConfig{Mode: "tcp", Listen: ":9001"},
+	}
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.2", ConfigPath: "/config.yml"}
+	tmp, err := os.MkdirTemp("", "compose-aws-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmp)
+	composePath := filepath.Join(tmp, "compose.yaml")
+	cfg := RunConfig{
+		TestCase: tc, Subject: subj, ConfigName: "default",
+		ConfigSrcPath: composePath, TmpDir: tmp,
+		GeneratorImage: "img-gen", ReceiverImage: "img-recv", CollectorImage: "img-coll",
+		ReceiverHostPort: 19001,
+	}
+	if err := writeCompose(composePath, cfg); err != nil {
+		t.Fatalf("writeCompose: %v", err)
+	}
+	data, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(data)
+	var parsed map[string]any
+	if err := yaml.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("rendered compose is not valid YAML: %v\n%s", err, out)
+	}
+	mustContain(t, out, "  localstack:\n")
+	mustContain(t, out, "container_name: \"bench-localstack\"")
+	mustContain(t, out, `SERVICES: "s3,sqs,sts"`)
+	mustContain(t, out, "/etc/localstack/init/ready.d/init-bench.sh:ro")
+	mustContain(t, out, "condition: service_healthy")
+	// Subject and the s3-mode generator both carry the emulator env.
+	mustContain(t, out, `AWS_ENDPOINT_URL: "http://localstack:4566"`)
+	mustContain(t, out, `AWS_EC2_METADATA_DISABLED: "true"`)
+	mustContain(t, out, `GENERATOR_S3_BUCKET: "bench-in"`)
+	// The TCP receiver must not gain emulator deps or env.
+	mustNotContain(t, out, "azurite")
+	// Init script exists and wires the S3→SQS notification.
+	script, err := os.ReadFile(filepath.Join(tmp, "aws-init.sh"))
+	if err != nil {
+		t.Fatalf("aws-init.sh not written: %v", err)
+	}
+	mustContain(t, string(script), "awslocal s3 mb 's3://bench-in'")
+	mustContain(t, string(script), "awslocal sqs create-queue --queue-name 'bench-events'")
+	mustContain(t, string(script), `"QueueArn":"arn:aws:sqs:us-east-1:000000000000:bench-events"`)
+}
+
+// TestComposeRendersAzure verifies an `azure:` case renders the Azurite
+// service plus the one-shot azure-init (receiver image), gates the subject on
+// init completion, and injects the connection string where needed.
+func TestComposeRendersAzure(t *testing.T) {
+	tc := &config.TestCase{
+		Name:     "azure-smoke",
+		Type:     "performance",
+		Duration: "30s",
+		Azure:    &config.AzureConfig{Containers: []string{"bench-out"}},
+		Generator: config.GeneratorConfig{
+			Mode: "tcp", Target: "subject:9000", Rate: 100, Format: "raw",
+		},
+		Receiver: config.ReceiverConfig{
+			Mode: "azure_blob",
+			Env:  map[string]string{"RECEIVER_AZURE_CONTAINER": "bench-out"},
+		},
+	}
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.2", ConfigPath: "/config.yml"}
+	tmp, err := os.MkdirTemp("", "compose-azure-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmp)
+	composePath := filepath.Join(tmp, "compose.yaml")
+	cfg := RunConfig{
+		TestCase: tc, Subject: subj, ConfigName: "default",
+		ConfigSrcPath: composePath, TmpDir: tmp,
+		GeneratorImage: "img-gen", ReceiverImage: "img-recv", CollectorImage: "img-coll",
+		ReceiverHostPort: 19001,
+	}
+	if err := writeCompose(composePath, cfg); err != nil {
+		t.Fatalf("writeCompose: %v", err)
+	}
+	data, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(data)
+	var parsed map[string]any
+	if err := yaml.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("rendered compose is not valid YAML: %v\n%s", err, out)
+	}
+	mustContain(t, out, "  azurite:\n")
+	mustContain(t, out, "container_name: \"bench-azurite\"")
+	mustContain(t, out, "  azure-init:\n")
+	mustContain(t, out, `RECEIVER_MODE: "azure_init"`)
+	mustContain(t, out, `AZURE_INIT_CONTAINERS: "bench-out"`)
+	// azure-init reuses the receiver image.
+	mustContain(t, out, `image: "img-recv"`)
+	// Subject and the polling receiver gate on init completing.
+	mustContain(t, out, "condition: service_completed_successfully")
+	mustContain(t, out, "AccountName=devstoreaccount1")
+	mustContain(t, out, `RECEIVER_AZURE_CONTAINER: "bench-out"`)
+	mustNotContain(t, out, "localstack")
+}
+
+// TestComposeOmitsCloudByDefault guards existing cases: no emulator service
+// or cloud env appears without an aws:/azure: block.
+func TestComposeOmitsCloudByDefault(t *testing.T) {
+	tc := &config.TestCase{
+		Name:      "plain",
+		Type:      "performance",
+		Duration:  "30s",
+		Generator: config.GeneratorConfig{Mode: "tcp", Target: "subject:9000", Rate: 10, LineSize: 64, Format: "raw"},
+		Receiver:  config.ReceiverConfig{Mode: "tcp", Listen: ":9001"},
+	}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.2", ConfigPath: "/config.yml"}
+	tmp, err := os.MkdirTemp("", "compose-nocloud-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmp)
+	composePath := filepath.Join(tmp, "compose.yaml")
+	cfg := RunConfig{
+		TestCase: tc, Subject: subj, ConfigName: "default",
+		ConfigSrcPath: composePath, TmpDir: tmp,
+		GeneratorImage: "img-gen", ReceiverImage: "img-recv", CollectorImage: "img-coll",
+		ReceiverHostPort: 19001,
+	}
+	if err := writeCompose(composePath, cfg); err != nil {
+		t.Fatalf("writeCompose: %v", err)
+	}
+	data, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(data)
+	mustNotContain(t, out, "localstack")
+	mustNotContain(t, out, "azurite")
+	mustNotContain(t, out, "AWS_")
+	mustNotContain(t, out, "AZURE_")
+	if _, err := os.Stat(filepath.Join(tmp, "aws-init.sh")); !os.IsNotExist(err) {
+		t.Errorf("aws-init.sh should not be written without an aws: block")
+	}
+}
+
 func mustContain(t *testing.T, hay, needle string) {
 	t.Helper()
 	if !strings.Contains(hay, needle) {

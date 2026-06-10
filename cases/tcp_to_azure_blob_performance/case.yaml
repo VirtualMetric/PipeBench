@@ -1,0 +1,33 @@
+name: tcp_to_azure_blob_performance
+type: performance
+description: "Measures throughput of a TCP-in to Azure-Blob-out pipeline (Azurite emulator). The receiver polls the output container, counts lines, and deletes drained blobs. Numbers are comparable across subjects, not against non-emulator cases — Azurite itself caps throughput."
+
+duration: 60s
+warmup: 15s
+drain_grace: 45s
+
+azure:
+  containers: [bench-out]
+
+generator:
+  mode: tcp
+  target: "subject:9000"
+  rate: 0
+  line_size: 256
+  format: raw
+
+receiver:
+  mode: azure_blob
+  env:
+    RECEIVER_AZURE_CONTAINER: "bench-out"
+
+requires: [azure_blob_sink]
+
+subjects:
+  - vmetric
+  - vector
+  - fluent-bit
+
+configurations:
+  default:
+    description: "Raw TCP to Azure block blobs — no transforms"

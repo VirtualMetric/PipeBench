@@ -1,0 +1,26 @@
+# Vector configuration for tcp_to_cloudwatch_performance — TCP in,
+# aws_cloudwatch_logs sink to LocalStack. Group/stream are pre-created by
+# the harness init. Credentials/region from the harness-injected AWS_* env.
+
+[sources.in]
+type = "socket"
+mode = "tcp"
+address = "0.0.0.0:9000"
+decoding.codec = "bytes"
+framing.method = "newline_delimited"
+
+[sinks.out]
+type = "aws_cloudwatch_logs"
+inputs = ["in"]
+group_name = "bench-group"
+stream_name = "vector"
+create_missing_group = false
+create_missing_stream = true
+region = "us-east-1"
+endpoint = "http://localstack:4566"
+
+[sinks.out.healthcheck]
+enabled = false
+
+[sinks.out.encoding]
+codec = "text"

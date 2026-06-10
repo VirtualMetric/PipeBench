@@ -1,0 +1,35 @@
+name: tcp_to_sqs_performance
+type: performance
+description: "Measures throughput of a TCP-in to SQS-out pipeline (LocalStack emulator). The receiver drains the queue with parallel pollers. Fixed generator rate — LocalStack's SQS is the known ceiling, not the subject."
+
+duration: 60s
+warmup: 15s
+drain_grace: 30s
+
+aws:
+  queues: [bench-out]
+
+generator:
+  mode: tcp
+  target: "subject:9000"
+  rate: 20000
+  line_size: 256
+  format: raw
+  connections: 4
+
+receiver:
+  mode: sqs
+  env:
+    RECEIVER_SQS_QUEUE: "bench-out"
+    RECEIVER_SQS_WORKERS: "8"
+
+requires: [sqs_sink]
+
+subjects:
+  - vmetric
+  - vector
+  - logstash
+
+configurations:
+  default:
+    description: "Raw TCP to SQS messages — no transforms"

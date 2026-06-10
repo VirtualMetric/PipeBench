@@ -1,0 +1,22 @@
+# Vector configuration for tcp_to_sqs_performance — TCP in, aws_sqs sink to
+# LocalStack. Credentials/region come from the harness-injected AWS_* env.
+
+[sources.in]
+type = "socket"
+mode = "tcp"
+address = "0.0.0.0:9000"
+decoding.codec = "bytes"
+framing.method = "newline_delimited"
+
+[sinks.out]
+type = "aws_sqs"
+inputs = ["in"]
+queue_url = "http://localstack:4566/000000000000/bench-out"
+region = "us-east-1"
+endpoint = "http://localstack:4566"
+
+[sinks.out.healthcheck]
+enabled = false
+
+[sinks.out.encoding]
+codec = "text"

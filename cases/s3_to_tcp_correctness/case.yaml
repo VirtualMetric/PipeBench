@@ -1,0 +1,49 @@
+name: s3_to_tcp_correctness
+type: correctness
+description: "Validates that every record uploaded to S3 (LocalStack emulator) is emitted over TCP. S3-via-SQS notification consumption is at-least-once, so duplicates are allowed (allow_overdelivery) — loss is not."
+
+duration: 60s
+warmup: 35s
+
+aws:
+  buckets: [bench-in]
+  queues: [bench-events]
+  bucket_notifications:
+    - bucket: bench-in
+      queue: bench-events
+
+generator:
+  mode: s3
+  target: "http://localstack:4566"
+  rate: 10000
+  total_lines: 100000
+  line_size: 256
+  format: json
+  connections: 2
+  env:
+    GENERATOR_S3_BUCKET: "bench-in"
+    GENERATOR_S3_PREFIX: "in/"
+    GENERATOR_S3_LINES_PER_OBJECT: "5000"
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+requires: [s3_source]
+
+subjects:
+  - vmetric
+  - vector
+  - logstash
+
+correctness:
+  expected_loss_pct: 0
+  # SQS notification delivery is at-least-once — duplicates are correct
+  # behavior, loss is not.
+  allow_overdelivery: true
+  drain_seconds: 120
+  drain_quiet_window: 15s
+
+configurations:
+  default:
+    description: "Exact-count S3 to TCP with at-least-once tolerance"

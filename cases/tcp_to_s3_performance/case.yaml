@@ -1,0 +1,35 @@
+name: tcp_to_s3_performance
+type: performance
+description: "Measures throughput of a TCP-in to S3-out pipeline (LocalStack emulator). The receiver polls the output bucket, counts lines, and deletes drained objects. Numbers are comparable across subjects, not against non-emulator cases — LocalStack itself caps throughput."
+
+duration: 60s
+warmup: 15s
+# Object-storage sinks flush on interval/size — give the tail time to land.
+drain_grace: 45s
+
+aws:
+  buckets: [bench-out]
+
+generator:
+  mode: tcp
+  target: "subject:9000"
+  rate: 0           # unlimited — push as fast as possible
+  line_size: 256
+  format: raw
+
+receiver:
+  mode: s3
+  env:
+    RECEIVER_S3_BUCKET: "bench-out"
+
+requires: [s3_sink]
+
+subjects:
+  - vmetric
+  - vector
+  - fluent-bit
+  - logstash
+
+configurations:
+  default:
+    description: "Raw TCP to S3 objects — no transforms"
