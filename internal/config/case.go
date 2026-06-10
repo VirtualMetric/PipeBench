@@ -348,6 +348,9 @@ func (tc *TestCase) Validate() error {
 			}
 		}
 	}
+	if tc.Correctness.MaxOverDeliveryPct < 0 {
+		return fmt.Errorf("case %q: max_overdelivery_pct must be non-negative, got %.2f", tc.Name, tc.Correctness.MaxOverDeliveryPct)
+	}
 	return nil
 }
 
