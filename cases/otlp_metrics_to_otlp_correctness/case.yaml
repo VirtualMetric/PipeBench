@@ -1,0 +1,46 @@
+name: otlp_metrics_to_otlp_correctness
+type: correctness
+description: "End-to-end OTLP/Metrics correctness head-to-head: each subject receives OTLP/HTTP+protobuf metrics and forwards via OTLP/HTTP+protobuf. Verifies the full receive→forward path and zero-loss for the metrics signal across vmetric and otel-collector."
+
+# Short window — the generator emits a finite total_lines and exits;
+# duration is just an upper bound while waiting for the receiver to drain.
+duration: 60s
+
+# 30s gives the slowest subject (vmetric) full headroom plus slow
+# Docker image start.
+warmup: 15s
+
+generator:
+  mode: otlp
+  target: "subject:4318"
+  rate: 0
+  # 500 metric datapoints (5 batches of 100) — enough to catch decode
+  # bugs without taking long to run.
+  total_lines: 500
+  format: raw
+  env:
+    # Drive the metrics signal. The generator emits one Gauge metric
+    # per record named "METRIC-<seq>" with a single datapoint, so the
+    # receiver counts one line ("metric_name=METRIC-<seq>") per record
+    # and the subject's merge-by-name never collapses datapoints.
+    GENERATOR_OTLP_SIGNAL: metrics
+
+receiver:
+  mode: otlp
+  listen: ":4318"
+
+subjects:
+  - vmetric
+  - otel-collector
+
+correctness:
+  validate_order: false
+  # Globally-unique "METRIC-<seq>" names across workers let hash-dedup
+  # catch both datapoint loss AND duplicate delivery — every metric
+  # must arrive exactly once.
+  validate_dedup: true
+  expected_loss_pct: 0.0
+  # The OTLP receiver emits "metric_name=METRIC-<seq>" per datapoint,
+  # so a subject that decoded + forwarded OTLP metrics correctly sees
+  # every line contain "METRIC-".
+  required_substring: "METRIC-"

@@ -166,12 +166,14 @@ func main() {
 		// linesSent * netflowV5RecordsPer lines emitted by the subject.
 		linesSent, bytesSent, err = runNetflowV5(cfg, &clock)
 	case "otlp":
-		// OTLP/Logs over gRPC or HTTP (proto/json) — transport picked
-		// via GENERATOR_OTLP_TRANSPORT. "lines" counts LogRecords sent
-		// (not batches) so the harness's lines-sent vs lines-received
-		// comparison stays meaningful: the receiver sees one TCP line
-		// per decoded record.
-		linesSent, bytesSent, err = runOTLPLogs(cfg, &clock)
+		// OTLP logs/metrics/traces — signal picked via
+		// GENERATOR_OTLP_SIGNAL (default logs), transport via
+		// GENERATOR_OTLP_TRANSPORT (logs: grpc|http_*; metrics/traces:
+		// http only). "lines" counts records sent — LogRecords,
+		// metric datapoints, or spans — not batches, so the harness's
+		// lines-sent vs lines-received comparison stays meaningful:
+		// the receiver sees one line per decoded record.
+		linesSent, bytesSent, err = runOTLP(cfg, &clock)
 	case "kafka":
 		// Produce JSON records to a Kafka topic. "lines" counts records (not
 		// messages); GENERATOR_KAFKA_BATCH packs 1 (one object) or N (a JSON

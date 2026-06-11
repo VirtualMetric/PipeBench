@@ -1,0 +1,29 @@
+name: otlp_metrics_to_otlp_performance
+type: performance
+description: "End-to-end OTLP/Metrics throughput head-to-head: rate at which each subject can receive OTLP/HTTP+protobuf metrics and forward them as OTLP/HTTP+protobuf. vmetric vs. otel-collector."
+
+# Steady-state window. Same shape as the other *_performance cases —
+# warmup so the listener finishes HTTP socket bring-up, then a
+# measurement window long enough to amortize over GC / jitter.
+duration: 60s
+warmup: 15s
+
+generator:
+  mode: otlp
+  target: "subject:4318"
+  # rate=0 = unlimited; the generator pushes batches as fast as the
+  # subject can ack them. HTTP has request-response semantics so
+  # backpressure is implicit (slow ack → fewer batches/sec).
+  rate: 0
+  format: raw
+  env:
+    # One Gauge metric per record ("METRIC-<seq>", single datapoint).
+    GENERATOR_OTLP_SIGNAL: metrics
+
+receiver:
+  mode: otlp
+  listen: ":4318"
+
+subjects:
+  - vmetric
+  - otel-collector
