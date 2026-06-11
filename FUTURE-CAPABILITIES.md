@@ -283,8 +283,11 @@ How it runs:
   the chain validates for `https://vault:8200` inside the bench network.
   Subjects whose secret providers are HTTPS-only work unmodified.
 - The harness bind-mounts that dir read-only into the subject at
-  `/vault-tls` — subject configs reference the CA as
-  `/vault-tls/vault-ca.pem` (for vmetric: `ca_name: "vault-tls/vault-ca.pem"`).
+  `/vault-tls`, so the CA's in-container path is `/vault-tls/vault-ca.pem`.
+  How a subject references it depends on its config convention — vmetric's
+  `ca_name` takes a path relative to the service root (the directory holding
+  the binary, `/` in the bench images), so it's written without the leading
+  slash: `ca_name: "vault-tls/vault-ca.pem"`.
 - `vault-init` waits for the server's healthcheck, then seeds each
   declared path via `vault kv put -mount=<mount> <path> @<file>`. Secret
   values travel from `case.yaml` into per-run `0600` JSON files — they
@@ -300,8 +303,8 @@ Rules:
 
 - `secrets:` must declare at least one path, and every path at least one
   field.
-- `vault`, `vault-init` (and `redpanda`, `redpanda-init`) are reserved —
-  an `endpoints:` entry can't use those names.
+- `vault`, `vault-init` are reserved — an `endpoints:` entry can't use
+  those names.
 - Composes with `kafka:`: a case may declare both blocks; the subject
   then gates on both init containers.
 
