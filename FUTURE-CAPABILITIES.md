@@ -254,6 +254,59 @@ Result JSON gains:
 
 ---
 
+## In-topology Vault secret store (`vault:`)
+
+A case can add a HashiCorp Vault dev server to the topology so a subject's
+secret-store integration (e.g. VirtualMetric DataStream's `hashicorpvault`
+credential provider) can be exercised end-to-end without real
+infrastructure. Mirrors the `kafka:` supporting-service pattern: the
+harness renders a `vault` service plus a one-shot `vault-init` that seeds
+the declared secrets, and the subject gates on the seeding completing
+(`service_completed_successfully`), so config-load-time secret resolution
+never races it.
+
+```yaml
+vault:
+  image: "hashicorp/vault:1.20"   # optional, default shown (needs >= 1.12)
+  token: "pipebench-dev-root"     # optional dev root token, default shown
+  mount: "secret"                 # optional KV mount, default shown (dev mode auto-enables it as KV v2)
+  secrets:                        # required: path -> field -> value
+    bench/http-auth:
+      username: "bench-user"
+      password: "bench-pass-12345"
+```
+
+How it runs:
+
+- The server runs in dev mode with TLS (`-dev-tls`): it generates its own
+  CA + leaf into `/vault/tls` (a per-run host dir), with SAN `vault` so
+  the chain validates for `https://vault:8200` inside the bench network.
+  Subjects whose secret providers are HTTPS-only work unmodified.
+- The harness bind-mounts that dir read-only into the subject at
+  `/vault-tls` — subject configs reference the CA as
+  `/vault-tls/vault-ca.pem` (for vmetric: `ca_name: "vault-tls/vault-ca.pem"`).
+- `vault-init` waits for the server's healthcheck, then seeds each
+  declared path via `vault kv put -mount=<mount> <path> @<file>`. Secret
+  values travel from `case.yaml` into per-run `0600` JSON files — they
+  never appear in the compose file, a command line, or `docker inspect`
+  output. Paths, field keys, mount, and token are charset-validated at
+  case load (`[A-Za-z0-9/_.-]`) because they do render into the compose
+  file.
+- The token is a deterministic test-only value (`VAULT_DEV_ROOT_TOKEN_ID`);
+  the bench Vault holds nothing but the seeded test secrets and exists
+  for the lifetime of one run.
+
+Rules:
+
+- `secrets:` must declare at least one path, and every path at least one
+  field.
+- `vault`, `vault-init` (and `redpanda`, `redpanda-init`) are reserved —
+  an `endpoints:` entry can't use those names.
+- Composes with `kafka:`: a case may declare both blocks; the subject
+  then gates on both init containers.
+
+---
+
 ## Compatibility
 
 None of the schema described on this page exists in any case in `cases/`
