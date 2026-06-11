@@ -26,6 +26,12 @@ jobs:
       - name: Go vet
         run: go vet ./...
 
+      - name: Go test
+        run: go test ./...
+
+      - name: Receiver module tests
+        run: cd containers/receiver && go test ./...
+
       - name: Build generator module
         run: cd containers/generator && go build ./...
 
@@ -81,3 +87,30 @@ jobs:
       - name: Build & push collector image
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: make push-collector ATTEST=1
+
+  emulator-smoke:
+    name: Emulator Smoke (LocalStack + Azurite)
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "stable"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build harness + container images
+        run: make build build-containers
+
+      # Two short end-to-end cases against the cloud emulators. Vector is
+      # the subject: its image is public and its endpoint overrides are the
+      # best documented, so this exercises the harness's emulator topology
+      # (compose wiring, init, polling receiver) without private images.
+      - name: S3 correctness (LocalStack)
+        run: bin/harness test -t tcp_to_s3_correctness -s vector
+
+      - name: Azure Blob correctness (Azurite)
+        run: bin/harness test -t tcp_to_azure_blob_correctness -s vector

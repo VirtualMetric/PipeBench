@@ -1,0 +1,44 @@
+name: s3_to_tcp_performance
+type: performance
+description: "Measures throughput ingesting from S3 (LocalStack emulator) to a TCP sink. The generator uploads objects continuously; SQS-notification-driven subjects (vmetric, vector, filebeat) consume via the bench-events queue, bucket-polling subjects (logstash) list the bucket. Numbers are comparable across subjects, not against non-emulator cases — LocalStack itself caps throughput."
+
+duration: 60s
+# SQS-notification sources only see objects uploaded AFTER they subscribe,
+# so give the subject time to come up before the measured upload window.
+warmup: 35s
+drain_grace: 30s
+
+aws:
+  buckets: [bench-in]
+  queues: [bench-events]
+  bucket_notifications:
+    - bucket: bench-in
+      queue: bench-events
+
+generator:
+  mode: s3
+  target: "http://localstack:4566"
+  rate: 100000          # fixed — the emulator is the known ceiling, not the subject
+  line_size: 256
+  format: json
+  connections: 4
+  env:
+    GENERATOR_S3_BUCKET: "bench-in"
+    GENERATOR_S3_PREFIX: "in/"
+    GENERATOR_S3_LINES_PER_OBJECT: "10000"
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+requires: [s3_source]
+
+subjects:
+  - vmetric
+  - vector
+  - logstash
+  - filebeat
+
+configurations:
+  default:
+    description: "S3 object ingest — no transforms"

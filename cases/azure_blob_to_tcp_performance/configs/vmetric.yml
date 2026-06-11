@@ -1,0 +1,28 @@
+devices:
+  - id: 1
+    name: azblob-bench
+    type: azblob
+    properties:
+      # Azurite's well-known development-storage account — public emulator
+      # constants, not secrets.
+      connection_string: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;QueueEndpoint=http://azurite:10001/devstoreaccount1;"
+      # container_name doubles as the storage queue polled for BlobCreated
+      # events (the generator enqueues them).
+      container_name: "bench-in"
+      # timeout is BOTH the dequeue poll interval and the queue visibility
+      # timeout. The 60s default would schedule the first poll after a short
+      # bench run already ended.
+      timeout: 2
+      batch_size: 32
+targets:
+  - name: tcp-target-bench
+    type: tcp
+    properties:
+      address: "receiver"
+      port: 9001
+routes:
+  - name: azblob-to-tcp-bench
+    devices:
+      - name: azblob-bench
+    targets:
+      - name: tcp-target-bench

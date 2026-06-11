@@ -1,0 +1,23 @@
+devices:
+  - id: 1
+    name: tcp-bench
+    type: tcp
+    properties:
+      address: "0.0.0.0"
+      port: 9000
+targets:
+  - name: cloudwatch-target-bench
+    type: amazoncloudwatch
+    properties:
+      endpoint: "http://localstack:4566"
+      key: "test"
+      secret: "test"
+      region: "us-east-1"
+      log_group: "bench-group"
+      log_stream: "bench-stream"
+routes:
+  - name: tcp-to-cloudwatch-bench
+    devices:
+      - name: tcp-bench
+    targets:
+      - name: cloudwatch-target-bench

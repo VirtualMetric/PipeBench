@@ -1,0 +1,24 @@
+devices:
+  - id: 1
+    name: tcp-bench
+    type: tcp
+    properties:
+      address: "0.0.0.0"
+      port: 9000
+targets:
+  - name: s3-target-bench
+    type: awss3
+    properties:
+      endpoint: "http://localstack:4566"
+      use_path_style: true
+      key: "test"
+      secret: "test"
+      region: "us-east-1"
+      bucket: "bench-out"
+      format: json
+routes:
+  - name: tcp-to-s3-bench
+    devices:
+      - name: tcp-bench
+    targets:
+      - name: s3-target-bench

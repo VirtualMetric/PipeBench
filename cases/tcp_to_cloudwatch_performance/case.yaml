@@ -1,0 +1,36 @@
+name: tcp_to_cloudwatch_performance
+type: performance
+description: "Measures throughput of a TCP-in to CloudWatch-Logs-out pipeline (LocalStack emulator). The receiver polls every stream of the log group with forward tokens. Fixed generator rate — LocalStack's CloudWatch is the known ceiling, not the subject."
+
+duration: 60s
+warmup: 15s
+drain_grace: 30s
+
+aws:
+  log_groups:
+    - group: bench-group
+      stream: bench-stream
+
+generator:
+  mode: tcp
+  target: "subject:9000"
+  rate: 10000
+  line_size: 256
+  format: raw
+  connections: 2
+
+receiver:
+  mode: cloudwatch
+  env:
+    RECEIVER_CWL_GROUP: "bench-group"
+
+requires: [cloudwatch_logs_sink]
+
+subjects:
+  - vmetric
+  - vector
+  - fluent-bit
+
+configurations:
+  default:
+    description: "Raw TCP to CloudWatch log events — no transforms"

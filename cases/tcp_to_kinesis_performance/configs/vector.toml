@@ -1,0 +1,23 @@
+# Vector configuration for tcp_to_kinesis_performance — TCP in,
+# aws_kinesis_streams sink to LocalStack. Credentials/region come from the
+# harness-injected AWS_* environment.
+
+[sources.in]
+type = "socket"
+mode = "tcp"
+address = "0.0.0.0:9000"
+decoding.codec = "bytes"
+framing.method = "newline_delimited"
+
+[sinks.out]
+type = "aws_kinesis_streams"
+inputs = ["in"]
+stream_name = "bench-stream"
+region = "us-east-1"
+endpoint = "http://localstack:4566"
+
+[sinks.out.healthcheck]
+enabled = false
+
+[sinks.out.encoding]
+codec = "text"

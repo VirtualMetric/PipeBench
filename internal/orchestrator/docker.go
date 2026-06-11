@@ -50,10 +50,20 @@ services:
     image: "{{ .SubjectImage }}"
     container_name: "{{ .SubjectContainer }}"
     networks: [bench]
-{{- if .KafkaEnabled }}
+{{- if or .KafkaEnabled .AWSEnabled .AzureEnabled }}
     depends_on:
+{{- if .KafkaEnabled }}
       redpanda-init:
         condition: service_completed_successfully
+{{- end }}
+{{- if .AWSEnabled }}
+      localstack:
+        condition: service_healthy
+{{- end }}
+{{- if .AzureEnabled }}
+      azure-init:
+        condition: service_completed_successfully
+{{- end }}
 {{- end }}
     volumes:
       - "{{ .ConfigSrc }}:{{ .ConfigDst }}{{ .ConfigMountOpts }}"
@@ -99,11 +109,21 @@ services:
     container_name: "bench-generator-{{ .ID }}"
     networks: [bench]
     depends_on:
-      - subject
+      subject:
+        condition: service_started
 {{- if not $.DeferReceiver }}
 {{- range $.Receivers }}
-      - receiver-{{ .ID }}
+      receiver-{{ .ID }}:
+        condition: service_started
 {{- end }}
+{{- end }}
+{{- if $.AWSEnabled }}
+      localstack:
+        condition: service_healthy
+{{- end }}
+{{- if $.AzureEnabled }}
+      azure-init:
+        condition: service_completed_successfully
 {{- end }}
 {{- if or $.UseSharedData $.TLSCertsHost .SampleFileHost }}
     volumes:
@@ -174,9 +194,19 @@ services:
         condition: service_completed_successfully
 {{- else }}
     depends_on:
-      - subject
+      subject:
+        condition: service_started
 {{- if not .DeferReceiver }}
-      - receiver
+      receiver:
+        condition: service_started
+{{- end }}
+{{- if .AWSEnabled }}
+      localstack:
+        condition: service_healthy
+{{- end }}
+{{- if .AzureEnabled }}
+      azure-init:
+        condition: service_completed_successfully
 {{- end }}
 {{- end }}
 {{- if or .UseSharedData .TLSCertsHost .GenSampleFileHost }}
@@ -256,6 +286,17 @@ services:
     image: "{{ $.ReceiverImage }}"
     container_name: "bench-receiver-{{ .ID }}"
     networks: [bench]
+{{- if or .AWSDep .AzureDep }}
+    depends_on:
+{{- if .AWSDep }}
+      localstack:
+        condition: service_healthy
+{{- end }}
+{{- if .AzureDep }}
+      azure-init:
+        condition: service_completed_successfully
+{{- end }}
+{{- end }}
     ports:
       - "{{ .HostPort }}:9090"
     environment:
@@ -273,6 +314,9 @@ services:
 {{- if $.RecvRecordArrival }}
       RECEIVER_RECORD_ARRIVAL_TIMES: "true"
 {{- end }}
+{{- range $k, $v := .Env }}
+      {{ $k }}: "{{ $v }}"
+{{- end }}
     restart: "no"
 {{- end }}
 {{- else }}
@@ -281,6 +325,17 @@ services:
     image: "{{ .ReceiverImage }}"
     container_name: "bench-receiver"
     networks: [bench]
+{{- if or .RecvAWSDep .RecvAzureDep }}
+    depends_on:
+{{- if .RecvAWSDep }}
+      localstack:
+        condition: service_healthy
+{{- end }}
+{{- if .RecvAzureDep }}
+      azure-init:
+        condition: service_completed_successfully
+{{- end }}
+{{- end }}
     ports:
       - "{{ .ReceiverHostPort }}:9090"
     environment:
@@ -300,6 +355,9 @@ services:
 {{- end }}
 {{- if .RecvRecordArrival }}
       RECEIVER_RECORD_ARRIVAL_TIMES: "true"
+{{- end }}
+{{- range $k, $v := .RecvEnv }}
+      {{ $k }}: "{{ $v }}"
 {{- end }}
     restart: "no"
 {{- end }}
@@ -388,6 +446,54 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - "rpk topic create {{ .KafkaTopic }} -p {{ .KafkaPartitions }} --brokers redpanda:9092 || rpk topic describe {{ .KafkaTopic }} --brokers redpanda:9092"
+    restart: "no"
+{{- end }}
+{{- if .AWSEnabled }}
+
+  localstack:
+    image: "{{ .AWSImage }}"
+    container_name: "bench-localstack"
+    hostname: "localstack"
+    networks: [bench]
+    environment:
+      SERVICES: "{{ .AWSServices }}"
+      AWS_DEFAULT_REGION: "{{ .AWSRegion }}"
+      EAGER_SERVICE_LOADING: "1"
+    volumes:
+      - "{{ .AWSInitHost }}:/etc/localstack/init/ready.d/init-bench.sh:ro"
+    healthcheck:
+      # Init hooks in ready.d run before "completed" flips true, so this
+      # gates BOTH emulator readiness and bench resource creation.
+      test: ["CMD-SHELL", "curl -sf localhost:4566/_localstack/init/ready | grep -q '\"completed\": true'"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 10s
+    restart: "no"
+{{- end }}
+{{- if .AzureEnabled }}
+
+  azurite:
+    image: "{{ .AzureImage }}"
+    container_name: "bench-azurite"
+    hostname: "azurite"
+    networks: [bench]
+    command: ["azurite", "--blobHost", "0.0.0.0", "--queueHost", "0.0.0.0", "--inMemoryPersistence", "--skipApiVersionCheck"]
+    restart: "no"
+
+  # One-shot: retry container/queue creation until Azurite answers, then
+  # exit 0. Reuses the bench-receiver image (it links the Azure SDK) so no
+  # azure-cli image pull is needed — exact redpanda-init semantics.
+  azure-init:
+    image: "{{ .ReceiverImage }}"
+    container_name: "bench-azure-init"
+    networks: [bench]
+    depends_on:
+      - azurite
+    environment:
+      RECEIVER_MODE: "azure_init"
+      AZURE_STORAGE_CONNECTION_STRING: "{{ .AzureConnString }}"
+      AZURE_INIT_CONTAINERS: "{{ .AzureInitContainers }}"
     restart: "no"
 {{- end }}
 `
@@ -735,6 +841,12 @@ type receiverTpl struct {
 	Mode     string
 	Listen   string
 	HostPort int
+	Env      map[string]string
+	// AWSDep/AzureDep gate a depends_on on the emulator services — set for
+	// cloud-polling receiver modes only, so listening receivers start
+	// immediately as before.
+	AWSDep   bool
+	AzureDep bool
 }
 
 // endpointTpl is the per-endpoint template data for the auxiliary containers
@@ -813,6 +925,9 @@ type composeVars struct {
 
 	RecvMode              string
 	RecvListen            string
+	RecvEnv               map[string]string
+	RecvAWSDep            bool
+	RecvAzureDep          bool
 	RecvValidateDedup     string
 	RecvValidateContent   string
 	RecvExpectedLines     int64
@@ -820,6 +935,19 @@ type composeVars struct {
 	RecvValidateJSON      bool
 	RecvRecordArrival     bool
 	DockerSocketGID       string
+
+	// Cloud emulator topology (a case's `aws:` / `azure:` blocks).
+	// AWSInitHost is the host path of the rendered LocalStack init script,
+	// bind-mounted into the emulator's ready.d hook directory.
+	AWSEnabled          bool
+	AWSImage            string
+	AWSServices         string
+	AWSRegion           string
+	AWSInitHost         string
+	AzureEnabled        bool
+	AzureImage          string
+	AzureConnString     string
+	AzureInitContainers string
 
 	// Plural mode: when these slices are non-empty, the template emits
 	// generator-<id> / receiver-<id> services and skips the singular block.
@@ -871,9 +999,39 @@ func writeCompose(path string, cfg RunConfig) error {
 
 	subjectContainer := "bench-subject-" + s.Name
 
-	// Merge subject default env + extra env from configuration
+	// Cloud emulator env. Injected into the subject whenever the case
+	// declares an emulator (subject configs interpolate these), and into
+	// generators/receivers per-mode below. Values are public emulator
+	// constants — never real credentials.
+	var awsEnv, azureEnv map[string]string
+	if tc.UsesAWS() {
+		awsEnv = map[string]string{
+			"AWS_ACCESS_KEY_ID":     config.AWSEmulatorAccessKey,
+			"AWS_SECRET_ACCESS_KEY": config.AWSEmulatorSecretKey,
+			"AWS_REGION":            tc.AWS.RegionOrDefault(),
+			"AWS_DEFAULT_REGION":    tc.AWS.RegionOrDefault(),
+			"AWS_ENDPOINT_URL":      tc.AWS.EndpointURL(),
+			// Kill IMDS credential probing: no SDK in any container can
+			// stall on or fall back to real AWS.
+			"AWS_EC2_METADATA_DISABLED": "true",
+		}
+	}
+	if tc.UsesAzure() {
+		azureEnv = map[string]string{
+			"AZURE_STORAGE_CONNECTION_STRING": tc.Azure.ConnectionString(),
+		}
+	}
+
+	// Merge subject default env + cloud env + extra env from configuration.
+	// Cloud env merges before ExtraSubjectEnv so a configuration can override.
 	env := map[string]string{}
 	for k, v := range s.Env {
+		env[k] = v
+	}
+	for k, v := range awsEnv {
+		env[k] = v
+	}
+	for k, v := range azureEnv {
 		env[k] = v
 	}
 	for k, v := range cfg.ExtraSubjectEnv {
@@ -1000,7 +1158,7 @@ func writeCompose(path string, cfg RunConfig) error {
 				Format:           format,
 				Connections:      conns,
 				ConnOffset:       offset,
-				Env:              g.Env,
+				Env:              mergeEnv(cloudEnvForMode(g.Mode, awsEnv, azureEnv), g.Env),
 				TLSEnabled:       g.TLS.Enabled,
 				TLSCert:          g.TLS.Cert,
 				TLSKey:           g.TLS.Key,
@@ -1032,7 +1190,7 @@ func writeCompose(path string, cfg RunConfig) error {
 		vars.GenFormat = genFormat
 		vars.GenConnections = resolveGeneratorConnections(g.Connections)
 		vars.GenTotalLines = g.TotalLines
-		vars.GenEnv = g.Env
+		vars.GenEnv = mergeEnv(cloudEnvForMode(g.Mode, awsEnv, azureEnv), g.Env)
 		vars.GenRotateMode = g.FileRotation.Mode
 		vars.GenRotateAt = g.FileRotation.At
 		vars.GenRotateQuiesce = g.FileRotation.Quiesce
@@ -1081,11 +1239,38 @@ func writeCompose(path string, cfg RunConfig) error {
 				Mode:     rc.Mode,
 				Listen:   rc.Listen,
 				HostPort: cfg.ReceiverHostPort + i,
+				Env:      mergeEnv(cloudEnvForMode(rc.Mode, awsEnv, azureEnv), rc.Env),
+				AWSDep:   tc.UsesAWS() && config.IsCloudPollingReceiverMode(rc.Mode) && rc.Mode != "azure_blob",
+				AzureDep: tc.UsesAzure() && rc.Mode == "azure_blob",
 			})
 		}
 	} else {
 		vars.RecvMode = tc.Receiver.Mode
 		vars.RecvListen = tc.Receiver.Listen
+		vars.RecvEnv = mergeEnv(cloudEnvForMode(tc.Receiver.Mode, awsEnv, azureEnv), tc.Receiver.Env)
+		vars.RecvAWSDep = tc.UsesAWS() && config.IsCloudPollingReceiverMode(tc.Receiver.Mode) && tc.Receiver.Mode != "azure_blob"
+		vars.RecvAzureDep = tc.UsesAzure() && tc.Receiver.Mode == "azure_blob"
+	}
+
+	// Cloud emulator services. The AWS init script is rendered from the
+	// validated `aws:` block and bind-mounted into LocalStack's ready.d
+	// hook directory; the healthcheck gates on it completing.
+	if tc.UsesAWS() {
+		vars.AWSEnabled = true
+		vars.AWSImage = tc.AWS.ImageOrDefault()
+		vars.AWSServices = tc.AWS.ServicesOrDefault()
+		vars.AWSRegion = tc.AWS.RegionOrDefault()
+		initPath := filepath.Join(cfg.TmpDir, "aws-init.sh")
+		if err := writeAWSInit(initPath, tc.AWS); err != nil {
+			return err
+		}
+		vars.AWSInitHost = filepath.ToSlash(initPath)
+	}
+	if tc.UsesAzure() {
+		vars.AzureEnabled = true
+		vars.AzureImage = tc.Azure.ImageOrDefault()
+		vars.AzureConnString = tc.Azure.ConnectionString()
+		vars.AzureInitContainers = strings.Join(tc.Azure.Containers, ",")
 	}
 
 	for _, ep := range tc.Endpoints {

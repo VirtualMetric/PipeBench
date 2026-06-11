@@ -1,0 +1,27 @@
+# Vector configuration for tcp_to_azure_blob_performance — TCP in,
+# azure_blob sink to Azurite via the well-known development-storage
+# connection string (public emulator constants, not secrets).
+
+[sources.in]
+type = "socket"
+mode = "tcp"
+address = "0.0.0.0:9000"
+decoding.codec = "bytes"
+framing.method = "newline_delimited"
+
+[sinks.out]
+type = "azure_blob"
+inputs = ["in"]
+connection_string = "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;"
+container_name = "bench-out"
+blob_prefix = "vector/"
+
+[sinks.out.healthcheck]
+enabled = false
+
+[sinks.out.encoding]
+codec = "text"
+
+[sinks.out.batch]
+max_bytes = 10485760
+timeout_secs = 2

@@ -1,0 +1,41 @@
+name: tcp_to_s3_correctness
+type: correctness
+description: "Validates that every line sent over TCP lands in S3 (LocalStack emulator) exactly once: fixed line count in, exact line count out of the bucket. The receiver polls, counts, and deletes drained objects."
+
+duration: 60s
+warmup: 15s
+
+aws:
+  buckets: [bench-out]
+
+generator:
+  mode: tcp
+  target: "subject:9000"
+  rate: 5000
+  total_lines: 100000
+  line_size: 256
+  format: raw
+
+receiver:
+  mode: s3
+  env:
+    RECEIVER_S3_BUCKET: "bench-out"
+
+requires: [s3_sink]
+
+subjects:
+  - vmetric
+  - vector
+  - fluent-bit
+  - logstash
+
+correctness:
+  expected_loss_pct: 0
+  # Object-storage sinks flush on interval/size — wait out the tail, but
+  # finish early once the bucket stays quiet past every flush interval.
+  drain_seconds: 120
+  drain_quiet_window: 15s
+
+configurations:
+  default:
+    description: "Exact-count TCP to S3 — no transforms"

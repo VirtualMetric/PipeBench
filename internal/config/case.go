@@ -51,6 +51,22 @@ type TestCase struct {
 	// kafka_performance / kafka_correctness types.
 	Kafka *KafkaConfig `yaml:"kafka"`
 
+	// AWS, when set, adds a LocalStack emulator to the test topology and
+	// creates the declared S3/SQS/SNS/Kinesis/CloudWatch resources before
+	// the subject starts. See AWSConfig in cloud.go.
+	AWS *AWSConfig `yaml:"aws"`
+
+	// Azure, when set, adds an Azurite (Azure Storage emulator) to the test
+	// topology plus a one-shot azure-init that creates the declared blob
+	// containers. See AzureConfig in cloud.go.
+	Azure *AzureConfig `yaml:"azure"`
+
+	// Requires lists subject capabilities every subject in this case must
+	// declare (Subject.Capabilities); the runner fails fast on subjects
+	// lacking one instead of starting a run that silently produces zero
+	// ingest. Generalizes the original hardcoded tls_tcp guard.
+	Requires []string `yaml:"requires"`
+
 	Subjects       []string                 `yaml:"subjects"`
 	Configurations map[string]Configuration `yaml:"configurations"`
 	Correctness    CorrectnessConfig        `yaml:"correctness"`
@@ -307,7 +323,11 @@ func (tc *TestCase) Validate() error {
 	}
 	// Endpoints: require name+image, unique, and not colliding with the fixed
 	// service names the compose template always emits.
-	reserved := map[string]struct{}{"subject": {}, "generator": {}, "receiver": {}, "collector": {}}
+	reserved := map[string]struct{}{
+		"subject": {}, "generator": {}, "receiver": {}, "collector": {},
+		// Cloud emulator services rendered from the aws:/azure: blocks.
+		"localstack": {}, "azurite": {}, "azure-init": {},
+	}
 	epNames := map[string]struct{}{}
 	for i, e := range tc.Endpoints {
 		if e.Name == "" {
@@ -351,7 +371,7 @@ func (tc *TestCase) Validate() error {
 	if tc.Correctness.MaxOverDeliveryPct < 0 {
 		return fmt.Errorf("case %q: max_overdelivery_pct must be non-negative, got %.2f", tc.Name, tc.Correctness.MaxOverDeliveryPct)
 	}
-	return nil
+	return tc.validateCloud()
 }
 
 // validateSampleFile rejects sample_file paths that are absolute or escape the
@@ -471,8 +491,12 @@ type ReceiverConfig struct {
 	// `receivers:`; ignored for the singular `receiver:` form (the
 	// container is always `bench-receiver` there).
 	ID     string `yaml:"id"`
-	Mode   string `yaml:"mode"`   // "tcp" | "file" | "http" | "otlp"
+	Mode   string `yaml:"mode"`   // "tcp" | "file" | "http" | "otlp" | "s3" | "azure_blob" | "sqs" | "kinesis" | "cloudwatch"
 	Listen string `yaml:"listen"` // ":9001" or file path
+	// Env is mode-specific extra env passed straight through to the
+	// receiver container (e.g. RECEIVER_S3_BUCKET=bench-out), mirroring
+	// GeneratorConfig.Env.
+	Env map[string]string `yaml:"env"`
 }
 
 type Configuration struct {
@@ -482,6 +506,11 @@ type Configuration struct {
 
 type CorrectnessConfig struct {
 	ValidateDedup bool `yaml:"validate_dedup"`
+	// AllowOverDelivery permits duplicates in the correctness verdict for
+	// at-least-once transports (S3-via-SQS notifications, SQS, Kinesis) —
+	// the same allowance IsKafkaType() grants kafka_* cases. Loss is still
+	// forbidden.
+	AllowOverDelivery bool `yaml:"allow_overdelivery"`
 	// ValidateContent runs a per-line structural check (CONN=/SEQ= prefix) to
 	// detect memory corruption without building a full hash map. Cheap enough
 	// for performance tests (O(1) per line, no heap growth).

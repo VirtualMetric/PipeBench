@@ -1,0 +1,36 @@
+name: tcp_to_kinesis_performance
+type: performance
+description: "Measures throughput of a TCP-in to Kinesis-out pipeline (LocalStack emulator, 4 shards). The receiver reads every shard from TRIM_HORIZON. Fixed generator rate — LocalStack's Kinesis is the known ceiling, not the subject."
+
+duration: 60s
+warmup: 15s
+drain_grace: 30s
+
+aws:
+  streams:
+    - name: bench-stream
+      shards: 4
+
+generator:
+  mode: tcp
+  target: "subject:9000"
+  rate: 20000
+  line_size: 256
+  format: raw
+  connections: 4
+
+receiver:
+  mode: kinesis
+  env:
+    RECEIVER_KINESIS_STREAM: "bench-stream"
+
+requires: [kinesis_sink]
+
+subjects:
+  - vmetric
+  - vector
+  - fluent-bit
+
+configurations:
+  default:
+    description: "Raw TCP to Kinesis records — no transforms"

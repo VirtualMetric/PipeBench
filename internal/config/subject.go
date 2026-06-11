@@ -92,12 +92,23 @@ var Registry = map[string]Subject{
 		Version:    "0.54.0-alpine",
 		ConfigPath: "/etc/vector/vector.toml",
 		Command:    []string{"--config", "/etc/vector/vector.toml"},
+		// All AWS sinks + the aws_s3 source take a custom `endpoint`;
+		// azure_blob sink takes a connection string (Azurite-ready).
+		Capabilities: []string{
+			"s3_sink", "s3_source", "azure_blob_sink",
+			"sqs_sink", "sns_sink", "kinesis_sink", "cloudwatch_logs_sink",
+		},
 	},
 	"fluent-bit": {
 		Name:       "fluent-bit",
 		Image:      "fluent/fluent-bit",
 		Version:    "5.0",
 		ConfigPath: "/fluent-bit/etc/fluent-bit.conf",
+		// s3 / azure_blob / kinesis_streams / cloudwatch_logs outputs all
+		// document a custom `endpoint`. No S3 *input* exists in fluent-bit.
+		Capabilities: []string{
+			"s3_sink", "azure_blob_sink", "kinesis_sink", "cloudwatch_logs_sink",
+		},
 	},
 	"fluentd": {
 		Name:       "fluentd",
@@ -110,6 +121,9 @@ var Registry = map[string]Subject{
 		Image:      "docker.elastic.co/logstash/logstash",
 		Version:    "8.13.0",
 		ConfigPath: "/usr/share/logstash/pipeline/logstash.conf",
+		// logstash-integration-aws is bundled: s3 input (bucket polling,
+		// `endpoint` + force_path_style), s3/sqs/sns outputs.
+		Capabilities: []string{"s3_sink", "s3_source", "sqs_sink", "sns_sink"},
 	},
 	"filebeat": {
 		Name:       "filebeat",
@@ -118,12 +132,17 @@ var Registry = map[string]Subject{
 		ConfigPath: "/usr/share/filebeat/filebeat.yml",
 		User:       "root",
 		Command:    []string{"-environment", "container", "--strict.perms=false", "-e"},
+		// aws-s3 input supports custom endpoints (non_aws_bucket_name);
+		// azure-blob-storage input — verify against Azurite before adding.
+		Capabilities: []string{"s3_source"},
 	},
 	"telegraf": {
 		Name:       "telegraf",
 		Image:      "telegraf",
 		Version:    "1.30-alpine",
 		ConfigPath: "/etc/telegraf/telegraf.conf",
+		// kinesis + cloudwatch_logs outputs take `endpoint_url`.
+		Capabilities: []string{"kinesis_sink", "cloudwatch_logs_sink"},
 	},
 	"nxlog": {
 		Name:       "nxlog",
@@ -147,20 +166,31 @@ var Registry = map[string]Subject{
 		ConfigPath: "/etc/syslog-ng/syslog-ng.conf",
 	},
 	"vmetric": {
-		Name:         "vmetric",
-		Image:        "vmetric/director",
-		Version:      "2.0.2",
-		ConfigPath:   "/config.yml",
-		Entrypoint:   []string{"/director"},
-		Command:      []string{"-config-path", "config.yml"},
-		ConfigRW:     true,
-		Capabilities: []string{"tls_tcp"},
+		Name:       "vmetric",
+		Image:      "vmetric/director",
+		Version:    "2.0.2",
+		ConfigPath: "/config.yml",
+		Entrypoint: []string{"/director"},
+		Command:    []string{"-config-path", "config.yml"},
+		ConfigRW:   true,
+		// Cloud capabilities require a director build with emulator
+		// endpoint support (awss3 listener `endpoint`/`use_path_style`,
+		// azblob target `connection_string`) — i.e. newer than 2.0.2.
+		Capabilities: []string{
+			"tls_tcp",
+			"s3_sink", "s3_source", "azure_blob_sink", "azure_blob_source",
+			"sqs_sink", "sns_sink", "kinesis_sink", "cloudwatch_logs_sink",
+		},
 	},
 	"otel-collector": {
 		Name:       "otel-collector",
 		Image:      "otel/opentelemetry-collector-contrib",
 		Version:    "0.149.0",
 		ConfigPath: "/etc/otelcol-contrib/config.yaml",
+		// awss3exporter + awscloudwatchlogsexporter take `endpoint`. Note
+		// the s3 exporter writes OTLP-JSON batches, not raw lines — keep
+		// otel out of exact-count correctness cases.
+		Capabilities: []string{"s3_sink", "cloudwatch_logs_sink"},
 	},
 	"grafana-alloy": {
 		Name:       "grafana-alloy",
@@ -181,6 +211,12 @@ var Registry = map[string]Subject{
 		Version:    "4.17.0",
 		ConfigPath: "/opt/cribl/local/cribl",
 		ConfigRW:   true,
+		// S3/SQS/SNS/Kinesis/CloudWatch destinations + S3 source all take
+		// custom endpoints; azure_blob via connection string.
+		Capabilities: []string{
+			"s3_sink", "s3_source", "azure_blob_sink",
+			"sqs_sink", "sns_sink", "kinesis_sink", "cloudwatch_logs_sink",
+		},
 	},
 	// rotel — Streamfold's Rust-based OTel collector. No config file:
 	// every option is a CLI flag or env var. Per-case configs/rotel.sh
