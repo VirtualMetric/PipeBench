@@ -823,7 +823,12 @@ func runHTTPSingle(cfg config, clock *sendClock) (int64, int64, error) {
 	}
 
 	_, _, err := sendLines(cfg, clock, func(line []byte) error {
-		batch = append(batch, line)
+		// Lines arrive with a trailing '\n' and may alias a reused buffer
+		// (sequenced mode rewrites the CONN=/SEQ= prefix in place), so copy
+		// and trim before batching: entries stay distinct until flush and
+		// the '\n' join there doesn't double newlines.
+		cp := append([]byte(nil), bytes.TrimSuffix(line, []byte("\n"))...)
+		batch = append(batch, cp)
 		if len(batch) >= batchSize {
 			return flush()
 		}
