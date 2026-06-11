@@ -1,0 +1,19 @@
+filebeat.inputs:
+  - type: aws-s3
+    queue_url: "http://localstack:4566/000000000000/bench-events"
+    endpoint: "http://localstack:4566"
+    region: us-east-1
+    access_key_id: test
+    secret_access_key: test
+    path_style: true
+
+output.elasticsearch:
+  hosts: ["http://receiver:9002"]
+  allow_older_versions: true
+  compression_level: 0
+
+logging.level: warning
+queue.mem:
+  events: 4096
+  flush.min_events: 2048
+  flush.timeout: 1s

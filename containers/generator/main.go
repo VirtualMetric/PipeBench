@@ -179,6 +179,14 @@ func main() {
 		// messages); GENERATOR_KAFKA_BATCH packs 1 (one object) or N (a JSON
 		// array of N objects) records per message.
 		linesSent, bytesSent, err = runKafka(cfg, &clock)
+	case "s3":
+		// Upload objects to S3 (LocalStack). "lines" counts records packed
+		// into objects, so lines-sent vs lines-received stays meaningful.
+		linesSent, bytesSent, err = runS3(cfg, &clock)
+	case "azure_blob":
+		// Upload block blobs to Azurite, optionally with synthetic
+		// EventGrid BlobCreated queue events for queue-driven listeners.
+		linesSent, bytesSent, err = runAzureBlob(cfg, &clock)
 	default:
 		fmt.Fprintf(os.Stderr, "generator: unknown mode %q\n", cfg.Mode)
 		os.Exit(1)
@@ -240,7 +248,9 @@ func readinessTarget(cfg config) (string, bool) {
 	switch cfg.Mode {
 	case "tcp":
 		return cfg.Target, true
-	case "http":
+	case "http", "s3", "azure_blob":
+		// Cloud modes carry the emulator endpoint URL in Target — TCP-dial
+		// its host:port, same as http.
 		u, err := url.Parse(cfg.Target)
 		if err != nil || u.Host == "" {
 			return "", false

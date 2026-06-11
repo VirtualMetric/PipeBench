@@ -29,7 +29,7 @@ After the test, the result is merged into a single per-(hardware, subject) JSON 
 
 ## Available tests
 
-### Performance tests (17)
+### Performance tests (25)
 
 | Test | What it does |
 | --- | --- |
@@ -50,8 +50,16 @@ After the test, the result is merged into a single per-(hardware, subject) JSON 
 | `otlp_to_otlp_generic_performance` | OTLP/HTTP+protobuf in, OTLP/HTTP+protobuf out (no transforms) |
 | `otlp_grpc_to_otlp_grpc_performance` | OTLP/gRPC end-to-end (isolates protocol cost vs. HTTP+protobuf) |
 | `otlp_pipeline_to_otlp_performance` | OTLP/HTTP in, OTLP/HTTP out with one add-attribute transform per record |
+| `s3_to_tcp_performance` | Ingest from S3 (LocalStack emulator, S3→SQS notifications), TCP out |
+| `tcp_to_s3_performance` | TCP in, S3 objects out (LocalStack emulator) |
+| `azure_blob_to_tcp_performance` | Ingest from Azure Blob Storage (Azurite emulator, BlobCreated queue events), TCP out |
+| `tcp_to_azure_blob_performance` | TCP in, Azure block blobs out (Azurite emulator) |
+| `tcp_to_sqs_performance` | TCP in, SQS messages out (LocalStack emulator) |
+| `tcp_to_sns_performance` | TCP in, SNS topic out, observed via an SQS subscription (LocalStack emulator) |
+| `tcp_to_kinesis_performance` | TCP in, Kinesis stream out across 4 shards (LocalStack emulator) |
+| `tcp_to_cloudwatch_performance` | TCP in, CloudWatch Logs out (LocalStack emulator) |
 
-### Correctness tests (14)
+### Correctness tests (17)
 
 | Test | What it checks |
 | --- | --- |
@@ -69,6 +77,18 @@ After the test, the result is merged into a single per-(hardware, subject) JSON 
 | `otlp_to_otlp_generic_correctness` | OTLP/HTTP+protobuf round-trip preserves every LogRecord body |
 | `otlp_grpc_to_otlp_grpc_correctness` | OTLP/gRPC round-trip preserves every LogRecord body |
 | `otlp_pipeline_to_otlp_correctness` | OTLP/HTTP round-trip with one add-attribute transform preserves every body |
+| `tcp_to_s3_correctness` | Every TCP line lands in S3 exactly once (LocalStack emulator) |
+| `s3_to_tcp_correctness` | Every S3 record is emitted over TCP; SQS-notification consumption is at-least-once, so duplicates are tolerated, loss is not |
+| `tcp_to_azure_blob_correctness` | Every TCP line lands in Azure Blob Storage exactly once (Azurite emulator) |
+
+### Cloud emulator cases (Azurite + LocalStack)
+
+Cloud cases run entirely against local emulators added to the compose topology by a case's `aws:` / `azure:` block — **[LocalStack](https://localstack.cloud)** for S3/SQS/SNS/Kinesis/CloudWatch Logs and **[Azurite](https://github.com/Azure/Azurite)** for Azure Blob Storage. The harness creates the declared buckets/queues/topics/streams/containers before the subject starts and injects the emulator endpoint plus the standard dummy credentials (`test`/`test` for AWS, Azurite's published `devstoreaccount1` development account) into every container. No real cloud account is touched: `AWS_ENDPOINT_URL` is pinned to the emulator, IMDS probing is disabled, and the emulators are reachable only on the isolated bench network.
+
+Two caveats when reading the numbers:
+
+- **Compare across subjects, not across case types.** The emulators (Python/Node single-process services) cap throughput far below the raw TCP cases. Every subject faces the same ceiling, so rankings are meaningful; absolute EPS is not comparable to `tcp_to_tcp_performance`.
+- **Out of scope:** Azure Event Hubs, Service Bus, Sentinel and Data Explorer have no usable local emulator; AWS Firehose and DynamoDB delivery are LocalStack pro-tier. Cases for those services would silently measure a mock, so they don't exist.
 
 ## Subjects
 
@@ -107,7 +127,7 @@ PipeBench/
     receiver/            Receives output, counts lines, validates correctness
     collector/           Polls Docker stats API, writes metrics CSV
     vmetric/             Dockerfile + pre-built binary for the VirtualMetric Director subject
-  cases/                 31 test cases (17 performance + 14 correctness), each with per-subject configs
+  cases/                 51 test cases (27 performance + 24 correctness), each with per-subject configs
   web/                   Static PipeBench UI (single HTML + per-(hardware, subject) JSON under web/results/)
 ```
 

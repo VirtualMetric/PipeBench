@@ -1,0 +1,36 @@
+name: azure_blob_to_tcp_performance
+type: performance
+description: "Measures throughput ingesting from Azure Blob Storage (Azurite emulator) to a TCP sink. The generator uploads blobs and enqueues synthetic EventGrid BlobCreated messages to the container-named storage queue (Azurite never emits them itself) — the consumption model vmetric's azblob listener uses. Most pipeline tools have no blob *input*, so the roster is thin by reality. Numbers are comparable across subjects, not against non-emulator cases."
+
+duration: 60s
+warmup: 25s
+drain_grace: 30s
+
+azure:
+  containers: [bench-in]
+
+generator:
+  mode: azure_blob
+  target: "http://azurite:10000"
+  rate: 50000          # fixed — Azurite is the known ceiling, not the subject
+  line_size: 256
+  format: json
+  connections: 2
+  env:
+    GENERATOR_AZURE_CONTAINER: "bench-in"
+    GENERATOR_AZURE_PREFIX: "in/"
+    GENERATOR_AZURE_LINES_PER_BLOB: "10000"
+    GENERATOR_AZURE_QUEUE_EVENTS: "true"
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+requires: [azure_blob_source]
+
+subjects:
+  - vmetric
+
+configurations:
+  default:
+    description: "Azure Blob ingest via BlobCreated queue events — no transforms"

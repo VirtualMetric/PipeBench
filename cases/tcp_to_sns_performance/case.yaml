@@ -1,0 +1,39 @@
+name: tcp_to_sns_performance
+type: performance
+description: "Measures throughput of a TCP-in to SNS-out pipeline (LocalStack emulator). SNS is not directly observable, so init subscribes an SQS queue to the topic with RawMessageDelivery and the receiver drains that queue. Fixed generator rate — LocalStack is the known ceiling."
+
+duration: 60s
+warmup: 15s
+drain_grace: 30s
+
+aws:
+  topics: [bench-topic]
+  queues: [bench-sub]
+  subscriptions:
+    - topic: bench-topic
+      queue: bench-sub
+
+generator:
+  mode: tcp
+  target: "subject:9000"
+  rate: 20000
+  line_size: 256
+  format: raw
+  connections: 4
+
+receiver:
+  mode: sqs
+  env:
+    RECEIVER_SQS_QUEUE: "bench-sub"
+    RECEIVER_SQS_WORKERS: "8"
+
+requires: [sns_sink]
+
+subjects:
+  - vmetric
+  - vector
+  - logstash
+
+configurations:
+  default:
+    description: "Raw TCP to SNS topic, observed via SQS subscription — no transforms"

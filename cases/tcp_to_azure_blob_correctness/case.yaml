@@ -1,0 +1,38 @@
+name: tcp_to_azure_blob_correctness
+type: correctness
+description: "Validates that every line sent over TCP lands in Azure Blob Storage (Azurite emulator) exactly once: fixed line count in, exact line count out of the container. The receiver polls, counts, and deletes drained blobs."
+
+duration: 60s
+warmup: 15s
+
+azure:
+  containers: [bench-out]
+
+generator:
+  mode: tcp
+  target: "subject:9000"
+  rate: 5000
+  total_lines: 100000
+  line_size: 256
+  format: raw
+
+receiver:
+  mode: azure_blob
+  env:
+    RECEIVER_AZURE_CONTAINER: "bench-out"
+
+requires: [azure_blob_sink]
+
+subjects:
+  - vmetric
+  - vector
+  - fluent-bit
+
+correctness:
+  expected_loss_pct: 0
+  drain_seconds: 120
+  drain_quiet_window: 15s
+
+configurations:
+  default:
+    description: "Exact-count TCP to Azure blobs — no transforms"

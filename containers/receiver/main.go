@@ -460,6 +460,14 @@ func hashLine(line []byte) string {
 
 func main() {
 	cfg := loadConfig()
+
+	// One-shot init helper for the azure-init compose service: creates the
+	// bench blob containers + queues in Azurite and exits — never serves.
+	if cfg.Mode == "azure_init" {
+		runAzureInit()
+		return
+	}
+
 	cnt := &counters{recordTimes: cfg.RecordArrivalTimes}
 	val := newValidator()
 
@@ -509,6 +517,16 @@ func main() {
 			}
 		}()
 		err = receiveOTLP(cfg, onLine)
+	case "s3":
+		err = receiveS3(cfg, cnt, val)
+	case "azure_blob":
+		err = receiveAzureBlob(cfg, cnt, val)
+	case "sqs":
+		err = receiveSQS(cfg, cnt, val)
+	case "kinesis":
+		err = receiveKinesis(cfg, cnt, val)
+	case "cloudwatch":
+		err = receiveCloudWatch(cfg, cnt, val)
 	default:
 		fmt.Fprintf(os.Stderr, "receiver: unknown mode %q\n", cfg.Mode)
 		os.Exit(1)

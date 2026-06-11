@@ -223,6 +223,16 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		}
 	}
 
+	// Capability guard: a case's `requires:` lists the capabilities every
+	// subject must declare. Failing fast beats starting a run that silently
+	// produces zero ingest.
+	for _, capName := range tc.Requires {
+		if !subject.HasCapability(capName) {
+			return results.RunResult{}, fmt.Errorf("subject %q does not declare capability %q required by case %q",
+				subject.Name, capName, tc.Name)
+		}
+	}
+
 	// TLS prep: when any generator opts into TLS, generate a self-signed
 	// CA + leaf cert set into <tmpDir>/certs and pass the path down to
 	// the orchestrator so it's bind-mounted into both the subject and the
@@ -278,6 +288,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	cleanupContainers := []string{
 		"bench-generator", "bench-receiver", "bench-collector",
 		"bench-subject-" + subject.Name,
+		"bench-localstack", "bench-azurite", "bench-azure-init",
 	}
 	// Supporting-service containers have fixed names too; a crashed prior run
 	// belongs to a different compose project, so Down() won't remove them and
@@ -1054,11 +1065,11 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 	}
 	if recvMetrics.LinesReceived > genStats.LinesSent {
 		extra := recvMetrics.LinesReceived - genStats.LinesSent
-		if tc.IsKafkaType() {
-			// Kafka is at-least-once: crash/restart recovery may re-consume
-			// uncommitted offsets and re-deliver records already buffered. That
-			// is correct behavior — duplicates, never loss — so over-delivery
-			// is informational here, not a failure.
+		if tc.IsKafkaType() || tc.Correctness.AllowOverDelivery {
+			// At-least-once transports (Kafka, S3-via-SQS notifications, SQS,
+			// Kinesis): crash/restart recovery may re-deliver records already
+			// buffered. That is correct behavior — duplicates, never loss —
+			// so over-delivery is informational here, not a failure.
 			fmt.Printf("  note: over-delivery of %s lines (at-least-once duplicates from recovery — not a failure)\n", formatCount(extra))
 		} else {
 			passed = false
@@ -1351,11 +1362,11 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 	}
 	if recvMetrics.LinesReceived > genStats.LinesSent {
 		extra := recvMetrics.LinesReceived - genStats.LinesSent
-		if tc.IsKafkaType() {
-			// Kafka is at-least-once: crash/restart recovery may re-consume
-			// uncommitted offsets and re-deliver records already buffered. That
-			// is correct behavior — duplicates, never loss — so over-delivery
-			// is informational here, not a failure.
+		if tc.IsKafkaType() || tc.Correctness.AllowOverDelivery {
+			// At-least-once transports (Kafka, S3-via-SQS notifications, SQS,
+			// Kinesis): crash/restart recovery may re-deliver records already
+			// buffered. That is correct behavior — duplicates, never loss —
+			// so over-delivery is informational here, not a failure.
 			fmt.Printf("  note: over-delivery of %s lines (at-least-once duplicates from recovery — not a failure)\n", formatCount(extra))
 		} else {
 			passed = false
