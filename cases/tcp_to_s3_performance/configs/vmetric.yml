@@ -1,3 +1,8 @@
+# Cap the in-process payload store well below its RAM/8 auto-scale so
+# the backlog at generator cutoff stays small enough to drain inside the
+# grace window — intake is TCP-throttled to the sink's true drain rate.
+payload_store:
+  memory_limit: 512
 devices:
   - id: 1
     name: tcp-bench
@@ -15,11 +20,32 @@ targets:
       secret: "test"
       region: "us-east-1"
       bucket: "bench-out"
-      format: json
-      # 32-core box: more sender workers overlap PutObject round trips so
-      # delivery keeps pace with unthrottled TCP ingest.
+      # raw = verbatim line passthrough — parity with vector's codec=text
+      # (no per-record JSON envelope, ~18% fewer upload bytes).
+      format: raw
+      # gzip objects — parity with vector's aws_s3 default compression;
+      # the bench receiver auto-detects gzip by magic bytes.
+      compression: gzip
+      extension: log.gz
+      # Payloads stay below 64MB, so the uploader takes the single
+      # PutObject path instead of multipart against LocalStack.
+      part_size: 64
+      # Unthrottled, the pipeline ingests and uploads ~7.3M lines/s —
+      # 3× what the bench receiver can validate (~2.4M lines/s), so the
+      # surplus sits uncounted in LocalStack at window close and reads
+      # as loss. limit.eps paces delivery just under the receiver
+      # ceiling; payload-store backpressure then throttles TCP intake to
+      # the same rate, keeping every line countable within the window.
+      # Configured above measured delivery: per-record pacing oversleeps
+      # at sub-microsecond intervals, so actual throughput lands ~25%
+      # below the configured rate (3.0M here ≈ 2.3-2.4M delivered).
+      limit:
+        eps: 3000000
+      # limit.eps defaults batch_size and parallelism to 1 — pin both:
+      # 100k-record objects and enough workers to overlap gzip+upload.
+      batch_size: 100000
       queue:
-        parallelism: 16
+        parallelism: 8
 routes:
   - name: tcp-to-s3-bench
     devices:
