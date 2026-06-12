@@ -11,8 +11,12 @@ devices:
       bucket_name: "bench-in"
       queue_url: "http://localstack:4566/000000000000/bench-events"
       file_name_filter: ".*"
-      sqs_max_messages: 10
+      # sqs_max_messages defaults to 10 (AWS cap). Short long-poll wait so
+      # the run drains promptly when the generator stops.
       sqs_wait_time_seconds: 2
+      # 32-core box: concurrent SQS pollers + object download/decode workers.
+      pollers: 4
+      workers: 16
 targets:
   - name: tcp-target-bench
     type: tcp

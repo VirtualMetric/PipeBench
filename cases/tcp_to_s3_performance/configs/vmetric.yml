@@ -16,6 +16,10 @@ targets:
       region: "us-east-1"
       bucket: "bench-out"
       format: json
+      # 32-core box: more sender workers overlap PutObject round trips so
+      # delivery keeps pace with unthrottled TCP ingest.
+      queue:
+        parallelism: 16
 routes:
   - name: tcp-to-s3-bench
     devices:

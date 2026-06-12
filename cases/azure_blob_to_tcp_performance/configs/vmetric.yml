@@ -9,11 +9,13 @@ devices:
       # container_name doubles as the storage queue polled for BlobCreated
       # events (the generator enqueues them).
       container_name: "bench-in"
-      # timeout is BOTH the dequeue poll interval and the queue visibility
-      # timeout. The 60s default would schedule the first poll after a short
-      # bench run already ended.
-      timeout: 2
-      batch_size: 32
+      # Idle backoff only — the pollers loop continuously while messages
+      # arrive; visibility_timeout (default 300s) is a separate property.
+      timeout: 1
+      # batch_size defaults to 32 (Azure cap).
+      # 32-core box: concurrent queue pollers + blob download/decode workers.
+      pollers: 4
+      workers: 16
 targets:
   - name: tcp-target-bench
     type: tcp
