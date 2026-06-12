@@ -104,10 +104,16 @@ var Registry = map[string]Subject{
 		Image:      "fluent/fluent-bit",
 		Version:    "5.0",
 		ConfigPath: "/fluent-bit/etc/fluent-bit.conf",
-		// s3 / azure_blob / kinesis_streams / cloudwatch_logs outputs all
-		// document a custom `endpoint`. No S3 *input* exists in fluent-bit.
+		// s3 / azure_blob outputs document a custom `endpoint`. No S3
+		// *input* exists in fluent-bit. kinesis_sink/cloudwatch_logs_sink
+		// are intentionally NOT declared: fluent-bit 5.0's aws_client
+		// hard-enforces TLS certificate verification on custom endpoints
+		// (`tls off`/`tls.verify off` are ignored), so it cannot reach
+		// LocalStack at all — see the comments in the kinesis/cloudwatch
+		// case configs (configs/fluent-bit.conf) for the verification
+		// history. Re-add once upstream ships an insecure-TLS option.
 		Capabilities: []string{
-			"s3_sink", "azure_blob_sink", "kinesis_sink", "cloudwatch_logs_sink",
+			"s3_sink", "azure_blob_sink",
 		},
 	},
 	"fluentd": {
