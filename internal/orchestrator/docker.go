@@ -455,10 +455,25 @@ services:
     container_name: "bench-localstack"
     hostname: "localstack"
     networks: [bench]
+    # Unlimited-rate S3 cases push hundreds of thousands of objects per
+    # minute; LocalStack's S3 keeps temp files per in-flight object and
+    # dies with EMFILE at the default container nofile limit.
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
     environment:
       SERVICES: "{{ .AWSServices }}"
       AWS_DEFAULT_REGION: "{{ .AWSRegion }}"
       EAGER_SERVICE_LOADING: "1"
+      # Generated resource URLs (GetQueueUrl etc.) default to
+      # localhost.localstack.cloud, which doesn't resolve on the bench
+      # network — SDKs that follow those URLs (logstash's SQS output)
+      # then connect nowhere. Pin URLs to the compose hostname, and use
+      # path-style queue URLs (domain style would prepend sqs.<region>.,
+      # which is not a resolvable alias here).
+      LOCALSTACK_HOST: "localstack:4566"
+      SQS_ENDPOINT_STRATEGY: "path"
     volumes:
       - "{{ .AWSInitHost }}:/etc/localstack/init/ready.d/init-bench.sh:ro"
     healthcheck:
@@ -597,7 +612,28 @@ func (r *ComposeRunner) populateServiceNames() {
 
 // Up starts all services detached.
 func (r *ComposeRunner) Up() error {
+	removeStaleBenchContainers()
 	return r.compose("up", "-d", "--quiet-pull")
+}
+
+// removeStaleBenchContainers force-removes leftover bench-* containers from a
+// previous run. Container names are fixed (bench-receiver, bench-localstack,
+// …), so a teardown that lost the race — or a --no-cleanup debug run — makes
+// every subsequent `compose up` fail with a name conflict. Sweeping by name
+// prefix right before up keeps back-to-back subject runs from tripping over
+// each other's corpses.
+func removeStaleBenchContainers() {
+	out, err := exec.Command("docker", "ps", "-aq", "--filter", "name=^bench-").Output()
+	if err != nil {
+		return
+	}
+	ids := strings.Fields(string(out))
+	if len(ids) == 0 {
+		return
+	}
+	fmt.Printf("  removing %d stale bench container(s)…\n", len(ids))
+	args := append([]string{"rm", "-f"}, ids...)
+	_ = exec.Command("docker", args...).Run()
 }
 
 // UpServices starts only the named compose services.
