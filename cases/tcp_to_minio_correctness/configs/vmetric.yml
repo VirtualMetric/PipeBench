@@ -1,0 +1,37 @@
+devices:
+  - id: 1
+    name: tcp-bench
+    type: tcp
+    properties:
+      address: "0.0.0.0"
+      port: 9000
+targets:
+  - name: s3-target-bench
+    # type: minio (not awss3) — the awss3 target runs an STS GetCallerIdentity
+    # credential probe for the native "awss3" type, which MinIO does not
+    # implement; every other registered S3-compatible alias (minio included)
+    # uses a ListBuckets probe instead, which MinIO answers.
+    type: minio
+    properties:
+      endpoint: "http://minio:9000"
+      use_path_style: true
+      # MinIO emulator root credentials (config.MinioRootUser/Password) —
+      # dev-only, never real; the harness injects the same pair as AWS_*.
+      key: "pipebench"
+      secret: "pipebench-minio-dev"
+      region: "us-east-1"
+      bucket: "bench-out"
+      # raw = verbatim line passthrough (parity with vector's codec=text);
+      # proves the raw path end-to-end with exact counts.
+      format: raw
+      # gzip objects — exercises the compressed path in the exact-count case.
+      compression: gzip
+      extension: log.gz
+      # Single PutObject path for <64MB objects.
+      part_size: 64
+routes:
+  - name: tcp-to-s3-bench
+    devices:
+      - name: tcp-bench
+    targets:
+      - name: s3-target-bench

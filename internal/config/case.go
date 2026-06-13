@@ -61,6 +61,11 @@ type TestCase struct {
 	// containers. See AzureConfig in cloud.go.
 	Azure *AzureConfig `yaml:"azure"`
 
+	// Minio, when set, adds a MinIO (multi-core S3-compatible) emulator to
+	// the test topology plus a one-shot minio-init that creates the declared
+	// buckets. Mutually exclusive with AWS. See MinioConfig in cloud.go.
+	Minio *MinioConfig `yaml:"minio"`
+
 	// Requires lists subject capabilities every subject in this case must
 	// declare (Subject.Capabilities); the runner fails fast on subjects
 	// lacking one instead of starting a run that silently produces zero
@@ -325,8 +330,9 @@ func (tc *TestCase) Validate() error {
 	// service names the compose template always emits.
 	reserved := map[string]struct{}{
 		"subject": {}, "generator": {}, "receiver": {}, "collector": {},
-		// Cloud emulator services rendered from the aws:/azure: blocks.
+		// Cloud emulator services rendered from the aws:/azure:/minio: blocks.
 		"localstack": {}, "azurite": {}, "azure-init": {},
+		"minio": {}, "minio-init": {},
 	}
 	epNames := map[string]struct{}{}
 	for i, e := range tc.Endpoints {
