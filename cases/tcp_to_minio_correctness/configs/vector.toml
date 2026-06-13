@@ -1,4 +1,4 @@
-# Vector configuration for tcp_to_minio_performance — TCP in, aws_s3 sink to
+# Vector configuration for tcp_to_minio_correctness — TCP in, aws_s3 sink to
 # MinIO. Short batch timeout keeps the drain window sane.
 # Credentials/region come from the harness-injected AWS_* environment.
 

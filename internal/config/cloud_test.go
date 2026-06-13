@@ -92,6 +92,14 @@ func TestValidateCloud(t *testing.T) {
 			wantErr: "reserved",
 		},
 		{
+			name: "redpanda endpoint name reserved",
+			tc: TestCase{
+				Name:      "c",
+				Endpoints: []Endpoint{{Name: "redpanda", Image: "img"}},
+			},
+			wantErr: "reserved",
+		},
+		{
 			name: "azure_blob receiver without azure block",
 			tc: TestCase{
 				Name:     "c",

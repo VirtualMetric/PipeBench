@@ -333,6 +333,8 @@ func (tc *TestCase) Validate() error {
 		// Cloud emulator services rendered from the aws:/azure:/minio: blocks.
 		"localstack": {}, "azurite": {}, "azure-init": {},
 		"minio": {}, "minio-init": {},
+		// Kafka broker services rendered from the kafka: block.
+		"redpanda": {}, "redpanda-init": {},
 	}
 	epNames := map[string]struct{}{}
 	for i, e := range tc.Endpoints {

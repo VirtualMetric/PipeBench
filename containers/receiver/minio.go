@@ -21,9 +21,19 @@ import (
 // receiver gate on its successful completion) — the azure-init pattern.
 func runMinioInit() {
 	endpoint := getEnv("RECEIVER_S3_ENDPOINT", getEnv("AWS_ENDPOINT_URL", "http://minio:9000"))
-	bucketsEnv := os.Getenv("MINIO_INIT_BUCKETS")
-	if strings.TrimSpace(bucketsEnv) == "" {
-		fmt.Fprintln(os.Stderr, "minio-init: MINIO_INIT_BUCKETS is required")
+
+	// Collect the non-empty bucket names up front. Validating the raw env
+	// string is not enough: inputs like "," or " , " are non-empty yet
+	// yield zero names, which would otherwise fall through the loop and
+	// exit 0 — falsely signalling "ready" with no bucket created.
+	var buckets []string
+	for name := range strings.SplitSeq(os.Getenv("MINIO_INIT_BUCKETS"), ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			buckets = append(buckets, name)
+		}
+	}
+	if len(buckets) == 0 {
+		fmt.Fprintln(os.Stderr, "minio-init: MINIO_INIT_BUCKETS must list at least one bucket")
 		os.Exit(1)
 	}
 
@@ -39,14 +49,16 @@ func runMinioInit() {
 		o.UsePathStyle = true
 	})
 
-	deadline := time.Now().Add(2 * time.Minute)
-	for name := range strings.SplitSeq(bucketsEnv, ",") {
-		name = strings.TrimSpace(name)
-		if name == "" {
-			continue
-		}
+	for _, name := range buckets {
+		// Per-bucket deadline so a slow bucket can't starve the rest.
+		deadline := time.Now().Add(2 * time.Minute)
 		for {
-			_, err := client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(name)})
+			// Per-request timeout so a connection that stalls mid-request
+			// can't block past the deadline (the deadline check only runs
+			// once CreateBucket returns).
+			reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			_, err := client.CreateBucket(reqCtx, &s3.CreateBucketInput{Bucket: aws.String(name)})
+			cancel()
 			if err == nil || bucketExists(err) {
 				break
 			}
