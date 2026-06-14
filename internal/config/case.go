@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -50,6 +51,14 @@ type TestCase struct {
 	// produces to it while the subject consumes from it. Used by the
 	// kafka_performance / kafka_correctness types.
 	Kafka *KafkaConfig `yaml:"kafka"`
+
+	// Vault, when set, adds a HashiCorp Vault dev-mode server (TLS-enabled)
+	// to the test topology: the harness renders a `vault` service plus a
+	// one-shot `vault-init` that seeds the declared secrets, and the subject
+	// gates on the seeding completing. Lets a case exercise a subject's
+	// secret-store integration (e.g. vmetric's hashicorpvault credential
+	// provider) without real infrastructure.
+	Vault *VaultConfig `yaml:"vault"`
 
 	// AWS, when set, adds a LocalStack emulator to the test topology and
 	// creates the declared S3/SQS/SNS/Kinesis/CloudWatch resources before
@@ -131,6 +140,51 @@ func (k *KafkaConfig) SMPOrDefault() int {
 		return k.SMP
 	}
 	return 1
+}
+
+// VaultConfig configures the in-topology HashiCorp Vault dev server (see
+// TestCase.Vault). All fields except Secrets are optional; the orchestrator
+// applies the defaults noted below. The dev server listens TLS-only at
+// https://vault:8200 with a self-generated CA the harness bind-mounts into
+// the subject at /vault-tls (vault-ca.pem).
+type VaultConfig struct {
+	// Image is the Vault container image (default "hashicorp/vault:1.20").
+	// Needs >= 1.12 for -dev-tls and `vault kv put -mount=...`.
+	Image string `yaml:"image"`
+	// Token is the deterministic dev-mode root token, fixed via
+	// VAULT_DEV_ROOT_TOKEN_ID (default "pipebench-dev-root"). Test-only —
+	// the bench Vault never holds real secrets.
+	Token string `yaml:"token"`
+	// Mount is the KV mount the secrets are seeded under (default "secret",
+	// the mount dev mode auto-enables as KV v2).
+	Mount string `yaml:"mount"`
+	// Secrets maps secret path -> field name -> value. vault-init seeds each
+	// path via `vault kv put -mount=<mount> <path> @<file>`; the values are
+	// written to per-run JSON files, never onto a command line.
+	Secrets map[string]map[string]string `yaml:"secrets"`
+}
+
+// VaultImageOrDefault etc. centralize the dev-server defaults so the
+// orchestrator and any caller render the same values.
+func (v *VaultConfig) VaultImageOrDefault() string {
+	if v != nil && v.Image != "" {
+		return v.Image
+	}
+	return "hashicorp/vault:1.20"
+}
+
+func (v *VaultConfig) TokenOrDefault() string {
+	if v != nil && v.Token != "" {
+		return v.Token
+	}
+	return "pipebench-dev-root"
+}
+
+func (v *VaultConfig) MountOrDefault() string {
+	if v != nil && v.Mount != "" {
+		return v.Mount
+	}
+	return "secret"
 }
 
 // Endpoint is an auxiliary container in the test topology (see
@@ -271,6 +325,9 @@ func (tc *TestCase) HasGenerator() bool {
 // UsesKafka reports whether the case adds a Redpanda broker to the topology.
 func (tc *TestCase) UsesKafka() bool { return tc.Kafka != nil }
 
+// UsesVault reports whether the case adds a Vault dev server to the topology.
+func (tc *TestCase) UsesVault() bool { return tc.Vault != nil }
+
 // IsPerformanceType reports whether the case is scored as a throughput test —
 // the plain `performance` type or the Kafka variant `kafka_performance`.
 func (tc *TestCase) IsPerformanceType() bool {
@@ -335,6 +392,8 @@ func (tc *TestCase) Validate() error {
 		"minio": {}, "minio-init": {},
 		// Kafka broker services rendered from the kafka: block.
 		"redpanda": {}, "redpanda-init": {},
+		// Secret store services rendered from the vault: block.
+		"vault": {}, "vault-init": {},
 	}
 	epNames := map[string]struct{}{}
 	for i, e := range tc.Endpoints {
@@ -379,7 +438,54 @@ func (tc *TestCase) Validate() error {
 	if tc.Correctness.MaxOverDeliveryPct < 0 {
 		return fmt.Errorf("case %q: max_overdelivery_pct must be non-negative, got %.2f", tc.Name, tc.Correctness.MaxOverDeliveryPct)
 	}
-	return tc.validateCloud()
+	if err := tc.validateVault(); err != nil {
+		return err
+	}
+  if err := tc.validateCloud(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// vaultPathRe / vaultTokenRe constrain the vault-config strings that end up
+// embedded in the generated docker-compose file (the vault-init command line
+// and environment): no shell or YAML metacharacter can pass. Secret VALUES
+// are exempt — they are written to JSON seed files, never rendered inline.
+var (
+	vaultPathRe  = regexp.MustCompile(`^[A-Za-z0-9/_.-]+$`)
+	vaultTokenRe = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+)
+
+// validateVault checks the optional `vault:` block: seeding at least one
+// secret is mandatory (a vault server nothing reads from is a case-authoring
+// mistake), and every compose-embedded string is charset-restricted.
+func (tc *TestCase) validateVault() error {
+	if tc.Vault == nil {
+		return nil
+	}
+	if len(tc.Vault.Secrets) == 0 {
+		return fmt.Errorf("case %q: vault block requires at least one entry under `secrets`", tc.Name)
+	}
+	if !vaultTokenRe.MatchString(tc.Vault.TokenOrDefault()) {
+		return fmt.Errorf("case %q: vault token must match %s", tc.Name, vaultTokenRe)
+	}
+	if !vaultPathRe.MatchString(tc.Vault.MountOrDefault()) {
+		return fmt.Errorf("case %q: vault mount %q must match %s", tc.Name, tc.Vault.MountOrDefault(), vaultPathRe)
+	}
+	for path, fields := range tc.Vault.Secrets {
+		if !vaultPathRe.MatchString(path) {
+			return fmt.Errorf("case %q: vault secret path %q must match %s", tc.Name, path, vaultPathRe)
+		}
+		if len(fields) == 0 {
+			return fmt.Errorf("case %q: vault secret %q has no fields", tc.Name, path)
+		}
+		for key := range fields {
+			if !vaultTokenRe.MatchString(key) {
+				return fmt.Errorf("case %q: vault secret %q field key %q must match %s", tc.Name, path, key, vaultTokenRe)
+			}
+		}
+	}
+	return nil
 }
 
 // validateSampleFile rejects sample_file paths that are absolute or escape the

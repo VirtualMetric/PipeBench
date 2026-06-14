@@ -290,6 +290,15 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		"bench-subject-" + subject.Name,
 		"bench-localstack", "bench-azurite", "bench-azure-init",
 	}
+	// Supporting-service containers have fixed names too; a crashed prior run
+	// belongs to a different compose project, so Down() won't remove them and
+	// the new run would collide on the name.
+	if tc.UsesKafka() {
+		cleanupContainers = append(cleanupContainers, "bench-redpanda", "bench-redpanda-init")
+	}
+	if tc.UsesVault() {
+		cleanupContainers = append(cleanupContainers, "bench-vault", "bench-vault-init")
+	}
 	// Plural-mode containers (bench-generator-<id>, bench-receiver-<id>)
 	// need cleanup too, otherwise a re-run of the same case can collide.
 	for _, c := range cr.GeneratorContainers() {

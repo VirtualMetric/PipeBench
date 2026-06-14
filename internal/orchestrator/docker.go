@@ -50,10 +50,14 @@ services:
     image: "{{ .SubjectImage }}"
     container_name: "{{ .SubjectContainer }}"
     networks: [bench]
-{{- if or .KafkaEnabled .AWSEnabled .AzureEnabled .MinioEnabled }}
+{{- if or .KafkaEnabled .AWSEnabled .AzureEnabled .VaultEnabled .MinioEnabled }}
     depends_on:
 {{- if .KafkaEnabled }}
       redpanda-init:
+        condition: service_completed_successfully
+{{- end }}
+{{- if .VaultEnabled }}
+      vault-init:
         condition: service_completed_successfully
 {{- end }}
 {{- if .AWSEnabled }}
@@ -77,6 +81,9 @@ services:
 {{- end }}
 {{- if .TLSCertsHost }}
       - "{{ .TLSCertsHost }}:/certs:ro"
+{{- end }}
+{{- if .VaultEnabled }}
+      - "{{ .VaultTLSHost }}:/vault-tls:ro"
 {{- end }}
 {{- if .SubjectUser }}
     user: "{{ .SubjectUser }}"
@@ -468,6 +475,58 @@ services:
       - "rpk topic create {{ .KafkaTopic }} -p {{ .KafkaPartitions }} --brokers redpanda:9092 || rpk topic describe {{ .KafkaTopic }} --brokers redpanda:9092"
     restart: "no"
 {{- end }}
+{{- if .VaultEnabled }}
+
+  vault:
+    image: "{{ .VaultImage }}"
+    container_name: "bench-vault"
+    hostname: "vault"
+    networks: [bench]
+    cap_add:
+      - IPC_LOCK
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: "{{ .VaultToken }}"
+    command:
+      - server
+      - "-dev"
+      - "-dev-tls"
+      - "-dev-tls-cert-dir=/vault/tls"
+      - "-dev-tls-san=vault"
+      - "-dev-listen-address=0.0.0.0:8200"
+    volumes:
+      - "{{ .VaultTLSHost }}:/vault/tls"
+    # -tls-skip-verify is a liveness probe choice, not a trust decision: the
+    # check races the dev server writing its own cert dir at startup. Full
+    # chain verification happens in vault-init (VAULT_CACERT) and the subject.
+    healthcheck:
+      test: ["CMD", "vault", "status", "-address=https://127.0.0.1:8200", "-tls-skip-verify"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 3s
+    restart: "no"
+
+  # One-shot: seed each declared secret from its mounted JSON file, then
+  # exit 0. The subject gates on this completing so config-load-time
+  # $secret resolution never races the seeding.
+  vault-init:
+    image: "{{ .VaultImage }}"
+    container_name: "bench-vault-init"
+    networks: [bench]
+    depends_on:
+      vault:
+        condition: service_healthy
+    environment:
+      VAULT_ADDR: "https://vault:8200"
+      VAULT_CACERT: "/vault/tls/vault-ca.pem"
+      VAULT_TOKEN: "{{ .VaultToken }}"
+    volumes:
+      - "{{ .VaultTLSHost }}:/vault/tls:ro"
+      - "{{ .VaultSecretsHost }}:/vault-secrets:ro"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "{{ .VaultInitCmd }}"
+{{- end }}
 {{- if .AWSEnabled }}
 
   localstack:
@@ -589,6 +648,13 @@ type RunConfig struct {
 	// path is bind-mounted into the subject and every TLS-using generator
 	// at /certs:ro.
 	TLSCertsHost string
+	// VaultTLSHost / VaultSecretsHost / VaultSeeds are the host paths and
+	// seed list provisioned by PrepareVault for a `vault:`-enabled case.
+	// NewComposeRunner populates them when empty; tests may set them
+	// directly to render a compose file without touching the filesystem.
+	VaultTLSHost     string
+	VaultSecretsHost string
+	VaultSeeds       []VaultSeed
 }
 
 // ComposeRunner manages a docker compose lifecycle for one test run.
@@ -617,6 +683,17 @@ func NewComposeRunner(cfg RunConfig) (*ComposeRunner, error) {
 
 	if cfg.DockerSocketGID == "" {
 		cfg.DockerSocketGID = dockerSocketGID()
+	}
+
+	// Vault topology prep lives here (not in the runner) so every RunConfig
+	// construction site — including the persistence/restart flows — gets it
+	// from the single place all of them already pass through.
+	if cfg.TestCase.UsesVault() && cfg.VaultTLSHost == "" {
+		vp, err := PrepareVault(cfg.TmpDir, cfg.TestCase.Vault)
+		if err != nil {
+			return nil, fmt.Errorf("preparing vault topology: %w", err)
+		}
+		cfg.VaultTLSHost, cfg.VaultSecretsHost, cfg.VaultSeeds = vp.TLSDir, vp.SecretsDir, vp.Seeds
 	}
 
 	composeFile := filepath.Join(cfg.TmpDir, "docker-compose.yaml")
@@ -1014,6 +1091,18 @@ type composeVars struct {
 	KafkaSMP        int
 	GenKafkaBatch   int
 
+	// Vault topology. VaultEnabled gates the vault + vault-init services,
+	// the subject's vault-init depends_on, and the /vault-tls subject mount.
+	// VaultInitCmd is the pre-built one-shot seeding shell line: mount and
+	// paths are charset-validated at case load, and the secret values live
+	// in the mounted JSON files, never in this string.
+	VaultEnabled     bool
+	VaultImage       string
+	VaultToken       string
+	VaultTLSHost     string
+	VaultSecretsHost string
+	VaultInitCmd     string
+
 	RecvMode              string
 	RecvListen            string
 	RecvEnv               map[string]string
@@ -1347,6 +1436,27 @@ func writeCompose(path string, cfg RunConfig) error {
 		vars.KafkaPartitions = tc.Kafka.PartitionsOrDefault()
 		vars.KafkaMemory = tc.Kafka.MemoryOrDefault()
 		vars.KafkaSMP = tc.Kafka.SMPOrDefault()
+	}
+
+	// Vault dev server: render the vault + vault-init services and gate the
+	// subject on the seeding completing. Defaults centralized on VaultConfig.
+	if tc.UsesVault() {
+		if cfg.VaultTLSHost == "" || cfg.VaultSecretsHost == "" {
+			return fmt.Errorf("case %q uses vault but the vault host dirs were not prepared", tc.Name)
+		}
+		vars.VaultEnabled = true
+		vars.VaultImage = tc.Vault.VaultImageOrDefault()
+		vars.VaultToken = tc.Vault.TokenOrDefault()
+		vars.VaultTLSHost = filepath.ToSlash(cfg.VaultTLSHost)
+		vars.VaultSecretsHost = filepath.ToSlash(cfg.VaultSecretsHost)
+		var sb strings.Builder
+		sb.WriteString("set -e; ")
+		for _, s := range cfg.VaultSeeds {
+			fmt.Fprintf(&sb, "vault kv put -mount=%s %s @/vault-secrets/%s; ",
+				tc.Vault.MountOrDefault(), s.Path, s.File)
+		}
+		sb.WriteString("echo vault seeding complete")
+		vars.VaultInitCmd = sb.String()
 	}
 
 	if tc.MultiReceiver() {
