@@ -26,10 +26,12 @@ receiver:
 
 requires: [cloudwatch_logs_sink]
 
+# fluent-bit is intentionally absent: its 5.0 aws_client cannot disable TLS
+# cert verification against LocalStack (see configs/fluent-bit.conf and the
+# capability note in internal/config/subject.go).
 subjects:
   - vmetric
   - vector
-  - fluent-bit
 
 configurations:
   default:

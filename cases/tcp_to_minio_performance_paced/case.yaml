@@ -1,0 +1,41 @@
+name: tcp_to_minio_performance_paced
+type: performance
+description: "TCP-in to S3-out against MinIO with the generator paced below the bench receiver's counting ceiling (~2.4M lines/s). Pacing the input throttles every subject uniformly, so delivery stays countable within the window and loss is ~0% — the clean, directly-comparable delivery number (the unthrottled peak is in tcp_to_minio_performance). The receiver polls the output bucket, counts lines, and deletes drained objects."
+
+duration: 60s
+warmup: 15s
+# Object-storage sinks flush on interval/size — give the tail time to land.
+drain_grace: 45s
+
+minio:
+  buckets: [bench-out]
+
+generator:
+  mode: tcp
+  target: "subject:9000"
+  # rate is PER CONNECTION, so total input = rate x connections. Pin both
+  # to 4 x 375k = 1.5M lines/s — comfortably under the single-poller
+  # receiver's drain ceiling so every subject's output is fully counted
+  # within the window (clean ~0% loss).
+  rate: 375000
+  connections: 4
+  line_size: 256
+  format: raw
+
+receiver:
+  mode: s3
+  env:
+    RECEIVER_S3_BUCKET: "bench-out"
+    RECEIVER_S3_ENDPOINT: "http://minio:9000"
+
+requires: [s3_sink]
+
+subjects:
+  - vmetric
+  - vector
+  - fluent-bit
+  - logstash
+
+configurations:
+  default:
+    description: "Raw TCP to S3 objects on MinIO — no transforms, paced input"

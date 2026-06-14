@@ -24,6 +24,14 @@ const (
 	// account name and key (the same pair every Azurite install accepts).
 	AzuriteAccount = "devstoreaccount1"
 	AzuriteKey     = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+
+	// MinioRootUser / MinioRootPassword are the static credentials the
+	// MinIO emulator boots with and every container uses against it. Like
+	// the values above they are emulator-only and never real; the harness
+	// never reads cloud credentials from the host environment. The password
+	// is >=8 chars because MinIO refuses to start otherwise.
+	MinioRootUser     = "pipebench"
+	MinioRootPassword = "pipebench-minio-dev"
 )
 
 // AWSConfig, when set on a TestCase (`aws:`), adds a LocalStack emulator to
@@ -192,8 +200,37 @@ func (a *AzureConfig) ConnectionString() string {
 	)
 }
 
+// MinioConfig, when set on a TestCase (`minio:`), adds a MinIO emulator to
+// the test topology: the harness renders a `minio` service plus a one-shot
+// `minio-init` (reusing the bench-receiver image) that creates the declared
+// buckets over the S3 API, then exits — the subject is gated on its
+// completion, mirroring the azure-init pattern. MinIO is S3-compatible, so
+// the s3 generator/receiver modes and the s3_sink/s3_source capabilities
+// apply unchanged; only the endpoint and credentials differ from LocalStack.
+type MinioConfig struct {
+	// Image is the MinIO container image (default below). Pinned to a
+	// release tag, never :latest.
+	Image string `yaml:"image"`
+	// Buckets are S3 buckets created by minio-init before the subject starts.
+	Buckets []string `yaml:"buckets"`
+}
+
+// ImageOrDefault returns the MinIO image.
+func (m *MinioConfig) ImageOrDefault() string {
+	if m != nil && m.Image != "" {
+		return m.Image
+	}
+	return "minio/minio:RELEASE.2025-04-22T22-12-26Z"
+}
+
+// EndpointURL is the MinIO S3 endpoint as seen from the bench network.
+func (m *MinioConfig) EndpointURL() string { return "http://minio:9000" }
+
 // UsesAWS reports whether the case adds a LocalStack emulator to the topology.
 func (tc *TestCase) UsesAWS() bool { return tc.AWS != nil }
+
+// UsesMinio reports whether the case adds a MinIO emulator to the topology.
+func (tc *TestCase) UsesMinio() bool { return tc.Minio != nil }
 
 // UsesAzure reports whether the case adds an Azurite emulator to the topology.
 func (tc *TestCase) UsesAzure() bool { return tc.Azure != nil }
@@ -229,8 +266,18 @@ func validateCloudName(caseName, kind, name string) error {
 // validateCloud runs the `aws:`/`azure:` structural checks called from
 // TestCase.Validate.
 func (tc *TestCase) validateCloud() error {
+	// AWS (LocalStack) and MinIO both own the S3 endpoint and credentials;
+	// a case must pick one.
+	if tc.AWS != nil && tc.Minio != nil {
+		return fmt.Errorf("case %q: `aws:` and `minio:` are mutually exclusive (both provide the S3 endpoint)", tc.Name)
+	}
 	if tc.AWS != nil {
 		if err := tc.validateAWS(); err != nil {
+			return err
+		}
+	}
+	if tc.Minio != nil {
+		if err := tc.validateMinio(); err != nil {
 			return err
 		}
 	}
@@ -242,12 +289,12 @@ func (tc *TestCase) validateCloud() error {
 
 	// Cloud generator/receiver modes only make sense with the matching
 	// emulator block (the orchestrator derives endpoints and init wiring
-	// from it).
+	// from it). The s3 mode is served by either LocalStack or MinIO.
 	for _, g := range tc.AllGenerators() {
 		switch g.Mode {
 		case "s3":
-			if tc.AWS == nil {
-				return fmt.Errorf("case %q: generator mode \"s3\" requires an `aws:` block", tc.Name)
+			if tc.AWS == nil && tc.Minio == nil {
+				return fmt.Errorf("case %q: generator mode \"s3\" requires an `aws:` or `minio:` block", tc.Name)
 			}
 		case "azure_blob":
 			if tc.Azure == nil {
@@ -257,7 +304,11 @@ func (tc *TestCase) validateCloud() error {
 	}
 	for _, r := range tc.AllReceivers() {
 		switch r.Mode {
-		case "s3", "sqs", "kinesis", "cloudwatch":
+		case "s3":
+			if tc.AWS == nil && tc.Minio == nil {
+				return fmt.Errorf("case %q: receiver mode \"s3\" requires an `aws:` or `minio:` block", tc.Name)
+			}
+		case "sqs", "kinesis", "cloudwatch":
 			if tc.AWS == nil {
 				return fmt.Errorf("case %q: receiver mode %q requires an `aws:` block", tc.Name, r.Mode)
 			}
@@ -266,6 +317,25 @@ func (tc *TestCase) validateCloud() error {
 				return fmt.Errorf("case %q: receiver mode \"azure_blob\" requires an `azure:` block", tc.Name)
 			}
 		}
+	}
+	return nil
+}
+
+// validateMinio runs the `minio:` structural checks: at least one bucket,
+// each matching the shared cloud-resource charset, no duplicates.
+func (tc *TestCase) validateMinio() error {
+	if len(tc.Minio.Buckets) == 0 {
+		return fmt.Errorf("case %q: `minio:` block requires at least one bucket", tc.Name)
+	}
+	seen := map[string]struct{}{}
+	for _, b := range tc.Minio.Buckets {
+		if err := validateCloudName(tc.Name, "minio bucket", b); err != nil {
+			return err
+		}
+		if _, dup := seen[b]; dup {
+			return fmt.Errorf("case %q: duplicate minio bucket %q", tc.Name, b)
+		}
+		seen[b] = struct{}{}
 	}
 	return nil
 }

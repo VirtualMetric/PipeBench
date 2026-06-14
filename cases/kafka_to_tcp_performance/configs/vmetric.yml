@@ -1,8 +1,3 @@
-# Kafka consumer device per https://vdocs.virtualmetric.com/configuration/devices/mq/kafka
-# Consume topic `bench` from the redpanda broker and forward verbatim to the
-# TCP receiver. The director's kafka device has no offset-reset knob, so the
-# generator waits out its `warmup` before producing — giving this consumer time
-# to join the group and be positioned before the first record is sent.
 devices:
   - id: 1
     name: kafka-bench
@@ -12,10 +7,6 @@ devices:
       port: 9092
       topic: "bench"
       group: "bench"
-      # 8 consumer workers — each joins the group as its own franz-go member, so
-      # the 8 topic partitions (kafka.partitions in case.yaml) are consumed in
-      # parallel. Default is NumCPU/4; pinning 8 matches the partition count.
-      workers: 8
 targets:
   - name: tcp-target-bench
     type: tcp

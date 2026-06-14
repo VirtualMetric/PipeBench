@@ -1,20 +1,3 @@
-# Round-trip exercising the Kafka TARGET's batching AND the device's splitting:
-#   tcp-in (TCP :9000)
-#     -> kafka-out (Kafka target, batch_mode: json_array, max_events: 100 ->
-#        packs up to 100 events into ONE Kafka message as a JSON array)
-#     -> topic bench
-#     -> kafka-in (Kafka device, split_mode: json_array -> splits each array
-#        back into individual events)
-#     -> tcp-out (TCP -> receiver:9001)
-# Count is preserved 1:1 end-to-end only if the target batches AND the device
-# splits correctly.
-#
-# Each route is bound to a single device via a device-static `if`. Without it,
-# vmetric fans every device out to every target, which would send kafka-in's
-# records back into kafka-out and create an infinite Kafka feedback loop
-# (bench -> kafka-in -> kafka-out -> bench -> ...). The `if` confines each device
-# to exactly one target so the flow is strictly tcp-in -> kafka-out and
-# kafka-in -> tcp-out.
 devices:
   - id: 1
     name: tcp-in

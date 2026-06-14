@@ -47,7 +47,57 @@ func TestValidateCloud(t *testing.T) {
 				Name:      "c",
 				Generator: GeneratorConfig{Mode: "s3", Target: "http://localstack:4566"},
 			},
-			wantErr: "requires an `aws:` block",
+			wantErr: "requires an `aws:` or `minio:` block",
+		},
+		{
+			name: "minio block with bucket and s3 receiver",
+			tc: TestCase{
+				Name:     "c",
+				Minio:    &MinioConfig{Buckets: []string{"bench-out"}},
+				Receiver: ReceiverConfig{Mode: "s3"},
+			},
+		},
+		{
+			name: "aws and minio mutually exclusive",
+			tc: TestCase{
+				Name:  "c",
+				AWS:   &AWSConfig{Buckets: []string{"bench-out"}},
+				Minio: &MinioConfig{Buckets: []string{"bench-out"}},
+			},
+			wantErr: "mutually exclusive",
+		},
+		{
+			name: "minio block without buckets",
+			tc: TestCase{
+				Name:  "c",
+				Minio: &MinioConfig{},
+			},
+			wantErr: "at least one bucket",
+		},
+		{
+			name: "minio bucket name charset enforced",
+			tc: TestCase{
+				Name:  "c",
+				Minio: &MinioConfig{Buckets: []string{"bad;rm -rf /"}},
+			},
+			wantErr: "contains characters outside",
+		},
+		{
+			name: "minio endpoint name reserved",
+			tc: TestCase{
+				Name:      "c",
+				Minio:     &MinioConfig{Buckets: []string{"bench-out"}},
+				Endpoints: []Endpoint{{Name: "minio", Image: "img"}},
+			},
+			wantErr: "reserved",
+		},
+		{
+			name: "redpanda endpoint name reserved",
+			tc: TestCase{
+				Name:      "c",
+				Endpoints: []Endpoint{{Name: "redpanda", Image: "img"}},
+			},
+			wantErr: "reserved",
 		},
 		{
 			name: "azure_blob receiver without azure block",
@@ -166,6 +216,16 @@ func TestAWSConfigDefaults(t *testing.T) {
 	}
 	if got, want := aws.TopicARN("t"), "arn:aws:sns:us-east-1:000000000000:t"; got != want {
 		t.Errorf("TopicARN() = %q, want %q", got, want)
+	}
+}
+
+func TestMinioConfigDefaults(t *testing.T) {
+	m := &MinioConfig{Buckets: []string{"bench-out"}}
+	if got, want := m.ImageOrDefault(), "minio/minio:RELEASE.2025-04-22T22-12-26Z"; got != want {
+		t.Errorf("ImageOrDefault() = %q, want %q", got, want)
+	}
+	if got, want := m.EndpointURL(), "http://minio:9000"; got != want {
+		t.Errorf("EndpointURL() = %q, want %q", got, want)
 	}
 }
 

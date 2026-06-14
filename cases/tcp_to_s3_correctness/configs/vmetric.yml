@@ -10,12 +10,12 @@ targets:
     type: awss3
     properties:
       endpoint: "http://localstack:4566"
-      use_path_style: true
       key: "test"
       secret: "test"
-      region: "us-east-1"
       bucket: "bench-out"
-      format: json
+      format: raw
+      compression: gzip
+      extension: log.gz
 routes:
   - name: tcp-to-s3-bench
     devices:

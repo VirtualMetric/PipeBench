@@ -1,0 +1,36 @@
+name: tcp_to_minio_performance
+type: performance
+description: "Measures throughput of a TCP-in to S3-out pipeline against MinIO (a multi-core, Go S3-compatible store) instead of LocalStack. Unlimited generator rate — pushes peak. Unlike LocalStack's single-core S3, MinIO is not the ceiling, so this exposes the subject's true delivery rate (note: the single-poller bench receiver, ~2.4M lines/s, can become the limit — surplus shows as uncounted-at-cutoff 'loss'). The receiver polls the output bucket, counts lines, and deletes drained objects."
+
+duration: 60s
+warmup: 15s
+# Object-storage sinks flush on interval/size — give the tail time to land.
+drain_grace: 45s
+
+minio:
+  buckets: [bench-out]
+
+generator:
+  mode: tcp
+  target: "subject:9000"
+  rate: 0           # unlimited — push as fast as possible
+  line_size: 256
+  format: raw
+
+receiver:
+  mode: s3
+  env:
+    RECEIVER_S3_BUCKET: "bench-out"
+    RECEIVER_S3_ENDPOINT: "http://minio:9000"
+
+requires: [s3_sink]
+
+subjects:
+  - vmetric
+  - vector
+  - fluent-bit
+  - logstash
+
+configurations:
+  default:
+    description: "Raw TCP to S3 objects on MinIO — no transforms, unlimited rate"

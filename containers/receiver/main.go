@@ -468,6 +468,13 @@ func main() {
 		return
 	}
 
+	// One-shot init helper for the minio-init compose service: creates the
+	// bench buckets in MinIO over the S3 API and exits — never serves.
+	if cfg.Mode == "minio_init" {
+		runMinioInit()
+		return
+	}
+
 	cnt := &counters{recordTimes: cfg.RecordArrivalTimes}
 	val := newValidator()
 
@@ -939,15 +946,15 @@ func serveMetrics(port string, cnt *counters, val *validator, cfg config) {
 
 func loadConfig() config {
 	return config{
-		Mode:          getEnv("RECEIVER_MODE", "tcp"),
-		Listen:        getEnv("RECEIVER_LISTEN", ":9001"),
-		MetricsPort:   getEnv("RECEIVER_METRICS_PORT", "9090"),
-		Timeout:       time.Duration(getEnvInt("RECEIVER_TIMEOUT_SECS", 30)) * time.Second,
-		ValidateDedup:     getEnvBool("RECEIVER_VALIDATE_DEDUP", false),
-		ValidateContent:   getEnvBool("RECEIVER_VALIDATE_CONTENT", false),
-		ExpectedLines:     int64(getEnvInt("RECEIVER_EXPECTED_LINES", 0)),
-		RequiredSubstring: getEnv("RECEIVER_REQUIRED_SUBSTRING", ""),
-		ValidateJSON:      getEnvBool("RECEIVER_VALIDATE_JSON", false),
+		Mode:               getEnv("RECEIVER_MODE", "tcp"),
+		Listen:             getEnv("RECEIVER_LISTEN", ":9001"),
+		MetricsPort:        getEnv("RECEIVER_METRICS_PORT", "9090"),
+		Timeout:            time.Duration(getEnvInt("RECEIVER_TIMEOUT_SECS", 30)) * time.Second,
+		ValidateDedup:      getEnvBool("RECEIVER_VALIDATE_DEDUP", false),
+		ValidateContent:    getEnvBool("RECEIVER_VALIDATE_CONTENT", false),
+		ExpectedLines:      int64(getEnvInt("RECEIVER_EXPECTED_LINES", 0)),
+		RequiredSubstring:  getEnv("RECEIVER_REQUIRED_SUBSTRING", ""),
+		ValidateJSON:       getEnvBool("RECEIVER_VALIDATE_JSON", false),
 		RecordArrivalTimes: getEnvBool("RECEIVER_RECORD_ARRIVAL_TIMES", false),
 	}
 }
