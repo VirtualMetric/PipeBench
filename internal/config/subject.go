@@ -104,10 +104,16 @@ var Registry = map[string]Subject{
 		Image:      "fluent/fluent-bit",
 		Version:    "5.0",
 		ConfigPath: "/fluent-bit/etc/fluent-bit.conf",
-		// s3 / azure_blob / kinesis_streams / cloudwatch_logs outputs all
-		// document a custom `endpoint`. No S3 *input* exists in fluent-bit.
+		// s3 / azure_blob outputs document a custom `endpoint`. No S3
+		// *input* exists in fluent-bit. kinesis_sink/cloudwatch_logs_sink
+		// are intentionally NOT declared: fluent-bit 5.0's aws_client
+		// hard-enforces TLS certificate verification on custom endpoints
+		// (`tls off`/`tls.verify off` are ignored), so it cannot reach
+		// LocalStack at all — see the comments in the kinesis/cloudwatch
+		// case configs (configs/fluent-bit.conf) for the verification
+		// history. Re-add once upstream ships an insecure-TLS option.
 		Capabilities: []string{
-			"s3_sink", "azure_blob_sink", "kinesis_sink", "cloudwatch_logs_sink",
+			"s3_sink", "azure_blob_sink",
 		},
 	},
 	"fluentd": {
@@ -133,8 +139,9 @@ var Registry = map[string]Subject{
 		User:       "root",
 		Command:    []string{"-environment", "container", "--strict.perms=false", "-e"},
 		// aws-s3 input supports custom endpoints (non_aws_bucket_name);
-		// azure-blob-storage input — verify against Azurite before adding.
-		Capabilities: []string{"s3_source"},
+		// azureblobstorage input (GA since 8.12) takes a storage_url
+		// override, so it points at Azurite directly.
+		Capabilities: []string{"s3_source", "azure_blob_source"},
 	},
 	"telegraf": {
 		Name:       "telegraf",
@@ -158,6 +165,13 @@ var Registry = map[string]Subject{
 		User:       "root",
 		Entrypoint: []string{"/opt/tenzir/bin/tenzir-node"},
 		Command:    []string{"--config=/etc/tenzir/tenzir.yaml"},
+		// No Azure Blob capabilities despite v5.30 shipping the
+		// operators: load_azure_blob_storage reads a single blob URI
+		// (no glob/watch), and save_azure_blob_storage writes one
+		// blob whose block list only commits on pipeline shutdown —
+		// verified empirically (8 GB buffered, 0 lines visible). The
+		// rotating to_/from_azure_blob_storage operators landed in a
+		// later release.
 	},
 	"axosyslog": {
 		Name:       "axosyslog",
@@ -168,14 +182,18 @@ var Registry = map[string]Subject{
 	"vmetric": {
 		Name:       "vmetric",
 		Image:      "vmetric/director",
-		Version:    "2.0.2",
+		Version:    "2.0.3",
 		ConfigPath: "/config.yml",
-		Entrypoint: []string{"/director"},
-		Command:    []string{"-config-path", "config.yml"},
+		// 2.0.3 moved the binary from /director to /opt/vmetric/director
+		// (workdir /opt/vmetric) — keep the config path absolute so the
+		// new workdir can't reroute it.
+		Entrypoint: []string{"/opt/vmetric/director"},
+		Command:    []string{"-config-path", "/config.yml"},
 		ConfigRW:   true,
 		// Cloud capabilities require a director build with emulator
 		// endpoint support (awss3 listener `endpoint`/`use_path_style`,
-		// azblob target `connection_string`) — i.e. newer than 2.0.2.
+		// azblob target `connection_string`) — 2.0.3 is the first
+		// release that ships it; 2.0.2 starts but ingests nothing.
 		Capabilities: []string{
 			"tls_tcp",
 			"s3_sink", "s3_source", "azure_blob_sink", "azure_blob_source",
@@ -212,9 +230,12 @@ var Registry = map[string]Subject{
 		ConfigPath: "/opt/cribl/local/cribl",
 		ConfigRW:   true,
 		// S3/SQS/SNS/Kinesis/CloudWatch destinations + S3 source all take
-		// custom endpoints; azure_blob via connection string.
+		// custom endpoints; azure_blob via connection string. The blob
+		// *source* consumes EventGrid messages from a storage queue —
+		// the bench generator enqueues synthetic ones (Azurite never
+		// emits them itself).
 		Capabilities: []string{
-			"s3_sink", "s3_source", "azure_blob_sink",
+			"s3_sink", "s3_source", "azure_blob_sink", "azure_blob_source",
 			"sqs_sink", "sns_sink", "kinesis_sink", "cloudwatch_logs_sink",
 		},
 	},

@@ -1,0 +1,29 @@
+filebeat.inputs:
+  - type: azure-blob-storage
+    account_name: devstoreaccount1
+    # Azurite's well-known development-storage key — public emulator
+    # constant, not a secret.
+    auth.shared_credentials.account_key: "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+    # storage_url overrides the https://<account>.blob.core.windows.net
+    # default — this is what makes the input Azurite-compatible. The
+    # trailing slash matters: filebeat appends the container name with
+    # plain string concatenation.
+    storage_url: "http://azurite:10000/devstoreaccount1/"
+    containers:
+      - name: bench-in
+        # poll defaults to false (one-shot listing) — the bench needs
+        # continuous pickup of blobs the generator keeps uploading.
+        poll: true
+        poll_interval: 2s
+        max_workers: 4
+
+output.elasticsearch:
+  hosts: ["http://receiver:9002"]
+  allow_older_versions: true
+  compression_level: 0
+
+logging.level: warning
+queue.mem:
+  events: 4096
+  flush.min_events: 2048
+  flush.timeout: 1s

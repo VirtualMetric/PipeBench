@@ -1,0 +1,23 @@
+outputs:
+  default:
+    defaultId: bench_azblob_out
+    type: default
+  bench_azblob_out:
+    type: azure_blob
+    authType: manual
+    # Azurite's well-known development-storage account — public emulator
+    # constants, not secrets.
+    connectionString: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;"
+    containerName: bench-out
+    createContainer: true
+    format: json
+    baseFileName: CriblOut
+    compress: none
+    # Schema minimums (open >= 10s, idle >= 5s) — the lowest Cribl accepts,
+    # so blobs land within the run + drain window instead of sitting in
+    # staging for the 300s/30s defaults.
+    maxFileSizeMB: 32
+    maxFileOpenTimeSec: 10
+    maxFileIdleTimeSec: 5
+    onBackpressure: block
+    stagePath: $CRIBL_HOME/state/outputs/staging

@@ -1,0 +1,26 @@
+devices:
+  - id: 1
+    name: tcp-bench
+    type: tcp
+    properties:
+      address: "0.0.0.0"
+      port: 9000
+targets:
+  - name: s3-target-bench
+    # type: minio (not awss3) — the awss3 target runs an STS GetCallerIdentity
+    # credential probe for the native "awss3" type, which MinIO does not
+    # implement; every other registered S3-compatible alias (minio included)
+    # uses a ListBuckets probe instead, which MinIO answers.
+    type: minio
+    properties:
+      endpoint: "http://minio:9000"
+      bucket: "bench-out"
+      format: raw
+      compression: gzip
+      extension: log.gz
+routes:
+  - name: tcp-to-s3-bench
+    devices:
+      - name: tcp-bench
+    targets:
+      - name: s3-target-bench

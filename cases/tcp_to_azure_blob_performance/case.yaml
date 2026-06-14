@@ -27,6 +27,7 @@ subjects:
   - vmetric
   - vector
   - fluent-bit
+  - cribl-stream
 
 configurations:
   default:

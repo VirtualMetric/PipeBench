@@ -50,7 +50,7 @@ services:
     image: "{{ .SubjectImage }}"
     container_name: "{{ .SubjectContainer }}"
     networks: [bench]
-{{- if or .KafkaEnabled .AWSEnabled .AzureEnabled .VaultEnabled }}
+{{- if or .KafkaEnabled .AWSEnabled .AzureEnabled .VaultEnabled .MinioEnabled }}
     depends_on:
 {{- if .KafkaEnabled }}
       redpanda-init:
@@ -66,6 +66,10 @@ services:
 {{- end }}
 {{- if .AzureEnabled }}
       azure-init:
+        condition: service_completed_successfully
+{{- end }}
+{{- if .MinioEnabled }}
+      minio-init:
         condition: service_completed_successfully
 {{- end }}
 {{- end }}
@@ -130,6 +134,10 @@ services:
 {{- end }}
 {{- if $.AzureEnabled }}
       azure-init:
+        condition: service_completed_successfully
+{{- end }}
+{{- if $.MinioEnabled }}
+      minio-init:
         condition: service_completed_successfully
 {{- end }}
 {{- if or $.UseSharedData $.TLSCertsHost .SampleFileHost }}
@@ -215,6 +223,10 @@ services:
       azure-init:
         condition: service_completed_successfully
 {{- end }}
+{{- if .MinioEnabled }}
+      minio-init:
+        condition: service_completed_successfully
+{{- end }}
 {{- end }}
 {{- if or .UseSharedData .TLSCertsHost .GenSampleFileHost }}
     volumes:
@@ -293,7 +305,7 @@ services:
     image: "{{ $.ReceiverImage }}"
     container_name: "bench-receiver-{{ .ID }}"
     networks: [bench]
-{{- if or .AWSDep .AzureDep }}
+{{- if or .AWSDep .AzureDep .MinioDep }}
     depends_on:
 {{- if .AWSDep }}
       localstack:
@@ -301,6 +313,10 @@ services:
 {{- end }}
 {{- if .AzureDep }}
       azure-init:
+        condition: service_completed_successfully
+{{- end }}
+{{- if .MinioDep }}
+      minio-init:
         condition: service_completed_successfully
 {{- end }}
 {{- end }}
@@ -332,7 +348,7 @@ services:
     image: "{{ .ReceiverImage }}"
     container_name: "bench-receiver"
     networks: [bench]
-{{- if or .RecvAWSDep .RecvAzureDep }}
+{{- if or .RecvAWSDep .RecvAzureDep .RecvMinioDep }}
     depends_on:
 {{- if .RecvAWSDep }}
       localstack:
@@ -340,6 +356,10 @@ services:
 {{- end }}
 {{- if .RecvAzureDep }}
       azure-init:
+        condition: service_completed_successfully
+{{- end }}
+{{- if .RecvMinioDep }}
+      minio-init:
         condition: service_completed_successfully
 {{- end }}
 {{- end }}
@@ -514,10 +534,25 @@ services:
     container_name: "bench-localstack"
     hostname: "localstack"
     networks: [bench]
+    # Unlimited-rate S3 cases push hundreds of thousands of objects per
+    # minute; LocalStack's S3 keeps temp files per in-flight object and
+    # dies with EMFILE at the default container nofile limit.
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
     environment:
       SERVICES: "{{ .AWSServices }}"
       AWS_DEFAULT_REGION: "{{ .AWSRegion }}"
       EAGER_SERVICE_LOADING: "1"
+      # Generated resource URLs (GetQueueUrl etc.) default to
+      # localhost.localstack.cloud, which doesn't resolve on the bench
+      # network — SDKs that follow those URLs (logstash's SQS output)
+      # then connect nowhere. Pin URLs to the compose hostname, and use
+      # path-style queue URLs (domain style would prepend sqs.<region>.,
+      # which is not a resolvable alias here).
+      LOCALSTACK_HOST: "localstack:4566"
+      SQS_ENDPOINT_STRATEGY: "path"
     volumes:
       - "{{ .AWSInitHost }}:/etc/localstack/init/ready.d/init-bench.sh:ro"
     healthcheck:
@@ -553,6 +588,40 @@ services:
       RECEIVER_MODE: "azure_init"
       AZURE_STORAGE_CONNECTION_STRING: "{{ .AzureConnString }}"
       AZURE_INIT_CONTAINERS: "{{ .AzureInitContainers }}"
+    restart: "no"
+{{- end }}
+{{- if .MinioEnabled }}
+
+  # MinIO is a multi-core, Go S3-compatible store — no Docker cpu limit so it
+  # uses every host core (unlike LocalStack's GIL-bound single-core S3).
+  minio:
+    image: "{{ .MinioImage }}"
+    container_name: "bench-minio"
+    hostname: "minio"
+    networks: [bench]
+    command: ["server", "/data"]
+    environment:
+      MINIO_ROOT_USER: "{{ .MinioRootUser }}"
+      MINIO_ROOT_PASSWORD: "{{ .MinioRootPassword }}"
+    restart: "no"
+
+  # One-shot: create the declared buckets over the S3 API, retrying until
+  # MinIO answers, then exit 0. Reuses the bench-receiver image (it links the
+  # AWS S3 SDK) so no mc client image is pulled — the azure-init pattern.
+  minio-init:
+    image: "{{ .ReceiverImage }}"
+    container_name: "bench-minio-init"
+    networks: [bench]
+    depends_on:
+      - minio
+    environment:
+      RECEIVER_MODE: "minio_init"
+      RECEIVER_S3_ENDPOINT: "{{ .MinioEndpoint }}"
+      MINIO_INIT_BUCKETS: "{{ .MinioInitBuckets }}"
+      AWS_ACCESS_KEY_ID: "{{ .MinioRootUser }}"
+      AWS_SECRET_ACCESS_KEY: "{{ .MinioRootPassword }}"
+      AWS_REGION: "us-east-1"
+      AWS_EC2_METADATA_DISABLED: "true"
     restart: "no"
 {{- end }}
 `
@@ -674,7 +743,28 @@ func (r *ComposeRunner) populateServiceNames() {
 
 // Up starts all services detached.
 func (r *ComposeRunner) Up() error {
+	removeStaleBenchContainers()
 	return r.compose("up", "-d", "--quiet-pull")
+}
+
+// removeStaleBenchContainers force-removes leftover bench-* containers from a
+// previous run. Container names are fixed (bench-receiver, bench-localstack,
+// …), so a teardown that lost the race — or a --no-cleanup debug run — makes
+// every subsequent `compose up` fail with a name conflict. Sweeping by name
+// prefix right before up keeps back-to-back subject runs from tripping over
+// each other's corpses.
+func removeStaleBenchContainers() {
+	out, err := exec.Command("docker", "ps", "-aq", "--filter", "name=^bench-").Output()
+	if err != nil {
+		return
+	}
+	ids := strings.Fields(string(out))
+	if len(ids) == 0 {
+		return
+	}
+	fmt.Printf("  removing %d stale bench container(s)…\n", len(ids))
+	args := append([]string{"rm", "-f"}, ids...)
+	_ = exec.Command("docker", args...).Run()
 }
 
 // UpServices starts only the named compose services.
@@ -919,11 +1009,12 @@ type receiverTpl struct {
 	Listen   string
 	HostPort int
 	Env      map[string]string
-	// AWSDep/AzureDep gate a depends_on on the emulator services — set for
-	// cloud-polling receiver modes only, so listening receivers start
-	// immediately as before.
+	// AWSDep/AzureDep/MinioDep gate a depends_on on the emulator services —
+	// set for cloud-polling receiver modes only, so listening receivers
+	// start immediately as before.
 	AWSDep   bool
 	AzureDep bool
+	MinioDep bool
 }
 
 // endpointTpl is the per-endpoint template data for the auxiliary containers
@@ -1017,6 +1108,7 @@ type composeVars struct {
 	RecvEnv               map[string]string
 	RecvAWSDep            bool
 	RecvAzureDep          bool
+	RecvMinioDep          bool
 	RecvValidateDedup     string
 	RecvValidateContent   string
 	RecvExpectedLines     int64
@@ -1037,6 +1129,16 @@ type composeVars struct {
 	AzureImage          string
 	AzureConnString     string
 	AzureInitContainers string
+
+	// MinIO emulator topology (a case's `minio:` block). MinIO is
+	// S3-compatible, so it reuses the s3 generator/receiver modes and the
+	// AWS_* env injected into containers; only endpoint and creds differ.
+	MinioEnabled      bool
+	MinioImage        string
+	MinioEndpoint     string
+	MinioInitBuckets  string
+	MinioRootUser     string
+	MinioRootPassword string
 
 	// Plural mode: when these slices are non-empty, the template emits
 	// generator-<id> / receiver-<id> services and skips the singular block.
@@ -1092,7 +1194,7 @@ func writeCompose(path string, cfg RunConfig) error {
 	// declares an emulator (subject configs interpolate these), and into
 	// generators/receivers per-mode below. Values are public emulator
 	// constants — never real credentials.
-	var awsEnv, azureEnv map[string]string
+	var awsEnv, minioEnv, azureEnv map[string]string
 	if tc.UsesAWS() {
 		awsEnv = map[string]string{
 			"AWS_ACCESS_KEY_ID":     config.AWSEmulatorAccessKey,
@@ -1102,6 +1204,18 @@ func writeCompose(path string, cfg RunConfig) error {
 			"AWS_ENDPOINT_URL":      tc.AWS.EndpointURL(),
 			// Kill IMDS credential probing: no SDK in any container can
 			// stall on or fall back to real AWS.
+			"AWS_EC2_METADATA_DISABLED": "true",
+		}
+	}
+	if tc.UsesMinio() {
+		// MinIO speaks S3, so containers reach it through the same AWS_*
+		// vars the S3 SDK reads — only the endpoint and credentials differ.
+		minioEnv = map[string]string{
+			"AWS_ACCESS_KEY_ID":         config.MinioRootUser,
+			"AWS_SECRET_ACCESS_KEY":     config.MinioRootPassword,
+			"AWS_REGION":                "us-east-1",
+			"AWS_DEFAULT_REGION":        "us-east-1",
+			"AWS_ENDPOINT_URL":          tc.Minio.EndpointURL(),
 			"AWS_EC2_METADATA_DISABLED": "true",
 		}
 	}
@@ -1118,6 +1232,9 @@ func writeCompose(path string, cfg RunConfig) error {
 		env[k] = v
 	}
 	for k, v := range awsEnv {
+		env[k] = v
+	}
+	for k, v := range minioEnv {
 		env[k] = v
 	}
 	for k, v := range azureEnv {
@@ -1247,7 +1364,7 @@ func writeCompose(path string, cfg RunConfig) error {
 				Format:           format,
 				Connections:      conns,
 				ConnOffset:       offset,
-				Env:              mergeEnv(cloudEnvForMode(g.Mode, awsEnv, azureEnv), g.Env),
+				Env:              mergeEnv(cloudEnvForMode(g.Mode, awsEnv, minioEnv, azureEnv), g.Env),
 				TLSEnabled:       g.TLS.Enabled,
 				TLSCert:          g.TLS.Cert,
 				TLSKey:           g.TLS.Key,
@@ -1279,7 +1396,7 @@ func writeCompose(path string, cfg RunConfig) error {
 		vars.GenFormat = genFormat
 		vars.GenConnections = resolveGeneratorConnections(g.Connections)
 		vars.GenTotalLines = g.TotalLines
-		vars.GenEnv = mergeEnv(cloudEnvForMode(g.Mode, awsEnv, azureEnv), g.Env)
+		vars.GenEnv = mergeEnv(cloudEnvForMode(g.Mode, awsEnv, minioEnv, azureEnv), g.Env)
 		vars.GenRotateMode = g.FileRotation.Mode
 		vars.GenRotateAt = g.FileRotation.At
 		vars.GenRotateQuiesce = g.FileRotation.Quiesce
@@ -1349,17 +1466,19 @@ func writeCompose(path string, cfg RunConfig) error {
 				Mode:     rc.Mode,
 				Listen:   rc.Listen,
 				HostPort: cfg.ReceiverHostPort + i,
-				Env:      mergeEnv(cloudEnvForMode(rc.Mode, awsEnv, azureEnv), rc.Env),
+				Env:      mergeEnv(cloudEnvForMode(rc.Mode, awsEnv, minioEnv, azureEnv), rc.Env),
 				AWSDep:   tc.UsesAWS() && config.IsCloudPollingReceiverMode(rc.Mode) && rc.Mode != "azure_blob",
 				AzureDep: tc.UsesAzure() && rc.Mode == "azure_blob",
+				MinioDep: tc.UsesMinio() && rc.Mode == "s3",
 			})
 		}
 	} else {
 		vars.RecvMode = tc.Receiver.Mode
 		vars.RecvListen = tc.Receiver.Listen
-		vars.RecvEnv = mergeEnv(cloudEnvForMode(tc.Receiver.Mode, awsEnv, azureEnv), tc.Receiver.Env)
+		vars.RecvEnv = mergeEnv(cloudEnvForMode(tc.Receiver.Mode, awsEnv, minioEnv, azureEnv), tc.Receiver.Env)
 		vars.RecvAWSDep = tc.UsesAWS() && config.IsCloudPollingReceiverMode(tc.Receiver.Mode) && tc.Receiver.Mode != "azure_blob"
 		vars.RecvAzureDep = tc.UsesAzure() && tc.Receiver.Mode == "azure_blob"
+		vars.RecvMinioDep = tc.UsesMinio() && tc.Receiver.Mode == "s3"
 	}
 
 	// Cloud emulator services. The AWS init script is rendered from the
@@ -1381,6 +1500,14 @@ func writeCompose(path string, cfg RunConfig) error {
 		vars.AzureImage = tc.Azure.ImageOrDefault()
 		vars.AzureConnString = tc.Azure.ConnectionString()
 		vars.AzureInitContainers = strings.Join(tc.Azure.Containers, ",")
+	}
+	if tc.UsesMinio() {
+		vars.MinioEnabled = true
+		vars.MinioImage = tc.Minio.ImageOrDefault()
+		vars.MinioEndpoint = tc.Minio.EndpointURL()
+		vars.MinioInitBuckets = strings.Join(tc.Minio.Buckets, ",")
+		vars.MinioRootUser = config.MinioRootUser
+		vars.MinioRootPassword = config.MinioRootPassword
 	}
 
 	for _, ep := range tc.Endpoints {

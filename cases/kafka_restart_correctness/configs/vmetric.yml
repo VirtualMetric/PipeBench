@@ -1,10 +1,3 @@
-# Kafka consumer in MEMORY mode (no persistent_storage). Crash-safety for kafka
-# comes from Kafka itself + the listener's deferred offset commit: the offset is
-# committed only after the sender delivers the records to the target, so a
-# stop/kill before delivery leaves the offset uncommitted and Kafka re-delivers
-# the records on restart (at-least-once, no loss). The on-disk crash-resistance
-# queue is intentionally NOT enabled — pairing it with Kafka re-consumption
-# would recover from both and double-deliver.
 devices:
   - id: 1
     name: kafka-bench

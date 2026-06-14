@@ -30,6 +30,8 @@ requires: [azure_blob_source]
 
 subjects:
   - vmetric
+  - filebeat
+  - cribl-stream
 
 configurations:
   default:

@@ -62,10 +62,18 @@ func writeAWSInit(path string, aws *config.AWSConfig) error {
 }
 
 // cloudEnvForMode returns the emulator env a cloud generator/receiver mode
-// needs (nil for non-cloud modes, so existing cases render unchanged).
-func cloudEnvForMode(mode string, awsEnv, azureEnv map[string]string) map[string]string {
+// needs (nil for non-cloud modes, so existing cases render unchanged). The
+// s3 mode is served by either LocalStack (awsEnv) or MinIO (minioEnv);
+// they are mutually exclusive per case and emit identical AWS_* keys, so
+// whichever is set wins.
+func cloudEnvForMode(mode string, awsEnv, minioEnv, azureEnv map[string]string) map[string]string {
 	switch mode {
-	case "s3", "sqs", "kinesis", "cloudwatch":
+	case "s3":
+		if awsEnv != nil {
+			return awsEnv
+		}
+		return minioEnv
+	case "sqs", "kinesis", "cloudwatch":
 		return awsEnv
 	case "azure_blob":
 		return azureEnv
