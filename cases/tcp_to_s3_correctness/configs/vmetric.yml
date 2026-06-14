@@ -10,21 +10,12 @@ targets:
     type: awss3
     properties:
       endpoint: "http://localstack:4566"
-      use_path_style: true
       key: "test"
       secret: "test"
-      region: "us-east-1"
       bucket: "bench-out"
-      # raw = verbatim line passthrough (same semantics as vector's
-      # codec=text); proves the raw path end-to-end with exact counts.
       format: raw
-      # gzip objects — parity with vector's aws_s3 default compression;
-      # exercises the compressed path in the exact-count case too.
       compression: gzip
       extension: log.gz
-      # Payloads stay below 64MB, so the uploader takes the single
-      # PutObject path instead of multipart against LocalStack.
-      part_size: 64
 routes:
   - name: tcp-to-s3-bench
     devices:

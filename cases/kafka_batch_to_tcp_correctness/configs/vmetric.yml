@@ -1,9 +1,3 @@
-# Kafka consumer device that SPLITS JSON-array batch messages into individual
-# events. The generator packs `kafka_batch` JSON objects per Kafka message as a
-# JSON array ([{...},{...}]); split_mode: json_array makes the device emit one
-# event per array element, so the TCP receiver sees one record per original log
-# (count preserved 1:1). Without split_mode (default "none") the entire array
-# would be forwarded as a single event and the counts would not reconcile.
 devices:
   - id: 1
     name: kafka-bench

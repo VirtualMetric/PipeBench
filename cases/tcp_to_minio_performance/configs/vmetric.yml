@@ -1,5 +1,3 @@
-payload_store:
-  memory_limit: 512
 devices:
   - id: 1
     name: tcp-bench
@@ -16,26 +14,10 @@ targets:
     type: minio
     properties:
       endpoint: "http://minio:9000"
-      use_path_style: true
-      # MinIO emulator root credentials (config.MinioRootUser/Password) —
-      # dev-only, never real; the harness injects the same pair as AWS_*.
-      key: "pipebench"
-      secret: "pipebench-minio-dev"
-      region: "us-east-1"
       bucket: "bench-out"
-      # raw = verbatim line passthrough (parity with vector's codec=text).
       format: raw
-      # gzip objects — parity with vector's aws_s3 default; receiver
-      # auto-detects gzip by magic bytes.
       compression: gzip
       extension: log.gz
-      # Single PutObject path for <64MB objects.
-      part_size: 64
-      # No limit.eps here: MinIO is multi-core, so this case measures peak.
-      # The _paced variant caps the generator instead (uniform across subjects).
-      batch_size: 100000
-      queue:
-        parallelism: 8
 routes:
   - name: tcp-to-s3-bench
     devices:
