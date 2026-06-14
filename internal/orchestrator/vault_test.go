@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/VirtualMetric/PipeBench/internal/config"
@@ -294,8 +295,14 @@ func TestPrepareVaultWritesSeeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("secrets dir: %v", err)
 	}
-	if got := secInfo.Mode().Perm(); got != 0o700 {
-		t.Errorf("secrets dir mode: got %o, want 700", got)
+	// Windows can't represent Unix permission bits on directories — os.Stat
+	// always reports 0777 there regardless of the 0700 passed to MkdirAll.
+	// The restrictive mode is only meaningful (and asserted) on Unix, which
+	// is also where the CI runs.
+	if runtime.GOOS != "windows" {
+		if got := secInfo.Mode().Perm(); got != 0o700 {
+			t.Errorf("secrets dir mode: got %o, want 700", got)
+		}
 	}
 
 	want := []VaultSeed{{Path: "a/first", File: "0.json"}, {Path: "z/last", File: "1.json"}}

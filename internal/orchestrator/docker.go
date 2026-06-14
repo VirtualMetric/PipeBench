@@ -59,6 +59,7 @@ services:
 {{- if .VaultEnabled }}
       vault-init:
         condition: service_completed_successfully
+{{- end }}
 {{- if .AWSEnabled }}
       localstack:
         condition: service_healthy
@@ -505,6 +506,7 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - "{{ .VaultInitCmd }}"
+{{- end }}
 {{- if .AWSEnabled }}
 
   localstack:
