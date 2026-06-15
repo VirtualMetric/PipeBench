@@ -33,6 +33,7 @@ func TestValidateKafkaAuth(t *testing.T) {
 		{"sasl over mutual", "plain", "mutual", false},
 		{"gssapi", "gssapi", "", false},
 		{"gssapi rejects tls", "gssapi", "server", true},
+		{"server tls without sasl", "", "server", true},
 		{"unknown mechanism", "digest-md5", "", true},
 		{"unknown tls", "plain", "always", true},
 		{"no-op auth block", "", "none", true},

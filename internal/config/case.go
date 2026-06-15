@@ -530,7 +530,7 @@ func (tc *TestCase) Validate() error {
 	if err := tc.validateKafkaAuth(); err != nil {
 		return err
 	}
-  if err := tc.validateCloud(); err != nil {
+	if err := tc.validateCloud(); err != nil {
 		return err
 	}
 	return nil
@@ -566,6 +566,13 @@ func (tc *TestCase) validateKafkaAuth() error {
 			return fmt.Errorf("case %q: kafka.auth.service_name %q must match %s", tc.Name, tc.Kafka.ServiceNameOrDefault(), kerberosNameRe)
 		}
 		return nil
+	}
+	// Server-only TLS without SASL is encryption with no client authentication.
+	// The render path would set authentication_method=mtls_identity yet leave
+	// require_client_auth false (an unauthenticated broker) — and the KafkaAuth
+	// contract reserves an empty mechanism for tls: mutual (cert-only auth).
+	if tc.Kafka.SASLMechanism() == "" && tc.Kafka.TLSMode() == "server" {
+		return fmt.Errorf("case %q: kafka.auth.tls %q requires a SASL mechanism; use tls=mutual for cert-only auth", tc.Name, tc.Kafka.Auth.TLS)
 	}
 	if !tc.Kafka.AuthEnabled() {
 		return fmt.Errorf("case %q: kafka.auth sets neither a SASL mechanism nor TLS — remove the block or configure one", tc.Name)

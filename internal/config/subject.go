@@ -1,8 +1,9 @@
 package config
 
-import "slices"
-
-import "fmt"
+import (
+	"fmt"
+	"slices"
+)
 
 // Subject describes a benchmarked tool and its container configuration.
 type Subject struct {

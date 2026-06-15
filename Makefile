@@ -1,5 +1,5 @@
 .PHONY: build build-containers build-generator build-receiver build-collector build-kdc \
-        push-containers push-generator push-receiver push-collector \
+        push-containers push-generator push-receiver push-collector push-kdc \
         test-local list clean tidy fmt vet
 
 # Output binary
@@ -135,7 +135,18 @@ push-collector:
 		--push \
 		.
 
-push-containers: push-generator push-receiver push-collector
+push-kdc:
+	$(DOCKER_BUILD) \
+		-f containers/kdc/Dockerfile \
+		-t $(KDC_IMAGE) \
+		-t vmetric/bench-kdc:sha-$(COMMIT) \
+		--platform linux/amd64 \
+		$(ATTEST_FLAGS) \
+		--build-arg BUILDKIT_INLINE_CACHE=1 \
+		--push \
+		.
+
+push-containers: push-generator push-receiver push-collector push-kdc
 
 # ── End-to-end test ───────────────────────────────────────────────────────────
 

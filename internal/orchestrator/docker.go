@@ -1653,6 +1653,12 @@ func writeCompose(path string, cfg RunConfig) error {
 		// krb5 dir + bootstrap command are provisioned by PrepareKerberos in
 		// NewComposeRunner (same pattern as Vault).
 		if tc.Kafka.UsesGSSAPI() {
+			// NewComposeRunner populates these from PrepareKerberos; a direct
+			// writeCompose caller that skips that would otherwise render an
+			// invalid /krb5 mount and an empty KDC command. Fail fast instead.
+			if cfg.KrbHostDir == "" || strings.TrimSpace(cfg.KerberosInitCmd) == "" {
+				return fmt.Errorf("case %q uses kafka gssapi but kerberos topology is incomplete (krb host dir/init cmd)", tc.Name)
+			}
 			vars.KafkaGSSAPIEnabled = true
 			vars.KerberosRealm = tc.Kafka.RealmOrDefault()
 			vars.KerberosServiceName = tc.Kafka.ServiceNameOrDefault()
