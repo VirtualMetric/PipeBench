@@ -103,6 +103,92 @@ type KafkaConfig struct {
 	Memory string `yaml:"memory"`
 	// SMP is the Redpanda --smp core count (default 1).
 	SMP int `yaml:"smp"`
+	// Auth, when set, makes the broker require authentication. The zero value
+	// (no `auth:` block) is the original PLAINTEXT, no-auth broker.
+	Auth *KafkaAuth `yaml:"auth"`
+}
+
+// KafkaAuth configures broker authentication for the in-topology Redpanda
+// broker (see KafkaConfig.Auth). It maps a case onto one of the supported
+// SASL/TLS combinations:
+//
+//	mechanism=plain|scram-* , tls=none    → SASL over PLAINTEXT (Redpanda)
+//	mechanism=plain|scram-* , tls=server  → SASL over TLS (SASL_SSL, Redpanda)
+//	mechanism="",            tls=mutual   → client-certificate auth (mTLS, Redpanda)
+//	mechanism=gssapi                      → Kerberos (Apache Kafka + KDC, see Realm)
+type KafkaAuth struct {
+	// Mechanism is the auth mechanism the broker requires and clients use:
+	// "" (none), "plain", "scram-sha-256", "scram-sha-512", or "gssapi"
+	// (Kerberos). Empty selects no SASL — only meaningful together with
+	// tls: mutual (client-cert auth). "gssapi" switches the broker to Apache
+	// Kafka + a KDC (Redpanda gates Kerberos behind an enterprise license).
+	Mechanism string `yaml:"mechanism"`
+	// TLS selects the broker's wire encryption / client-cert policy:
+	// "" or "none" = PLAINTEXT, "server" = server-only TLS (SASL_SSL when a
+	// mechanism is set), "mutual" = TLS requiring a client certificate.
+	// Not used with gssapi (the Kerberos case is SASL_PLAINTEXT).
+	TLS string `yaml:"tls"`
+	// Realm is the Kerberos realm for the gssapi mechanism (default
+	// "PIPEBENCH.LOCAL"). Ignored by the other mechanisms.
+	Realm string `yaml:"realm"`
+	// ServiceName is the Kerberos service name half of the broker SPN
+	// (service/host@REALM; default "kafka"). Ignored by the other mechanisms.
+	ServiceName string `yaml:"service_name"`
+}
+
+// SASLMechanism returns the lowercased SASL mechanism, or "" when the broker
+// uses no SASL (mTLS-only or no auth).
+func (k *KafkaConfig) SASLMechanism() string {
+	if k != nil && k.Auth != nil {
+		return strings.ToLower(strings.TrimSpace(k.Auth.Mechanism))
+	}
+	return ""
+}
+
+// TLSMode returns "none" | "server" | "mutual" — the broker's TLS policy.
+func (k *KafkaConfig) TLSMode() string {
+	if k != nil && k.Auth != nil {
+		if m := strings.ToLower(strings.TrimSpace(k.Auth.TLS)); m != "" {
+			return m
+		}
+	}
+	return "none"
+}
+
+// UsesGSSAPI reports whether the case uses Kerberos — which the orchestrator
+// serves with Apache Kafka + a KDC, NOT the Redpanda SASL/TLS path below.
+func (k *KafkaConfig) UsesGSSAPI() bool { return k.SASLMechanism() == "gssapi" }
+
+// AuthEnabled reports whether the case requested Redpanda broker auth (SCRAM/
+// PLAIN SASL and/or TLS). It is false for gssapi (handled by the Apache Kafka
+// path) and for no auth (the original PLAINTEXT broker).
+func (k *KafkaConfig) AuthEnabled() bool {
+	return k != nil && k.Auth != nil && (k.UsesSASL() || k.UsesTLS())
+}
+
+// UsesSASL / UsesTLS / RequireClientAuth split AuthEnabled into the knobs the
+// orchestrator wires onto the Redpanda broker and clients. UsesSASL covers
+// PLAIN/SCRAM only — gssapi is a distinct broker path (UsesGSSAPI).
+func (k *KafkaConfig) UsesSASL() bool {
+	m := k.SASLMechanism()
+	return m != "" && m != "gssapi"
+}
+func (k *KafkaConfig) UsesTLS() bool           { return k.TLSMode() != "none" }
+func (k *KafkaConfig) RequireClientAuth() bool { return k.TLSMode() == "mutual" }
+
+// RealmOrDefault / ServiceNameOrDefault centralize the Kerberos defaults.
+func (k *KafkaConfig) RealmOrDefault() string {
+	if k != nil && k.Auth != nil && strings.TrimSpace(k.Auth.Realm) != "" {
+		return strings.TrimSpace(k.Auth.Realm)
+	}
+	return "PIPEBENCH.LOCAL"
+}
+
+func (k *KafkaConfig) ServiceNameOrDefault() string {
+	if k != nil && k.Auth != nil && strings.TrimSpace(k.Auth.ServiceName) != "" {
+		return strings.TrimSpace(k.Auth.ServiceName)
+	}
+	return "kafka"
 }
 
 // KafkaImageOrDefault etc. centralize the broker defaults so the orchestrator
@@ -441,11 +527,56 @@ func (tc *TestCase) Validate() error {
 	if err := tc.validateVault(); err != nil {
 		return err
 	}
+	if err := tc.validateKafkaAuth(); err != nil {
+		return err
+	}
   if err := tc.validateCloud(); err != nil {
 		return err
 	}
 	return nil
 }
+
+// validateKafkaAuth checks the optional `kafka.auth` block: the mechanism and
+// TLS mode must be from the known sets, and an `auth:` block that requests
+// neither SASL nor TLS is a case-authoring mistake (a no-op).
+func (tc *TestCase) validateKafkaAuth() error {
+	if tc.Kafka == nil || tc.Kafka.Auth == nil {
+		return nil
+	}
+	switch tc.Kafka.SASLMechanism() {
+	case "", "plain", "scram-sha-256", "scram-sha-512", "gssapi":
+	default:
+		return fmt.Errorf("case %q: kafka.auth.mechanism %q must be one of plain, scram-sha-256, scram-sha-512, gssapi (or empty for mTLS)", tc.Name, tc.Kafka.Auth.Mechanism)
+	}
+	switch tc.Kafka.TLSMode() {
+	case "none", "server", "mutual":
+	default:
+		return fmt.Errorf("case %q: kafka.auth.tls %q must be one of none, server, mutual", tc.Name, tc.Kafka.Auth.TLS)
+	}
+	if tc.Kafka.UsesGSSAPI() {
+		// Kerberos runs on its own Apache Kafka + KDC topology (SASL_PLAINTEXT);
+		// it does not combine with the Redpanda SASL/TLS knobs.
+		if tc.Kafka.TLSMode() != "none" {
+			return fmt.Errorf("case %q: kafka.auth.tls is not supported with mechanism gssapi (Kerberos case is SASL_PLAINTEXT)", tc.Name)
+		}
+		if !kerberosNameRe.MatchString(tc.Kafka.RealmOrDefault()) {
+			return fmt.Errorf("case %q: kafka.auth.realm %q must match %s", tc.Name, tc.Kafka.RealmOrDefault(), kerberosNameRe)
+		}
+		if !kerberosNameRe.MatchString(tc.Kafka.ServiceNameOrDefault()) {
+			return fmt.Errorf("case %q: kafka.auth.service_name %q must match %s", tc.Name, tc.Kafka.ServiceNameOrDefault(), kerberosNameRe)
+		}
+		return nil
+	}
+	if !tc.Kafka.AuthEnabled() {
+		return fmt.Errorf("case %q: kafka.auth sets neither a SASL mechanism nor TLS — remove the block or configure one", tc.Name)
+	}
+	return nil
+}
+
+// kerberosNameRe constrains the realm/service-name strings that end up embedded
+// in the rendered KDC bootstrap shell command — no shell or YAML metacharacter
+// can pass (mirrors vaultPathRe). Realms are conventionally upper-case domains.
+var kerberosNameRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
 // vaultPathRe / vaultTokenRe constrain the vault-config strings that end up
 // embedded in the generated docker-compose file (the vault-init command line

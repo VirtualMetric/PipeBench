@@ -39,8 +39,8 @@ func hardwareCores(name string) (cores int, ok bool) {
 	case "xlarge":
 		return 4, true
 	}
-	if strings.HasSuffix(size, "xlarge") {
-		if n, err := strconv.Atoi(strings.TrimSuffix(size, "xlarge")); err == nil {
+	if before, ok0 := strings.CutSuffix(size, "xlarge"); ok0 {
+		if n, err := strconv.Atoi(before); err == nil {
 			return n * 4, true
 		}
 	}

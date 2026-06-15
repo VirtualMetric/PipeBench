@@ -171,8 +171,8 @@ func testCmd() *cobra.Command {
 				// case is loaded and paired with the resolved subject set
 				// independently, so `-t a,b -s vector,fluent-bit` runs the
 				// full cross product of cases × subjects.
-				testNames := strings.Split(testName, ",")
-				for _, name := range testNames {
+				testNames := strings.SplitSeq(testName, ",")
+				for name := range testNames {
 					name = strings.TrimSpace(name)
 					if name == "" {
 						continue

@@ -32,6 +32,16 @@ const (
 	// is >=8 chars because MinIO refuses to start otherwise.
 	MinioRootUser     = "pipebench"
 	MinioRootPassword = "pipebench-minio-dev"
+
+	// KafkaSASLUser / KafkaSASLPassword are the static SASL credentials the
+	// harness bootstraps on the Redpanda broker for `kafka.auth` cases and
+	// hands to the generator and subject. Emulator-only, never real; injected
+	// into the subject as KAFKA_SASL_PASSWORD (the case configs read
+	// ${KAFKA_SASL_PASSWORD}). The password is non-trivial because a plaintext
+	// device password trips the director's credential decryptor — see
+	// KAFKA_TESTS.md.
+	KafkaSASLUser     = "bench"
+	KafkaSASLPassword = "pipebench-kafka-dev"
 )
 
 // AWSConfig, when set on a TestCase (`aws:`), adds a LocalStack emulator to

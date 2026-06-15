@@ -1,5 +1,7 @@
 package config
 
+import "slices"
+
 import "fmt"
 
 // Subject describes a benchmarked tool and its container configuration.
@@ -15,6 +17,15 @@ type Subject struct {
 	ConfigRW   bool              // mount config read-write (for tools that write state alongside config)
 	Env        map[string]string // default environment variables for the subject
 
+	// CertDir, when set, is an additional in-container path the harness mounts
+	// the generated TLS cert dir at FOR THE SUBJECT (the generator always gets
+	// them at /certs). Some subjects only accept cert paths inside their own
+	// working/config root — vmetric's director resolves device cert_name
+	// against its WorkingDir (/opt/vmetric) and rejects paths outside it, so
+	// /certs is unreadable; mounting at /opt/vmetric/certs lets the device
+	// reference certs/client.crt. Empty = mount only at /certs.
+	CertDir string
+
 	// Capabilities is a free-form set of feature tags the subject is known
 	// to support end-to-end through PipeBench (e.g. "tls_tcp", "tls_syslog").
 	// The harness consults these when a case opts into a transport that
@@ -29,12 +40,7 @@ type Subject struct {
 // The match is case-sensitive; capability names are kept lowercase by
 // convention.
 func (s Subject) HasCapability(name string) bool {
-	for _, c := range s.Capabilities {
-		if c == name {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(s.Capabilities, name)
 }
 
 // ConfigFile returns the expected filename (basename) of the subject config.
@@ -184,6 +190,10 @@ var Registry = map[string]Subject{
 		Image:      "vmetric/director",
 		Version:    "2.0.3",
 		ConfigPath: "/config.yml",
+		// The director resolves device TLS cert_name against its WorkingDir
+		// (/opt/vmetric) and rejects paths outside it, so mount the harness
+		// certs there too; device configs reference /opt/vmetric/certs/*.
+		CertDir: "/opt/vmetric/certs",
 		// 2.0.3 moved the binary from /director to /opt/vmetric/director
 		// (workdir /opt/vmetric) — keep the config path absolute so the
 		// new workdir can't reroute it.

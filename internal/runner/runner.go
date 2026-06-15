@@ -2,8 +2,10 @@ package runner
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
@@ -179,6 +181,12 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	if tc.Type == "kafka_offset_commit_restart" {
 		return r.runKafkaOffsetCommitRestart(tc, subject)
 	}
+	// Kafka cert rotation: an mTLS broker whose server leaf is re-signed (same
+	// CA) and reloaded mid-delivery; the subject's consumer must reconnect over
+	// TLS and continue with no loss (over-delivery from the reconnect allowed).
+	if tc.Type == "kafka_cert_rotation_correctness" {
+		return r.runKafkaCertRotation(tc, subject)
+	}
 
 	configName := r.opts.ConfigName
 
@@ -218,9 +226,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	// Resolve extra env from named configuration
 	extraEnv := map[string]string{}
 	if cfg, ok := tc.Configurations[configName]; ok {
-		for k, v := range cfg.Env {
-			extraEnv[k] = v
-		}
+		maps.Copy(extraEnv, cfg.Env)
 	}
 
 	// Capability guard: a case's `requires:` lists the capabilities every
@@ -240,12 +246,21 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	// their Capabilities cause the case to fail fast (cleaner than
 	// starting and silently producing zero ingest).
 	tlsCertsHost := ""
-	if tlsRequested(tc) {
-		if !subject.HasCapability("tls_tcp") {
+	kafkaTLS := tc.Kafka != nil && tc.Kafka.UsesTLS()
+	if tlsRequested(tc) || kafkaTLS {
+		// The tls_tcp capability gates the TCP-listener TLS path only; Kafka
+		// broker TLS is handled by the broker + client libraries and needs no
+		// subject capability.
+		if tlsRequested(tc) && !subject.HasCapability("tls_tcp") {
 			return results.RunResult{}, fmt.Errorf("subject %q does not declare TLS support (capability \"tls_tcp\")", subject.Name)
 		}
+		serverHosts := []string{"subject", "localhost"}
+		if kafkaTLS {
+			// The broker cert must be valid for the hostname clients dial.
+			serverHosts = append(serverHosts, "redpanda")
+		}
 		certsDir := filepath.Join(tmpDir, "certs")
-		path, err := orchestrator.GenerateTLSCerts(certsDir, []string{"subject", "localhost"})
+		path, err := orchestrator.GenerateTLSCerts(certsDir, serverHosts)
 		if err != nil {
 			return results.RunResult{}, fmt.Errorf("generating TLS certs: %w", err)
 		}
@@ -343,10 +358,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	duration := tc.DurationOrDefault(2 * time.Minute)
 	warmup := tc.WarmupOrDefault(10 * time.Second)
 	if tc.HasGenerator() {
-		genTimeout := duration + warmup + 2*time.Minute
-		if genTimeout > r.opts.Timeout {
-			genTimeout = r.opts.Timeout
-		}
+		genTimeout := min(duration+warmup+2*time.Minute, r.opts.Timeout)
 
 		fmt.Printf("  waiting for generator (up to %s)…\n", genTimeout)
 		if err := orch.WaitForGeneratorExit(genTimeout); err != nil {
@@ -442,10 +454,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		// 12 stable polls of 5s = 60s, same as before).
 		quietPolls := 12
 		if quietWindow > 0 {
-			quietPolls = int(quietWindow / drainPoll)
-			if quietPolls < 1 {
-				quietPolls = 1
-			}
+			quietPolls = max(int(quietWindow/drainPoll), 1)
 		}
 		ports := orch.ReceiverMetricsPorts()
 		drainDeadline := time.Now().Add(drainTimeout)
@@ -589,10 +598,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	// with M receivers each seeing every record, the expected receiver
 	// total is lines_in * M. Defaults to 1 (no fan-out) so existing
 	// math is unchanged.
-	expectedMul := tc.Correctness.ExpectedMultiplier
-	if expectedMul < 1 {
-		expectedMul = 1
-	}
+	expectedMul := max(tc.Correctness.ExpectedMultiplier, 1)
 	expectedOut := genStats.LinesSent * int64(expectedMul)
 	lossPct := 0.0
 	if expectedOut > 0 {
@@ -707,7 +713,15 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		}
 	} else if tc.IsCorrectnessType() {
 		lossOK := lossPct <= tc.Correctness.ExpectedLossPct
-		overOK := recvMetrics.LinesReceived <= expectedOut
+		// Kafka consumption is at-least-once: the consumer may re-deliver a
+		// fetch batch on its initial group join / rebalance, so allow bounded
+		// over-delivery (Correctness.MaxOverDeliveryPct, default 0 = exact).
+		// Non-kafka correctness stays strict.
+		overCap := expectedOut
+		if tc.IsKafkaType() {
+			overCap += int64(float64(expectedOut) * tc.Correctness.MaxOverDeliveryPct / 100.0)
+		}
+		overOK := recvMetrics.LinesReceived <= overCap
 		recvOK := result.Passed == nil || *result.Passed
 
 		var failReasons []string
@@ -852,7 +866,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		} else {
 			fmt.Println("  correctness: FAILED")
 			if result.FailReason != "" {
-				for _, e := range strings.Split(result.FailReason, "; ") {
+				for e := range strings.SplitSeq(result.FailReason, "; ") {
 					fmt.Printf("    - %s\n", e)
 				}
 			} else {
@@ -918,9 +932,7 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 
 	extraEnv := map[string]string{}
 	if cfg, ok := tc.Configurations[configName]; ok {
-		for k, v := range cfg.Env {
-			extraEnv[k] = v
-		}
+		maps.Copy(extraEnv, cfg.Env)
 	}
 
 	// CaseDir must be absolute: the orchestrator turns it into a host bind
@@ -983,10 +995,7 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 
 	duration := tc.DurationOrDefault(10 * time.Second)
 	warmup := tc.WarmupOrDefault(10 * time.Second)
-	genTimeout := duration + warmup + 2*time.Minute
-	if genTimeout > r.opts.Timeout {
-		genTimeout = r.opts.Timeout
-	}
+	genTimeout := min(duration+warmup+2*time.Minute, r.opts.Timeout)
 
 	fmt.Printf("  waiting for generator (up to %s)…\n", genTimeout)
 	if err := orch.WaitForGeneratorExit(genTimeout); err != nil {
@@ -1198,9 +1207,7 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 
 	extraEnv := map[string]string{}
 	if cfg, ok := tc.Configurations[configName]; ok {
-		for k, v := range cfg.Env {
-			extraEnv[k] = v
-		}
+		maps.Copy(extraEnv, cfg.Env)
 	}
 
 	// CaseDir must be absolute: the orchestrator turns it into a host bind
@@ -1263,10 +1270,7 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 
 	duration := tc.DurationOrDefault(10 * time.Second)
 	warmup := tc.WarmupOrDefault(10 * time.Second)
-	genTimeout := duration + warmup + 2*time.Minute
-	if genTimeout > r.opts.Timeout {
-		genTimeout = r.opts.Timeout
-	}
+	genTimeout := min(duration+warmup+2*time.Minute, r.opts.Timeout)
 
 	fmt.Printf("  waiting for generator (up to %s)…\n", genTimeout)
 	if err := orch.WaitForGeneratorExit(genTimeout); err != nil {
@@ -1449,18 +1453,41 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 	return result, nil
 }
 
-// runKafkaInflightCrash crashes the subject WHILE it is actively delivering
-// consumed Kafka records to the receiver (the receiver stays UP the whole
-// time), unlike the persistence flow which buffers with the receiver down.
-// This exercises the at-least-once over-delivery window: records that were
-// delivered to the target but whose offset commit had not yet fired are
-// re-consumed on restart and re-delivered. The kill is timed to land
-// mid-stream — once the receiver has seen ~half the records.
-//
-// Verdict: no loss (every produced record must arrive — loss <=
-// expected_loss_pct); duplicates are measured and reported, not failed,
-// because at-least-once permits them.
-func (r *Runner) runKafkaInflightCrash(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
+// midDeliveryFlow parameterizes the shared kafka correctness driver
+// (runKafkaMidDeliveryAction): produce to the broker with the receiver live,
+// fire one disruptive action once the receiver has seen ~half of total_lines,
+// then drain and assert no loss (over-delivery from at-least-once recovery is
+// reported, not failed). The action is the only thing that varies between the
+// flows — an in-flight subject crash, a broker cert rotation, etc.
+type midDeliveryFlow struct {
+	// verdictLabel names the flow in the PASS/FAIL line, e.g.
+	// "kafka cert rotation correctness".
+	verdictLabel string
+	// actionLog is printed when the mid-delivery action fires.
+	actionLog string
+	// overDelivNote explains why duplicates are expected, shown on the
+	// over-delivery line.
+	overDelivNote string
+	// totalLinesErr is returned when generator.total_lines <= 0.
+	totalLinesErr string
+	// prepare runs after RunConfig is built but before the compose runner is
+	// created, so it can add run state (e.g. generate TLS certs and set
+	// rc.TLSCertsHost). May be nil.
+	prepare func(tmpDir string, rc *orchestrator.RunConfig) error
+	// extraCleanup lists fixed container names to force-remove pre-run beyond
+	// the standard generator/receiver/collector/subject set.
+	extraCleanup []string
+	// action is the disruptive hook run once at mid-delivery. It owns any
+	// settle sleeps it needs.
+	action func(orch orchestrator.Orchestrator) error
+}
+
+// runKafkaMidDeliveryAction is the shared driver behind the kafka in-flight
+// crash and cert-rotation flows: both bring everything up with the receiver
+// live, wait until the receiver has seen half the records, fire one disruptive
+// action, then drain and apply the same no-loss / at-least-once verdict. Only
+// the action (and a little setup/labelling) differs — see midDeliveryFlow.
+func (r *Runner) runKafkaMidDeliveryAction(tc *config.TestCase, subject config.Subject, f midDeliveryFlow) (results.RunResult, error) {
 	configName := r.opts.ConfigName
 	subject = r.applySubjectOverrides(subject)
 
@@ -1496,9 +1523,7 @@ func (r *Runner) runKafkaInflightCrash(tc *config.TestCase, subject config.Subje
 
 	extraEnv := map[string]string{}
 	if cfg, ok := tc.Configurations[configName]; ok {
-		for k, v := range cfg.Env {
-			extraEnv[k] = v
-		}
+		maps.Copy(extraEnv, cfg.Env)
 	}
 
 	runCfg := orchestrator.RunConfig{
@@ -1517,12 +1542,22 @@ func (r *Runner) runKafkaInflightCrash(tc *config.TestCase, subject config.Subje
 		MemLimit:         r.opts.MemLimit,
 	}
 
+	// Per-flow setup (e.g. generate TLS certs and set rc.TLSCertsHost) before
+	// the compose runner reads RunConfig.
+	if f.prepare != nil {
+		if err := f.prepare(tmpDir, &runCfg); err != nil {
+			return results.RunResult{}, err
+		}
+	}
+
 	orch, err := orchestrator.NewComposeRunner(runCfg)
 	if err != nil {
 		return results.RunResult{}, fmt.Errorf("compose setup: %w", err)
 	}
 
-	for _, c := range []string{"bench-generator", "bench-receiver", "bench-collector", "bench-subject-" + subject.Name} {
+	cleanup := []string{"bench-generator", "bench-receiver", "bench-collector", "bench-subject-" + subject.Name}
+	cleanup = append(cleanup, f.extraCleanup...)
+	for _, c := range cleanup {
 		_ = exec.Command("docker", "rm", "-f", c).Run()
 	}
 	_ = orch.Down()
@@ -1537,7 +1572,7 @@ func (r *Runner) runKafkaInflightCrash(tc *config.TestCase, subject config.Subje
 
 	n := tc.Generator.TotalLines
 	if n <= 0 {
-		return results.RunResult{}, fmt.Errorf("kafka_inflight_crash requires generator.total_lines > 0")
+		return results.RunResult{}, errors.New(f.totalLinesErr)
 	}
 	mid := n / 2
 
@@ -1553,45 +1588,36 @@ func (r *Runner) runKafkaInflightCrash(tc *config.TestCase, subject config.Subje
 	}
 	defer stopPortFwd()
 
-	// Wait until the receiver has seen ~half the records, then SIGKILL the
-	// subject mid-delivery.
+	// Wait until the receiver has seen ~half the records, then fire the
+	// disruptive action. Driving off receiver progress (not a fixed sleep)
+	// guarantees it lands mid-delivery regardless of run speed.
 	fmt.Printf("  waiting for mid-delivery (receiver >= %s of %s)…\n", formatCount(mid), formatCount(n))
-	crashed := false
-	crashDeadline := time.Now().Add(r.opts.Timeout)
-	for time.Now().Before(crashDeadline) {
+	fired := false
+	deadline := time.Now().Add(r.opts.Timeout)
+	for time.Now().Before(deadline) {
 		rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
 		if qerr == nil {
 			fmt.Printf("    received: %s\n", formatCount(rm.LinesReceived))
 			if rm.LinesReceived >= mid {
-				fmt.Println("  mid-delivery reached — SIGKILL subject (no graceful shutdown)…")
-				if err := orch.KillServices("subject"); err != nil {
-					return results.RunResult{}, fmt.Errorf("killing subject: %w", err)
+				fmt.Printf("  mid-delivery reached — %s…\n", f.actionLog)
+				if err := f.action(orch); err != nil {
+					return results.RunResult{}, err
 				}
-				crashed = true
+				fired = true
 				break
 			}
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	if !crashed {
-		return results.RunResult{}, fmt.Errorf("subject never reached mid-delivery (%s) before timeout", formatCount(mid))
-	}
-
-	// Restart — it should re-consume the uncommitted offsets and deliver the rest.
-	time.Sleep(3 * time.Second)
-	fmt.Println("  restarting subject (replays uncommitted offsets)…")
-	if err := orch.UpServices("subject"); err != nil {
-		return results.RunResult{}, fmt.Errorf("restarting subject: %w", err)
+	if !fired {
+		return results.RunResult{}, fmt.Errorf("never reached mid-delivery (%s) before timeout", formatCount(mid))
 	}
 
 	// The generator produces to Kafka independently of the subject; collect
 	// its final count.
 	duration := tc.DurationOrDefault(60 * time.Second)
 	warmup := tc.WarmupOrDefault(30 * time.Second)
-	genTimeout := duration + warmup + 2*time.Minute
-	if genTimeout > r.opts.Timeout {
-		genTimeout = r.opts.Timeout
-	}
+	genTimeout := min(duration+warmup+2*time.Minute, r.opts.Timeout)
 	if err := orch.WaitForGeneratorExit(genTimeout); err != nil {
 		fmt.Printf("  (generator wait: %v)\n", err)
 	}
@@ -1638,25 +1664,25 @@ func (r *Runner) runKafkaInflightCrash(tc *config.TestCase, subject config.Subje
 	}
 
 	passed := lossPct <= tc.Correctness.ExpectedLossPct
-	var errors []string
+	var errs []string
 	if !passed {
-		errors = append(errors, fmt.Sprintf("expected loss <= %.2f%%, got %.2f%% (%s of %s lines lost)",
+		errs = append(errs, fmt.Sprintf("expected loss <= %.2f%%, got %.2f%% (%s of %s lines lost)",
 			tc.Correctness.ExpectedLossPct, lossPct,
 			formatCount(genStats.LinesSent-recvMetrics.LinesReceived), formatCount(genStats.LinesSent)))
 	}
 	if recvMetrics.LinesReceived > genStats.LinesSent {
 		extra := recvMetrics.LinesReceived - genStats.LinesSent
 		overPct := 100.0 * float64(extra) / float64(genStats.LinesSent)
-		fmt.Printf("  over-delivery: %s duplicate lines (%.2f%%) — at-least-once, expected for a mid-delivery crash\n",
-			formatCount(extra), overPct)
+		fmt.Printf("  over-delivery: %s duplicate lines (%.2f%%) — at-least-once, %s\n",
+			formatCount(extra), overPct, f.overDelivNote)
 	}
 
 	fmt.Printf("  lines sent: %s  lines received: %s  loss: %.2f%%\n",
 		formatCount(genStats.LinesSent), formatCount(recvMetrics.LinesReceived), lossPct)
 	if passed {
-		fmt.Println("  kafka in-flight crash correctness: PASSED ✓")
+		fmt.Printf("  %s: PASSED ✓\n", f.verdictLabel)
 	} else {
-		fmt.Println("  kafka in-flight crash correctness: FAILED ✗")
+		fmt.Printf("  %s: FAILED ✗\n", f.verdictLabel)
 	}
 
 	result := results.RunResult{
@@ -1679,12 +1705,11 @@ func (r *Runner) runKafkaInflightCrash(tc *config.TestCase, subject config.Subje
 		Passed:          &passed,
 	}
 	if !passed {
-		result.FailReason = strings.Join(errors, "; ")
+		result.FailReason = strings.Join(errs, "; ")
 	}
 
 	// Persist the result like every other run path — Run's contract is to
-	// return the *persisted* result, so without this the in-flight crash
-	// run never lands in the results store (and never reaches the report).
+	// return the *persisted* result.
 	dir, err := r.store.Save(result, "")
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
@@ -1692,6 +1717,90 @@ func (r *Runner) runKafkaInflightCrash(tc *config.TestCase, subject config.Subje
 	fmt.Printf("  done. results → %s\n", dir)
 
 	return result, nil
+}
+
+// rotateAndReload performs a generic in-flight rotation: mutate a mounted
+// artifact (rotate) then reload the service by bouncing it, so a live consumer
+// must reconnect. The broker server-cert case is the one instance today;
+// client-cert / credential / config rotations are new rotate closures +
+// service names, with no driver changes.
+func rotateAndReload(orch orchestrator.Orchestrator, service string, rotate func() error) error {
+	if err := rotate(); err != nil {
+		return fmt.Errorf("rotate %s artifact: %w", service, err)
+	}
+	if err := orch.StopServices(10*time.Second, service); err != nil {
+		return fmt.Errorf("stopping %s: %w", service, err)
+	}
+	if err := orch.UpServices(service); err != nil {
+		return fmt.Errorf("restarting %s: %w", service, err)
+	}
+	return nil
+}
+
+// runKafkaInflightCrash crashes the subject WHILE it is actively delivering
+// consumed Kafka records to the receiver (receiver stays UP), exercising the
+// at-least-once over-delivery window: records delivered but not yet
+// offset-committed are re-consumed on restart. Verdict: no loss; duplicates are
+// reported, not failed.
+func (r *Runner) runKafkaInflightCrash(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
+	return r.runKafkaMidDeliveryAction(tc, subject, midDeliveryFlow{
+		verdictLabel:  "kafka in-flight crash correctness",
+		actionLog:     "SIGKILL subject (no graceful shutdown), then restart",
+		overDelivNote: "expected for a mid-delivery crash",
+		totalLinesErr: "kafka_inflight_crash requires generator.total_lines > 0",
+		action: func(orch orchestrator.Orchestrator) error {
+			if err := orch.KillServices("subject"); err != nil {
+				return fmt.Errorf("killing subject: %w", err)
+			}
+			// Settle before the consumer rejoins and replays uncommitted offsets.
+			time.Sleep(3 * time.Second)
+			if err := orch.UpServices("subject"); err != nil {
+				return fmt.Errorf("restarting subject: %w", err)
+			}
+			return nil
+		},
+	})
+}
+
+// runKafkaCertRotation verifies a subject survives an in-flight broker TLS
+// certificate rotation with no loss. The broker runs mTLS; mid-delivery the
+// server leaf is re-signed under the SAME CA and the broker is bounced, forcing
+// the consumer to reconnect over TLS against the new cert. Verdict: no loss;
+// over-delivery across the reconnect is reported, not failed.
+func (r *Runner) runKafkaCertRotation(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
+	// certsDir is set by prepare and read by action; both close over it here,
+	// and prepare runs before action, so the capture is well-ordered.
+	var certsDir string
+	hosts := []string{"subject", "localhost", "redpanda"}
+	return r.runKafkaMidDeliveryAction(tc, subject, midDeliveryFlow{
+		verdictLabel:  "kafka cert rotation correctness",
+		actionLog:     "rotating broker cert (same CA) + bouncing broker",
+		overDelivNote: "expected across a broker reconnect",
+		totalLinesErr: "kafka_cert_rotation_correctness requires generator.total_lines > 0",
+		extraCleanup:  []string{"bench-redpanda", "bench-redpanda-init"},
+		prepare: func(tmpDir string, rc *orchestrator.RunConfig) error {
+			// mTLS broker: generate the CA + server/client leaves the broker and
+			// clients mount at /certs. certsDir is kept so the server leaf can be
+			// re-signed (same CA) mid-run.
+			certsDir = filepath.Join(tmpDir, "certs")
+			if _, err := orchestrator.GenerateTLSCerts(certsDir, hosts); err != nil {
+				return fmt.Errorf("generating TLS certs: %w", err)
+			}
+			rc.TLSCertsHost = certsDir
+			return nil
+		},
+		action: func(orch orchestrator.Orchestrator) error {
+			if err := rotateAndReload(orch, "redpanda", func() error {
+				return orchestrator.RotateServerCert(certsDir, hosts)
+			}); err != nil {
+				return err
+			}
+			// Let the broker come back and the consumer re-establish TLS before
+			// asserting delivery resumes.
+			time.Sleep(5 * time.Second)
+			return nil
+		},
+	})
 }
 
 // runKafkaOffsetCommitRestart verifies that delivery-bound source
@@ -1745,9 +1854,7 @@ func (r *Runner) runKafkaOffsetCommitRestart(tc *config.TestCase, subject config
 
 	extraEnv := map[string]string{}
 	if cfg, ok := tc.Configurations[configName]; ok {
-		for k, v := range cfg.Env {
-			extraEnv[k] = v
-		}
+		maps.Copy(extraEnv, cfg.Env)
 	}
 
 	runCfg := orchestrator.RunConfig{
@@ -1805,10 +1912,7 @@ func (r *Runner) runKafkaOffsetCommitRestart(tc *config.TestCase, subject config
 	// Let the generator finish producing, then collect its final count.
 	duration := tc.DurationOrDefault(60 * time.Second)
 	warmup := tc.WarmupOrDefault(30 * time.Second)
-	genTimeout := duration + warmup + 2*time.Minute
-	if genTimeout > r.opts.Timeout {
-		genTimeout = r.opts.Timeout
-	}
+	genTimeout := min(duration+warmup+2*time.Minute, r.opts.Timeout)
 	if err := orch.WaitForGeneratorExit(genTimeout); err != nil {
 		fmt.Printf("  (generator wait: %v)\n", err)
 	}
@@ -2009,9 +2113,7 @@ func (r *Runner) runPersistenceFileRestartCorrectness(tc *config.TestCase, subje
 
 	extraEnv := map[string]string{}
 	if cfg, ok := tc.Configurations[configName]; ok {
-		for k, v := range cfg.Env {
-			extraEnv[k] = v
-		}
+		maps.Copy(extraEnv, cfg.Env)
 	}
 
 	// CaseDir must be absolute: the orchestrator turns it into a host bind
@@ -2087,10 +2189,7 @@ func (r *Runner) runPersistenceFileRestartCorrectness(tc *config.TestCase, subje
 	// PHASE 4: generator continues writing the rest of the test budget to
 	// the new file while the subject is offline.
 	duration := tc.DurationOrDefault(60 * time.Second)
-	genTimeout := duration + warmup + 2*time.Minute
-	if genTimeout > r.opts.Timeout {
-		genTimeout = r.opts.Timeout
-	}
+	genTimeout := min(duration+warmup+2*time.Minute, r.opts.Timeout)
 	fmt.Printf("  phase 4: waiting for generator to finish writing (up to %s)…\n", genTimeout)
 	if err := orch.WaitForGeneratorExit(genTimeout); err != nil {
 		return results.RunResult{}, fmt.Errorf("waiting for generator: %w", err)
@@ -2302,7 +2401,7 @@ func getSystemInfo() (cpus int, memMB int64) {
 	// Try to read total memory from /proc/meminfo (Linux)
 	data, err := os.ReadFile("/proc/meminfo")
 	if err == nil {
-		for _, line := range strings.Split(string(data), "\n") {
+		for line := range strings.SplitSeq(string(data), "\n") {
 			if strings.HasPrefix(line, "MemTotal:") {
 				fields := strings.Fields(line)
 				if len(fields) >= 2 {

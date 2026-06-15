@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -52,7 +53,10 @@ services:
     networks: [bench]
 {{- if or .KafkaEnabled .AWSEnabled .AzureEnabled .VaultEnabled .MinioEnabled }}
     depends_on:
-{{- if .KafkaEnabled }}
+{{- if .KafkaGSSAPIEnabled }}
+      kafka-init:
+        condition: service_completed_successfully
+{{- else if .KafkaEnabled }}
       redpanda-init:
         condition: service_completed_successfully
 {{- end }}
@@ -81,6 +85,12 @@ services:
 {{- end }}
 {{- if .TLSCertsHost }}
       - "{{ .TLSCertsHost }}:/certs:ro"
+{{- if .SubjectCertDir }}
+      - "{{ .TLSCertsHost }}:{{ .SubjectCertDir }}:ro"
+{{- end }}
+{{- end }}
+{{- if .KrbHostDir }}
+      - "{{ .KrbHostDir }}:/krb5:ro"
 {{- end }}
 {{- if .VaultEnabled }}
       - "{{ .VaultTLSHost }}:/vault-tls:ro"
@@ -203,7 +213,11 @@ services:
     image: "{{ .GeneratorImage }}"
     container_name: "bench-generator"
     networks: [bench]
-{{- if and (eq .GenMode "kafka") .KafkaEnabled }}
+{{- if and (eq .GenMode "kafka") .KafkaGSSAPIEnabled }}
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+{{- else if and (eq .GenMode "kafka") .KafkaEnabled }}
     depends_on:
       redpanda-init:
         condition: service_completed_successfully
@@ -269,6 +283,14 @@ services:
 {{- if .KafkaEnabled }}
       GENERATOR_KAFKA_TOPIC: "{{ .KafkaTopic }}"
       GENERATOR_KAFKA_BATCH: "{{ .GenKafkaBatch }}"
+{{- if .KafkaSASLEnabled }}
+      GENERATOR_KAFKA_SASL: "{{ .KafkaSASLMechanism }}"
+      GENERATOR_KAFKA_USER: "{{ .KafkaSASLUser }}"
+      GENERATOR_KAFKA_PASSWORD: "{{ .KafkaSASLPassword }}"
+{{- end }}
+{{- if .KafkaTLSEnabled }}
+      GENERATOR_KAFKA_TLS: "true"
+{{- end }}
 {{- end }}
 {{- if .GenRotateMode }}
       GENERATOR_ROTATE_MODE: "{{ .GenRotateMode }}"
@@ -430,13 +452,97 @@ services:
 {{- end }}
     restart: "no"
 {{- end }}
-{{- if .KafkaEnabled }}
+{{- if .KafkaGSSAPIEnabled }}
+
+  # MIT Kerberos KDC: creates the realm + broker SPN + client principal and
+  # exports their keytabs into the shared /krb5 dir at boot (see
+  # internal/orchestrator/kerberos.go). Healthy once the keytabs exist.
+  kdc:
+    image: "{{ .KDCImage }}"
+    container_name: "bench-kdc"
+    hostname: "kdc"
+    networks: [bench]
+    volumes:
+      - "{{ .KrbHostDir }}:/krb5"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "{{ .KerberosInitCmd }}"
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /krb5/.ready"]
+      interval: 2s
+      timeout: 5s
+      retries: 40
+      start_period: 2s
+    restart: "no"
+
+  # Apache Kafka (KRaft) with a dual listener: PLAINTEXT for the generator +
+  # topic-init, SASL_PLAINTEXT/GSSAPI for the subject (Redpanda can't serve
+  # Kerberos without an enterprise license). The broker authenticates with its
+  # keytab via inline JAAS.
+  kafka:
+    image: "{{ .KafkaImage }}"
+    container_name: "bench-kafka"
+    hostname: "kafka"
+    networks: [bench]
+    depends_on:
+      kdc:
+        condition: service_healthy
+    volumes:
+      - "{{ .KrbHostDir }}:/krb5:ro"
+    environment:
+      CLUSTER_ID: "{{ .KafkaClusterID }}"
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,SASL_PLAINTEXT://0.0.0.0:9094"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092,SASL_PLAINTEXT://kafka:9094"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,SASL_PLAINTEXT:SASL_PLAINTEXT"
+      KAFKA_SASL_ENABLED_MECHANISMS: "GSSAPI"
+      KAFKA_SASL_KERBEROS_SERVICE_NAME: "{{ .KerberosServiceName }}"
+      # Double underscore (SASL__PLAINTEXT) encodes the literal "_" in the
+      # listener name sasl_plaintext — the cp-kafka env→property converter maps
+      # "__"→"_" and "_"→"." , so single underscores here would wrongly yield
+      # listener.name.sasl.plaintext.* and the JAAS entry is never found.
+      KAFKA_LISTENER_NAME_SASL__PLAINTEXT_GSSAPI_SASL_JAAS_CONFIG: 'com.sun.security.auth.module.Krb5LoginModule required useKeyTab=true storeKey=true keyTab="/krb5/broker.keytab" principal="{{ .KerberosServiceName }}/kafka@{{ .KerberosRealm }}";'
+      KAFKA_OPTS: "-Djava.security.krb5.conf=/krb5/krb5.conf"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 40
+      start_period: 10s
+    restart: "no"
+
+  # One-shot: create the topic over the PLAINTEXT listener (the generator also
+  # produces over PLAINTEXT). Generator + subject gate on this completing.
+  kafka-init:
+    image: "{{ .KafkaImage }}"
+    container_name: "bench-kafka-init"
+    networks: [bench]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic {{ .KafkaTopic }} --partitions {{ .KafkaPartitions }} --replication-factor 1"
+    restart: "no"
+{{- else if .KafkaEnabled }}
 
   redpanda:
     image: "{{ .KafkaImage }}"
     container_name: "bench-redpanda"
     hostname: "redpanda"
     networks: [bench]
+{{- if .KafkaTLSEnabled }}
+    volumes:
+      - "{{ .TLSCertsHost }}:/certs:ro"
+{{- end }}
     command:
       - redpanda
       - start
@@ -446,12 +552,43 @@ services:
       - "{{ .KafkaSMP }}"
       - "--memory"
       - "{{ .KafkaMemory }}"
+{{- if .KafkaAuthEnabled }}
+      # Named listener "internal" so the TLS config can match it by name. SASL
+      # and/or mTLS is applied per-listener; topics auto-create on first
+      # produce (no authenticated topic-init needed).
+      - "--kafka-addr"
+      - "internal://0.0.0.0:9092"
+      - "--advertise-kafka-addr"
+      - "internal://redpanda:9092"
+      - "--set"
+      - "redpanda.auto_create_topics_enabled=true"
+      - "--set"
+      - "redpanda.kafka_api[0].authentication_method={{ .KafkaAuthMethod }}"
+{{- if .KafkaSASLEnabled }}
+      - "--set"
+      - "redpanda.enable_sasl=true"
+      - "--set"
+      - "redpanda.superusers=['{{ .KafkaSASLUser }}']"
+      # Enable PLAIN alongside SCRAM (Redpanda defaults to SCRAM-only and
+      # rejects PLAIN-only). The mechanism name is "SCRAM" (it covers both
+      # SCRAM-SHA-256 and SCRAM-SHA-512) — the per-variant names are NOT valid
+      # sasl_mechanisms values. PLAIN validates against the SCRAM-SHA-256
+      # credential the user is bootstrapped with.
+      - "--set"
+      - "redpanda.sasl_mechanisms=['SCRAM','PLAIN']"
+{{- end }}
+{{- if .KafkaTLSEnabled }}
+      - "--set"
+      - 'redpanda.kafka_api_tls=[{"name":"internal","enabled":true,"cert_file":"/certs/server.crt","key_file":"/certs/server.key","truststore_file":"/certs/ca.crt","require_client_auth":{{ .KafkaRequireClientAuth }}}]'
+{{- end }}
+{{- else }}
       - "--kafka-addr"
       - "PLAINTEXT://0.0.0.0:9092"
       - "--advertise-kafka-addr"
       - "PLAINTEXT://redpanda:9092"
       - "--set"
       - "redpanda.auto_create_topics_enabled=true"
+{{- end }}
     healthcheck:
       test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
       interval: 3s
@@ -460,9 +597,10 @@ services:
       start_period: 5s
     restart: "no"
 
-  # One-shot: wait for the broker, create the topic with the requested
-  # partition count, then exit 0. Generator and subject gate on this
-  # completing so neither races topic auto-creation.
+  # One-shot: wait for the broker, then either create the topic (no-auth path)
+  # or bootstrap the SASL user over the unauthenticated admin API (auth path,
+  # where the topic auto-creates on first produce). Generator and subject gate
+  # on this completing.
   redpanda-init:
     image: "{{ .KafkaImage }}"
     container_name: "bench-redpanda-init"
@@ -472,7 +610,17 @@ services:
         condition: service_healthy
     entrypoint: ["/bin/sh", "-c"]
     command:
+{{- if .KafkaSASLEnabled }}
+      # A Redpanda user can be created only once, so create it under the single
+      # mechanism the case uses (SASL/PLAIN authenticates against SCRAM-SHA-256).
+      - "rpk security user create {{ .KafkaSASLUser }} -p {{ .KafkaSASLPassword }} --mechanism {{ .KafkaBootstrapMechanism }} --api-urls redpanda:9644; echo redpanda sasl init complete"
+{{- else if .KafkaAuthEnabled }}
+      # Pure echo — the mTLS path has no user to bootstrap and the topic
+      # auto-creates on first produce; this just satisfies the one-shot gate.
+      - "echo 'redpanda mtls init complete (topic auto-creates on first produce)'"
+{{- else }}
       - "rpk topic create {{ .KafkaTopic }} -p {{ .KafkaPartitions }} --brokers redpanda:9092 || rpk topic describe {{ .KafkaTopic }} --brokers redpanda:9092"
+{{- end }}
     restart: "no"
 {{- end }}
 {{- if .VaultEnabled }}
@@ -655,6 +803,11 @@ type RunConfig struct {
 	VaultTLSHost     string
 	VaultSecretsHost string
 	VaultSeeds       []VaultSeed
+	// KrbHostDir / KerberosInitCmd are provisioned by PrepareKerberos for a
+	// `kafka.auth.mechanism: gssapi` case. NewComposeRunner populates them when
+	// empty; tests may set them directly to render without touching the KDC.
+	KrbHostDir      string
+	KerberosInitCmd string
 }
 
 // ComposeRunner manages a docker compose lifecycle for one test run.
@@ -694,6 +847,17 @@ func NewComposeRunner(cfg RunConfig) (*ComposeRunner, error) {
 			return nil, fmt.Errorf("preparing vault topology: %w", err)
 		}
 		cfg.VaultTLSHost, cfg.VaultSecretsHost, cfg.VaultSeeds = vp.TLSDir, vp.SecretsDir, vp.Seeds
+	}
+
+	// Kerberos topology prep, same pattern as Vault: a gssapi case needs the
+	// KDC bootstrap command + the shared krb5 dir before the compose file is
+	// rendered.
+	if cfg.TestCase.Kafka != nil && cfg.TestCase.Kafka.UsesGSSAPI() && cfg.KrbHostDir == "" {
+		kp, err := PrepareKerberos(cfg.TmpDir, cfg.TestCase.Kafka)
+		if err != nil {
+			return nil, fmt.Errorf("preparing kerberos topology: %w", err)
+		}
+		cfg.KrbHostDir, cfg.KerberosInitCmd = kp.Dir, kp.InitCmd
 	}
 
 	composeFile := filepath.Join(cfg.TmpDir, "docker-compose.yaml")
@@ -803,10 +967,7 @@ func (r *ComposeRunner) resolveServiceAliases(names []string) []string {
 // StopServices sends SIGTERM to named services with the given grace timeout
 // before SIGKILL. Uses `docker compose stop -t <seconds> <svc>...`.
 func (r *ComposeRunner) StopServices(timeout time.Duration, services ...string) error {
-	secs := int(timeout.Seconds())
-	if secs < 0 {
-		secs = 0
-	}
+	secs := max(int(timeout.Seconds()), 0)
 	resolved := r.resolveServiceAliases(services)
 	args := append([]string{"stop", "-t", strconv.Itoa(secs)}, resolved...)
 	return r.compose(args...)
@@ -933,9 +1094,7 @@ func (r *ComposeRunner) ReceiverMetricsPort() (int, func(), error) {
 // For singular-receiver cases the map has one entry under id "default".
 func (r *ComposeRunner) ReceiverMetricsPorts() map[string]int {
 	out := make(map[string]int, len(r.recvHostPorts))
-	for k, v := range r.recvHostPorts {
-		out[k] = v
-	}
+	maps.Copy(out, r.recvHostPorts)
 	return out
 }
 
@@ -1036,6 +1195,7 @@ type composeVars struct {
 	SubjectCmd        string
 	SubjectEntrypoint string
 	SubjectUser       string
+	SubjectCertDir    string
 	SubjectEnv        map[string]string
 	HasResourceLimits bool
 	CPULimit          string
@@ -1090,6 +1250,39 @@ type composeVars struct {
 	KafkaMemory     string
 	KafkaSMP        int
 	GenKafkaBatch   int
+
+	// Kafka broker auth (a case's `kafka.auth` block). KafkaAuthEnabled gates
+	// the SASL/TLS broker flags, the user bootstrap in redpanda-init, the
+	// broker /certs mount, and the generator SASL/TLS env. KafkaSASLMechanism
+	// is "" for the mTLS-only case. KafkaAuthMethod is the per-listener
+	// authentication_method ("sasl" or "mtls_identity").
+	KafkaAuthEnabled       bool
+	KafkaSASLEnabled       bool
+	KafkaSASLMechanism     string // plain | scram-sha-256 | scram-sha-512
+	KafkaTLSEnabled        bool
+	KafkaRequireClientAuth bool
+	KafkaAuthMethod        string // sasl | mtls_identity
+	KafkaSASLUser          string
+	KafkaSASLPassword      string
+
+	// Kafka Kerberos/GSSAPI (a case's `kafka.auth.mechanism: gssapi`). When
+	// enabled the orchestrator renders an Apache Kafka (KRaft) broker + a KDC +
+	// kafka-init INSTEAD of Redpanda. KrbHostDir holds the KDC-generated krb5
+	// material (krb5.conf + keytabs), mounted into the kdc (rw), broker, and
+	// subject (ro). KerberosInitCmd is the KDC bootstrap shell line.
+	KafkaGSSAPIEnabled  bool
+	KerberosRealm       string
+	KerberosServiceName string
+	KDCImage            string
+	KrbHostDir          string
+	KerberosInitCmd     string
+	KafkaClusterID      string
+	// KafkaBootstrapMechanism is the SCRAM mechanism redpanda-init creates the
+	// user under: SCRAM-SHA-512 for the scram-sha-512 case, SCRAM-SHA-256
+	// otherwise (SASL/PLAIN authenticates against a SCRAM-SHA-256 credential).
+	// A Redpanda user can only be created once, so we pick the single mechanism
+	// the case actually uses.
+	KafkaBootstrapMechanism string
 
 	// Vault topology. VaultEnabled gates the vault + vault-init services,
 	// the subject's vault-init depends_on, and the /vault-tls subject mount.
@@ -1228,21 +1421,11 @@ func writeCompose(path string, cfg RunConfig) error {
 	// Merge subject default env + cloud env + extra env from configuration.
 	// Cloud env merges before ExtraSubjectEnv so a configuration can override.
 	env := map[string]string{}
-	for k, v := range s.Env {
-		env[k] = v
-	}
-	for k, v := range awsEnv {
-		env[k] = v
-	}
-	for k, v := range minioEnv {
-		env[k] = v
-	}
-	for k, v := range azureEnv {
-		env[k] = v
-	}
-	for k, v := range cfg.ExtraSubjectEnv {
-		env[k] = v
-	}
+	maps.Copy(env, s.Env)
+	maps.Copy(env, awsEnv)
+	maps.Copy(env, minioEnv)
+	maps.Copy(env, azureEnv)
+	maps.Copy(env, cfg.ExtraSubjectEnv)
 
 	warmup := tc.WarmupOrDefault(10 * time.Second).String()
 	duration := tc.DurationOrDefault(2 * time.Minute).String()
@@ -1289,6 +1472,7 @@ func writeCompose(path string, cfg RunConfig) error {
 		SubjectCmd:        formatYAMLList(s.Command),
 		SubjectEntrypoint: formatYAMLList(s.Entrypoint),
 		SubjectUser:       s.User,
+		SubjectCertDir:    s.CertDir,
 		SubjectEnv:        env,
 		HasResourceLimits: cfg.CPULimit != "" || cfg.MemLimit != "",
 		CPULimit:          defaultStr(cfg.CPULimit, "1"),
@@ -1421,10 +1605,7 @@ func writeCompose(path string, cfg RunConfig) error {
 			vars.GenSampleFile = dst
 			vars.GenRewriteTimestamp = g.RewriteTimestamp
 		}
-		vars.GenKafkaBatch = g.KafkaBatch
-		if vars.GenKafkaBatch < 1 {
-			vars.GenKafkaBatch = 1
-		}
+		vars.GenKafkaBatch = max(g.KafkaBatch, 1)
 	}
 
 	// Kafka (Redpanda) broker: render the redpanda + redpanda-init services and
@@ -1436,6 +1617,56 @@ func writeCompose(path string, cfg RunConfig) error {
 		vars.KafkaPartitions = tc.Kafka.PartitionsOrDefault()
 		vars.KafkaMemory = tc.Kafka.MemoryOrDefault()
 		vars.KafkaSMP = tc.Kafka.SMPOrDefault()
+
+		// Broker auth (`kafka.auth`). SASL users are bootstrapped by
+		// redpanda-init over the (unauthenticated) admin API; topics
+		// auto-create on first produce so no authenticated topic-init is
+		// needed. The broker /certs mount and the generator's SASL/TLS env are
+		// gated on these too. The director reads the password from
+		// KAFKA_SASL_PASSWORD (the case configs reference ${KAFKA_SASL_PASSWORD}).
+		if tc.Kafka.AuthEnabled() {
+			vars.KafkaAuthEnabled = true
+			vars.KafkaSASLEnabled = tc.Kafka.UsesSASL()
+			vars.KafkaSASLMechanism = tc.Kafka.SASLMechanism()
+			vars.KafkaTLSEnabled = tc.Kafka.UsesTLS()
+			vars.KafkaRequireClientAuth = tc.Kafka.RequireClientAuth()
+			vars.KafkaSASLUser = config.KafkaSASLUser
+			vars.KafkaSASLPassword = config.KafkaSASLPassword
+			if tc.Kafka.UsesSASL() {
+				vars.KafkaAuthMethod = "sasl"
+				if tc.Kafka.SASLMechanism() == "scram-sha-512" {
+					vars.KafkaBootstrapMechanism = "SCRAM-SHA-512"
+				} else {
+					// plain + scram-sha-256 both authenticate against a
+					// SCRAM-SHA-256 credential.
+					vars.KafkaBootstrapMechanism = "SCRAM-SHA-256"
+				}
+				env["KAFKA_SASL_PASSWORD"] = config.KafkaSASLPassword
+			} else {
+				// mTLS-only: the client certificate carries the principal.
+				vars.KafkaAuthMethod = "mtls_identity"
+			}
+		}
+
+		// Kerberos/GSSAPI: render an Apache Kafka (KRaft) broker + KDC instead
+		// of Redpanda (which gates Kerberos behind an enterprise license). The
+		// krb5 dir + bootstrap command are provisioned by PrepareKerberos in
+		// NewComposeRunner (same pattern as Vault).
+		if tc.Kafka.UsesGSSAPI() {
+			vars.KafkaGSSAPIEnabled = true
+			vars.KerberosRealm = tc.Kafka.RealmOrDefault()
+			vars.KerberosServiceName = tc.Kafka.ServiceNameOrDefault()
+			vars.KDCImage = "vmetric/bench-kdc:latest"
+			vars.KrbHostDir = filepath.ToSlash(cfg.KrbHostDir)
+			vars.KerberosInitCmd = cfg.KerberosInitCmd
+			// Fixed valid KRaft cluster id — the per-run broker is throwaway.
+			vars.KafkaClusterID = "MkU3OEVBNTcwNTJENDM2Qk"
+			// The Kerberos case needs a GSSAPI-capable broker; if the case
+			// didn't pin one, default to cp-kafka (Redpanda can't serve it).
+			if tc.Kafka.Image == "" {
+				vars.KafkaImage = "confluentinc/cp-kafka:7.7.1"
+			}
+		}
 	}
 
 	// Vault dev server: render the vault + vault-init services and gate the
