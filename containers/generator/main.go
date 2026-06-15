@@ -72,6 +72,15 @@ type config struct {
 	// per message.
 	KafkaTopic string
 	KafkaBatch int
+	// Kafka broker auth (kafka mode only). KafkaSASL selects the SASL
+	// mechanism ("" | plain | scram-sha-256 | scram-sha-512); KafkaUser/
+	// KafkaPassword are the credentials. KafkaTLS wraps the broker connection
+	// in TLS (reusing the TLS* cert paths / InsecureVerify knobs above), which
+	// also covers mTLS when a client cert is present at /certs.
+	KafkaSASL     string
+	KafkaUser     string
+	KafkaPassword string
+	KafkaTLS      bool
 }
 
 type result struct {
@@ -310,6 +319,10 @@ func loadConfig() config {
 	if cfg.KafkaBatch < 1 {
 		cfg.KafkaBatch = 1
 	}
+	cfg.KafkaSASL = strings.ToLower(strings.TrimSpace(os.Getenv("GENERATOR_KAFKA_SASL")))
+	cfg.KafkaUser = os.Getenv("GENERATOR_KAFKA_USER")
+	cfg.KafkaPassword = os.Getenv("GENERATOR_KAFKA_PASSWORD")
+	cfg.KafkaTLS = getEnvBool("GENERATOR_KAFKA_TLS", false)
 
 	cfg.Sequenced = getEnvBool("GENERATOR_SEQUENCED", false)
 	cfg.Connections = getEnvInt("GENERATOR_CONNECTIONS", 1)

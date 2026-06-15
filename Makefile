@@ -1,5 +1,5 @@
-.PHONY: build build-containers build-generator build-receiver build-collector \
-        push-containers push-generator push-receiver push-collector \
+.PHONY: build build-containers build-generator build-receiver build-collector build-kdc \
+        push-containers push-generator push-receiver push-collector push-kdc \
         test-local list clean tidy fmt vet
 
 # Output binary
@@ -18,6 +18,7 @@ LDFLAGS  := -s -w \
 GENERATOR_IMAGE := vmetric/bench-generator:latest
 RECEIVER_IMAGE  := vmetric/bench-receiver:latest
 COLLECTOR_IMAGE := vmetric/bench-collector:latest
+KDC_IMAGE       := vmetric/bench-kdc:latest
 
 # Set ATTEST=1 to emit SBOM + max-mode provenance (used when publishing to Docker Hub).
 # Requires the docker-container buildx driver; the default docker driver on GitHub
@@ -84,7 +85,16 @@ build-collector:
 		--load \
 		.
 
-build-containers: build-generator build-receiver build-collector
+build-kdc:
+	$(DOCKER_BUILD) \
+		-f containers/kdc/Dockerfile \
+		-t $(KDC_IMAGE) \
+		--platform linux/amd64 \
+		--build-arg BUILDKIT_INLINE_CACHE=1 \
+		--load \
+		.
+
+build-containers: build-generator build-receiver build-collector build-kdc
 
 # ── Publish to Docker Hub ─────────────────────────────────────────────────────
 #
@@ -125,7 +135,18 @@ push-collector:
 		--push \
 		.
 
-push-containers: push-generator push-receiver push-collector
+push-kdc:
+	$(DOCKER_BUILD) \
+		-f containers/kdc/Dockerfile \
+		-t $(KDC_IMAGE) \
+		-t vmetric/bench-kdc:sha-$(COMMIT) \
+		--platform linux/amd64 \
+		$(ATTEST_FLAGS) \
+		--build-arg BUILDKIT_INLINE_CACHE=1 \
+		--push \
+		.
+
+push-containers: push-generator push-receiver push-collector push-kdc
 
 # ── End-to-end test ───────────────────────────────────────────────────────────
 
@@ -142,7 +163,7 @@ list: build
 clean:
 	rm -f $(BINARY)
 	$(BINARY) clean 2>/dev/null || true
-	docker rmi -f $(GENERATOR_IMAGE) $(RECEIVER_IMAGE) $(COLLECTOR_IMAGE) 2>/dev/null || true
+	docker rmi -f $(GENERATOR_IMAGE) $(RECEIVER_IMAGE) $(COLLECTOR_IMAGE) $(KDC_IMAGE) 2>/dev/null || true
 
 # ── Go tooling ────────────────────────────────────────────────────────────────
 

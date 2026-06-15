@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -192,11 +193,11 @@ func (r *Runner) receiverTimestamps(port int, timeout time.Duration) ([]int64, e
 // onto the per-run extras blob so an analyst can drill into a failed
 // throttle-correctness run without re-instrumenting the receiver.
 type RateWindowResult struct {
-	MaxObservedEPS         float64 `json:"rate_window_max_observed_eps"`
-	OvershootCount         int64   `json:"rate_window_overshoot_count"`
-	FirstOvershootStartNs  int64   `json:"rate_window_overshoot_first_window_start_ns,omitempty"`
-	Passed                 bool    `json:"rate_window_passed"`
-	FailureReason          string  `json:"rate_window_failure,omitempty"`
+	MaxObservedEPS        float64 `json:"rate_window_max_observed_eps"`
+	OvershootCount        int64   `json:"rate_window_overshoot_count"`
+	FirstOvershootStartNs int64   `json:"rate_window_overshoot_first_window_start_ns,omitempty"`
+	Passed                bool    `json:"rate_window_passed"`
+	FailureReason         string  `json:"rate_window_failure,omitempty"`
 }
 
 // applyRateCeiling slides a Window-sized window across arrival timestamps
@@ -227,7 +228,7 @@ func applyRateCeiling(rc config.RateCeilingConfig, timestamps []int64) RateWindo
 	tolerance := rc.Tolerance
 	threshold := rc.MaxEPS * (1.0 + tolerance)
 
-	sort.Slice(timestamps, func(i, j int) bool { return timestamps[i] < timestamps[j] })
+	slices.Sort(timestamps)
 	first := timestamps[0]
 	last := timestamps[len(timestamps)-1]
 	deliverySpan := time.Duration(last - first)

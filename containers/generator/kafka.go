@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/sasl/plain"
+	"github.com/twmb/franz-go/pkg/sasl/scram"
 )
 
 // runKafka produces records to a Kafka topic on the broker(s) at cfg.Target
@@ -168,6 +170,39 @@ func newKafkaClient(cfg config) (*kgo.Client, error) {
 		// acks — Produce only blocks once this many records are unacked.
 		kgo.MaxBufferedRecords(500_000),
 	}
+
+	// SASL auth, when the broker requires it. PLAIN and SCRAM-SHA-256/512 are
+	// in the franz-go module already vendored for the producer.
+	switch cfg.KafkaSASL {
+	case "", "none":
+		// no SASL
+	case "plain":
+		opts = append(opts, kgo.SASL(plain.Plain(func(context.Context) (plain.Auth, error) {
+			return plain.Auth{User: cfg.KafkaUser, Pass: cfg.KafkaPassword}, nil
+		})))
+	case "scram-sha-256":
+		opts = append(opts, kgo.SASL(scram.Sha256(func(context.Context) (scram.Auth, error) {
+			return scram.Auth{User: cfg.KafkaUser, Pass: cfg.KafkaPassword}, nil
+		})))
+	case "scram-sha-512":
+		opts = append(opts, kgo.SASL(scram.Sha512(func(context.Context) (scram.Auth, error) {
+			return scram.Auth{User: cfg.KafkaUser, Pass: cfg.KafkaPassword}, nil
+		})))
+	default:
+		return nil, fmt.Errorf("kafka: unknown SASL mechanism %q", cfg.KafkaSASL)
+	}
+
+	// TLS, when the broker listens over TLS. buildTLSConfig trusts /certs/ca.crt
+	// and presents /certs/client.{crt,key} if present (mTLS) — the same cert
+	// material the harness mounts at /certs.
+	if cfg.KafkaTLS {
+		tlsCfg, err := buildTLSConfig(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("kafka tls config: %w", err)
+		}
+		opts = append(opts, kgo.DialTLSConfig(tlsCfg))
+	}
+
 	client, err := kgo.NewClient(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("kafka: new client for %q: %w", cfg.Target, err)
