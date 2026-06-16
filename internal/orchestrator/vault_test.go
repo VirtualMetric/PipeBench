@@ -41,7 +41,7 @@ func TestComposeRendersVault(t *testing.T) {
 	if err := tc.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
-	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.2", ConfigPath: "/config.yml"}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.3", ConfigPath: "/config.yml"}
 	tmp, err := os.MkdirTemp("", "compose-vault-")
 	if err != nil {
 		t.Fatal(err)
@@ -119,7 +119,7 @@ func TestComposeOmitsVaultByDefault(t *testing.T) {
 		Generator: config.GeneratorConfig{Mode: "tcp", Target: "subject:9000", Rate: 10, LineSize: 64, Format: "raw"},
 		Receiver:  config.ReceiverConfig{Mode: "tcp", Listen: ":9001"},
 	}
-	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.2", ConfigPath: "/config.yml"}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.3", ConfigPath: "/config.yml"}
 	// Note: the tmp dir path is bind-mounted into the rendered compose, so its
 	// name must not itself contain the strings asserted absent below.
 	tmp, err := os.MkdirTemp("", "compose-plain-")
@@ -159,7 +159,7 @@ func TestComposeRendersKafkaAndVaultTogether(t *testing.T) {
 	if err := tc.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
-	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.2", ConfigPath: "/config.yml"}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.3", ConfigPath: "/config.yml"}
 	tmp, err := os.MkdirTemp("", "compose-kafka-vault-")
 	if err != nil {
 		t.Fatal(err)
@@ -207,7 +207,7 @@ func TestComposeRendersKafkaAndVaultTogether(t *testing.T) {
 // dirs (instead of rendering empty bind-mount sources).
 func TestWriteComposeRejectsUnpreparedVault(t *testing.T) {
 	tc := vaultSmokeCase()
-	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.2", ConfigPath: "/config.yml"}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.3", ConfigPath: "/config.yml"}
 	tmp, err := os.MkdirTemp("", "compose-vault-unprep-")
 	if err != nil {
 		t.Fatal(err)

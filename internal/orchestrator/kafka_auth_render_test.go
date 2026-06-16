@@ -137,6 +137,9 @@ func TestKafkaGSSAPIRenders(t *testing.T) {
 	out := string(data)
 
 	mustContain(t, out, "  kdc:\n")
+	// KDC binds privileged port 88 as a non-root user; the sysctl must be set
+	// explicitly rather than relying on Docker's runtime default.
+	mustContain(t, out, "net.ipv4.ip_unprivileged_port_start: 0")
 	mustContain(t, out, "  kafka:\n")
 	mustContain(t, out, "  kafka-init:\n")
 	mustContain(t, out, "SASL_PLAINTEXT://0.0.0.0:9094")

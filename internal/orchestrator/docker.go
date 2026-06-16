@@ -462,6 +462,12 @@ services:
     container_name: "bench-kdc"
     hostname: "kdc"
     networks: [bench]
+    # krb5kdc runs non-root (see containers/kdc/Dockerfile) yet binds privileged
+    # port 88. Docker defaults this namespaced sysctl to 0 in the container's net
+    # namespace, but set it explicitly so the bind never silently fails if a host
+    # or runtime ships a different default.
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: 0
     volumes:
       - "{{ .KrbHostDir }}:/krb5"
     entrypoint: ["/bin/sh", "-c"]
