@@ -77,11 +77,11 @@ func TestGenerateTLSCerts_ClientCertBundlesCA(t *testing.T) {
 	// so that bundling does not leak into the files consumed by redpanda.
 	caCerts := decodeCertFile(t, filepath.Join(dir, "ca.crt"))
 	if len(caCerts) != 1 {
-		t.Errorf("ca.crt: want 1 CERTIFICATE block, got %d", len(caCerts))
+		t.Fatalf("ca.crt: want 1 CERTIFICATE block, got %d", len(caCerts))
 	}
 	srvCerts := decodeCertFile(t, filepath.Join(dir, "server.crt"))
 	if len(srvCerts) != 1 {
-		t.Errorf("server.crt: want 1 CERTIFICATE block, got %d", len(srvCerts))
+		t.Fatalf("server.crt: want 1 CERTIFICATE block, got %d", len(srvCerts))
 	}
 
 	// Trust proof: build a pool from the CA carried inside client.crt and verify
@@ -136,7 +136,7 @@ func TestRotateServerCert_PreservesClientBundle(t *testing.T) {
 
 	srvCerts := decodeCertFile(t, filepath.Join(dir, "server.crt"))
 	if len(srvCerts) != 1 {
-		t.Errorf("server.crt after rotation: want 1 CERTIFICATE block, got %d", len(srvCerts))
+		t.Fatalf("server.crt after rotation: want 1 CERTIFICATE block, got %d", len(srvCerts))
 	}
 	if _, err := srvCerts[0].Verify(x509.VerifyOptions{
 		Roots:   roots,
