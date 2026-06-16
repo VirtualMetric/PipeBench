@@ -27,6 +27,7 @@ type Options struct {
 	GeneratorImage string
 	ReceiverImage  string
 	CollectorImage string
+	VerifierImage  string
 	// Override subject version (empty = use registry default)
 	SubjectVersion string
 	// Override subject image repository (empty = use registry default)
@@ -61,6 +62,9 @@ func (o *Options) applyDefaults() {
 	}
 	if o.CollectorImage == "" {
 		o.CollectorImage = "vmetric/bench-collector:latest"
+	}
+	if o.VerifierImage == "" {
+		o.VerifierImage = "vmetric/bench-verifier:latest"
 	}
 	if o.ConfigName == "" {
 		o.ConfigName = "default"
@@ -285,6 +289,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		GeneratorImage:   r.opts.GeneratorImage,
 		ReceiverImage:    r.opts.ReceiverImage,
 		CollectorImage:   r.opts.CollectorImage,
+		VerifierImage:    r.opts.VerifierImage,
 		ReceiverHostPort: r.opts.ReceiverHostPort,
 		ExtraSubjectEnv:  extraEnv,
 		CPULimit:         r.opts.CPULimit,
@@ -380,132 +385,143 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		}
 	}
 
-	metricsPort, stopPortFwd, err := orch.ReceiverMetricsPort()
-	if err != nil {
-		return results.RunResult{}, fmt.Errorf("setting up receiver access: %w", err)
-	}
-	defer stopPortFwd()
-
-	if tc.IsPerformanceType() && r.opts.Drain > 0 {
-		// Diagnostic drain mode: poll the receiver until it goes idle (or the
-		// configured ceiling fires). Same pattern as the correctness path
-		// below, but bounded by --drain.
-		fmt.Printf("  drain mode: waiting up to %s for receiver to go idle…\n", r.opts.Drain)
-		const drainPoll = 5 * time.Second
-		const quietPolls = 6 // 30s stable window
-		ports := orch.ReceiverMetricsPorts()
-		drainDeadline := time.Now().Add(r.opts.Drain)
-		if drainDeadline.After(runDeadline) {
-			drainDeadline = runDeadline
-		}
-		var drainStable int
-		var drainLast int64
-		drainStart := time.Now()
-		for time.Now().Before(drainDeadline) {
-			time.Sleep(drainPoll)
-			var totalLines int64
-			if tc.MultiReceiver() {
-				agg, _, qerr := r.aggregateReceivers(ports, 10*time.Second)
-				if qerr != nil {
-					continue
-				}
-				totalLines = agg.LinesReceived
-			} else {
-				rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
-				if qerr != nil {
-					continue
-				}
-				totalLines = rm.LinesReceived
-			}
-			fmt.Printf("    received: %s lines\n", formatCount(totalLines))
-			if totalLines == drainLast && totalLines > 0 {
-				drainStable++
-				if drainStable >= quietPolls {
-					fmt.Printf("    receiver stable — drain complete after %s\n", time.Since(drainStart).Round(time.Second))
-					break
-				}
-			} else {
-				drainStable = 0
-			}
-			drainLast = totalLines
-		}
-	} else if tc.IsPerformanceType() {
-		drainGrace := tc.DrainGraceOrDefault(5 * time.Second)
-		if rem := time.Until(runDeadline); rem < drainGrace {
-			drainGrace = rem
-		}
-		if drainGrace > 0 {
-			fmt.Printf("  waiting post-send receive grace (%s)…\n", drainGrace)
-			time.Sleep(drainGrace)
-		}
-	} else {
-		// Correctness tests need completeness rather than a fixed SLA window:
-		// wait until the receiver stops moving or the bounded drain timeout hits.
-		// In drain-aware mode (correctness.drain_seconds set) the timeout
-		// follows the case; otherwise the default 2-minute ceiling applies.
-		fmt.Println("  waiting for receiver to drain…")
-		const drainPoll = 5 * time.Second
-		drainTimeout := 2 * time.Minute
-		if tc.Correctness.DrainSeconds > 0 {
-			drainTimeout = time.Duration(tc.Correctness.DrainSeconds) * time.Second
-		}
-		quietWindow := parseDurationOr(tc.Correctness.DrainQuietWindow, 0)
-		// Convert quietWindow into a poll count (default behaviour:
-		// 12 stable polls of 5s = 60s, same as before).
-		quietPolls := 12
-		if quietWindow > 0 {
-			quietPolls = max(int(quietWindow/drainPoll), 1)
-		}
-		ports := orch.ReceiverMetricsPorts()
-		drainDeadline := time.Now().Add(drainTimeout)
-		if drainDeadline.After(runDeadline) {
-			drainDeadline = runDeadline
-		}
-		var drainStable int
-		var drainLast int64
-		for time.Now().Before(drainDeadline) {
-			time.Sleep(drainPoll)
-			var totalLines int64
-			if tc.MultiReceiver() {
-				agg, _, qerr := r.aggregateReceivers(ports, 10*time.Second)
-				if qerr != nil {
-					continue
-				}
-				totalLines = agg.LinesReceived
-			} else {
-				rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
-				if qerr != nil {
-					continue
-				}
-				totalLines = rm.LinesReceived
-			}
-			fmt.Printf("    received: %s lines\n", formatCount(totalLines))
-			if totalLines == drainLast && totalLines > 0 {
-				drainStable++
-				if drainStable >= quietPolls {
-					fmt.Println("    receiver stable — drain complete")
-					break
-				}
-			} else {
-				drainStable = 0
-			}
-			drainLast = totalLines
-		}
-	}
-
-	// Fetch final metrics from receiver(s).
+	// The verifier path replaces the receiver entirely: the subject's sink is
+	// S3, nothing listens on TCP, and the s3 receiver's destructive drain would
+	// corrupt the verifier's read. Verifier cases skip the receiver drain loop
+	// and read the DuckDB verdict instead.
 	var recvMetrics ReceiverMetrics
 	var perReceiver []PerReceiverMetrics
-	if tc.MultiReceiver() {
-		ports := orch.ReceiverMetricsPorts()
-		recvMetrics, perReceiver, err = r.aggregateReceivers(ports, 30*time.Second)
+	if tc.UsesVerifier() {
+		recvMetrics, err = r.runVerifier(orch, tc, tmpDir, runDeadline)
 		if err != nil {
-			return results.RunResult{}, fmt.Errorf("querying receiver metrics: %w", err)
+			return results.RunResult{}, err
 		}
 	} else {
-		recvMetrics, err = r.queryReceiverMetrics(metricsPort, 30*time.Second)
+		metricsPort, stopPortFwd, err := orch.ReceiverMetricsPort()
 		if err != nil {
-			return results.RunResult{}, fmt.Errorf("querying receiver metrics: %w", err)
+			return results.RunResult{}, fmt.Errorf("setting up receiver access: %w", err)
+		}
+		defer stopPortFwd()
+
+		if tc.IsPerformanceType() && r.opts.Drain > 0 {
+			// Diagnostic drain mode: poll the receiver until it goes idle (or the
+			// configured ceiling fires). Same pattern as the correctness path
+			// below, but bounded by --drain.
+			fmt.Printf("  drain mode: waiting up to %s for receiver to go idle…\n", r.opts.Drain)
+			const drainPoll = 5 * time.Second
+			const quietPolls = 6 // 30s stable window
+			ports := orch.ReceiverMetricsPorts()
+			drainDeadline := time.Now().Add(r.opts.Drain)
+			if drainDeadline.After(runDeadline) {
+				drainDeadline = runDeadline
+			}
+			var drainStable int
+			var drainLast int64
+			drainStart := time.Now()
+			for time.Now().Before(drainDeadline) {
+				time.Sleep(drainPoll)
+				var totalLines int64
+				if tc.MultiReceiver() {
+					agg, _, qerr := r.aggregateReceivers(ports, 10*time.Second)
+					if qerr != nil {
+						continue
+					}
+					totalLines = agg.LinesReceived
+				} else {
+					rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+					if qerr != nil {
+						continue
+					}
+					totalLines = rm.LinesReceived
+				}
+				fmt.Printf("    received: %s lines\n", formatCount(totalLines))
+				if totalLines == drainLast && totalLines > 0 {
+					drainStable++
+					if drainStable >= quietPolls {
+						fmt.Printf("    receiver stable — drain complete after %s\n", time.Since(drainStart).Round(time.Second))
+						break
+					}
+				} else {
+					drainStable = 0
+				}
+				drainLast = totalLines
+			}
+		} else if tc.IsPerformanceType() {
+			drainGrace := tc.DrainGraceOrDefault(5 * time.Second)
+			if rem := time.Until(runDeadline); rem < drainGrace {
+				drainGrace = rem
+			}
+			if drainGrace > 0 {
+				fmt.Printf("  waiting post-send receive grace (%s)…\n", drainGrace)
+				time.Sleep(drainGrace)
+			}
+		} else {
+			// Correctness tests need completeness rather than a fixed SLA window:
+			// wait until the receiver stops moving or the bounded drain timeout hits.
+			// In drain-aware mode (correctness.drain_seconds set) the timeout
+			// follows the case; otherwise the default 2-minute ceiling applies.
+			fmt.Println("  waiting for receiver to drain…")
+			const drainPoll = 5 * time.Second
+			drainTimeout := 2 * time.Minute
+			if tc.Correctness.DrainSeconds > 0 {
+				drainTimeout = time.Duration(tc.Correctness.DrainSeconds) * time.Second
+			}
+			quietWindow := parseDurationOr(tc.Correctness.DrainQuietWindow, 0)
+			// Convert quietWindow into a poll count (default behaviour:
+			// 12 stable polls of 5s = 60s, same as before).
+			quietPolls := 12
+			if quietWindow > 0 {
+				quietPolls = max(int(quietWindow/drainPoll), 1)
+			}
+			ports := orch.ReceiverMetricsPorts()
+			drainDeadline := time.Now().Add(drainTimeout)
+			if drainDeadline.After(runDeadline) {
+				drainDeadline = runDeadline
+			}
+			var drainStable int
+			var drainLast int64
+			for time.Now().Before(drainDeadline) {
+				time.Sleep(drainPoll)
+				var totalLines int64
+				if tc.MultiReceiver() {
+					agg, _, qerr := r.aggregateReceivers(ports, 10*time.Second)
+					if qerr != nil {
+						continue
+					}
+					totalLines = agg.LinesReceived
+				} else {
+					rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+					if qerr != nil {
+						continue
+					}
+					totalLines = rm.LinesReceived
+				}
+				fmt.Printf("    received: %s lines\n", formatCount(totalLines))
+				if totalLines == drainLast && totalLines > 0 {
+					drainStable++
+					if drainStable >= quietPolls {
+						fmt.Println("    receiver stable — drain complete")
+						break
+					}
+				} else {
+					drainStable = 0
+				}
+				drainLast = totalLines
+			}
+		}
+
+		// Fetch final metrics from receiver(s).
+		if tc.MultiReceiver() {
+			ports := orch.ReceiverMetricsPorts()
+			recvMetrics, perReceiver, err = r.aggregateReceivers(ports, 30*time.Second)
+			if err != nil {
+				return results.RunResult{}, fmt.Errorf("querying receiver metrics: %w", err)
+			}
+		} else {
+			recvMetrics, err = r.queryReceiverMetrics(metricsPort, 30*time.Second)
+			if err != nil {
+				return results.RunResult{}, fmt.Errorf("querying receiver metrics: %w", err)
+			}
 		}
 	}
 
@@ -711,7 +727,12 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		} else {
 			result.FailReason = strings.Join(failReasons, "; ")
 		}
-	} else if tc.IsCorrectnessType() {
+	} else if tc.IsCorrectnessType() && !tc.UsesVerifier() {
+		// Verifier cases are excluded: the DuckDB verifier is the correctness
+		// oracle and already encoded the verdict (loss, duplicates, NULLs, and
+		// its own over-delivery policy) into recvMetrics.Passed/.Errors above.
+		// Re-deriving pass/fail from line-count loss + a strict over-delivery
+		// cap here would wrongly flip a valid allow_overdelivery verifier pass.
 		lossOK := lossPct <= tc.Correctness.ExpectedLossPct
 		// Kafka consumption is at-least-once: the consumer may re-deliver a
 		// fetch batch on its initial group join / rebalance, so allow bounded
@@ -2343,6 +2364,51 @@ func (r *Runner) queryReceiverMetrics(port int, timeout time.Duration) (Receiver
 		return m, nil
 	}
 	return ReceiverMetrics{}, fmt.Errorf("receiver metrics not available after %s", timeout)
+}
+
+// runVerifier starts the one-shot DuckDB verifier (a profiled compose service,
+// so the initial Up skipped it), waits for it to finish, and reads the verdict
+// it wrote to the shared results volume. The verifier owns drain detection
+// (poll-until-stable on the bucket), so the runner just waits for it to exit.
+// The verdict uses the same JSON shape as the receiver's /metrics, so it maps
+// through ReceiverMetrics into the RunResult unchanged. A failed verdict
+// (passed=false) is a normal outcome read from the file, not an error here —
+// only an infrastructure failure (verifier never finished, no verdict written)
+// returns an error.
+func (r *Runner) runVerifier(orch orchestrator.Orchestrator, tc *config.TestCase, tmpDir string, runDeadline time.Time) (ReceiverMetrics, error) {
+	fmt.Println("  starting DuckDB verifier…")
+	if err := orch.UpServices("verifier"); err != nil {
+		return ReceiverMetrics{}, fmt.Errorf("starting verifier: %w", err)
+	}
+
+	// Give the verifier its own timeout plus a small buffer, capped by the run
+	// deadline so a hung verifier can't overrun Options.Timeout.
+	wait := tc.Verifier.TimeoutDuration() + 30*time.Second
+	rem := time.Until(runDeadline)
+	if rem <= 0 {
+		return ReceiverMetrics{}, fmt.Errorf("run deadline (Options.Timeout) reached before the verifier could start")
+	}
+	if rem < wait {
+		wait = rem
+	}
+	if err := orch.WaitForVerifierExit(wait); err != nil {
+		return ReceiverMetrics{}, fmt.Errorf("%w\nverifier logs:\n%s", err, orch.Logs("verifier", 30))
+	}
+
+	verdictPath := filepath.Join(tmpDir, "verdict.json")
+	data, err := os.ReadFile(verdictPath)
+	if err != nil {
+		return ReceiverMetrics{}, fmt.Errorf("reading verifier verdict %s: %w\nverifier logs:\n%s",
+			verdictPath, err, orch.Logs("verifier", 30))
+	}
+	var m ReceiverMetrics
+	if err := json.Unmarshal(data, &m); err != nil {
+		return ReceiverMetrics{}, fmt.Errorf("parsing verifier verdict: %w", err)
+	}
+	passed := m.Passed != nil && *m.Passed
+	fmt.Printf("  verifier: rows=%d unique=%d duplicates=%d passed=%v\n",
+		m.LinesReceived, m.UniqueLines, m.Duplicates, passed)
+	return m, nil
 }
 
 // parseGeneratorStats extracts the JSON result from the generator's stdout.

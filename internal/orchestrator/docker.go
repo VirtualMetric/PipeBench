@@ -225,7 +225,7 @@ services:
     depends_on:
       subject:
         condition: service_started
-{{- if not .DeferReceiver }}
+{{- if and (not .DeferReceiver) (not .VerifierEnabled) }}
       receiver:
         condition: service_started
 {{- end }}
@@ -364,7 +364,7 @@ services:
 {{- end }}
     restart: "no"
 {{- end }}
-{{- else }}
+{{- else if not .VerifierEnabled }}
 
   receiver:
     image: "{{ .ReceiverImage }}"
@@ -434,6 +434,40 @@ services:
       COLLECTOR_INTERVAL_SECS: "1"
       COLLECTOR_OUTPUT: "/results/metrics.csv"
     restart: "no"
+{{- if .VerifierEnabled }}
+
+  # One-shot DuckDB verifier under the compose profile "verify", so the
+  # initial up skips it; the runner starts it (UpServices) after the generator
+  # exits. It reads the subject's {{ .VerifierFormat }} objects from the S3
+  # emulator via httpfs, waits for the bucket to settle, then asserts row count
+  # / duplicates / NULL payloads and writes /results/verdict.json.
+  verifier:
+    image: "{{ .VerifierImage }}"
+    container_name: "bench-verifier"
+    networks: [bench]
+    profiles: ["verify"]
+    volumes:
+      - "{{ .TmpDir }}:/results"
+    user: "0:0"
+    environment:
+      VERIFIER_S3_BUCKET: "{{ .VerifierBucket }}"
+{{- if .VerifierPrefix }}
+      VERIFIER_S3_PREFIX: "{{ .VerifierPrefix }}"
+{{- end }}
+      VERIFIER_OBJECT_FORMAT: "{{ .VerifierFormat }}"
+      VERIFIER_EXPECTED_LINES: "{{ .VerifierExpected }}"
+      VERIFIER_ALLOW_OVERDELIVERY: "{{ .VerifierAllowOverDel }}"
+      VERIFIER_QUIET_WINDOW: "{{ .VerifierQuietWindow }}"
+      VERIFIER_TIMEOUT: "{{ .VerifierTimeout }}"
+      VERIFIER_MSG_FIELD: "{{ .VerifierMsgField }}"
+{{- if .VerifierNullFields }}
+      VERIFIER_NULL_FIELDS: "{{ .VerifierNullFields }}"
+{{- end }}
+{{- range $k, $v := .VerifierEnv }}
+      {{ $k }}: "{{ $v }}"
+{{- end }}
+    restart: "no"
+{{- end }}
 {{- range .Endpoints }}
 
   {{ .Name }}:
@@ -791,7 +825,8 @@ type RunConfig struct {
 	GeneratorImage   string
 	ReceiverImage    string
 	CollectorImage   string
-	ReceiverHostPort int // base host port; in multi-receiver mode, +N for receiver N
+	VerifierImage    string // DuckDB verifier image (verifier cases only)
+	ReceiverHostPort int    // base host port; in multi-receiver mode, +N for receiver N
 	ExtraSubjectEnv  map[string]string
 	CPULimit         string // e.g. "1", "4" — number of cores for subject
 	MemLimit         string // e.g. "1g", "16g" — memory limit for subject
@@ -892,6 +927,12 @@ func (r *ComposeRunner) populateServiceNames() {
 	// else: no generator configured — leave the lists empty so nothing waits
 	// on or queries a generator container that the compose never renders.
 	r.recvHostPorts = map[string]int{}
+	// Verifier cases render no receiver service (the subject's sink is S3), so
+	// leave the receiver metadata empty rather than advertising a receiver that
+	// doesn't exist — ReceiverMetricsPort(s) must not point at a phantom port.
+	if tc.UsesVerifier() {
+		return
+	}
 	if tc.MultiReceiver() {
 		for i, rc := range tc.Receivers {
 			r.recvServices = append(r.recvServices, "receiver-"+rc.ID)
@@ -1025,6 +1066,24 @@ func (r *ComposeRunner) WaitForGeneratorExit(timeout time.Duration) error {
 		time.Sleep(2 * time.Second)
 	}
 	return fmt.Errorf("generator(s) did not exit within %s (still running: %v)", timeout, pending)
+}
+
+// WaitForVerifierExit blocks until the bench-verifier container exits or the
+// timeout expires. A non-zero exit is NOT treated as an error here: the
+// verifier exits 1 when the correctness verdict fails, which is a legitimate
+// test outcome the runner reads from verdict.json — only a timeout (the
+// container never finished) is an error.
+func (r *ComposeRunner) WaitForVerifierExit(timeout time.Duration) error {
+	const name = "bench-verifier"
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		out, err := exec.Command("docker", "inspect", "--format={{.State.Status}}", name).Output()
+		if err == nil && strings.TrimSpace(string(out)) == "exited" {
+			return nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return fmt.Errorf("verifier did not exit within %s", timeout)
 }
 
 func (r *ComposeRunner) checkExitCode(container string) error {
@@ -1315,6 +1374,24 @@ type composeVars struct {
 	RecvValidateJSON      bool
 	RecvRecordArrival     bool
 	DockerSocketGID       string
+
+	// Verifier (a case's `verifier:` block): a one-shot DuckDB container under
+	// the compose profile "verify", so the initial Up() skips it. The runner
+	// starts it via UpServices("verifier") after the generator exits, it reads
+	// the subject's columnar objects from the S3 emulator via httpfs, and emits
+	// /results/verdict.json. When enabled the singular receiver is not rendered.
+	VerifierEnabled      bool
+	VerifierImage        string
+	VerifierBucket       string
+	VerifierPrefix       string
+	VerifierFormat       string
+	VerifierExpected     int64
+	VerifierAllowOverDel string
+	VerifierQuietWindow  string
+	VerifierTimeout      string
+	VerifierMsgField     string
+	VerifierNullFields   string
+	VerifierEnv          map[string]string
 
 	// Cloud emulator topology (a case's `aws:` / `azure:` blocks).
 	// AWSInitHost is the host path of the rendered LocalStack init script,
@@ -1751,6 +1828,31 @@ func writeCompose(path string, cfg RunConfig) error {
 		vars.MinioInitBuckets = strings.Join(tc.Minio.Buckets, ",")
 		vars.MinioRootUser = config.MinioRootUser
 		vars.MinioRootPassword = config.MinioRootPassword
+	}
+
+	// Verifier: a one-shot DuckDB container that reads the subject's columnar
+	// objects from the S3 emulator. EXPECTED_LINES comes from the case's fixed
+	// generator total_lines (deterministic — a rate-limited generator with
+	// total_lines set sends exactly that many), so the verifier can assert an
+	// exact count without a runtime handoff. S3 access reuses the emulator's
+	// credential/endpoint env.
+	if tc.UsesVerifier() {
+		vars.VerifierEnabled = true
+		vars.VerifierImage = cfg.VerifierImage
+		vars.VerifierBucket = tc.Verifier.S3Bucket
+		vars.VerifierPrefix = tc.Verifier.S3Prefix
+		vars.VerifierFormat = tc.Verifier.Format
+		vars.VerifierExpected = tc.Generator.TotalLines
+		vars.VerifierAllowOverDel = boolStr(tc.Verifier.AllowOverDelivery)
+		vars.VerifierQuietWindow = tc.Verifier.QuietWindowOrDefault()
+		vars.VerifierTimeout = tc.Verifier.TimeoutOrDefault()
+		vars.VerifierMsgField = defaultStr(tc.Verifier.MsgField, "msg")
+		vars.VerifierNullFields = strings.Join(tc.Verifier.NullFields, ",")
+		if tc.UsesMinio() {
+			vars.VerifierEnv = minioEnv
+		} else {
+			vars.VerifierEnv = awsEnv
+		}
 	}
 
 	for _, ep := range tc.Endpoints {

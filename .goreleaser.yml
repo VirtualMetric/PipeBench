@@ -101,6 +101,7 @@ release:
     - `vmetric/bench-generator:sha-{{ .ShortCommit }}`
     - `vmetric/bench-receiver:sha-{{ .ShortCommit }}`
     - `vmetric/bench-collector:sha-{{ .ShortCommit }}`
+    - `vmetric/bench-verifier:sha-{{ .ShortCommit }}`
 
     ### Install
 
