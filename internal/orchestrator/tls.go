@@ -20,12 +20,13 @@ import (
 // the absolute path of outDir so the caller can hand it to RunConfig.
 //
 // The files written are:
-//   ca.crt      — root CA certificate (PEM)
-//   ca.key      — root CA private key (PEM)
-//   server.crt  — leaf cert with SAN serverHosts (PEM), signed by ca.crt
-//   server.key  — leaf private key (PEM)
-//   client.crt  — leaf cert for the generator (PEM), signed by ca.crt
-//   client.key  — leaf private key (PEM)
+//
+//	ca.crt      — root CA certificate (PEM)
+//	ca.key      — root CA private key (PEM)
+//	server.crt  — leaf cert with SAN serverHosts (PEM), signed by ca.crt
+//	server.key  — leaf private key (PEM)
+//	client.crt  — leaf cert for the generator (PEM), signed by ca.crt
+//	client.key  — leaf private key (PEM)
 //
 // serverHosts is the list of SAN entries baked into server.crt. For the
 // PipeBench network, "subject" is the only hostname that matters (the
@@ -49,13 +50,13 @@ func GenerateTLSCerts(outDir string, serverHosts []string) (string, error) {
 		return "", fmt.Errorf("generate ca key: %w", err)
 	}
 	caTpl := &x509.Certificate{
-		SerialNumber: bigSerial(),
-		Subject:      pkix.Name{CommonName: "PipeBench Bench CA"},
-		NotBefore:    time.Now().Add(-1 * time.Hour),
-		NotAfter:     time.Now().Add(24 * time.Hour),
-		IsCA:         true,
-		KeyUsage:     x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		SerialNumber:          bigSerial(),
+		Subject:               pkix.Name{CommonName: "PipeBench Bench CA"},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true,
 	}
 	caDER, err := x509.CreateCertificate(rand.Reader, caTpl, caTpl, &caKey.PublicKey, caKey)
@@ -121,7 +122,7 @@ func GenerateTLSCerts(outDir string, serverHosts []string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("sign client cert: %w", err)
 	}
-	if err := writePEMCert(filepath.Join(abs, "client.crt"), cliDER); err != nil {
+	if err := writePEMCertChain(filepath.Join(abs, "client.crt"), cliDER, caDER); err != nil {
 		return "", err
 	}
 	if err := writePEMKey(filepath.Join(abs, "client.key"), cliKey, 0o644); err != nil {
@@ -206,13 +207,39 @@ func loadCA(dir string) (*x509.Certificate, *ecdsa.PrivateKey, error) {
 	return cert, key, nil
 }
 
-func writePEMCert(path string, der []byte) error {
+func writePEMCert(path string, der []byte) (err error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		if closeErr := f.Close(); err == nil && closeErr != nil {
+			err = closeErr
+		}
+	}()
 	return pem.Encode(f, &pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+// writePEMCertChain writes one or more CERTIFICATE blocks to path in order
+// (leaf first, then issuing CA), producing a chain bundle. Used to embed the
+// CA into client.crt so the director can load the CA into tls.Config.RootCAs
+// from the same cert_name PEM it already reads for client-cert auth.
+func writePEMCertChain(path string, ders ...[]byte) (err error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := f.Close(); err == nil && closeErr != nil {
+			err = closeErr
+		}
+	}()
+	for _, der := range ders {
+		if err := pem.Encode(f, &pem.Block{Type: "CERTIFICATE", Bytes: der}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func writePEMKey(path string, key *ecdsa.PrivateKey, perm os.FileMode) error {
