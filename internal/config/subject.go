@@ -205,10 +205,18 @@ var Registry = map[string]Subject{
 		// endpoint support (awss3 listener `endpoint`/`use_path_style`,
 		// azblob target `connection_string`) — 2.0.3 is the first
 		// release that ships it; 2.0.2 starts but ingests nothing.
+		//
+		// s3_avro_sink / s3_parquet_sink gate the columnar S3 correctness
+		// cases. The awss3 target writes Avro (OCF) and Parquet via the
+		// shared filesystem-sender machinery (helper/sender/filesystem),
+		// so only vmetric declares these for now — other subjects' Avro/
+		// Parquet S3 support is unverified, so the `requires:` gate skips
+		// them rather than producing a false correctness result.
 		Capabilities: []string{
 			"tls_tcp",
 			"s3_sink", "s3_source", "azure_blob_sink", "azure_blob_source",
 			"sqs_sink", "sns_sink", "kinesis_sink", "cloudwatch_logs_sink",
+			"s3_avro_sink", "s3_parquet_sink",
 		},
 	},
 	"otel-collector": {

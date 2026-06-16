@@ -30,6 +30,12 @@ type Orchestrator interface {
 	// WaitForGeneratorExit blocks until the generator finishes or timeout expires.
 	WaitForGeneratorExit(timeout time.Duration) error
 
+	// WaitForVerifierExit blocks until the one-shot DuckDB verifier container
+	// exits or timeout expires. A non-zero exit (failed verdict) is not an
+	// error — only a timeout is. The runner reads the verdict from
+	// verdict.json regardless of exit code.
+	WaitForVerifierExit(timeout time.Duration) error
+
 	// StopCollector signals the collector to flush its CSV and exit.
 	StopCollector() error
 

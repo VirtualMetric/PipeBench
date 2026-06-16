@@ -75,6 +75,10 @@ jobs:
         if: github.event_name == 'pull_request'
         run: make build-collector
 
+      - name: Build verifier image
+        if: github.event_name == 'pull_request'
+        run: make build-verifier
+
       # Main branch: build + tag with both :latest and :sha-<commit>, then push.
       - name: Build & push generator image
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -87,6 +91,10 @@ jobs:
       - name: Build & push collector image
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: make push-collector ATTEST=1
+
+      - name: Build & push verifier image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: make push-verifier ATTEST=1
 
   emulator-smoke:
     name: Emulator Smoke (LocalStack + Azurite)

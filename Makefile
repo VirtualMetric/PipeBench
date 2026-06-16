@@ -1,5 +1,5 @@
-.PHONY: build build-containers build-generator build-receiver build-collector build-kdc \
-        push-containers push-generator push-receiver push-collector push-kdc \
+.PHONY: build build-containers build-generator build-receiver build-collector build-kdc build-verifier \
+        push-containers push-generator push-receiver push-collector push-kdc push-verifier \
         test-local list clean tidy fmt vet
 
 # Output binary
@@ -19,6 +19,7 @@ GENERATOR_IMAGE := vmetric/bench-generator:latest
 RECEIVER_IMAGE  := vmetric/bench-receiver:latest
 COLLECTOR_IMAGE := vmetric/bench-collector:latest
 KDC_IMAGE       := vmetric/bench-kdc:latest
+VERIFIER_IMAGE  := vmetric/bench-verifier:latest
 
 # Set ATTEST=1 to emit SBOM + max-mode provenance (used when publishing to Docker Hub).
 # Requires the docker-container buildx driver; the default docker driver on GitHub
@@ -94,7 +95,18 @@ build-kdc:
 		--load \
 		.
 
-build-containers: build-generator build-receiver build-collector build-kdc
+# The verifier bundles the DuckDB CLI (FROM the official duckdb image) + the
+# httpfs/avro extensions; only the columnar S3 correctness cases use it.
+build-verifier:
+	$(DOCKER_BUILD) \
+		-f containers/verifier/Dockerfile \
+		-t $(VERIFIER_IMAGE) \
+		--platform linux/amd64 \
+		--build-arg BUILDKIT_INLINE_CACHE=1 \
+		--load \
+		.
+
+build-containers: build-generator build-receiver build-collector build-kdc build-verifier
 
 # ── Publish to Docker Hub ─────────────────────────────────────────────────────
 #
@@ -146,7 +158,18 @@ push-kdc:
 		--push \
 		.
 
-push-containers: push-generator push-receiver push-collector push-kdc
+push-verifier:
+	$(DOCKER_BUILD) \
+		-f containers/verifier/Dockerfile \
+		-t $(VERIFIER_IMAGE) \
+		-t vmetric/bench-verifier:sha-$(COMMIT) \
+		--platform linux/amd64 \
+		$(ATTEST_FLAGS) \
+		--build-arg BUILDKIT_INLINE_CACHE=1 \
+		--push \
+		.
+
+push-containers: push-generator push-receiver push-collector push-kdc push-verifier
 
 # ── End-to-end test ───────────────────────────────────────────────────────────
 
@@ -172,6 +195,7 @@ tidy:
 	cd containers/generator && go mod tidy
 	cd containers/receiver  && go mod tidy
 	cd containers/collector && go mod tidy
+	cd containers/verifier  && go mod tidy
 
 fmt:
 	gofmt -w -s .

@@ -84,6 +84,70 @@ type TestCase struct {
 	Subjects       []string                 `yaml:"subjects"`
 	Configurations map[string]Configuration `yaml:"configurations"`
 	Correctness    CorrectnessConfig        `yaml:"correctness"`
+
+	// Verifier, when set, replaces the receiver with a one-shot DuckDB
+	// verifier container that reads the subject's Avro/Parquet objects
+	// directly from the S3 emulator (httpfs) and emits a correctness verdict.
+	// Used by the tcp_to_s3_{avro,parquet}_correctness cases — the receiver
+	// can't decode columnar objects, and the s3 receiver's destructive drain
+	// would corrupt the read. See VerifierConfig.
+	Verifier *VerifierConfig `yaml:"verifier"`
+}
+
+// VerifierConfig configures the post-drain DuckDB verifier container (see
+// TestCase.Verifier). The verifier owns drain detection (it polls the bucket
+// until the row count settles), then asserts exact row count, no duplicates,
+// and no NULL payload fields over the columnar data.
+type VerifierConfig struct {
+	// S3Bucket is the bucket the subject wrote to (required). S3Prefix is an
+	// optional key prefix to scope the scan to.
+	S3Bucket string `yaml:"s3_bucket"`
+	S3Prefix string `yaml:"s3_prefix"`
+
+	// Format is the object format to read: "avro" | "parquet" (required).
+	Format string `yaml:"format"`
+
+	// MsgField is the column whose value is unique per source record, used for
+	// the duplicate check (defaults to "msg" — the generator's json payload).
+	// NullFields are columns that must be non-NULL on every row (defaults to
+	// MsgField).
+	MsgField   string   `yaml:"msg_field"`
+	NullFields []string `yaml:"null_fields"`
+
+	// AllowOverDelivery tolerates duplicate rows (at-least-once delivery);
+	// loss is still a failure.
+	AllowOverDelivery bool `yaml:"allow_overdelivery"`
+
+	// QuietWindow is how long the bucket row count must hold steady before the
+	// verifier treats the run as drained (default 15s). Timeout bounds the
+	// whole verify (default 5m).
+	QuietWindow string `yaml:"quiet_window"`
+	Timeout     string `yaml:"timeout"`
+}
+
+// QuietWindowOrDefault returns the configured quiet window or 15s.
+func (v *VerifierConfig) QuietWindowOrDefault() string {
+	if v != nil && v.QuietWindow != "" {
+		return v.QuietWindow
+	}
+	return "15s"
+}
+
+// TimeoutOrDefault returns the configured verifier timeout or 5m.
+func (v *VerifierConfig) TimeoutOrDefault() string {
+	if v != nil && v.Timeout != "" {
+		return v.Timeout
+	}
+	return "5m"
+}
+
+// TimeoutDuration parses TimeoutOrDefault, falling back to 5m on a parse error.
+func (v *VerifierConfig) TimeoutDuration() time.Duration {
+	d, err := time.ParseDuration(v.TimeoutOrDefault())
+	if err != nil {
+		return 5 * time.Minute
+	}
+	return d
 }
 
 // KafkaConfig configures the in-topology Redpanda broker (see TestCase.Kafka).
@@ -414,6 +478,10 @@ func (tc *TestCase) UsesKafka() bool { return tc.Kafka != nil }
 // UsesVault reports whether the case adds a Vault dev server to the topology.
 func (tc *TestCase) UsesVault() bool { return tc.Vault != nil }
 
+// UsesVerifier reports whether the case drives correctness through the one-shot
+// DuckDB verifier container instead of a receiver.
+func (tc *TestCase) UsesVerifier() bool { return tc.Verifier != nil }
+
 // IsPerformanceType reports whether the case is scored as a throughput test —
 // the plain `performance` type or the Kafka variant `kafka_performance`.
 func (tc *TestCase) IsPerformanceType() bool {
@@ -532,6 +600,33 @@ func (tc *TestCase) Validate() error {
 	}
 	if err := tc.validateCloud(); err != nil {
 		return err
+	}
+	if err := tc.validateVerifier(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateVerifier checks the optional `verifier:` block: it needs a bucket, a
+// known columnar format, and an S3 emulator (aws: or minio:) to read from.
+func (tc *TestCase) validateVerifier() error {
+	if tc.Verifier == nil {
+		return nil
+	}
+	if tc.Verifier.S3Bucket == "" {
+		return fmt.Errorf("case %q: verifier requires `s3_bucket`", tc.Name)
+	}
+	if tc.Verifier.Format != "avro" && tc.Verifier.Format != "parquet" {
+		return fmt.Errorf("case %q: verifier.format must be \"avro\" or \"parquet\", got %q", tc.Name, tc.Verifier.Format)
+	}
+	if !tc.UsesAWS() && !tc.UsesMinio() {
+		return fmt.Errorf("case %q: verifier requires an `aws:` or `minio:` block for S3 access", tc.Name)
+	}
+	if _, err := time.ParseDuration(tc.Verifier.QuietWindowOrDefault()); err != nil {
+		return fmt.Errorf("case %q: verifier.quiet_window %q is not a valid duration: %w", tc.Name, tc.Verifier.QuietWindow, err)
+	}
+	if _, err := time.ParseDuration(tc.Verifier.TimeoutOrDefault()); err != nil {
+		return fmt.Errorf("case %q: verifier.timeout %q is not a valid duration: %w", tc.Name, tc.Verifier.Timeout, err)
 	}
 	return nil
 }
