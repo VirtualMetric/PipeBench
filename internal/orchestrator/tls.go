@@ -121,7 +121,7 @@ func GenerateTLSCerts(outDir string, serverHosts []string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("sign client cert: %w", err)
 	}
-	if err := writePEMCert(filepath.Join(abs, "client.crt"), cliDER); err != nil {
+	if err := writePEMCertChain(filepath.Join(abs, "client.crt"), cliDER, caDER); err != nil {
 		return "", err
 	}
 	if err := writePEMKey(filepath.Join(abs, "client.key"), cliKey, 0o644); err != nil {
@@ -213,6 +213,24 @@ func writePEMCert(path string, der []byte) error {
 	}
 	defer f.Close()
 	return pem.Encode(f, &pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+// writePEMCertChain writes one or more CERTIFICATE blocks to path in order
+// (leaf first, then issuing CA), producing a chain bundle. Used to embed the
+// CA into client.crt so the director can load the CA into tls.Config.RootCAs
+// from the same cert_name PEM it already reads for client-cert auth.
+func writePEMCertChain(path string, ders ...[]byte) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	for _, der := range ders {
+		if err := pem.Encode(f, &pem.Block{Type: "CERTIFICATE", Bytes: der}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func writePEMKey(path string, key *ecdsa.PrivateKey, perm os.FileMode) error {
