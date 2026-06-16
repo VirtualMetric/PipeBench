@@ -623,6 +623,14 @@ func (tc *TestCase) validateVerifier() error {
 	if tc.Generator.TotalLines <= 0 {
 		return fmt.Errorf("case %q: verifier requires `generator.total_lines` > 0 for exact-count assertions", tc.Name)
 	}
+	// The verifier replaces the receiver entirely (the subject's sink is S3), and
+	// the orchestrator renders no receiver for verifier cases. A `receiver:` /
+	// `receivers:` block would render phantom services the orchestrator's
+	// computed metadata omits, so reject the combination up front. (Mode/Listen
+	// mirror the singular-receiver detection used in Validate().)
+	if tc.MultiReceiver() || tc.Receiver.Mode != "" || tc.Receiver.Listen != "" {
+		return fmt.Errorf("case %q: verifier replaces the receiver — remove the `receiver:`/`receivers:` block (the subject's sink is S3)", tc.Name)
+	}
 	if tc.Verifier.S3Bucket == "" {
 		return fmt.Errorf("case %q: verifier requires `s3_bucket`", tc.Name)
 	}

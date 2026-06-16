@@ -55,6 +55,16 @@ func TestValidateVerifier(t *testing.T) {
 			wantErr: "aws",
 		},
 		{
+			name:    "plural receivers rejected",
+			mutate:  func(tc *TestCase) { tc.Receivers = []ReceiverConfig{{ID: "r1", Mode: "tcp", Listen: ":9001"}} },
+			wantErr: "receiver",
+		},
+		{
+			name:    "singular receiver rejected",
+			mutate:  func(tc *TestCase) { tc.Receiver = ReceiverConfig{Mode: "tcp", Listen: ":9001"} },
+			wantErr: "receiver",
+		},
+		{
 			name:    "bad quiet_window",
 			mutate:  func(tc *TestCase) { tc.Verifier.QuietWindow = "soon" },
 			wantErr: "quiet_window",
