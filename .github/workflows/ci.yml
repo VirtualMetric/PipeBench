@@ -32,6 +32,9 @@ jobs:
       - name: Receiver module tests
         run: cd containers/receiver && go test ./...
 
+      - name: Verifier module tests
+        run: cd containers/verifier && go test ./...
+
       - name: Build generator module
         run: cd containers/generator && go build ./...
 
@@ -40,6 +43,9 @@ jobs:
 
       - name: Build collector module
         run: cd containers/collector && go build ./...
+
+      - name: Build verifier module
+        run: cd containers/verifier && go build ./...
 
   containers:
     name: Build & Publish Container Images

@@ -927,6 +927,12 @@ func (r *ComposeRunner) populateServiceNames() {
 	// else: no generator configured — leave the lists empty so nothing waits
 	// on or queries a generator container that the compose never renders.
 	r.recvHostPorts = map[string]int{}
+	// Verifier cases render no receiver service (the subject's sink is S3), so
+	// leave the receiver metadata empty rather than advertising a receiver that
+	// doesn't exist — ReceiverMetricsPort(s) must not point at a phantom port.
+	if tc.UsesVerifier() {
+		return
+	}
 	if tc.MultiReceiver() {
 		for i, rc := range tc.Receivers {
 			r.recvServices = append(r.recvServices, "receiver-"+rc.ID)

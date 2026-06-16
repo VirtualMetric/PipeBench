@@ -613,6 +613,16 @@ func (tc *TestCase) validateVerifier() error {
 	if tc.Verifier == nil {
 		return nil
 	}
+	// The verifier's exact-count assertion derives EXPECTED_LINES from the
+	// singular generator's total_lines (see orchestrator). A plural generators:
+	// list or an unset/zero total_lines would silently disable exact-count
+	// verification, so require a deterministic source.
+	if tc.MultiGenerator() {
+		return fmt.Errorf("case %q: verifier requires a singular `generator:`; `generators:` is not supported", tc.Name)
+	}
+	if tc.Generator.TotalLines <= 0 {
+		return fmt.Errorf("case %q: verifier requires `generator.total_lines` > 0 for exact-count assertions", tc.Name)
+	}
 	if tc.Verifier.S3Bucket == "" {
 		return fmt.Errorf("case %q: verifier requires `s3_bucket`", tc.Name)
 	}

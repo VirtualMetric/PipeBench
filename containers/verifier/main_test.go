@@ -33,11 +33,22 @@ func TestBuildVerdict(t *testing.T) {
 			wantErrSub:     "duplicate",
 		},
 		{
+			// Expected is the SOURCE count; total exceeds it from at-least-once
+			// duplication. Under AllowOverDel the count check asserts on distinct
+			// (== source), so this passes despite total > Expected.
 			name:           "duplicates tolerated under overdelivery",
 			st:             stats{total: 100010, distinct: 100000, nulls: 0},
-			cfg:            config{Expected: 100010, MsgField: "msg", NullFields: []string{"msg"}, AllowOverDel: true},
+			cfg:            config{Expected: 100000, MsgField: "msg", NullFields: []string{"msg"}, AllowOverDel: true},
 			wantPassed:     true,
 			wantDuplicates: 10,
+		},
+		{
+			// Overdelivery tolerates duplicates but NOT loss of unique rows.
+			name:       "overdelivery still fails on unique-row loss",
+			st:         stats{total: 99990, distinct: 99990, nulls: 0},
+			cfg:        config{Expected: 100000, MsgField: "msg", NullFields: []string{"msg"}, AllowOverDel: true},
+			wantPassed: false,
+			wantErrSub: "unique row count mismatch",
 		},
 		{
 			name:       "loss fail",

@@ -140,12 +140,25 @@ func buildVerdict(st stats, cfg config) verdict {
 		Duplicates:    duplicates,
 		Passed:        true,
 	}
-	if cfg.Expected > 0 && st.total != cfg.Expected {
-		loss := 100.0 * (1.0 - float64(st.total)/float64(cfg.Expected))
-		v.Errors = append(v.Errors, fmt.Sprintf(
-			"row count mismatch: expected %d, got %d (loss: %.2f%%)",
-			cfg.Expected, st.total, loss))
-		v.Passed = false
+	// Count check. Under allow-overdelivery (at-least-once) the invariant is
+	// "no loss of UNIQUE rows" — total may legitimately exceed Expected from
+	// duplicates — so assert on distinct. Otherwise require an exact total.
+	if cfg.Expected > 0 {
+		if cfg.AllowOverDel {
+			if st.distinct != cfg.Expected {
+				loss := 100.0 * (1.0 - float64(st.distinct)/float64(cfg.Expected))
+				v.Errors = append(v.Errors, fmt.Sprintf(
+					"unique row count mismatch: expected %d, got %d (loss: %.2f%%)",
+					cfg.Expected, st.distinct, loss))
+				v.Passed = false
+			}
+		} else if st.total != cfg.Expected {
+			loss := 100.0 * (1.0 - float64(st.total)/float64(cfg.Expected))
+			v.Errors = append(v.Errors, fmt.Sprintf(
+				"row count mismatch: expected %d, got %d (loss: %.2f%%)",
+				cfg.Expected, st.total, loss))
+			v.Passed = false
+		}
 	}
 	if duplicates > 0 && !cfg.AllowOverDel {
 		v.Errors = append(v.Errors, fmt.Sprintf("%d duplicate rows detected", duplicates))

@@ -727,7 +727,12 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		} else {
 			result.FailReason = strings.Join(failReasons, "; ")
 		}
-	} else if tc.IsCorrectnessType() {
+	} else if tc.IsCorrectnessType() && !tc.UsesVerifier() {
+		// Verifier cases are excluded: the DuckDB verifier is the correctness
+		// oracle and already encoded the verdict (loss, duplicates, NULLs, and
+		// its own over-delivery policy) into recvMetrics.Passed/.Errors above.
+		// Re-deriving pass/fail from line-count loss + a strict over-delivery
+		// cap here would wrongly flip a valid allow_overdelivery verifier pass.
 		lossOK := lossPct <= tc.Correctness.ExpectedLossPct
 		// Kafka consumption is at-least-once: the consumer may re-deliver a
 		// fetch batch on its initial group join / rebalance, so allow bounded
@@ -2379,7 +2384,11 @@ func (r *Runner) runVerifier(orch orchestrator.Orchestrator, tc *config.TestCase
 	// Give the verifier its own timeout plus a small buffer, capped by the run
 	// deadline so a hung verifier can't overrun Options.Timeout.
 	wait := tc.Verifier.TimeoutDuration() + 30*time.Second
-	if rem := time.Until(runDeadline); rem > 0 && rem < wait {
+	rem := time.Until(runDeadline)
+	if rem <= 0 {
+		return ReceiverMetrics{}, fmt.Errorf("run deadline (Options.Timeout) reached before the verifier could start")
+	}
+	if rem < wait {
 		wait = rem
 	}
 	if err := orch.WaitForVerifierExit(wait); err != nil {
