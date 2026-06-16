@@ -36,7 +36,7 @@ func TestSingularComposeRendersClean(t *testing.T) {
 	subj := config.Subject{
 		Name:       "vmetric",
 		Image:      "vmetric/director",
-		Version:    "2.0.2",
+		Version:    "2.0.3",
 		ConfigPath: "/config.yml",
 	}
 	tmp, err := os.MkdirTemp("", "compose-test-")
@@ -106,7 +106,7 @@ func TestPluralComposeRenders(t *testing.T) {
 	subj := config.Subject{
 		Name:       "vmetric",
 		Image:      "vmetric/director",
-		Version:    "2.0.2",
+		Version:    "2.0.3",
 		ConfigPath: "/config.yml",
 	}
 	tmp, err := os.MkdirTemp("", "compose-plural-test-")
@@ -181,7 +181,7 @@ func TestSingularComposeRendersSampleFile(t *testing.T) {
 		},
 		Receiver: config.ReceiverConfig{Mode: "tcp", Listen: ":9001"},
 	}
-	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.2", ConfigPath: "/config.yml"}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.3", ConfigPath: "/config.yml"}
 	tmp, err := os.MkdirTemp("", "compose-sample-")
 	if err != nil {
 		t.Fatal(err)
@@ -229,7 +229,7 @@ func TestPluralComposeRendersSampleFile(t *testing.T) {
 	if err := tc.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
-	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.2", ConfigPath: "/config.yml"}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.3", ConfigPath: "/config.yml"}
 	tmp, err := os.MkdirTemp("", "compose-plural-sample-")
 	if err != nil {
 		t.Fatal(err)
@@ -300,7 +300,7 @@ func TestComposeRendersEndpoints(t *testing.T) {
 	if err := tc.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
-	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.2", ConfigPath: "/config.yml"}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.3", ConfigPath: "/config.yml"}
 	tmp, err := os.MkdirTemp("", "compose-endpoint-")
 	if err != nil {
 		t.Fatal(err)
@@ -370,7 +370,7 @@ func TestComposeOmitsGeneratorWhenNone(t *testing.T) {
 	if tc.HasGenerator() {
 		t.Fatal("HasGenerator() should be false with no generator config")
 	}
-	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.2", ConfigPath: "/config.yml"}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.3", ConfigPath: "/config.yml"}
 	tmp, err := os.MkdirTemp("", "compose-nogen-")
 	if err != nil {
 		t.Fatal(err)
@@ -420,7 +420,7 @@ func TestEndpointCommandDollarEscaping(t *testing.T) {
 	if err := tc.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
-	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.2", ConfigPath: "/config.yml"}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.3", ConfigPath: "/config.yml"}
 	tmp, err := os.MkdirTemp("", "compose-esc-")
 	if err != nil {
 		t.Fatal(err)
@@ -463,7 +463,7 @@ func TestComposeRendersKafka(t *testing.T) {
 	if err := tc.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
-	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.2", ConfigPath: "/config.yml"}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.3", ConfigPath: "/config.yml"}
 	tmp, err := os.MkdirTemp("", "compose-kafka-")
 	if err != nil {
 		t.Fatal(err)
@@ -513,7 +513,7 @@ func TestComposeOmitsKafkaByDefault(t *testing.T) {
 		Generator: config.GeneratorConfig{Mode: "tcp", Target: "subject:9000", Rate: 10, LineSize: 64, Format: "raw"},
 		Receiver:  config.ReceiverConfig{Mode: "tcp", Listen: ":9001"},
 	}
-	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.2", ConfigPath: "/config.yml"}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.3", ConfigPath: "/config.yml"}
 	tmp, err := os.MkdirTemp("", "compose-nokafka-")
 	if err != nil {
 		t.Fatal(err)
@@ -586,7 +586,7 @@ func TestComposeRendersAWS(t *testing.T) {
 	if err := tc.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
-	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.2", ConfigPath: "/config.yml"}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.3", ConfigPath: "/config.yml"}
 	tmp, err := os.MkdirTemp("", "compose-aws-")
 	if err != nil {
 		t.Fatal(err)
@@ -652,7 +652,7 @@ func TestComposeRendersAzure(t *testing.T) {
 	if err := tc.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
-	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.2", ConfigPath: "/config.yml"}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.3", ConfigPath: "/config.yml"}
 	tmp, err := os.MkdirTemp("", "compose-azure-")
 	if err != nil {
 		t.Fatal(err)
@@ -701,7 +701,7 @@ func TestComposeOmitsCloudByDefault(t *testing.T) {
 		Generator: config.GeneratorConfig{Mode: "tcp", Target: "subject:9000", Rate: 10, LineSize: 64, Format: "raw"},
 		Receiver:  config.ReceiverConfig{Mode: "tcp", Listen: ":9001"},
 	}
-	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.2", ConfigPath: "/config.yml"}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.3", ConfigPath: "/config.yml"}
 	tmp, err := os.MkdirTemp("", "compose-nocloud-")
 	if err != nil {
 		t.Fatal(err)
