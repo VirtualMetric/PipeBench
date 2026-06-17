@@ -178,6 +178,76 @@ func RotateServerCert(outDir string, serverHosts []string) error {
 	return writePEMKey(filepath.Join(abs, "server.key"), srvKey, 0o644)
 }
 
+// RotateServerCertWrongCA re-signs the server leaf under a BRAND-NEW, UNTRUSTED
+// CA (generated here and thrown away — never written to ca.crt or the client
+// bundle), keeping the same SAN set, and overwrites server.crt / server.key in
+// place. The trusted CA files (ca.crt, the CA bundled in client.crt) are left
+// untouched, so a client that genuinely validates the broker's certificate
+// against its RootCAs MUST reject the new leaf with "certificate signed by
+// unknown authority". This is the negative half of the cert-rotation case: it
+// proves the subject actually verifies the broker cert — a subject that skipped
+// verification (e.g. insecure_skip_verify) would accept this leaf and keep
+// delivering, which is exactly the silent regression we want to catch.
+func RotateServerCertWrongCA(outDir string, serverHosts []string) error {
+	abs, err := filepath.Abs(outDir)
+	if err != nil {
+		return err
+	}
+
+	// Fresh, untrusted CA — deliberately NOT persisted, so nothing in the
+	// topology trusts it.
+	badCAKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return fmt.Errorf("generate untrusted ca key: %w", err)
+	}
+	badCATpl := &x509.Certificate{
+		SerialNumber:          bigSerial(),
+		Subject:               pkix.Name{CommonName: "PipeBench UNTRUSTED CA"},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+	}
+	badCADER, err := x509.CreateCertificate(rand.Reader, badCATpl, badCATpl, &badCAKey.PublicKey, badCAKey)
+	if err != nil {
+		return fmt.Errorf("sign untrusted ca: %w", err)
+	}
+	badCACert, err := x509.ParseCertificate(badCADER)
+	if err != nil {
+		return fmt.Errorf("parse untrusted ca: %w", err)
+	}
+
+	if len(serverHosts) == 0 {
+		serverHosts = []string{"subject"}
+	}
+	serverDNS, serverIP := splitHosts(serverHosts)
+	srvKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return fmt.Errorf("generate server key: %w", err)
+	}
+	srvTpl := &x509.Certificate{
+		SerialNumber: bigSerial(),
+		Subject:      pkix.Name{CommonName: serverHosts[0]},
+		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     serverDNS,
+		IPAddresses:  serverIP,
+	}
+	// Signed by the UNTRUSTED CA, not the real one — this is the whole point.
+	srvDER, err := x509.CreateCertificate(rand.Reader, srvTpl, badCACert, &srvKey.PublicKey, badCAKey)
+	if err != nil {
+		return fmt.Errorf("sign server cert under untrusted ca: %w", err)
+	}
+	if err := writePEMCert(filepath.Join(abs, "server.crt"), srvDER); err != nil {
+		return err
+	}
+	return writePEMKey(filepath.Join(abs, "server.key"), srvKey, 0o644)
+}
+
 // loadCA reads and parses the CA cert + key written by GenerateTLSCerts.
 func loadCA(dir string) (*x509.Certificate, *ecdsa.PrivateKey, error) {
 	certPEM, err := os.ReadFile(filepath.Join(dir, "ca.crt"))
