@@ -93,7 +93,11 @@ services:
       - "{{ .KrbHostDir }}:/krb5:ro"
 {{- end }}
 {{- if .VaultEnabled }}
+{{- if .SubjectVaultDir }}
+      - "{{ .VaultTLSHost }}:{{ .SubjectVaultDir }}:ro"
+{{- else }}
       - "{{ .VaultTLSHost }}:/vault-tls:ro"
+{{- end }}
 {{- end }}
 {{- if .SubjectUser }}
     user: "{{ .SubjectUser }}"
@@ -1261,6 +1265,7 @@ type composeVars struct {
 	SubjectEntrypoint string
 	SubjectUser       string
 	SubjectCertDir    string
+	SubjectVaultDir   string
 	SubjectEnv        map[string]string
 	HasResourceLimits bool
 	CPULimit          string
@@ -1561,6 +1566,7 @@ func writeCompose(path string, cfg RunConfig) error {
 		SubjectEntrypoint: formatYAMLList(s.Entrypoint),
 		SubjectUser:       s.User,
 		SubjectCertDir:    s.CertDir,
+		SubjectVaultDir:   s.VaultDir,
 		SubjectEnv:        env,
 		HasResourceLimits: cfg.CPULimit != "" || cfg.MemLimit != "",
 		CPULimit:          defaultStr(cfg.CPULimit, "1"),

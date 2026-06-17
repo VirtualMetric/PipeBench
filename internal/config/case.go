@@ -929,6 +929,19 @@ type CorrectnessConfig struct {
 	// it — at-least-once types deliberately tolerate duplicates.
 	MaxOverDeliveryPct float64 `yaml:"max_overdelivery_pct"`
 
+	// ExpectFailure inverts the verdict for NEGATIVE (security) tests: the case
+	// PASSES iff the data path was BLOCKED — the receiver observed at most
+	// ExpectFailureMaxReceived lines (default 0) — and FAILS if records got
+	// through. Use to prove a control is load-bearing: e.g. a client presenting
+	// the WRONG basic-auth password against a Vault-sourced HTTP device must be
+	// 401'd so nothing is forwarded; if records arrive, auth was bypassed (a
+	// regression a normal no-loss test would never catch). Requires a generator.
+	ExpectFailure bool `yaml:"expect_failure"`
+	// ExpectFailureMaxReceived is the inclusive upper bound on received lines
+	// for an ExpectFailure case to still pass (default 0 = nothing may get
+	// through). A small non-zero value tolerates a tiny in-flight leak.
+	ExpectFailureMaxReceived int64 `yaml:"expect_failure_max_received"`
+
 	// RateCeiling validates a per-window EPS ceiling on the receive side.
 	// Empty MaxEPS = check disabled.
 	RateCeiling RateCeilingConfig `yaml:"rate_ceiling"`

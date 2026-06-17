@@ -367,7 +367,16 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 
 		fmt.Printf("  waiting for generator (up to %s)…\n", genTimeout)
 		if err := orch.WaitForGeneratorExit(genTimeout); err != nil {
-			return results.RunResult{}, fmt.Errorf("waiting for generator: %w", err)
+			if tc.Correctness.ExpectFailure {
+				// A negative test EXPECTS the data path to fail — e.g. the
+				// generator gets 401s because auth correctly rejects a wrong
+				// credential — so a non-zero generator exit is not fatal here.
+				// Proceed to the expect_failure verdict, which asserts that
+				// (almost) nothing was delivered to the receiver.
+				fmt.Printf("  (generator exited non-zero — expected for expect_failure: %v)\n", err)
+			} else {
+				return results.RunResult{}, fmt.Errorf("waiting for generator: %w", err)
+			}
 		}
 	} else {
 		// No generator: the subject drives data on its own (e.g. an agentless
@@ -700,7 +709,25 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	// validate_dedup runs with zero received lines reported PASSED: the
 	// dedup check trivially passes over an empty set, so the receiver set
 	// Passed=true and the loss check below was skipped entirely.
-	if tc.IsCorrectnessType() && !tc.HasGenerator() {
+	if tc.IsCorrectnessType() && tc.Correctness.ExpectFailure {
+		// NEGATIVE test: the data path is supposed to be blocked (e.g. a client
+		// with the wrong basic-auth password must be 401'd by a Vault-sourced
+		// HTTP device). Pass iff the receiver saw at most the allowed number of
+		// lines; if records got through, the control under test was bypassed.
+		cap := tc.Correctness.ExpectFailureMaxReceived
+		blocked := recvMetrics.LinesReceived <= cap
+		result.Passed = &blocked
+		if blocked {
+			result.FailReason = ""
+			fmt.Printf("  expect_failure: data path blocked as required — receiver saw %s line(s) (<= %s) ✓\n",
+				formatCount(recvMetrics.LinesReceived), formatCount(cap))
+		} else {
+			result.FailReason = fmt.Sprintf(
+				"expect_failure: data path was NOT blocked — receiver observed %s line(s) (> %s); "+
+					"the control under test (e.g. auth) appears bypassed",
+				formatCount(recvMetrics.LinesReceived), formatCount(cap))
+		}
+	} else if tc.IsCorrectnessType() && !tc.HasGenerator() {
 		// No generator: there's no expected line count to derive loss or
 		// over-delivery from, so those guards don't apply. Success = the subject
 		// delivered at least MinReceived records to the receiver (default 1) and

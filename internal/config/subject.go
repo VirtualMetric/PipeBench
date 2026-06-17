@@ -27,6 +27,14 @@ type Subject struct {
 	// reference certs/client.crt. Empty = mount only at /certs.
 	CertDir string
 
+	// VaultDir, when set, is the in-container path the harness mounts the
+	// Vault-generated CA dir at FOR THE SUBJECT (vault cases). Same rationale as
+	// CertDir: the director resolves ca_name under its root (/opt/vmetric) and
+	// refuses paths outside it, so the CA must be mounted under that root — the
+	// old fixed /vault-tls mount (outside the root) is unreadable. Empty = mount
+	// at /vault-tls (subjects whose root is "/").
+	VaultDir string
+
 	// Capabilities is a free-form set of feature tags the subject is known
 	// to support end-to-end through PipeBench (e.g. "tls_tcp", "tls_syslog").
 	// The harness consults these when a case opts into a transport that
@@ -195,6 +203,9 @@ var Registry = map[string]Subject{
 		// (/opt/vmetric) and rejects paths outside it, so mount the harness
 		// certs there too; device configs reference /opt/vmetric/certs/*.
 		CertDir: "/opt/vmetric/certs",
+		// Same reasoning for the Vault CA: mount it under the director root so
+		// ca_name can reference it (device configs use /opt/vmetric/vault-tls/*).
+		VaultDir: "/opt/vmetric/vault-tls",
 		// 2.0.3 moved the binary from /director to /opt/vmetric/director
 		// (workdir /opt/vmetric) — keep the config path absolute so the
 		// new workdir can't reroute it.
