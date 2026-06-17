@@ -1542,7 +1542,12 @@ func writeCompose(path string, cfg RunConfig) error {
 		configDst = "/usr/share/logstash/config"
 	}
 
-	sequenced := boolStr(tc.Correctness.ValidateDedup || tc.Correctness.ValidateContent)
+	// Verifier-based correctness cases (e.g. S3 Avro/Parquet) assert a unique
+	// msg per source record. The generator's default json path reuses one
+	// pre-generated templateLine for every record, which that assertion can
+	// never satisfy — so enable sequenced (unique-per-record) generation for
+	// verifier cases too, the same way receiver dedup/content checks do.
+	sequenced := boolStr(tc.Correctness.ValidateDedup || tc.Correctness.ValidateContent || tc.UsesVerifier())
 	tlsCertsHost := filepath.ToSlash(cfg.TLSCertsHost)
 
 	vars := composeVars{
