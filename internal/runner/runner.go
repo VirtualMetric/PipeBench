@@ -1783,11 +1783,21 @@ func (r *Runner) runKafkaInflightCrash(tc *config.TestCase, subject config.Subje
 	})
 }
 
-// runKafkaCertRotation verifies a subject survives an in-flight broker TLS
-// certificate rotation with no loss. The broker runs mTLS; mid-delivery the
-// server leaf is re-signed under the SAME CA and the broker is bounced, forcing
-// the consumer to reconnect over TLS against the new cert. Verdict: no loss;
-// over-delivery across the reconnect is reported, not failed.
+// runKafkaCertRotation verifies the subject's broker-cert handling over mTLS in
+// TWO halves, so the run fails if EITHER property breaks:
+//
+//  1. VALIDATION (negative half): mid-delivery the broker leaf is re-signed
+//     under a brand-new UNTRUSTED CA and the broker is bounced. A subject that
+//     actually verifies the broker cert MUST reject it — we assert a TLS
+//     verify error (x509: certificate signed by unknown authority) appears in
+//     the subject's log. A subject that skipped verification would accept the
+//     bad leaf and keep delivering (no error), which fails the run loudly.
+//  2. RECOVERY (positive half): the broker leaf is then re-signed under the
+//     ORIGINAL trusted CA and bounced again; the consumer must reconnect over
+//     TLS and the run must finish with no loss (the shared driver's verdict).
+//
+// This replaces the old single same-CA rotation, which only proved reconnect
+// and would have passed even with broker-cert validation disabled.
 func (r *Runner) runKafkaCertRotation(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
 	// certsDir is set by prepare and read by action; both close over it here,
 	// and prepare runs before action, so the capture is well-ordered.
@@ -1795,14 +1805,14 @@ func (r *Runner) runKafkaCertRotation(tc *config.TestCase, subject config.Subjec
 	hosts := []string{"subject", "localhost", "redpanda"}
 	return r.runKafkaMidDeliveryAction(tc, subject, midDeliveryFlow{
 		verdictLabel:  "kafka cert rotation correctness",
-		actionLog:     "rotating broker cert (same CA) + bouncing broker",
-		overDelivNote: "expected across a broker reconnect",
+		actionLog:     "rotating broker cert to an UNTRUSTED CA (must be rejected), then back to a trusted cert",
+		overDelivNote: "expected across the broker reconnects",
 		totalLinesErr: "kafka_cert_rotation_correctness requires generator.total_lines > 0",
 		extraCleanup:  []string{"bench-redpanda", "bench-redpanda-init"},
 		prepare: func(tmpDir string, rc *orchestrator.RunConfig) error {
 			// mTLS broker: generate the CA + server/client leaves the broker and
 			// clients mount at /certs. certsDir is kept so the server leaf can be
-			// re-signed (same CA) mid-run.
+			// re-signed mid-run (under a wrong CA, then the real CA).
 			certsDir = filepath.Join(tmpDir, "certs")
 			if _, err := orchestrator.GenerateTLSCerts(certsDir, hosts); err != nil {
 				return fmt.Errorf("generating TLS certs: %w", err)
@@ -1811,17 +1821,71 @@ func (r *Runner) runKafkaCertRotation(tc *config.TestCase, subject config.Subjec
 			return nil
 		},
 		action: func(orch orchestrator.Orchestrator) error {
+			subj := orch.SubjectContainer()
+
+			// ---- Phase 1: UNTRUSTED rotation — the subject MUST reject it. ----
+			_, before := subjectLogStats(subj)
+			if err := rotateAndReload(orch, "redpanda", func() error {
+				return orchestrator.RotateServerCertWrongCA(certsDir, hosts)
+			}); err != nil {
+				return err
+			}
+			// Give the broker time to come back and the consumer time to
+			// bounce-detect and retry against the untrusted leaf (each attempt
+			// should fail certificate verification).
+			time.Sleep(25 * time.Second)
+
+			lines, after := subjectLogStats(subj)
+			if lines == 0 {
+				return fmt.Errorf("subject produced no console logs, cannot verify cert rejection — " +
+					"the cert-rotation case config must set debug.console.status: true")
+			}
+			if after <= before {
+				return fmt.Errorf("SECURITY: subject did NOT reject the untrusted broker cert "+
+					"(no new TLS verify error after wrong-CA rotation; before=%d after=%d) — "+
+					"broker-cert validation appears disabled", before, after)
+			}
+			fmt.Printf("  untrusted broker cert REJECTED by subject (%d new TLS verify error(s)) ✓\n", after-before)
+
+			// ---- Phase 2: TRUSTED rotation — recovery (no-loss verdict follows). ----
 			if err := rotateAndReload(orch, "redpanda", func() error {
 				return orchestrator.RotateServerCert(certsDir, hosts)
 			}); err != nil {
 				return err
 			}
-			// Let the broker come back and the consumer re-establish TLS before
-			// asserting delivery resumes.
 			time.Sleep(5 * time.Second)
+			fmt.Println("  broker cert restored under the trusted CA — expecting delivery to resume")
 			return nil
 		},
 	})
+}
+
+// subjectLogStats returns (total non-empty log lines, cert-verification-error
+// lines) from the subject container's console log. The cert-error count is the
+// signature of a consumer rejecting an untrusted broker leaf; the total-line
+// count lets the caller distinguish "no rejection" from "subject isn't logging
+// to console at all" (debug.console.status off).
+func subjectLogStats(container string) (int, int) {
+	if container == "" {
+		return 0, 0
+	}
+	out, _ := exec.Command("docker", "logs", container).CombinedOutput()
+	total, certErrs := 0, 0
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		total++
+		l := strings.ToLower(line)
+		if strings.Contains(l, "x509") ||
+			strings.Contains(l, "unknown authority") ||
+			strings.Contains(l, "failed to verify") ||
+			strings.Contains(l, "bad certificate") ||
+			strings.Contains(l, "certificate is not trusted") {
+			certErrs++
+		}
+	}
+	return total, certErrs
 }
 
 // runKafkaOffsetCommitRestart verifies that delivery-bound source
