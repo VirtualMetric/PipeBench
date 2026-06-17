@@ -997,7 +997,14 @@ func sendLinesConn(cfg config, connID int, clock *sendClock, write func([]byte) 
 			// Replay the sample, cycling through its lines.
 			line = sampleLine(sampleLines[int(linesSent%int64(len(sampleLines)))], cfg.RewriteTimestamp)
 		case cfg.Sequenced:
-			line = writeSequencedPrefix(seqBuf, connID, linesSent)
+			// json must stay well-formed, so embed the unique CONN/SEQ token
+			// inside the msg field rather than as a bare line prefix. Other
+			// formats use the in-place prefix-rewrite fast path.
+			if cfg.Format == "json" {
+				line = generateSequencedJSONLine(connID, linesSent, cfg.LineSize)
+			} else {
+				line = writeSequencedPrefix(seqBuf, connID, linesSent)
+			}
 		case linesSent%1000 == 0:
 			// Sample every 1000th line with a timestamp for latency measurement
 			line = generateTimestampedLine(cfg.LineSize, cfg.Format)
@@ -1072,6 +1079,25 @@ func generateSequencedLineConn(connID int, seq int64, size int) []byte {
 		pad = 0
 	}
 	return []byte(prefix + randString(pad) + "\n")
+}
+
+// generateSequencedJSONLine produces a well-formed JSON record
+// {"ts":<ms>,"level":"info","msg":"CONN=<id> SEQ=<n> <random padding>"} whose
+// msg is unique per (connID, seq). Verifier-based correctness cases (S3
+// Avro/Parquet) assert a unique msg per source record; the default json
+// templateLine path reuses one msg for every record, which that assertion can
+// never satisfy. The random padding also keeps the payload incompressible so
+// columnar objects aren't degenerate. The trailing '\n' is included to match
+// generateLine's contract.
+func generateSequencedJSONLine(connID int, seq int64, size int) []byte {
+	ts := time.Now().UnixMilli()
+	uniq := fmt.Sprintf("CONN=%d SEQ=%d ", connID, seq)
+	pad := size - 50 - len(uniq)
+	if pad < 1 {
+		pad = 1
+	}
+	msg := uniq + randString(pad)
+	return []byte(fmt.Sprintf(`{"ts":%d,"level":"info","msg":"%s"}`+"\n", ts, msg))
 }
 
 // writeSequencedPrefix rewrites the "CONN=<id> SEQ=<n> " header in place
