@@ -353,10 +353,17 @@ func loadConfig() config {
 func dialTCP(target string) (net.Conn, error) {
 	timeout := time.Duration(getEnvInt("GENERATOR_CONNECT_TIMEOUT", 120)) * time.Second
 	deadline := time.Now().Add(timeout)
-	var conn net.Conn
+	// KeepAlive lets the OS detect a dead server within ~15s so a wedged
+	// subject surfaces an error promptly instead of blocking until the
+	// run-duration write deadline fires.
+	dialer := net.Dialer{
+		Timeout:   5 * time.Second,
+		KeepAlive: 15 * time.Second,
+	}
 	var err error
 	for time.Now().Before(deadline) {
-		conn, err = net.DialTimeout("tcp", target, 5*time.Second)
+		var conn net.Conn
+		conn, err = dialer.Dial("tcp", target)
 		if err == nil {
 			return conn, nil
 		}
@@ -382,7 +389,7 @@ func dialMaybeTLS(cfg config) (net.Conn, error) {
 	timeout := time.Duration(getEnvInt("GENERATOR_CONNECT_TIMEOUT", 120)) * time.Second
 	deadline := time.Now().Add(timeout)
 	var lastErr error
-	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 15 * time.Second}
 	for time.Now().Before(deadline) {
 		conn, err := tls.DialWithDialer(dialer, "tcp", cfg.Target, tlsCfg)
 		if err == nil {
@@ -501,29 +508,85 @@ func applyWriteDeadline(conn net.Conn, cfg config) {
 }
 
 func runTCPSingle(cfg config, clock *sendClock) (int64, int64, error) {
-	conn, err := dialMaybeTLS(cfg)
-	if err != nil {
-		return 0, 0, err
-	}
-	defer conn.Close()
-	applyWriteDeadline(conn, cfg)
+	// runEnd is the absolute wall-clock ceiling for the entire run — the same
+	// Duration+5s budget that applyWriteDeadline used to enforce on a single
+	// connection. With reconnect support we apply it across all attempts so
+	// the test never overruns its budget regardless of how many reconnects occur.
+	runEnd := time.Now().Add(cfg.Duration + 5*time.Second)
+	var totalSent, totalBytes int64
 
-	w := bufio.NewWriterSize(conn, 256*1024)
-	sent, bytesSent, err := sendLinesConn(cfg, cfg.ConnOffset, clock, func(line []byte) error {
-		_, werr := w.Write(line)
-		return werr
-	})
-	ferr := w.Flush()
-	if isDurationTimeout(err) {
-		err = nil
+	for {
+		if time.Now().After(runEnd) {
+			return totalSent, totalBytes, nil
+		}
+
+		conn, err := dialMaybeTLS(cfg)
+		if err != nil {
+			// dialMaybeTLS already retried for its own connect timeout.
+			// If the run ceiling has passed, exit cleanly; otherwise
+			// propagate the fatal dial error.
+			if time.Now().After(runEnd) {
+				return totalSent, totalBytes, nil
+			}
+			return totalSent, totalBytes, err
+		}
+
+		// Absolute write deadline: conn.Write/Flush cannot block past runEnd.
+		_ = conn.SetWriteDeadline(runEnd)
+
+		// Derive a per-attempt config so sendLinesConn's inner duration
+		// deadline fires a few seconds before the absolute conn deadline
+		// (replicating the old applyWriteDeadline semantics). Also subtract
+		// lines already sent so TotalLines is not exceeded across reconnects.
+		attempt := cfg
+		attempt.Duration = time.Until(runEnd) - 5*time.Second
+		if attempt.Duration <= 0 {
+			_ = conn.Close()
+			return totalSent, totalBytes, nil
+		}
+		if attempt.TotalLines > 0 {
+			attempt.TotalLines -= totalSent
+			if attempt.TotalLines <= 0 {
+				_ = conn.Close()
+				return totalSent, totalBytes, nil
+			}
+		}
+
+		w := bufio.NewWriterSize(conn, 256*1024)
+		sent, bytes, werr := sendLinesConn(attempt, cfg.ConnOffset, clock, func(line []byte) error {
+			_, e := w.Write(line)
+			return e
+		})
+		ferr := w.Flush()
+		_ = conn.Close()
+
+		totalSent += sent
+		totalBytes += bytes
+
+		// Absolute conn deadline fired: clean exit (run budget consumed).
+		if isDurationTimeout(werr) || isDurationTimeout(ferr) {
+			return totalSent, totalBytes, nil
+		}
+		// sendLinesConn exited cleanly: inner duration elapsed or TotalLines hit.
+		if werr == nil && ferr == nil {
+			return totalSent, totalBytes, nil
+		}
+		// Past the run ceiling: exit without error.
+		if time.Now().After(runEnd) {
+			return totalSent, totalBytes, nil
+		}
+
+		// Connection broke (broken pipe, connection reset, etc.) — log and
+		// reconnect after a brief pause. dialMaybeTLS will retry TLS failures
+		// (e.g. while an untrusted cert is active) until it succeeds or the
+		// run ceiling is reached, so no extra retry logic is needed here.
+		e := werr
+		if e == nil {
+			e = ferr
+		}
+		fmt.Fprintf(os.Stderr, "generator: connection lost (%v), reconnecting…\n", e)
+		time.Sleep(500 * time.Millisecond)
 	}
-	if isDurationTimeout(ferr) {
-		ferr = nil
-	}
-	if ferr != nil && err == nil {
-		err = ferr
-	}
-	return sent, bytesSent, err
 }
 
 func runTCPParallel(cfg config, clock *sendClock) (int64, int64, error) {

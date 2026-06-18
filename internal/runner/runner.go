@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -190,6 +191,12 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	// TLS and continue with no loss (over-delivery from the reconnect allowed).
 	if tc.Type == "kafka_cert_rotation_correctness" {
 		return r.runKafkaCertRotation(tc, subject)
+	}
+	// Syslog TLS Vault cert rotation: a syslog device whose TLS server cert is
+	// sourced from HashiCorp Vault. Mid-run the cert is rotated to an untrusted
+	// leaf (generator TLS must fail) then restored (director must recover).
+	if tc.Type == "syslog_tls_vault_cert_rotation_correctness" {
+		return r.runSyslogVaultCertRotation(tc, subject)
 	}
 
 	configName := r.opts.ConfigName
@@ -2579,6 +2586,167 @@ func defaultVal(val, def string) string {
 		return val
 	}
 	return def
+}
+
+// runSyslogVaultCertRotation verifies the director's handling of a TLS syslog
+// device whose server cert is sourced from (and rotated in) HashiCorp Vault.
+//
+// The run proceeds in two phases:
+//
+//  1. ROTATION (negative half): the syslog server cert is replaced with a leaf
+//     signed by an UNTRUSTED CA and re-seeded in Vault. Once the director's
+//     credential cache expires (cache_ttl in the credentials store, set to a
+//     low value in vmetric.yml) and its collector monitor loop detects the cert
+//     change (has_vault_credentials flag), it restarts the syslog collector with
+//     the bad leaf. The generator's TLS client then cannot connect — its lines
+//     are lost during this window, and the receiver count stalls.
+//
+//  2. RECOVERY (positive half): the trusted-CA cert is restored in Vault. The
+//     director detects the change again, restarts the collector with the good
+//     cert, and the generator reconnects. The run drains and the loss verdict
+//     is applied; expected_loss_pct in case.yaml accounts for lines dropped
+//     during the bad-cert window.
+//
+// Requires: a `vault:` block in case.yaml (triggers Vault topology), and
+// generator.total_lines > 0 (mid-delivery poll needs a finite target).
+func (r *Runner) runSyslogVaultCertRotation(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
+	hosts := []string{"subject", "localhost"}
+	var certsDir string
+
+	return r.runKafkaMidDeliveryAction(tc, subject, midDeliveryFlow{
+		verdictLabel:  "syslog TLS vault cert rotation correctness",
+		actionLog:     "rotating syslog server cert to UNTRUSTED CA (generator TLS must fail), then restoring trusted cert",
+		overDelivNote: "expected after the trusted cert is restored and the generator reconnects",
+		totalLinesErr: "syslog_tls_vault_cert_rotation_correctness requires generator.total_lines > 0",
+		extraCleanup:  []string{"bench-vault", "bench-vault-init"},
+		prepare: func(tmpDir string, rc *orchestrator.RunConfig) error {
+			// Generate the initial cert set. rc.TLSCertsHost makes the harness
+			// mount ca.crt + server.crt/key into the subject at /opt/vmetric/certs
+			// AND gives the generator ca.crt at /certs so it trusts the server.
+			certsDir = filepath.Join(tmpDir, "certs")
+			if _, err := orchestrator.GenerateTLSCerts(certsDir, hosts); err != nil {
+				return fmt.Errorf("generating initial TLS certs: %w", err)
+			}
+			rc.TLSCertsHost = certsDir
+
+			// Populate the Vault secret with the runtime-generated cert PEM.
+			// PrepareVault (called by NewComposeRunner after prepare) will write
+			// these bytes to the vault-secrets JSON file so Vault's initial seed
+			// contains real cert material, not the case.yaml placeholders.
+			certPEM, keyPEM, err := readServerCertAndKey(certsDir)
+			if err != nil {
+				return fmt.Errorf("reading initial certs for Vault seed: %w", err)
+			}
+			if rc.TestCase.Vault == nil {
+				return fmt.Errorf("case %q requires a vault: block in case.yaml", tc.Name)
+			}
+			if rc.TestCase.Vault.Secrets == nil {
+				rc.TestCase.Vault.Secrets = make(map[string]map[string]string)
+			}
+			rc.TestCase.Vault.Secrets["bench/syslog-tls"] = map[string]string{
+				"cert": certPEM,
+				"key":  keyPEM,
+			}
+			return nil
+		},
+		action: func(orch orchestrator.Orchestrator) error {
+			// One context covers all docker exec / cp calls in the action.
+			// A 3-minute budget is well above the sum of both phase deadlines.
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			defer cancel()
+
+			mount := tc.Vault.MountOrDefault()
+			token := tc.Vault.TokenOrDefault()
+			// Receiver metrics port is already forwarded by runKafkaMidDeliveryAction.
+			metricsPort := orch.ReceiverMetricsPorts()["default"]
+
+			// ---- Phase 1: UNTRUSTED cert — generator TLS must fail ----
+			// RotateServerCertWrongCA overwrites server.crt/server.key in certsDir
+			// with a leaf signed under a brand-new throwaway CA; ca.crt (the
+			// generator's trust anchor) is left untouched.
+			if err := orchestrator.RotateServerCertWrongCA(certsDir, hosts); err != nil {
+				return fmt.Errorf("phase 1: rotate to untrusted cert: %w", err)
+			}
+			certPEM, keyPEM, err := readServerCertAndKey(certsDir)
+			if err != nil {
+				return fmt.Errorf("phase 1: reading rotated cert: %w", err)
+			}
+			if err := orchestrator.ReseedVaultSecret(ctx, "bench-vault", mount, token,
+				"bench/syslog-tls", map[string]string{"cert": certPEM, "key": keyPEM}); err != nil {
+				return fmt.Errorf("phase 1: reseeding vault with untrusted cert: %w", err)
+			}
+			fmt.Println("  phase 1: untrusted cert seeded in Vault — polling receiver for TLS rejection (stall)…")
+
+			// Poll until the receiver's line count stops advancing: that proves
+			// the director served the untrusted leaf and the generator's TLS
+			// client cannot complete the handshake. Deadline: cache_ttl (5 s in
+			// vmetric.yml) + monitor tick + collector restart + retry window.
+			phase1Deadline := time.Now().Add(45 * time.Second)
+			lastCount := int64(-1)
+			stallRounds := 0
+			rejected := false
+			for time.Now().Before(phase1Deadline) {
+				time.Sleep(2 * time.Second)
+				rm, qerr := r.queryReceiverMetrics(metricsPort, 5*time.Second)
+				if qerr != nil {
+					continue
+				}
+				if rm.LinesReceived == lastCount && lastCount >= 0 {
+					stallRounds++
+					if stallRounds >= 4 {
+						fmt.Printf("  phase 1: receiver stalled at %d lines — "+
+							"untrusted cert active, generator TLS rejected ✓\n", rm.LinesReceived)
+						rejected = true
+						break
+					}
+				} else {
+					stallRounds = 0
+				}
+				lastCount = rm.LinesReceived
+			}
+			if !rejected {
+				return fmt.Errorf(
+					"SECURITY: receiver count never stalled after wrong-CA rotation "+
+						"(last count: %d) — director did not serve the untrusted cert, "+
+						"or generator ignored cert validation; check debug.console.status: true logs",
+					lastCount)
+			}
+
+			// ---- Phase 2: TRUSTED cert restored — recovery ----
+			if err := orchestrator.RotateServerCert(certsDir, hosts); err != nil {
+				return fmt.Errorf("phase 2: rotate to trusted cert: %w", err)
+			}
+			certPEM, keyPEM, err = readServerCertAndKey(certsDir)
+			if err != nil {
+				return fmt.Errorf("phase 2: reading restored cert: %w", err)
+			}
+			if err := orchestrator.ReseedVaultSecret(ctx, "bench-vault", mount, token,
+				"bench/syslog-tls", map[string]string{"cert": certPEM, "key": keyPEM}); err != nil {
+				return fmt.Errorf("phase 2: reseeding vault with trusted cert: %w", err)
+			}
+			// Allow time for cache_ttl expiry + monitor tick + collector restart.
+			// Recovery is confirmed by the final loss verdict: if the director
+			// does not recover, lines_out < expected and loss_percent > ceiling.
+			fmt.Println("  phase 2: trusted cert restored in Vault — waiting 25s for director to detect and recover…")
+			time.Sleep(25 * time.Second)
+			fmt.Println("  phase 2: director should have restarted with the restored cert — delivery resuming")
+			return nil
+		},
+	})
+}
+
+// readServerCertAndKey reads server.crt and server.key from dir as PEM strings.
+// Both files are written by GenerateTLSCerts and overwritten by RotateServerCert*.
+func readServerCertAndKey(dir string) (certPEM, keyPEM string, err error) {
+	certBytes, err := os.ReadFile(filepath.Join(dir, "server.crt"))
+	if err != nil {
+		return "", "", fmt.Errorf("reading server.crt: %w", err)
+	}
+	keyBytes, err := os.ReadFile(filepath.Join(dir, "server.key"))
+	if err != nil {
+		return "", "", fmt.Errorf("reading server.key: %w", err)
+	}
+	return string(certBytes), string(keyBytes), nil
 }
 
 func formatCount(n int64) string {
