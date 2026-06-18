@@ -1,10 +1,12 @@
 package orchestrator
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 
@@ -68,4 +70,71 @@ func PrepareVault(tmpDir string, v *config.VaultConfig) (VaultPaths, error) {
 	}
 
 	return VaultPaths{TLSDir: tlsDir, SecretsDir: secretsDir, Seeds: seeds}, nil
+}
+
+// ReseedVaultSecret updates an existing KV v2 secret in the running Vault
+// container mid-run without bouncing Vault. It writes the new field values to
+// a temp file, docker-copies it into the container, then runs `vault kv put`
+// inside the container. Use this for mid-run credential/cert rotations.
+//
+// vaultContainer defaults to "bench-vault" when empty.
+// mount defaults to VaultConfig's default ("secret") when empty.
+// token defaults to VaultConfig's default ("pipebench-dev-root") when empty.
+func ReseedVaultSecret(ctx context.Context, vaultContainer, mount, token, path string, fields map[string]string) error {
+	if vaultContainer == "" {
+		vaultContainer = "bench-vault"
+	}
+	if mount == "" {
+		mount = (&config.VaultConfig{}).MountOrDefault()
+	}
+	if token == "" {
+		token = (&config.VaultConfig{}).TokenOrDefault()
+	}
+
+	data, err := json.Marshal(fields)
+	if err != nil {
+		return fmt.Errorf("encoding vault secret fields: %w", err)
+	}
+
+	tmp, err := os.CreateTemp("", "vault-reseed-*.json")
+	if err != nil {
+		return fmt.Errorf("creating reseed temp file: %w", err)
+	}
+	defer os.Remove(tmp.Name())
+	defer tmp.Close() // idempotent after the explicit Close below; covers error paths
+
+	if _, err := tmp.Write(data); err != nil {
+		return fmt.Errorf("writing reseed temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("closing reseed temp file: %w", err)
+	}
+
+	// Copy the JSON file into the container so PEM content never appears on
+	// the command line. Use a unique in-container path derived from the host
+	// temp name to avoid collisions across concurrent runs.
+	inContainerPath := "/tmp/" + filepath.Base(tmp.Name())
+	dst := vaultContainer + ":" + inContainerPath
+	if out, err := exec.CommandContext(ctx, "docker", "cp", tmp.Name(), dst).CombinedOutput(); err != nil {
+		return fmt.Errorf("docker cp to %s: %w\n%s", vaultContainer, err, out)
+	}
+
+	// Pass credentials via docker exec -e so they are environment variables
+	// inside the container, not part of the shell command string visible in
+	// the process's argv. This also eliminates the sh -c wrapper entirely.
+	out, err := exec.CommandContext(ctx, "docker", "exec",
+		"-e", "VAULT_ADDR=https://127.0.0.1:8200",
+		"-e", "VAULT_TOKEN="+token,
+		"-e", "VAULT_CACERT=/vault/tls/vault-ca.pem",
+		vaultContainer,
+		"vault", "kv", "put", "-mount="+mount, path, "@"+inContainerPath,
+	).CombinedOutput()
+
+	// Remove the temp file from the container; ignore errors (run is ephemeral).
+	_ = exec.CommandContext(ctx, "docker", "exec", vaultContainer, "rm", "-f", inContainerPath).Run()
+
+	if err != nil {
+		return fmt.Errorf("vault kv put in %s: %w\n%s", vaultContainer, err, out)
+	}
+	return nil
 }
