@@ -509,6 +509,7 @@ services:
     user: "0:0"
 {{- end }}
 {{- if .AgentCommand }}
+    entrypoint: ""
     command: {{ .AgentCommand }}
 {{- end }}
 {{- if .AgentEnv }}

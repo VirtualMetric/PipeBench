@@ -88,6 +88,15 @@ type TestCase struct {
 	// ingest. Generalizes the original hardcoded tls_tcp guard.
 	Requires []string `yaml:"requires"`
 
+	// SubjectImage and SubjectVersion pin the subject container image for this
+	// specific case. Applied after the registry default and before the global
+	// CLI --image/--version flags, so: CLI flag > case pin > registry default.
+	// Leave empty to use the registry default (or whatever --image/--version
+	// specifies). Non-strict YAML decode means older harness binaries silently
+	// ignore these fields — they fall back to the registry default.
+	SubjectImage   string `yaml:"subject_image"`
+	SubjectVersion string `yaml:"subject_version"`
+
 	Subjects       []string                 `yaml:"subjects"`
 	Configurations map[string]Configuration `yaml:"configurations"`
 	Correctness    CorrectnessConfig        `yaml:"correctness"`

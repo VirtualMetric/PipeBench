@@ -149,7 +149,7 @@ func testCmd() *cobra.Command {
 							continue
 						}
 						for _, s := range subs {
-							pairs = append(pairs, runPair{tc: tc, subject: s})
+							pairs = append(pairs, runPair{tc: tc, subject: applyCasePin(s, tc)})
 						}
 					}
 					if len(subjectsToLoop) > 1 {
@@ -194,7 +194,7 @@ func testCmd() *cobra.Command {
 						}
 					}
 					for _, s := range subjects {
-						pairs = append(pairs, runPair{tc: tc, subject: s})
+						pairs = append(pairs, runPair{tc: tc, subject: applyCasePin(s, tc)})
 					}
 				}
 				if len(pairs) == 0 {
@@ -683,6 +683,21 @@ func versionCmd() *cobra.Command {
 			fmt.Printf("harness %s (commit: %s, built: %s)\n", buildVersion, buildCommit, buildDate)
 		},
 	}
+}
+
+// applyCasePin overlays a case's subject_image/subject_version pin onto a
+// registry-resolved Subject. The global --image/--version CLI flags are applied
+// later in runner.applySubjectOverrides, so an explicit CLI flag still wins:
+//
+//	CLI --image/--version  >  case subject_image/subject_version  >  registry default
+func applyCasePin(s config.Subject, tc *config.TestCase) config.Subject {
+	if tc.SubjectImage != "" {
+		s = s.WithImage(tc.SubjectImage)
+	}
+	if tc.SubjectVersion != "" {
+		s = s.WithVersion(tc.SubjectVersion)
+	}
+	return s
 }
 
 func resolveSubjects(tc *config.TestCase, subjectFlag string) ([]config.Subject, error) {
