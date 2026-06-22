@@ -94,7 +94,7 @@ services:
     image: "{{ .SubjectImage }}"
     container_name: "{{ .SubjectContainer }}"
     networks: [bench]
-{{- if or .KafkaEnabled .AWSEnabled .AzureEnabled .VaultEnabled .MinioEnabled }}
+{{- if or .KafkaEnabled .AWSEnabled .AzureEnabled .VaultEnabled .MinioEnabled .PipelineBrokerEnabled }}
     depends_on:
 {{- if .KafkaGSSAPIEnabled }}
       kafka-init:
@@ -118,6 +118,15 @@ services:
 {{- if .MinioEnabled }}
       minio-init:
         condition: service_completed_successfully
+{{- end }}
+{{- if .PipelineBrokerEnabled }}
+{{- if .PipelineBrokerHasTopics }}
+      pipeline-broker-init:
+        condition: service_completed_successfully
+{{- else }}
+      pipeline-broker:
+        condition: service_healthy
+{{- end }}
 {{- end }}
 {{- end }}
     volumes:
@@ -709,6 +718,59 @@ services:
       - "rpk topic create {{ .KafkaTopic }} -p {{ .KafkaPartitions }} --brokers redpanda:9092 || rpk topic describe {{ .KafkaTopic }} --brokers redpanda:9092"
 {{- end }}
     restart: "no"
+{{- end }}
+{{- if .PipelineBrokerEnabled }}
+
+  # Dedicated Redpanda broker for the SUBJECT's internal pipeline bus
+  # (e.g. VirtualMetric pipeline_bus type=kafka). Separate from the kafka block
+  # broker (hostname redpanda, port 9092) -- different hostname AND port
+  # (default 19092) so a case can use both at once without collision. The
+  # subject depends_on this being healthy, so its broker dial cannot race
+  # startup; topics auto-create on first produce (the bus owns its topics).
+  pipeline-broker:
+    image: "{{ .PipelineBrokerImage }}"
+    container_name: "bench-pipeline-broker"
+    hostname: "pipeline-broker"
+    networks: [bench]
+    command:
+      - redpanda
+      - start
+      - "--mode"
+      - "dev-container"
+      - "--smp"
+      - "{{ .PipelineBrokerSMP }}"
+      - "--memory"
+      - "{{ .PipelineBrokerMemory }}"
+      - "--kafka-addr"
+      - "PLAINTEXT://0.0.0.0:{{ .PipelineBrokerPort }}"
+      - "--advertise-kafka-addr"
+      - "PLAINTEXT://pipeline-broker:{{ .PipelineBrokerPort }}"
+      - "--set"
+      - "redpanda.auto_create_topics_enabled={{ .PipelineBrokerAutoCreate }}"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+    restart: "no"
+{{- if .PipelineBrokerHasTopics }}
+
+  # Pre-create the pipeline-bus topics before the subject starts -- mirrors a
+  # broker that disallows auto-create (e.g. Azure Event Hubs), where the bus
+  # topics must exist up front. The subject depends_on this completing.
+  pipeline-broker-init:
+    image: "{{ .PipelineBrokerImage }}"
+    container_name: "bench-pipeline-broker-init"
+    networks: [bench]
+    depends_on:
+      pipeline-broker:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "{{ .PipelineBrokerTopicCreateCmd }}"
+    restart: "no"
+{{- end }}
 {{- end }}
 {{- if .VaultEnabled }}
 
@@ -1397,6 +1459,19 @@ type composeVars struct {
 	// the case actually uses.
 	KafkaBootstrapMechanism string
 
+	// PipelineBroker (a case's `pipeline_broker` block): a dedicated Redpanda
+	// ("pipeline-broker") for the SUBJECT's internal pipeline bus, separate from
+	// the `kafka:` broker (different hostname + port). The subject depends_on it
+	// being healthy before starting.
+	PipelineBrokerEnabled        bool
+	PipelineBrokerImage          string
+	PipelineBrokerMemory         string
+	PipelineBrokerSMP            int
+	PipelineBrokerPort           int
+	PipelineBrokerAutoCreate     bool
+	PipelineBrokerHasTopics      bool
+	PipelineBrokerTopicCreateCmd string
+
 	// Vault topology. VaultEnabled gates the vault + vault-init services,
 	// the subject's vault-init depends_on, and the /vault-tls subject mount.
 	// VaultInitCmd is the pre-built one-shot seeding shell line: mount and
@@ -1752,6 +1827,22 @@ func writeCompose(path string, cfg RunConfig) error {
 			vars.GenRewriteTimestamp = g.RewriteTimestamp
 		}
 		vars.GenKafkaBatch = max(g.KafkaBatch, 1)
+	}
+
+	// Pipeline broker (a case's `pipeline_broker`): a dedicated Redpanda for the
+	// subject's internal pipeline bus, independent of the `kafka:` broker.
+	if tc.PipelineBroker != nil {
+		vars.PipelineBrokerEnabled = true
+		vars.PipelineBrokerImage = tc.PipelineBroker.ImageOrDefault()
+		vars.PipelineBrokerMemory = tc.PipelineBroker.MemoryOrDefault()
+		vars.PipelineBrokerSMP = tc.PipelineBroker.SMPOrDefault()
+		vars.PipelineBrokerPort = tc.PipelineBroker.PortOrDefault()
+		vars.PipelineBrokerAutoCreate = tc.PipelineBroker.AutoCreateOrDefault()
+		if len(tc.PipelineBroker.Topics) > 0 {
+			vars.PipelineBrokerHasTopics = true
+			vars.PipelineBrokerTopicCreateCmd = fmt.Sprintf("rpk topic create %s --brokers pipeline-broker:%d",
+				strings.Join(tc.PipelineBroker.Topics, " "), tc.PipelineBroker.PortOrDefault())
+		}
 	}
 
 	// Kafka (Redpanda) broker: render the redpanda + redpanda-init services and
