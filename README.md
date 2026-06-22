@@ -94,7 +94,7 @@ Two caveats when reading the numbers:
 
 | Name | Image | Version |
 | --- | --- | --- |
-| VirtualMetric DataStream | `vmetric/director` | `2.0.3` |
+| VirtualMetric DataStream | `vmetric/director` | `2.0.5` |
 | Vector | `timberio/vector` | `0.54.0-alpine` |
 | Fluent Bit | `fluent/fluent-bit` | `5.0` |
 | Fluentd | `fluent/fluentd` | `v1.17-debian-1` |
