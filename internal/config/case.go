@@ -52,6 +52,17 @@ type TestCase struct {
 	// kafka_performance / kafka_correctness types.
 	Kafka *KafkaConfig `yaml:"kafka"`
 
+	// PipelineBroker, when set, adds a SECOND, dedicated Redpanda broker
+	// (hostname "pipeline-broker") for the SUBJECT's own internal transport —
+	// e.g. VirtualMetric's `pipeline_bus: {type: kafka}`. It is independent of
+	// the `kafka:` block above (which feeds the generator / subject device):
+	// different hostname and port, so a case may use both at once with no
+	// collision. The subject depends_on it being healthy before starting, so the
+	// subject's broker dial can't race startup. Topics auto-create on first
+	// produce (the bus owns its topics). Point the subject config at
+	// "pipeline-broker:<port>" (default 19092).
+	PipelineBroker *PipelineBrokerConfig `yaml:"pipeline_broker"`
+
 	// Vault, when set, adds a HashiCorp Vault dev-mode server (TLS-enabled)
 	// to the test topology: the harness renders a `vault` service plus a
 	// one-shot `vault-init` that seeds the declared secrets, and the subject
@@ -290,6 +301,67 @@ func (k *KafkaConfig) SMPOrDefault() int {
 		return k.SMP
 	}
 	return 1
+}
+
+// PipelineBrokerConfig configures the dedicated Redpanda broker the harness
+// stands up for the subject's internal pipeline bus (see TestCase.PipelineBroker).
+// All fields are optional; the orchestrator applies the defaults noted below.
+type PipelineBrokerConfig struct {
+	// Image is the Redpanda container image (default "redpandadata/redpanda:latest").
+	Image string `yaml:"image"`
+	// Memory is the Redpanda --memory allotment (default "1G").
+	Memory string `yaml:"memory"`
+	// SMP is the Redpanda --smp core count (default 1).
+	SMP int `yaml:"smp"`
+	// Port is the broker's advertised Kafka API port (default 19092). Kept
+	// distinct from the `kafka:` broker's 9092 so both can run side by side.
+	Port int `yaml:"port"`
+	// AutoCreate controls broker-side topic auto-creation. Unset/true is the
+	// Redpanda/Kafka convenience default; set false to mirror brokers that
+	// disallow it (e.g. Azure Event Hubs), in which case Topics MUST list the
+	// pipeline-bus topics to pre-create.
+	AutoCreate *bool `yaml:"auto_create"`
+	// Topics are pre-created by a one-shot (pipeline-broker-init) before the
+	// subject starts. Required when AutoCreate is false; the subject then
+	// depends_on that init completing rather than just the broker being healthy.
+	Topics []string `yaml:"topics"`
+}
+
+// AutoCreateOrDefault reports whether broker-side topic auto-creation is on
+// (default true).
+func (p *PipelineBrokerConfig) AutoCreateOrDefault() bool {
+	if p != nil && p.AutoCreate != nil {
+		return *p.AutoCreate
+	}
+	return true
+}
+
+func (p *PipelineBrokerConfig) ImageOrDefault() string {
+	if p != nil && p.Image != "" {
+		return p.Image
+	}
+	return "redpandadata/redpanda:latest"
+}
+
+func (p *PipelineBrokerConfig) MemoryOrDefault() string {
+	if p != nil && p.Memory != "" {
+		return p.Memory
+	}
+	return "1G"
+}
+
+func (p *PipelineBrokerConfig) SMPOrDefault() int {
+	if p != nil && p.SMP > 0 {
+		return p.SMP
+	}
+	return 1
+}
+
+func (p *PipelineBrokerConfig) PortOrDefault() int {
+	if p != nil && p.Port > 0 {
+		return p.Port
+	}
+	return 19092
 }
 
 // VaultConfig configures the in-topology HashiCorp Vault dev server (see
