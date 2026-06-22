@@ -620,6 +620,8 @@ func (tc *TestCase) Validate() error {
 		"redpanda": {}, "redpanda-init": {},
 		// Secret store services rendered from the vault: block.
 		"vault": {}, "vault-init": {},
+		// Dedicated pipeline-bus broker rendered from the pipeline_broker: block.
+		"pipeline-broker": {}, "pipeline-broker-init": {},
 	}
 	epNames := map[string]struct{}{}
 	for i, e := range tc.Endpoints {
@@ -670,11 +672,28 @@ func (tc *TestCase) Validate() error {
 	if err := tc.validateKafkaAuth(); err != nil {
 		return err
 	}
+	if err := tc.validatePipelineBroker(); err != nil {
+		return err
+	}
 	if err := tc.validateCloud(); err != nil {
 		return err
 	}
 	if err := tc.validateVerifier(); err != nil {
 		return err
+	}
+	return nil
+}
+
+// validatePipelineBroker checks the optional `pipeline_broker:` block. When
+// broker-side auto-create is disabled, topics can't be created on first produce,
+// so the case must list the bus topics for the pipeline-broker-init one-shot to
+// pre-create — otherwise the subject would dial a broker with no topics.
+func (tc *TestCase) validatePipelineBroker() error {
+	if tc.PipelineBroker == nil {
+		return nil
+	}
+	if !tc.PipelineBroker.AutoCreateOrDefault() && len(tc.PipelineBroker.Topics) == 0 {
+		return fmt.Errorf("case %q: pipeline_broker.auto_create is false but no `topics:` are listed — list the bus topics so they can be pre-created", tc.Name)
 	}
 	return nil
 }
