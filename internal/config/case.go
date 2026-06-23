@@ -103,6 +103,13 @@ type TestCase struct {
 	// can't decode columnar objects, and the s3 receiver's destructive drain
 	// would corrupt the read. See VerifierConfig.
 	Verifier *VerifierConfig `yaml:"verifier"`
+
+	// Rotation, when set, parameterizes the
+	// director_agent_tls_cert_rotation_correctness driver: which director TLS
+	// cert/CA rotation to perform mid-run and how the enrolled agent is expected
+	// to respond. Required by (and only meaningful for) that type. See
+	// RotationConfig and runDirectorAgentCertRotation.
+	Rotation *RotationConfig `yaml:"rotation"`
 }
 
 // VerifierConfig configures the post-drain DuckDB verifier container (see
@@ -409,6 +416,65 @@ func (v *VaultConfig) MountOrDefault() string {
 	return "secret"
 }
 
+// Rotation parameterizes the director_agent_tls_cert_rotation_correctness
+// driver (see TestCase.Rotation, runDirectorAgentCertRotation). The director
+// deploys an agent that streams back over the proxy_tls listener; mid-run the
+// director's serving cert/CA is rotated on disk and the director is bounced so
+// the enrolled agent must re-handshake. Mode selects which rotation and the
+// expected agent response.
+type RotationConfig struct {
+	// Mode selects the mid-run rotation:
+	//   "same_ca"        — re-sign the director leaf under the SAME CA
+	//                      (RotateServerCert). The agent reconnects transparently
+	//                      because the chain still validates. Verdict: delivery
+	//                      resumes (count grows after the bounce).
+	//   "new_ca_recover" — rotate to a BRAND-NEW CA written to ca.crt and served
+	//                      at /dl/cert.pem (RotateServerCertNewCA). A bootstrap
+	//                      agent (no operator-pinned CA) must re-fetch the new CA
+	//                      and reconnect. Verdict: delivery resumes.
+	//   "new_ca_reject"  — TWO PHASE. Phase 1 re-signs the leaf under an UNTRUSTED
+	//                      CA the director never serves (RotateServerCertWrongCA):
+	//                      the agent MUST fail validation, so delivery STALLS
+	//                      (a missing stall is a SECURITY failure — validation is
+	//                      disabled). Phase 2 restores a trusted leaf
+	//                      (RotateServerCert) and delivery must resume.
+	Mode string `yaml:"mode"`
+
+	// SettleSeconds is the pause after a rotation+bounce before the driver samples
+	// the receiver, giving the director time to rebind its listener and the agent
+	// time to detect the dropped session and reconnect (default 25s).
+	SettleSeconds int `yaml:"settle_seconds"`
+
+	// StallSeconds (new_ca_reject only) is how long the receiver count must hold
+	// flat after the untrusted rotation for the bad cert to count as rejected
+	// (default 20s). The case's endpoint seed loop MUST still be appending fresh
+	// records during this window, else the stall is vacuous — see the case NOTES.
+	StallSeconds int `yaml:"stall_seconds"`
+}
+
+// Rotation mode values for RotationConfig.Mode.
+const (
+	RotationSameCA       = "same_ca"
+	RotationNewCARecover = "new_ca_recover"
+	RotationNewCAReject  = "new_ca_reject"
+)
+
+// SettleSecondsOrDefault / StallSecondsOrDefault centralize the rotation timing
+// defaults so the driver and any caller agree.
+func (rc *RotationConfig) SettleSecondsOrDefault() int {
+	if rc != nil && rc.SettleSeconds > 0 {
+		return rc.SettleSeconds
+	}
+	return 25
+}
+
+func (rc *RotationConfig) StallSecondsOrDefault() int {
+	if rc != nil && rc.StallSeconds > 0 {
+		return rc.StallSeconds
+	}
+	return 20
+}
+
 // Endpoint is an auxiliary container in the test topology (see
 // TestCase.Endpoints). It's a host the subject reaches on the bench network —
 // not a generator or receiver.
@@ -554,6 +620,13 @@ func (tc *TestCase) UsesVault() bool { return tc.Vault != nil }
 // DuckDB verifier container instead of a receiver.
 func (tc *TestCase) UsesVerifier() bool { return tc.Verifier != nil }
 
+// IsDirectorAgentRotationType reports whether the case is the director↔agent
+// TLS cert-rotation correctness flow, which has its own subject-driven (no
+// generator) driver — see runDirectorAgentCertRotation.
+func (tc *TestCase) IsDirectorAgentRotationType() bool {
+	return tc.Type == "director_agent_tls_cert_rotation_correctness"
+}
+
 // IsPerformanceType reports whether the case is scored as a throughput test —
 // the plain `performance` type or the Kafka variant `kafka_performance`.
 func (tc *TestCase) IsPerformanceType() bool {
@@ -680,6 +753,45 @@ func (tc *TestCase) Validate() error {
 	}
 	if err := tc.validateVerifier(); err != nil {
 		return err
+	}
+	if err := tc.validateRotation(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateRotation checks the optional `rotation:` block and the
+// director_agent_tls_cert_rotation_correctness type's structural requirements:
+// the block is required for (and only meaningful to) that type, the mode must be
+// known, and the case must be subject-driven (an endpoint the director deploys
+// onto, no generator) with a min_received floor for the verdict.
+func (tc *TestCase) validateRotation() error {
+	if !tc.IsDirectorAgentRotationType() {
+		if tc.Rotation != nil {
+			return fmt.Errorf("case %q: `rotation:` is only valid for type director_agent_tls_cert_rotation_correctness", tc.Name)
+		}
+		return nil
+	}
+	if tc.Rotation == nil {
+		return fmt.Errorf("case %q: type director_agent_tls_cert_rotation_correctness requires a `rotation:` block", tc.Name)
+	}
+	switch tc.Rotation.Mode {
+	case RotationSameCA, RotationNewCARecover, RotationNewCAReject:
+	default:
+		return fmt.Errorf("case %q: rotation.mode %q must be one of %s, %s, %s",
+			tc.Name, tc.Rotation.Mode, RotationSameCA, RotationNewCARecover, RotationNewCAReject)
+	}
+	// The director drives data by collecting from an endpoint and forwarding —
+	// there is no generator, so the verdict rests on min_received plus the
+	// post-rotation count behaviour. Guard the two structural preconditions.
+	if tc.HasGenerator() {
+		return fmt.Errorf("case %q: director_agent_tls_cert_rotation_correctness is subject-driven and must not declare a generator", tc.Name)
+	}
+	if len(tc.Endpoints) == 0 {
+		return fmt.Errorf("case %q: director_agent_tls_cert_rotation_correctness requires an `endpoints:` block (the host the director deploys the agent onto)", tc.Name)
+	}
+	if tc.Correctness.MinReceived <= 0 {
+		return fmt.Errorf("case %q: director_agent_tls_cert_rotation_correctness requires correctness.min_received > 0", tc.Name)
 	}
 	return nil
 }

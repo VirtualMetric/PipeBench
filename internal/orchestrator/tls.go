@@ -248,6 +248,84 @@ func RotateServerCertWrongCA(outDir string, serverHosts []string) error {
 	return writePEMKey(filepath.Join(abs, "server.key"), srvKey, 0o644)
 }
 
+// RotateServerCertNewCA rotates the entire trust root: it generates a BRAND-NEW
+// CA, overwrites ca.crt / ca.key in place, and re-signs server.crt / server.key
+// under the new CA (same SAN set). Unlike RotateServerCertWrongCA — which throws
+// the new CA away so nothing can ever trust the new leaf — this PERSISTS the new
+// CA, so a party that re-reads ca.crt (e.g. a director serving it at
+// /dl/cert.pem, or a bootstrap agent that re-fetches it) can recover trust and
+// reconnect. It models a full CA rollover with re-distribution. Used by the
+// director↔agent "new_ca_recover" rotation case.
+//
+// The client bundle (client.crt) is intentionally left untouched: the
+// director↔agent cases have no generator/client leaf, and rewriting it would
+// only matter to a client that pins the old CA, which this rollover deliberately
+// supersedes.
+func RotateServerCertNewCA(outDir string, serverHosts []string) error {
+	abs, err := filepath.Abs(outDir)
+	if err != nil {
+		return err
+	}
+
+	// Fresh CA — PERSISTED to ca.crt/ca.key (the difference from
+	// RotateServerCertWrongCA), so anything that re-reads the CA can recover.
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return fmt.Errorf("generate new ca key: %w", err)
+	}
+	caTpl := &x509.Certificate{
+		SerialNumber:          bigSerial(),
+		Subject:               pkix.Name{CommonName: "PipeBench Rotated CA"},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTpl, caTpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		return fmt.Errorf("sign new ca: %w", err)
+	}
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		return fmt.Errorf("parse new ca: %w", err)
+	}
+	if err := writePEMCert(filepath.Join(abs, "ca.crt"), caDER); err != nil {
+		return err
+	}
+	if err := writePEMKey(filepath.Join(abs, "ca.key"), caKey, 0o600); err != nil {
+		return err
+	}
+
+	if len(serverHosts) == 0 {
+		serverHosts = []string{"subject"}
+	}
+	serverDNS, serverIP := splitHosts(serverHosts)
+	srvKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return fmt.Errorf("generate server key: %w", err)
+	}
+	srvTpl := &x509.Certificate{
+		SerialNumber: bigSerial(),
+		Subject:      pkix.Name{CommonName: serverHosts[0]},
+		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     serverDNS,
+		IPAddresses:  serverIP,
+	}
+	srvDER, err := x509.CreateCertificate(rand.Reader, srvTpl, caCert, &srvKey.PublicKey, caKey)
+	if err != nil {
+		return fmt.Errorf("re-sign server cert under new ca: %w", err)
+	}
+	if err := writePEMCert(filepath.Join(abs, "server.crt"), srvDER); err != nil {
+		return err
+	}
+	return writePEMKey(filepath.Join(abs, "server.key"), srvKey, 0o644)
+}
+
 // loadCA reads and parses the CA cert + key written by GenerateTLSCerts.
 func loadCA(dir string) (*x509.Certificate, *ecdsa.PrivateKey, error) {
 	certPEM, err := os.ReadFile(filepath.Join(dir, "ca.crt"))

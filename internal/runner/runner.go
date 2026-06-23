@@ -198,6 +198,13 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	if tc.Type == "syslog_tls_vault_cert_rotation_correctness" {
 		return r.runSyslogVaultCertRotation(tc, subject)
 	}
+	// Director↔agent TLS cert rotation: the director deploys an agent that
+	// streams back over its proxy_tls listener; mid-run the director's serving
+	// cert/CA is rotated on disk and the director is bounced so the enrolled
+	// agent must re-handshake and reconnect. Subject-driven (no generator).
+	if tc.IsDirectorAgentRotationType() {
+		return r.runDirectorAgentCertRotation(tc, subject)
+	}
 
 	configName := r.opts.ConfigName
 
@@ -732,7 +739,8 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 			result.FailReason = fmt.Sprintf(
 				"expect_failure: data path was NOT blocked — receiver observed %s line(s) (> %s); "+
 					"the control under test (e.g. auth) appears bypassed",
-				formatCount(recvMetrics.LinesReceived), formatCount(cap))
+				formatCount(recvMetrics.LinesReceived), formatCount(cap),
+			)
 		}
 	} else if tc.IsCorrectnessType() && !tc.HasGenerator() {
 		// No generator: there's no expected line count to derive loss or
@@ -752,7 +760,8 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		if !gotEnough {
 			failReasons = append(failReasons, fmt.Sprintf(
 				"expected >= %s received records, got %s",
-				formatCount(minRecv), formatCount(recvMetrics.LinesReceived)))
+				formatCount(minRecv), formatCount(recvMetrics.LinesReceived),
+			))
 		}
 		passed := gotEnough && recvOK
 		result.Passed = &passed
@@ -786,13 +795,15 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		if !lossOK {
 			failReasons = append(failReasons, fmt.Sprintf(
 				"expected loss <= %.2f%%, got %.2f%%",
-				tc.Correctness.ExpectedLossPct, lossPct))
+				tc.Correctness.ExpectedLossPct, lossPct,
+			))
 		}
 		if !overOK {
 			extra := recvMetrics.LinesReceived - expectedOut
 			failReasons = append(failReasons, fmt.Sprintf(
 				"over-delivery: received %s lines but only %s were expected (%s extra/duplicate lines)",
-				formatCount(recvMetrics.LinesReceived), formatCount(expectedOut), formatCount(extra)))
+				formatCount(recvMetrics.LinesReceived), formatCount(expectedOut), formatCount(extra),
+			))
 		}
 
 		passed := lossOK && overOK && recvOK
@@ -1894,6 +1905,33 @@ func (r *Runner) runKafkaCertRotation(tc *config.TestCase, subject config.Subjec
 	})
 }
 
+// subjectHasAgentPackage reports whether the subject (director) container ships
+// the baked vmetric-agent that the push-deploy pushes to endpoints. The
+// agent-capable image (vmetric/director-enterprise) ships
+// /opt/vmetric/package/agent; the default vmetric/director image has no package
+// dir at all, so a director↔agent case run on it can never deploy an agent.
+//
+// conclusive is false when the probe could not run (empty container, exec not
+// ready, neither marker printed) so callers do NOT fast-fail on noise — they
+// fall through to the timed wait. Only (present=false, conclusive=true) — the
+// image demonstrably lacks the agent — is a safe fast-fail signal.
+func subjectHasAgentPackage(container string) (present, conclusive bool) {
+	if container == "" {
+		return false, false
+	}
+	out, _ := exec.Command("docker", "exec", container, "sh", "-c",
+		"test -d /opt/vmetric/package/agent && echo PRESENT || echo ABSENT").CombinedOutput()
+	s := string(out)
+	switch {
+	case strings.Contains(s, "PRESENT"):
+		return true, true
+	case strings.Contains(s, "ABSENT"):
+		return false, true
+	default:
+		return false, false
+	}
+}
+
 // subjectLogStats returns (total non-empty log lines, cert-verification-error
 // lines) from the subject container's console log. The cert-error count is the
 // signature of a consumer rejecting an untrusted broker leaf; the total-line
@@ -1920,6 +1958,348 @@ func subjectLogStats(container string) (int, int) {
 		}
 	}
 	return total, certErrs
+}
+
+// runDirectorAgentCertRotation drives the director↔agent TLS cert-rotation
+// correctness flow. Unlike the kafka/syslog rotation cases (a generator feeds
+// the subject), this case is SUBJECT-DRIVEN: the director SSH-deploys an agent
+// onto an endpoint, the agent streams collected logs back over the director's
+// proxy_tls listener, and the receiver counts what arrives. There is no
+// generator, so the verdict rests on min_received plus proof that delivery
+// RESUMED after the mid-run rotation (a live reconnect, not just replay of
+// pre-rotation records).
+//
+// Disruption: the director's serving cert is a file path under the subject's
+// CertDir, bind-mounted from a host dir the harness owns. Mid-run the harness
+// rotates those files and bounces the director (StopServices→UpServices). A
+// live wss/NATS session does not re-handshake on its own, so the bounce is the
+// reconnect trigger; the already-running agent (the director re-attaches to it
+// on restart — it does not re-deploy) reconnects against the rotated cert.
+//
+// Modes (rotation.mode):
+//   - same_ca:        leaf re-signed under the same CA — transparent reconnect.
+//   - new_ca_recover: CA rolled over and re-served at /dl/cert.pem — a bootstrap
+//     agent must re-fetch the new CA and reconnect.
+//   - new_ca_reject:  two-phase. Phase 1 rotates to an UNTRUSTED, unserved leaf;
+//     the agent MUST fail validation, so delivery STALLS (a missing stall is a
+//     SECURITY failure — the agent accepted an untrusted cert). Phase 2 restores
+//     a trusted leaf and delivery must resume.
+func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
+	configName := r.opts.ConfigName
+	subject = r.applySubjectOverrides(subject)
+
+	fmt.Printf("→ test=%s  subject=%s  version=%s  config=%s\n",
+		tc.Name, subject.Name, subject.Version, configName)
+
+	configSrc, err := tc.ConfigFilePath(r.opts.CasesDir, configName, subject)
+	if err != nil {
+		return results.RunResult{}, err
+	}
+	configSrc, err = filepath.Abs(configSrc)
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("resolving config path: %w", err)
+	}
+
+	tmpDir, err := os.MkdirTemp("", "bench-"+tc.Name+"-")
+	if err != nil {
+		return results.RunResult{}, err
+	}
+	if err := os.Chmod(tmpDir, 0o777); err != nil {
+		return results.RunResult{}, fmt.Errorf("chmod tmpdir: %w", err)
+	}
+	defer func() {
+		if !r.opts.NoCleanup {
+			os.RemoveAll(tmpDir)
+		}
+	}()
+
+	caseDir, err := filepath.Abs(filepath.Join(r.opts.CasesDir, tc.Name))
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("resolving case directory: %w", err)
+	}
+
+	extraEnv := map[string]string{}
+	if cfg, ok := tc.Configurations[configName]; ok {
+		maps.Copy(extraEnv, cfg.Env)
+	}
+
+	// The director's proxy_tls leaf is served to the agent on the "subject"
+	// alias; bake that (and localhost) into the SAN set. certsDir is rotated
+	// in place mid-run and reflected into the subject via the CertDir bind mount.
+	certsDir := filepath.Join(tmpDir, "certs")
+	hosts := []string{"subject", "localhost"}
+	if _, err := orchestrator.GenerateTLSCerts(certsDir, hosts); err != nil {
+		return results.RunResult{}, fmt.Errorf("generating TLS certs: %w", err)
+	}
+
+	runCfg := orchestrator.RunConfig{
+		TestCase:         tc,
+		Subject:          subject,
+		ConfigName:       configName,
+		ConfigSrcPath:    configSrc,
+		CaseDir:          caseDir,
+		TmpDir:           tmpDir,
+		GeneratorImage:   r.opts.GeneratorImage,
+		ReceiverImage:    r.opts.ReceiverImage,
+		CollectorImage:   r.opts.CollectorImage,
+		ReceiverHostPort: r.opts.ReceiverHostPort,
+		ExtraSubjectEnv:  extraEnv,
+		CPULimit:         r.opts.CPULimit,
+		MemLimit:         r.opts.MemLimit,
+		TLSCertsHost:     certsDir,
+	}
+
+	orch, err := orchestrator.NewComposeRunner(runCfg)
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("compose setup: %w", err)
+	}
+
+	cleanup := []string{"bench-receiver", "bench-collector", "bench-subject-" + subject.Name}
+	for _, e := range tc.Endpoints {
+		cleanup = append(cleanup, "bench-"+e.Name)
+	}
+	for _, c := range cleanup {
+		_ = exec.Command("docker", "rm", "-f", c).Run()
+	}
+	_ = orch.Down()
+
+	startTime := time.Now()
+	defer func() {
+		if !r.opts.NoCleanup {
+			fmt.Println("  tearing down…")
+			_ = orch.Down()
+		}
+	}()
+
+	minRecv := tc.Correctness.MinReceived
+	if minRecv <= 0 {
+		minRecv = 1
+	}
+
+	fmt.Println("  starting all services (director deploys the agent; receiver UP throughout)…")
+	if err := orch.Up(); err != nil {
+		return results.RunResult{}, fmt.Errorf("starting services: %w", err)
+	}
+
+	metricsPort, stopPortFwd, err := orch.ReceiverMetricsPort()
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("setting up receiver access: %w", err)
+	}
+	defer stopPortFwd()
+
+	// Pre-flight: these cases need the agent-capable image. The default
+	// vmetric/director image ships no baked vmetric-agent (no
+	// /opt/vmetric/package/agent), so the director can never push/run an agent
+	// — the run would otherwise sit at 0 records until the initial-wait timeout
+	// and fail with a misleading "deploy/enroll/connect failed". Detect the wrong
+	// image up front and fail immediately with the actual cause. Inconclusive
+	// probes (container not ready) fall through to the timed wait below.
+	if present, conclusive := subjectHasAgentPackage(orch.SubjectContainer()); conclusive && !present {
+		return results.RunResult{}, fmt.Errorf(
+			"subject image %s:%s has no baked vmetric-agent (/opt/vmetric/package/agent missing): "+
+				"director↔agent cert-rotation cases require the agent-capable image — "+
+				"re-run with VMETRIC_IMAGE=vmetric/director-enterprise",
+			subject.Image, subject.Version,
+		)
+	}
+
+	// Phase 0 — wait for the initial deploy→enroll→stream chain to deliver at
+	// least min_received records, proving the agent connected before we disturb
+	// it. Budget off warmup + a deploy allowance, capped by the overall timeout.
+	warmup := tc.WarmupOrDefault(30 * time.Second)
+	initialBudget := min(warmup+3*time.Minute, r.opts.Timeout)
+	fmt.Printf("  waiting for initial delivery (receiver >= %s, up to %s)…\n", formatCount(minRecv), initialBudget)
+	var countAtRotation int64
+	initialDeadline := time.Now().Add(initialBudget)
+	established := false
+	for time.Now().Before(initialDeadline) {
+		rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+		if qerr == nil {
+			fmt.Printf("    received: %s\n", formatCount(rm.LinesReceived))
+			if rm.LinesReceived >= minRecv {
+				countAtRotation = rm.LinesReceived
+				established = true
+				break
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if !established {
+		return results.RunResult{}, fmt.Errorf(
+			"agent never delivered the initial %s records within %s (subject image %s:%s) — "+
+				"deploy/enroll/connect failed; if this is not the agent-capable image, "+
+				"re-run with VMETRIC_IMAGE=vmetric/director-enterprise",
+			formatCount(minRecv), initialBudget, subject.Image, subject.Version,
+		)
+	}
+	fmt.Printf("  agent established — %s records before rotation ✓\n", formatCount(countAtRotation))
+
+	// Phase 1 — rotate the director cert per mode and bounce the director so the
+	// agent must re-handshake.
+	settle := time.Duration(tc.Rotation.SettleSecondsOrDefault()) * time.Second
+	switch tc.Rotation.Mode {
+	case config.RotationSameCA:
+		fmt.Println("  rotating director leaf under the SAME CA, then bouncing the director…")
+		if err := rotateAndReload(orch, "subject", func() error {
+			return orchestrator.RotateServerCert(certsDir, hosts)
+		}); err != nil {
+			return results.RunResult{}, err
+		}
+		time.Sleep(settle)
+
+	case config.RotationNewCARecover:
+		fmt.Println("  rolling the director CA over (re-served at /dl/cert.pem), then bouncing the director…")
+		if err := rotateAndReload(orch, "subject", func() error {
+			return orchestrator.RotateServerCertNewCA(certsDir, hosts)
+		}); err != nil {
+			return results.RunResult{}, err
+		}
+		time.Sleep(settle)
+
+	case config.RotationNewCAReject:
+		// Phase 1a (negative/security): untrusted, unserved leaf — the agent MUST
+		// reject it, so delivery stalls. Sample the count, rotate+bounce, wait the
+		// stall window, then require the count did NOT advance.
+		rmBefore, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+		if qerr != nil {
+			return results.RunResult{}, fmt.Errorf("sampling receiver before untrusted rotation: %w", qerr)
+		}
+		stall := time.Duration(tc.Rotation.StallSecondsOrDefault()) * time.Second
+		fmt.Printf("  rotating director leaf to an UNTRUSTED CA (must be rejected), bouncing, then holding %s…\n", stall)
+		if err := rotateAndReload(orch, "subject", func() error {
+			return orchestrator.RotateServerCertWrongCA(certsDir, hosts)
+		}); err != nil {
+			return results.RunResult{}, err
+		}
+		time.Sleep(stall)
+		rmStall, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+		if qerr != nil {
+			return results.RunResult{}, fmt.Errorf("sampling receiver during untrusted window: %w", qerr)
+		}
+		// A handful of in-flight records may land right as the session drops;
+		// tolerate a tiny leak but fail loudly if delivery clearly continued
+		// (which would mean the agent accepted the untrusted cert).
+		const stallLeak = 3
+		advanced := rmStall.LinesReceived - rmBefore.LinesReceived
+		if advanced > stallLeak {
+			return results.RunResult{}, fmt.Errorf(
+				"SECURITY: delivery did NOT stall after rotating to an untrusted director cert "+
+					"(%s new records during the %s window; before=%s after=%s) — the agent appears to accept untrusted certs",
+				formatCount(advanced), stall, formatCount(rmBefore.LinesReceived), formatCount(rmStall.LinesReceived),
+			)
+		}
+		fmt.Printf("  delivery STALLED under the untrusted cert (%s new records) ✓\n", formatCount(advanced))
+
+		// Phase 1b (recovery): restore a trusted leaf under the original CA and
+		// bounce again; delivery must resume.
+		fmt.Println("  restoring a trusted director leaf, then bouncing the director…")
+		if err := rotateAndReload(orch, "subject", func() error {
+			return orchestrator.RotateServerCert(certsDir, hosts)
+		}); err != nil {
+			return results.RunResult{}, err
+		}
+		time.Sleep(settle)
+
+	default:
+		return results.RunResult{}, fmt.Errorf("unknown rotation.mode %q", tc.Rotation.Mode)
+	}
+
+	// Phase 2 — wait for the post-rotation RESUME, then drain to stable. The
+	// agent's reconnect is not instant: it must detect the dropped session and
+	// (for a CA rollover) re-fetch /dl/cert.pem with jitter + backoff, so the
+	// count legitimately sits flat at countAtRotation for a while. Crucially the
+	// stable-exit is gated on resume having been observed (count > countAtRotation)
+	// — otherwise that recovery gap looks "stable" and the drain bails before the
+	// agent ever reconnects (a false failure). Until resume, we keep polling for
+	// the full window; once resumed, six unchanged rounds means drained.
+	drainTimeout := 3 * time.Minute
+	if tc.Correctness.DrainSeconds > 0 {
+		drainTimeout = time.Duration(tc.Correctness.DrainSeconds) * time.Second
+	}
+	fmt.Printf("  waiting for resume then draining (up to %s)…\n", drainTimeout)
+	var lastCount int64
+	stableRounds := 0
+	resumedObserved := false
+	drainDeadline := time.Now().Add(drainTimeout)
+	for time.Now().Before(drainDeadline) {
+		time.Sleep(5 * time.Second)
+		rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+		if qerr != nil {
+			continue
+		}
+		fmt.Printf("    received: %s\n", formatCount(rm.LinesReceived))
+		if rm.LinesReceived > countAtRotation && !resumedObserved {
+			resumedObserved = true
+			fmt.Println("    delivery resumed after rotation ✓")
+		}
+		if resumedObserved && rm.LinesReceived == lastCount && rm.LinesReceived > 0 {
+			stableRounds++
+			if stableRounds >= 6 {
+				fmt.Println("    receiver stable — drained")
+				break
+			}
+		} else {
+			stableRounds = 0
+		}
+		lastCount = rm.LinesReceived
+	}
+
+	recvMetrics, err := r.queryReceiverMetrics(metricsPort, 30*time.Second)
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("querying receiver metrics: %w", err)
+	}
+
+	// Verdict: enough records overall AND delivery resumed after the rotation
+	// (proves a live reconnect, not just the pre-rotation backlog). The reject
+	// case additionally required the stall, already enforced inline above.
+	gotEnough := recvMetrics.LinesReceived >= minRecv
+	resumed := recvMetrics.LinesReceived > countAtRotation
+	passed := gotEnough && resumed
+	var errs []string
+	if !gotEnough {
+		errs = append(errs, fmt.Sprintf("expected >= %s received records, got %s",
+			formatCount(minRecv), formatCount(recvMetrics.LinesReceived)))
+	}
+	if !resumed {
+		errs = append(errs, fmt.Sprintf(
+			"delivery did not resume after rotation — %s records at rotation, %s at drain (agent never reconnected)",
+			formatCount(countAtRotation), formatCount(recvMetrics.LinesReceived),
+		))
+	}
+
+	elapsed := time.Since(startTime).Seconds()
+	fmt.Printf("  records at rotation: %s  final: %s\n", formatCount(countAtRotation), formatCount(recvMetrics.LinesReceived))
+	if passed {
+		fmt.Printf("  director↔agent cert rotation (%s): PASSED ✓\n", tc.Rotation.Mode)
+	} else {
+		fmt.Printf("  director↔agent cert rotation (%s): FAILED ✗\n", tc.Rotation.Mode)
+	}
+
+	result := results.RunResult{
+		TestName:        tc.Name,
+		Config:          configName,
+		Subject:         subject.Name,
+		Version:         subject.Version,
+		Hardware:        hardwareID(),
+		Timestamp:       startTime,
+		DurationSec:     elapsed,
+		FirstReceivedNs: recvMetrics.FirstReceivedNs,
+		LastReceivedNs:  recvMetrics.LastReceivedNs,
+		LinesOut:        recvMetrics.LinesReceived,
+		BytesOut:        recvMetrics.BytesReceived,
+		Passed:          &passed,
+	}
+	if !passed {
+		result.FailReason = strings.Join(errs, "; ")
+	}
+
+	dir, err := r.store.Save(result, "")
+	if err != nil {
+		return result, fmt.Errorf("saving results: %w", err)
+	}
+	fmt.Printf("  done. results → %s\n", dir)
+
+	return result, nil
 }
 
 // runKafkaOffsetCommitRestart verifies that delivery-bound source
@@ -2131,7 +2511,8 @@ func (r *Runner) runKafkaOffsetCommitRestart(tc *config.TestCase, subject config
 	if overPct > tc.Correctness.MaxOverDeliveryPct {
 		errors = append(errors, fmt.Sprintf(
 			"expected over-delivery <= %.2f%%, got %.2f%% (%s duplicate lines) — restart re-consumed records whose offsets should have been committed",
-			tc.Correctness.MaxOverDeliveryPct, overPct, formatCount(extra)))
+			tc.Correctness.MaxOverDeliveryPct, overPct, formatCount(extra),
+		))
 	}
 	passed := len(errors) == 0
 
@@ -2709,7 +3090,8 @@ func (r *Runner) runSyslogVaultCertRotation(tc *config.TestCase, subject config.
 					"SECURITY: receiver count never stalled after wrong-CA rotation "+
 						"(last count: %d) — director did not serve the untrusted cert, "+
 						"or generator ignored cert validation; check debug.console.status: true logs",
-					lastCount)
+					lastCount,
+				)
 			}
 
 			// ---- Phase 2: TRUSTED cert restored — recovery ----
