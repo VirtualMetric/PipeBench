@@ -45,6 +45,13 @@ type TestCase struct {
 	// drives data purely through endpoints.
 	Endpoints []Endpoint `yaml:"endpoints"`
 
+	// Agent, when set, adds an external agent container to the test topology.
+	// The agent connects INTO the subject (director) rather than being connected
+	// to by it — useful for testing agent-mode device collection. The compose
+	// service depends_on the subject (service_started) so the director's
+	// WebSocket + HTTP endpoints are bound when the agent dials in.
+	Agent *AgentConfig `yaml:"agent"`
+
 	// Kafka, when set, adds a Redpanda (Kafka-compatible) broker to the test
 	// topology: the harness renders a `redpanda` service plus a one-shot
 	// `redpanda-init` that creates the topic, and the generator (mode: kafka)
@@ -91,6 +98,15 @@ type TestCase struct {
 	// lacking one instead of starting a run that silently produces zero
 	// ingest. Generalizes the original hardcoded tls_tcp guard.
 	Requires []string `yaml:"requires"`
+
+	// SubjectImage and SubjectVersion pin the subject container image for this
+	// specific case. Applied after the registry default and before the global
+	// CLI --image/--version flags, so: CLI flag > case pin > registry default.
+	// Leave empty to use the registry default (or whatever --image/--version
+	// specifies). Non-strict YAML decode means older harness binaries silently
+	// ignore these fields — they fall back to the registry default.
+	SubjectImage   string `yaml:"subject_image"`
+	SubjectVersion string `yaml:"subject_version"`
 
 	Subjects       []string                 `yaml:"subjects"`
 	Configurations map[string]Configuration `yaml:"configurations"`
@@ -409,6 +425,29 @@ func (v *VaultConfig) MountOrDefault() string {
 	return "secret"
 }
 
+// AgentConfig configures an external agent container in the test topology
+// (see TestCase.Agent). Unlike endpoints (which the subject connects out to),
+// the agent connects INTO the subject over the bench network — it starts after
+// the subject (depends_on: subject service_started) so the director's
+// WebSocket + HTTP endpoints are ready when the agent first dials in.
+type AgentConfig struct {
+	// Image is the container image to run. For vmetric agent-mode tests this
+	// is typically vmetric/director-enterprise (which bakes vmetric-agent at
+	// /package/agent/linux/amd64), avoiding a separate published image.
+	Image string `yaml:"image"`
+	// Env is the agent's environment — e.g. VMETRIC_CONFIG_HASH for the
+	// vmetric-agent registration URL + device token + device ID.
+	Env map[string]string `yaml:"env"`
+	// Command overrides the image's default command (optional). Write it as
+	// normal shell — "$" (e.g. $(date), ${VAR}) is passed literally to the
+	// container; the harness escapes it for docker-compose interpolation.
+	Command []string `yaml:"command"`
+	// MountsSharedData, when true, mounts the shared-data volume at /data
+	// inside the agent container (user 0:0). Use only when the agent needs
+	// to write to /data.
+	MountsSharedData bool `yaml:"mounts_shared_data"`
+}
+
 // Endpoint is an auxiliary container in the test topology (see
 // TestCase.Endpoints). It's a host the subject reaches on the bench network —
 // not a generator or receiver.
@@ -554,6 +593,10 @@ func (tc *TestCase) UsesVault() bool { return tc.Vault != nil }
 // DuckDB verifier container instead of a receiver.
 func (tc *TestCase) UsesVerifier() bool { return tc.Verifier != nil }
 
+// UsesAgent reports whether the case adds an external agent container to the
+// topology. The agent connects into the subject rather than being connected to.
+func (tc *TestCase) UsesAgent() bool { return tc.Agent != nil }
+
 // IsPerformanceType reports whether the case is scored as a throughput test —
 // the plain `performance` type or the Kafka variant `kafka_performance`.
 func (tc *TestCase) IsPerformanceType() bool {
@@ -613,6 +656,8 @@ func (tc *TestCase) Validate() error {
 	// service names the compose template always emits.
 	reserved := map[string]struct{}{
 		"subject": {}, "generator": {}, "receiver": {}, "collector": {},
+		// External agent service rendered from the agent: block.
+		"agent": {},
 		// Cloud emulator services rendered from the aws:/azure:/minio: blocks.
 		"localstack": {}, "azurite": {}, "azure-init": {},
 		"minio": {}, "minio-init": {},

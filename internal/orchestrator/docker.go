@@ -542,6 +542,36 @@ services:
 {{- end }}
     restart: "no"
 {{- end }}
+{{- if .AgentEnabled }}
+
+  # External agent container (TestCase.Agent). The agent connects
+  # INTO the subject rather than being connected to. Starts after the
+  # subject so the director WebSocket + HTTP endpoints are bound first.
+  agent:
+    image: "{{ .AgentImage }}"
+    container_name: "bench-agent"
+    hostname: "agent"
+    networks: [bench]
+    depends_on:
+      subject:
+        condition: service_started
+{{- if .AgentMountsSharedData }}
+    volumes:
+      - "shared-data:/data"
+    user: "0:0"
+{{- end }}
+{{- if .AgentCommand }}
+    entrypoint: ""
+    command: {{ .AgentCommand }}
+{{- end }}
+{{- if .AgentEnv }}
+    environment:
+{{- range $k, $v := .AgentEnv }}
+      {{ $k }}: "{{ $v }}"
+{{- end }}
+{{- end }}
+    restart: "no"
+{{- end }}
 {{- if .KafkaGSSAPIEnabled }}
 
   # MIT Kerberos KDC: creates the realm + broker SPN + client principal and
@@ -1548,6 +1578,16 @@ type composeVars struct {
 	// as their own services after the collector.
 	Endpoints []endpointTpl
 
+	// Agent is the optional external agent container (a case's `agent:` block).
+	// When AgentEnabled is true the template renders an `agent:` service with
+	// depends_on: subject (service_started) so the director's WebSocket + HTTP
+	// endpoints are bound before the agent dials in.
+	AgentEnabled         bool
+	AgentImage           string
+	AgentCommand         string
+	AgentEnv             map[string]string
+	AgentMountsSharedData bool
+
 	// TLSCertsHost is the host directory holding the auto-generated cert
 	// material for TLS-enabled runs. Empty when no generator opts into
 	// TLS; non-empty triggers the /certs bind mount on subject and
@@ -2028,6 +2068,24 @@ func writeCompose(path string, cfg RunConfig) error {
 			Env:     env,
 			Command: formatYAMLList(cmd),
 		})
+	}
+
+	if tc.UsesAgent() {
+		a := tc.Agent
+		// Escape "$" for the same reason as endpoints above.
+		agentCmd := make([]string, len(a.Command))
+		for i, c := range a.Command {
+			agentCmd[i] = strings.ReplaceAll(c, "$", "$$")
+		}
+		agentEnv := map[string]string{}
+		for k, v := range a.Env {
+			agentEnv[k] = strings.ReplaceAll(v, "$", "$$")
+		}
+		vars.AgentEnabled = true
+		vars.AgentImage = a.Image
+		vars.AgentCommand = formatYAMLList(agentCmd)
+		vars.AgentEnv = agentEnv
+		vars.AgentMountsSharedData = a.MountsSharedData
 	}
 
 	tmpl, err := template.New("compose").Parse(composeTemplate)

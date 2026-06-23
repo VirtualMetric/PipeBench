@@ -731,6 +731,97 @@ func TestComposeOmitsCloudByDefault(t *testing.T) {
 	}
 }
 
+// TestComposeRendersAgent verifies that a case with an `agent:` block renders
+// an `agent:` compose service that depends_on the subject and carries the
+// correct image, env, and command. Also confirms that a case without an
+// `agent:` block produces no `agent:` service (opt-in, not default).
+func TestComposeRendersAgent(t *testing.T) {
+	tc := &config.TestCase{
+		Name:     "smoke-agent",
+		Type:     "correctness",
+		Duration: "60s",
+		Receiver: config.ReceiverConfig{Mode: "tcp", Listen: ":9001"},
+		Agent: &config.AgentConfig{
+			Image:   "vmetric/director-enterprise:2.0.0",
+			Env:     map[string]string{"VMETRIC_CONFIG_HASH": "dGVzdA=="},
+			Command: []string{"sh", "-c", "echo hello && /package/agent/linux/amd64 -agentless"},
+		},
+	}
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director-enterprise", Version: "2.0.0", ConfigPath: "/config.yml"}
+	tmp, err := os.MkdirTemp("", "compose-agent-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmp)
+	composePath := filepath.Join(tmp, "compose.yaml")
+	cfg := RunConfig{
+		TestCase: tc, Subject: subj, ConfigName: "default",
+		ConfigSrcPath: composePath, TmpDir: tmp,
+		GeneratorImage: "img-gen", ReceiverImage: "img-recv", CollectorImage: "img-coll",
+		ReceiverHostPort: 19001,
+	}
+	if err := writeCompose(composePath, cfg); err != nil {
+		t.Fatalf("writeCompose: %v", err)
+	}
+	data, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(data)
+	mustContain(t, out, "  agent:\n")
+	mustContain(t, out, "container_name: \"bench-agent\"")
+	mustContain(t, out, "hostname: \"agent\"")
+	mustContain(t, out, "image: \"vmetric/director-enterprise:2.0.0\"")
+	mustContain(t, out, "VMETRIC_CONFIG_HASH: \"dGVzdA==\"")
+	mustContain(t, out, "/package/agent/linux/amd64")
+	// The agent depends_on the subject — this is the semantic difference from an endpoint.
+	mustContain(t, out, "depends_on:")
+	mustContain(t, out, "service_started")
+	// No shared-data volume by default.
+	// (MountsSharedData was not set in this test case)
+
+	// Without an agent: block, no agent service is rendered.
+	tcNoAgent := &config.TestCase{
+		Name:      "no-agent",
+		Type:      "correctness",
+		Duration:  "10s",
+		Generator: config.GeneratorConfig{Mode: "tcp", Target: "subject:9000", Rate: 10, LineSize: 64, Format: "raw"},
+		Receiver:  config.ReceiverConfig{Mode: "tcp", Listen: ":9001"},
+	}
+	composePath2 := filepath.Join(tmp, "compose2.yaml")
+	cfg2 := RunConfig{
+		TestCase: tcNoAgent, Subject: subj, ConfigName: "default",
+		ConfigSrcPath: composePath2, TmpDir: tmp,
+		GeneratorImage: "img-gen", ReceiverImage: "img-recv", CollectorImage: "img-coll",
+		ReceiverHostPort: 19001,
+	}
+	if err := writeCompose(composePath2, cfg2); err != nil {
+		t.Fatalf("writeCompose (no-agent): %v", err)
+	}
+	data2, err := os.ReadFile(composePath2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustNotContain(t, string(data2), "  agent:\n")
+	mustNotContain(t, string(data2), "container_name: \"bench-agent\"")
+}
+
+// TestValidateRejectsAgentNameAsEndpoint confirms the reserved name "agent"
+// blocks an endpoint from colliding with the agent: service.
+func TestValidateRejectsAgentNameAsEndpoint(t *testing.T) {
+	tc := &config.TestCase{
+		Name:      "bad-agent-ep",
+		Generator: config.GeneratorConfig{Mode: "tcp", Target: "x:1"},
+		Endpoints: []config.Endpoint{{Name: "agent", Image: "x"}},
+	}
+	if err := tc.Validate(); err == nil {
+		t.Fatal("expected validation error for endpoint named 'agent' (reserved)")
+	}
+}
+
 func mustContain(t *testing.T, hay, needle string) {
 	t.Helper()
 	if !strings.Contains(hay, needle) {
