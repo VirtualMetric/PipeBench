@@ -1919,7 +1919,12 @@ func subjectHasAgentPackage(container string) (present, conclusive bool) {
 	if container == "" {
 		return false, false
 	}
-	out, _ := exec.Command("docker", "exec", container, "sh", "-c",
+	// Bound the probe: a stalled `docker exec` must not hang the whole run. A
+	// timeout (or any error) leaves the result inconclusive so the caller falls
+	// through to the timed delivery wait rather than failing on a flaky probe.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, _ := exec.CommandContext(ctx, "docker", "exec", container, "sh", "-c",
 		"test -d /opt/vmetric/package/agent && echo PRESENT || echo ABSENT").CombinedOutput()
 	s := string(out)
 	switch {
@@ -1988,6 +1993,16 @@ func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject confi
 	configName := r.opts.ConfigName
 	subject = r.applySubjectOverrides(subject)
 
+	// This specialized handler is dispatched before the generic capability guard
+	// in Run, so honor the case's `requires:` here too — otherwise a rotation case
+	// declaring a capability could start against a subject that lacks it.
+	for _, capName := range tc.Requires {
+		if !subject.HasCapability(capName) {
+			return results.RunResult{}, fmt.Errorf("subject %q does not declare capability %q required by case %q",
+				subject.Name, capName, tc.Name)
+		}
+	}
+
 	fmt.Printf("→ test=%s  subject=%s  version=%s  config=%s\n",
 		tc.Name, subject.Name, subject.Version, configName)
 
@@ -2004,7 +2019,10 @@ func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject confi
 	if err != nil {
 		return results.RunResult{}, err
 	}
-	if err := os.Chmod(tmpDir, 0o777); err != nil {
+	// World-writable so container UIDs can write the mounted cert/compose files,
+	// plus the sticky bit so a co-tenant on a multi-user host can't unlink or
+	// replace this run's generated certs/compose.
+	if err := os.Chmod(tmpDir, 0o1777); err != nil {
 		return results.RunResult{}, fmt.Errorf("chmod tmpdir: %w", err)
 	}
 	defer func() {
@@ -2064,6 +2082,18 @@ func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject confi
 	_ = orch.Down()
 
 	startTime := time.Now()
+	// All rotation waits (settle, stall, drain) are clamped to the overall run
+	// deadline so a run can't keep sleeping/polling past Options.Timeout — the
+	// same bound the persistence drivers apply via runDeadline.
+	runDeadline := startTime.Add(r.opts.Timeout)
+	sleepWithinDeadline := func(d time.Duration) error {
+		rem := time.Until(runDeadline)
+		if rem <= 0 {
+			return fmt.Errorf("run timeout (%s) exceeded before the rotation wait completed", r.opts.Timeout)
+		}
+		time.Sleep(min(d, rem))
+		return nil
+	}
 	defer func() {
 		if !r.opts.NoCleanup {
 			fmt.Println("  tearing down…")
@@ -2135,26 +2165,44 @@ func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject confi
 	fmt.Printf("  agent established — %s records before rotation ✓\n", formatCount(countAtRotation))
 
 	// Phase 1 — rotate the director cert per mode and bounce the director so the
-	// agent must re-handshake.
+	// agent must re-handshake. resumeBaseline is the receiver count captured
+	// immediately before the disruption (and, for reject, AFTER the stall) so the
+	// "delivery resumed" verdict reflects only genuine post-disruption reconnects —
+	// not pre-rotation arrivals still draining, nor the tolerated stall leak.
 	settle := time.Duration(tc.Rotation.SettleSecondsOrDefault()) * time.Second
+	resumeBaseline := countAtRotation
 	switch tc.Rotation.Mode {
 	case config.RotationSameCA:
+		rmBefore, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+		if qerr != nil {
+			return results.RunResult{}, fmt.Errorf("sampling receiver before same-CA rotation: %w", qerr)
+		}
+		resumeBaseline = rmBefore.LinesReceived
 		fmt.Println("  rotating director leaf under the SAME CA, then bouncing the director…")
 		if err := rotateAndReload(orch, "subject", func() error {
 			return orchestrator.RotateServerCert(certsDir, hosts)
 		}); err != nil {
 			return results.RunResult{}, err
 		}
-		time.Sleep(settle)
+		if err := sleepWithinDeadline(settle); err != nil {
+			return results.RunResult{}, err
+		}
 
 	case config.RotationNewCARecover:
+		rmBefore, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+		if qerr != nil {
+			return results.RunResult{}, fmt.Errorf("sampling receiver before CA rollover: %w", qerr)
+		}
+		resumeBaseline = rmBefore.LinesReceived
 		fmt.Println("  rolling the director CA over (re-served at /dl/cert.pem), then bouncing the director…")
 		if err := rotateAndReload(orch, "subject", func() error {
 			return orchestrator.RotateServerCertNewCA(certsDir, hosts)
 		}); err != nil {
 			return results.RunResult{}, err
 		}
-		time.Sleep(settle)
+		if err := sleepWithinDeadline(settle); err != nil {
+			return results.RunResult{}, err
+		}
 
 	case config.RotationNewCAReject:
 		// Phase 1a (negative/security): untrusted, unserved leaf — the agent MUST
@@ -2171,7 +2219,9 @@ func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject confi
 		}); err != nil {
 			return results.RunResult{}, err
 		}
-		time.Sleep(stall)
+		if err := sleepWithinDeadline(stall); err != nil {
+			return results.RunResult{}, err
+		}
 		rmStall, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
 		if qerr != nil {
 			return results.RunResult{}, fmt.Errorf("sampling receiver during untrusted window: %w", qerr)
@@ -2188,6 +2238,9 @@ func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject confi
 				formatCount(advanced), stall, formatCount(rmBefore.LinesReceived), formatCount(rmStall.LinesReceived),
 			)
 		}
+		// Resume must be measured against the stalled level, not the pre-rotation
+		// count — the ≤stallLeak in-flight records are not a reconnect.
+		resumeBaseline = rmStall.LinesReceived
 		fmt.Printf("  delivery STALLED under the untrusted cert (%s new records) ✓\n", formatCount(advanced))
 
 		// Phase 1b (recovery): restore a trusted leaf under the original CA and
@@ -2198,7 +2251,9 @@ func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject confi
 		}); err != nil {
 			return results.RunResult{}, err
 		}
-		time.Sleep(settle)
+		if err := sleepWithinDeadline(settle); err != nil {
+			return results.RunResult{}, err
+		}
 
 	default:
 		return results.RunResult{}, fmt.Errorf("unknown rotation.mode %q", tc.Rotation.Mode)
@@ -2207,8 +2262,8 @@ func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject confi
 	// Phase 2 — wait for the post-rotation RESUME, then drain to stable. The
 	// agent's reconnect is not instant: it must detect the dropped session and
 	// (for a CA rollover) re-fetch /dl/cert.pem with jitter + backoff, so the
-	// count legitimately sits flat at countAtRotation for a while. Crucially the
-	// stable-exit is gated on resume having been observed (count > countAtRotation)
+	// count legitimately sits flat at resumeBaseline for a while. Crucially the
+	// stable-exit is gated on resume having been observed (count > resumeBaseline)
 	// — otherwise that recovery gap looks "stable" and the drain bails before the
 	// agent ever reconnects (a false failure). Until resume, we keep polling for
 	// the full window; once resumed, six unchanged rounds means drained.
@@ -2220,7 +2275,11 @@ func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject confi
 	var lastCount int64
 	stableRounds := 0
 	resumedObserved := false
+	// Clamp the drain to the overall run deadline so it can't poll past Options.Timeout.
 	drainDeadline := time.Now().Add(drainTimeout)
+	if drainDeadline.After(runDeadline) {
+		drainDeadline = runDeadline
+	}
 	for time.Now().Before(drainDeadline) {
 		time.Sleep(5 * time.Second)
 		rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
@@ -2228,7 +2287,7 @@ func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject confi
 			continue
 		}
 		fmt.Printf("    received: %s\n", formatCount(rm.LinesReceived))
-		if rm.LinesReceived > countAtRotation && !resumedObserved {
+		if rm.LinesReceived > resumeBaseline && !resumedObserved {
 			resumedObserved = true
 			fmt.Println("    delivery resumed after rotation ✓")
 		}
@@ -2249,26 +2308,35 @@ func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject confi
 		return results.RunResult{}, fmt.Errorf("querying receiver metrics: %w", err)
 	}
 
-	// Verdict: enough records overall AND delivery resumed after the rotation
-	// (proves a live reconnect, not just the pre-rotation backlog). The reject
-	// case additionally required the stall, already enforced inline above.
+	// Verdict: enough records overall, delivery resumed past the pre-rotation
+	// baseline (a live reconnect, not just drained backlog), AND the receiver
+	// raised no content failure. The reject case additionally required the stall,
+	// already enforced inline above.
 	gotEnough := recvMetrics.LinesReceived >= minRecv
-	resumed := recvMetrics.LinesReceived > countAtRotation
-	passed := gotEnough && resumed
+	resumed := recvMetrics.LinesReceived > resumeBaseline
+	recvOK := recvMetrics.Passed == nil || *recvMetrics.Passed
+	passed := gotEnough && resumed && recvOK
 	var errs []string
+	if !recvOK {
+		if len(recvMetrics.Errors) > 0 {
+			errs = append(errs, recvMetrics.Errors...)
+		} else {
+			errs = append(errs, "receiver flagged a content failure")
+		}
+	}
 	if !gotEnough {
 		errs = append(errs, fmt.Sprintf("expected >= %s received records, got %s",
 			formatCount(minRecv), formatCount(recvMetrics.LinesReceived)))
 	}
 	if !resumed {
 		errs = append(errs, fmt.Sprintf(
-			"delivery did not resume after rotation — %s records at rotation, %s at drain (agent never reconnected)",
-			formatCount(countAtRotation), formatCount(recvMetrics.LinesReceived),
+			"delivery did not resume after rotation — %s records pre-rotation, %s at drain (agent never reconnected)",
+			formatCount(resumeBaseline), formatCount(recvMetrics.LinesReceived),
 		))
 	}
 
 	elapsed := time.Since(startTime).Seconds()
-	fmt.Printf("  records at rotation: %s  final: %s\n", formatCount(countAtRotation), formatCount(recvMetrics.LinesReceived))
+	fmt.Printf("  pre-rotation baseline: %s  final: %s\n", formatCount(resumeBaseline), formatCount(recvMetrics.LinesReceived))
 	if passed {
 		fmt.Printf("  director↔agent cert rotation (%s): PASSED ✓\n", tc.Rotation.Mode)
 	} else {
