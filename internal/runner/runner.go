@@ -2170,7 +2170,7 @@ func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject confi
 	// "delivery resumed" verdict reflects only genuine post-disruption reconnects —
 	// not pre-rotation arrivals still draining, nor the tolerated stall leak.
 	settle := time.Duration(tc.Rotation.SettleSecondsOrDefault()) * time.Second
-	resumeBaseline := countAtRotation
+	var resumeBaseline int64
 	switch tc.Rotation.Mode {
 	case config.RotationSameCA:
 		rmBefore, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
