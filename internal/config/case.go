@@ -826,6 +826,14 @@ func (tc *TestCase) validateRotation() error {
 		return fmt.Errorf("case %q: rotation.mode %q must be one of %s, %s, %s",
 			tc.Name, tc.Rotation.Mode, RotationSameCA, RotationNewCARecover, RotationNewCAReject)
 	}
+	// 0/unset defaults via SettleSecondsOrDefault/StallSecondsOrDefault; reject
+	// negatives so a typo like `settle_seconds: -5` can't be silently defaulted.
+	if tc.Rotation.SettleSeconds < 0 {
+		return fmt.Errorf("case %q: rotation.settle_seconds must be >= 0 (0/unset defaults to 25), got %d", tc.Name, tc.Rotation.SettleSeconds)
+	}
+	if tc.Rotation.StallSeconds < 0 {
+		return fmt.Errorf("case %q: rotation.stall_seconds must be >= 0 (0/unset defaults to 20), got %d", tc.Name, tc.Rotation.StallSeconds)
+	}
 	// The director drives data by collecting from an endpoint and forwarding —
 	// there is no generator, so the verdict rests on min_received plus the
 	// post-rotation count behaviour. Guard the two structural preconditions.
