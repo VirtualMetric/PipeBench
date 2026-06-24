@@ -150,12 +150,13 @@ func splitJSONBlobs(s string) []string {
 		if inStr {
 			continue
 		}
-		if c == '{' {
+		switch c {
+		case '{':
 			if depth == 0 {
 				start = i
 			}
 			depth++
-		} else if c == '}' {
+		case '}':
 			depth--
 			if depth == 0 && start >= 0 {
 				out = append(out, s[start:i+1])
