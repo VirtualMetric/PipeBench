@@ -514,6 +514,65 @@ type AgentConfig struct {
 	MountsSharedData bool `yaml:"mounts_shared_data"`
 }
 
+// Rotation parameterizes the director_agent_tls_cert_rotation_correctness
+// driver (see TestCase.Rotation, runDirectorAgentCertRotation). The director
+// deploys an agent that streams back over the proxy_tls listener; mid-run the
+// director's serving cert/CA is rotated on disk and the director is bounced so
+// the enrolled agent must re-handshake. Mode selects which rotation and the
+// expected agent response.
+type RotationConfig struct {
+	// Mode selects the mid-run rotation:
+	//   "same_ca"        — re-sign the director leaf under the SAME CA
+	//                      (RotateServerCert). The agent reconnects transparently
+	//                      because the chain still validates. Verdict: delivery
+	//                      resumes (count grows after the bounce).
+	//   "new_ca_recover" — rotate to a BRAND-NEW CA written to ca.crt and served
+	//                      at /dl/cert.pem (RotateServerCertNewCA). A bootstrap
+	//                      agent (no operator-pinned CA) must re-fetch the new CA
+	//                      and reconnect. Verdict: delivery resumes.
+	//   "new_ca_reject"  — TWO PHASE. Phase 1 re-signs the leaf under an UNTRUSTED
+	//                      CA the director never serves (RotateServerCertWrongCA):
+	//                      the agent MUST fail validation, so delivery STALLS
+	//                      (a missing stall is a SECURITY failure — validation is
+	//                      disabled). Phase 2 restores a trusted leaf
+	//                      (RotateServerCert) and delivery must resume.
+	Mode string `yaml:"mode"`
+
+	// SettleSeconds is the pause after a rotation+bounce before the driver samples
+	// the receiver, giving the director time to rebind its listener and the agent
+	// time to detect the dropped session and reconnect (default 25s).
+	SettleSeconds int `yaml:"settle_seconds"`
+
+	// StallSeconds (new_ca_reject only) is how long the receiver count must hold
+	// flat after the untrusted rotation for the bad cert to count as rejected
+	// (default 20s). The case's endpoint seed loop MUST still be appending fresh
+	// records during this window, else the stall is vacuous — see the case NOTES.
+	StallSeconds int `yaml:"stall_seconds"`
+}
+
+// Rotation mode values for RotationConfig.Mode.
+const (
+	RotationSameCA       = "same_ca"
+	RotationNewCARecover = "new_ca_recover"
+	RotationNewCAReject  = "new_ca_reject"
+)
+
+// SettleSecondsOrDefault / StallSecondsOrDefault centralize the rotation timing
+// defaults so the driver and any caller agree.
+func (rc *RotationConfig) SettleSecondsOrDefault() int {
+	if rc != nil && rc.SettleSeconds > 0 {
+		return rc.SettleSeconds
+	}
+	return 25
+}
+
+func (rc *RotationConfig) StallSecondsOrDefault() int {
+	if rc != nil && rc.StallSeconds > 0 {
+		return rc.StallSeconds
+	}
+	return 20
+}
+
 // Endpoint is an auxiliary container in the test topology (see
 // TestCase.Endpoints). It's a host the subject reaches on the bench network —
 // not a generator or receiver.
@@ -669,6 +728,13 @@ func (tc *TestCase) IsDirectorAgentRotationType() bool {
 // UsesAgent reports whether the case adds an external agent container to the
 // topology. The agent connects into the subject rather than being connected to.
 func (tc *TestCase) UsesAgent() bool { return tc.Agent != nil }
+
+// IsDirectorAgentRotationType reports whether the case is the director↔agent
+// TLS cert-rotation correctness flow, which has its own subject-driven (no
+// generator) driver — see runDirectorAgentCertRotation.
+func (tc *TestCase) IsDirectorAgentRotationType() bool {
+	return tc.Type == "director_agent_tls_cert_rotation_correctness"
+}
 
 // IsPerformanceType reports whether the case is scored as a throughput test —
 // the plain `performance` type or the Kafka variant `kafka_performance`.
