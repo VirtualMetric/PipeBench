@@ -2085,7 +2085,10 @@ func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject confi
 		if rem <= 0 {
 			return fmt.Errorf("run timeout (%s) exceeded before the rotation wait completed", r.opts.Timeout)
 		}
-		time.Sleep(min(d, rem))
+		if d > rem {
+			return fmt.Errorf("run timeout (%s) exceeded during the rotation wait", r.opts.Timeout)
+		}
+		time.Sleep(d)
 		return nil
 	}
 	defer func() {
@@ -2131,7 +2134,10 @@ func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject confi
 	// least min_received records, proving the agent connected before we disturb
 	// it. Budget off warmup + a deploy allowance, capped by the overall timeout.
 	warmup := tc.WarmupOrDefault(30 * time.Second)
-	initialBudget := min(warmup+3*time.Minute, r.opts.Timeout)
+	initialBudget := min(warmup+3*time.Minute, time.Until(runDeadline))
+	if initialBudget <= 0 {
+		return results.RunResult{}, fmt.Errorf("run timeout (%s) exceeded before the initial delivery wait", r.opts.Timeout)
+	}
 	fmt.Printf("  waiting for initial delivery (receiver >= %s, up to %s)…\n", formatCount(minRecv), initialBudget)
 	var countAtRotation int64
 	initialDeadline := time.Now().Add(initialBudget)
@@ -2165,6 +2171,7 @@ func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject confi
 	// not pre-rotation arrivals still draining, nor the tolerated stall leak.
 	settle := time.Duration(tc.Rotation.SettleSecondsOrDefault()) * time.Second
 	var resumeBaseline int64
+	var stallFailure string
 	switch tc.Rotation.Mode {
 	case config.RotationSameCA:
 		rmBefore, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
@@ -2226,16 +2233,22 @@ func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject confi
 		const stallLeak = 3
 		advanced := rmStall.LinesReceived - rmBefore.LinesReceived
 		if advanced > stallLeak {
-			return results.RunResult{}, fmt.Errorf(
+			// The subject kept delivering under an untrusted cert — a genuine
+			// SECURITY failure of the subject, not a harness error. Record it as a
+			// verdict (folded into `passed`/`errs` below) and let the flow continue
+			// through Phase 1b/2 so the failed RunResult is still persisted.
+			stallFailure = fmt.Sprintf(
 				"SECURITY: delivery did NOT stall after rotating to an untrusted director cert "+
 					"(%s new records during the %s window; before=%s after=%s) — the agent appears to accept untrusted certs",
 				formatCount(advanced), stall, formatCount(rmBefore.LinesReceived), formatCount(rmStall.LinesReceived),
 			)
+			fmt.Printf("  %s\n", stallFailure)
+		} else {
+			fmt.Printf("  delivery STALLED under the untrusted cert (%s new records) ✓\n", formatCount(advanced))
 		}
 		// Resume must be measured against the stalled level, not the pre-rotation
 		// count — the ≤stallLeak in-flight records are not a reconnect.
 		resumeBaseline = rmStall.LinesReceived
-		fmt.Printf("  delivery STALLED under the untrusted cert (%s new records) ✓\n", formatCount(advanced))
 
 		// Phase 1b (recovery): restore a trusted leaf under the original CA and
 		// bounce again; delivery must resume.
@@ -2309,8 +2322,11 @@ func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject confi
 	gotEnough := recvMetrics.LinesReceived >= minRecv
 	resumed := recvMetrics.LinesReceived > resumeBaseline
 	recvOK := recvMetrics.Passed == nil || *recvMetrics.Passed
-	passed := gotEnough && resumed && recvOK
+	passed := gotEnough && resumed && recvOK && stallFailure == ""
 	var errs []string
+	if stallFailure != "" {
+		errs = append(errs, stallFailure)
+	}
 	if !recvOK {
 		if len(recvMetrics.Errors) > 0 {
 			errs = append(errs, recvMetrics.Errors...)
