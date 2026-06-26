@@ -126,6 +126,14 @@ type TestCase struct {
 	// to respond. Required by (and only meaningful for) that type. See
 	// RotationConfig and runDirectorAgentCertRotation.
 	Rotation *RotationConfig `yaml:"rotation"`
+
+	// ACLRotation, when set, parameterizes the
+	// director_agent_acl_rotation_correctness driver: it rewrites the director's
+	// on-disk config mid-run (swapping acl.allowed_ips) and relies on the
+	// director's own refreshACL hot-reload — NO restart — to pick up the change.
+	// Required by (and only meaningful for) that type. See ACLRotationConfig and
+	// runDirectorAgentACLRotation.
+	ACLRotation *ACLRotationConfig `yaml:"acl_rotation"`
 }
 
 // VerifierConfig configures the post-drain DuckDB verifier container (see
@@ -534,6 +542,69 @@ func (rc *RotationConfig) StallSecondsOrDefault() int {
 	return 20
 }
 
+// ACLRotationConfig parameterizes the director_agent_acl_rotation_correctness
+// driver. Unlike the cert-rotation driver (which bounces the director), this
+// driver rewrites the director's mounted config in place mid-run and relies on
+// the director's own ACL hot-reload (refreshACL re-reads the config every
+// acl.update_interval seconds — no restart). The case ships two configs that
+// differ ONLY in acl.allowed_ips: the initial configs/<configName>/vmetric.yml
+// (or configs/vmetric.yml) and a rotated configs/<ToConfig>/vmetric.yml.
+type ACLRotationConfig struct {
+	// Expect selects the direction and verdict:
+	//   "recover" — start BLOCKED (initial allowed_ips excludes the agent → 0
+	//               records), rotate to an allowlist that admits the agent;
+	//               delivery must START. Verdict: ~0 before, >= min_received after.
+	//   "revoke"  — start ALLOWED (records flow), rotate to an allowlist that
+	//               excludes the agent; the next /agent/vmf POST after the
+	//               refresh is rejected so delivery must STOP. Verdict:
+	//               >= min_received before, no meaningful new records after.
+	Expect string `yaml:"expect"`
+
+	// ToConfig is the configs/ subdirectory holding the rotated vmetric.yml the
+	// driver swaps in mid-run (default "rotated").
+	ToConfig string `yaml:"to_config"`
+
+	// SettleSeconds is how long to wait after rewriting the config before
+	// sampling the receiver. It MUST comfortably exceed the director's
+	// acl.update_interval (set that low — e.g. 3 — in the case config) so the
+	// refresh tick has fired (default 15).
+	SettleSeconds int `yaml:"settle_seconds"`
+
+	// BaselineSeconds (recover only) is how long the driver confirms the agent is
+	// blocked (count stays ~0) before rotating, proving the case really starts in
+	// the blocked state (default 20).
+	BaselineSeconds int `yaml:"baseline_seconds"`
+}
+
+// ACL rotation Expect values for ACLRotationConfig.Expect.
+const (
+	ACLRotationRecover = "recover"
+	ACLRotationRevoke  = "revoke"
+)
+
+// ToConfigOrDefault / SettleSecondsOrDefault / BaselineSecondsOrDefault centralize
+// the ACL-rotation defaults so the driver and any caller agree.
+func (ac *ACLRotationConfig) ToConfigOrDefault() string {
+	if ac != nil && ac.ToConfig != "" {
+		return ac.ToConfig
+	}
+	return "rotated"
+}
+
+func (ac *ACLRotationConfig) SettleSecondsOrDefault() int {
+	if ac != nil && ac.SettleSeconds > 0 {
+		return ac.SettleSeconds
+	}
+	return 15
+}
+
+func (ac *ACLRotationConfig) BaselineSecondsOrDefault() int {
+	if ac != nil && ac.BaselineSeconds > 0 {
+		return ac.BaselineSeconds
+	}
+	return 20
+}
+
 // DurationOrDefault parses the Duration field, returning defaultVal on empty/error.
 func (tc *TestCase) DurationOrDefault(defaultVal time.Duration) time.Duration {
 	if tc.Duration == "" {
@@ -670,6 +741,13 @@ func (tc *TestCase) IsDirectorAgentRotationType() bool {
 	return tc.Type == "director_agent_tls_cert_rotation_correctness"
 }
 
+// IsDirectorAgentACLRotationType reports whether the case is the director↔agent
+// ACL (allowed_ips) hot-reload rotation flow, which has its own subject-driven
+// (no generator), no-bounce driver — see runDirectorAgentACLRotation.
+func (tc *TestCase) IsDirectorAgentACLRotationType() bool {
+	return tc.Type == "director_agent_acl_rotation_correctness"
+}
+
 // IsPerformanceType reports whether the case is scored as a throughput test —
 // the plain `performance` type or the Kafka variant `kafka_performance`.
 func (tc *TestCase) IsPerformanceType() bool {
@@ -801,6 +879,50 @@ func (tc *TestCase) Validate() error {
 	}
 	if err := tc.validateRotation(); err != nil {
 		return err
+	}
+	if err := tc.validateACLRotation(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateACLRotation checks the optional `acl_rotation:` block and the
+// director_agent_acl_rotation_correctness type's structural requirements: the
+// block is required for (and only meaningful to) that type, expect must be
+// known, and the case is subject-driven (an `agent:` container that dials in, no
+// generator) with a min_received floor for the verdict.
+func (tc *TestCase) validateACLRotation() error {
+	if !tc.IsDirectorAgentACLRotationType() {
+		if tc.ACLRotation != nil {
+			return fmt.Errorf("case %q: `acl_rotation:` is only valid for type director_agent_acl_rotation_correctness", tc.Name)
+		}
+		return nil
+	}
+	if tc.ACLRotation == nil {
+		return fmt.Errorf("case %q: type director_agent_acl_rotation_correctness requires an `acl_rotation:` block", tc.Name)
+	}
+	switch tc.ACLRotation.Expect {
+	case ACLRotationRecover, ACLRotationRevoke:
+	default:
+		return fmt.Errorf("case %q: acl_rotation.expect %q must be one of %s, %s",
+			tc.Name, tc.ACLRotation.Expect, ACLRotationRecover, ACLRotationRevoke)
+	}
+	if tc.ACLRotation.SettleSeconds < 0 {
+		return fmt.Errorf("case %q: acl_rotation.settle_seconds must be >= 0 (0/unset defaults to 15), got %d", tc.Name, tc.ACLRotation.SettleSeconds)
+	}
+	if tc.ACLRotation.BaselineSeconds < 0 {
+		return fmt.Errorf("case %q: acl_rotation.baseline_seconds must be >= 0 (0/unset defaults to 20), got %d", tc.Name, tc.ACLRotation.BaselineSeconds)
+	}
+	// Subject-driven via the agent container — no generator. The verdict rests on
+	// min_received plus the before/after count behaviour around the rotation.
+	if tc.HasGenerator() {
+		return fmt.Errorf("case %q: director_agent_acl_rotation_correctness is subject-driven and must not declare a generator", tc.Name)
+	}
+	if !tc.UsesAgent() {
+		return fmt.Errorf("case %q: director_agent_acl_rotation_correctness requires an `agent:` block (the agent container that dials into the director)", tc.Name)
+	}
+	if tc.Correctness.MinReceived <= 0 {
+		return fmt.Errorf("case %q: director_agent_acl_rotation_correctness requires correctness.min_received > 0", tc.Name)
 	}
 	return nil
 }

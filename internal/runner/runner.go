@@ -205,6 +205,14 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	if tc.IsDirectorAgentRotationType() {
 		return r.runDirectorAgentCertRotation(tc, subject)
 	}
+	// Director↔agent ACL (allowed_ips) hot-reload rotation: an agent container
+	// streams into the director; mid-run the harness rewrites the director's
+	// mounted config (swapping acl.allowed_ips) and the director's own refreshACL
+	// picks it up within acl.update_interval — NO restart. Verifies delivery
+	// starts (recover) or stops (revoke) as the live allowlist changes.
+	if tc.IsDirectorAgentACLRotationType() {
+		return r.runDirectorAgentACLRotation(tc, subject)
+	}
 
 	configName := r.opts.ConfigName
 
@@ -2366,6 +2374,346 @@ func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject confi
 		LinesOut:        recvMetrics.LinesReceived,
 		BytesOut:        recvMetrics.BytesReceived,
 		Passed:          &passed,
+	}
+	if !passed {
+		result.FailReason = strings.Join(errs, "; ")
+	}
+
+	dir, err := r.store.Save(result, "")
+	if err != nil {
+		return result, fmt.Errorf("saving results: %w", err)
+	}
+	fmt.Printf("  done. results → %s\n", dir)
+
+	return result, nil
+}
+
+// runDirectorAgentACLRotation drives the director↔agent ACL (allowed_ips)
+// hot-reload rotation case. Unlike the cert-rotation driver it does NOT bounce
+// the director: it rewrites the director's mounted config in place mid-run and
+// relies on the director's refreshACL ticker (re-reads the config every
+// acl.update_interval seconds) to apply the new allowlist live. The agent runs
+// in a separate container (the `agent:` block), so its bench-network source IP
+// — not a director-local address — is what the ACL admits or rejects.
+//
+//	expect: recover — start BLOCKED (initial allowed_ips excludes the agent → 0
+//	                  records); confirm the block, rotate to an allowlist that
+//	                  admits the agent, then require delivery to START.
+//	expect: revoke  — start ALLOWED (records flow); rotate to an allowlist that
+//	                  excludes the agent and require delivery to STOP (the next
+//	                  /agent/vmf POST after the refresh is rejected).
+func (r *Runner) runDirectorAgentACLRotation(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
+	configName := r.opts.ConfigName
+	subject = r.applySubjectOverrides(subject)
+
+	for _, capName := range tc.Requires {
+		if !subject.HasCapability(capName) {
+			return results.RunResult{}, fmt.Errorf("subject %q does not declare capability %q required by case %q",
+				subject.Name, capName, tc.Name)
+		}
+	}
+
+	fmt.Printf("→ test=%s  subject=%s  version=%s  config=%s\n",
+		tc.Name, subject.Name, subject.Version, configName)
+
+	// Initial (pre-rotation) config and the rotated config we swap in mid-run.
+	// They must differ ONLY in acl.allowed_ips.
+	initialSrc, err := tc.ConfigFilePath(r.opts.CasesDir, configName, subject)
+	if err != nil {
+		return results.RunResult{}, err
+	}
+	initialSrc, err = filepath.Abs(initialSrc)
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("resolving config path: %w", err)
+	}
+	rotatedSrc, err := filepath.Abs(filepath.Join(r.opts.CasesDir, tc.Name, "configs", tc.ACLRotation.ToConfigOrDefault(), subject.ConfigFile()))
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("resolving rotated config path: %w", err)
+	}
+	rotatedBytes, err := os.ReadFile(rotatedSrc)
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("reading rotated config %s (acl_rotation.to_config=%q): %w",
+			rotatedSrc, tc.ACLRotation.ToConfigOrDefault(), err)
+	}
+
+	tmpDir, err := os.MkdirTemp("", "bench-"+tc.Name+"-")
+	if err != nil {
+		return results.RunResult{}, err
+	}
+	if err := os.Chmod(tmpDir, 0o1777); err != nil {
+		return results.RunResult{}, fmt.Errorf("chmod tmpdir: %w", err)
+	}
+	defer func() {
+		if !r.opts.NoCleanup {
+			os.RemoveAll(tmpDir)
+		}
+	}()
+
+	// Own the mounted config file: copy the initial config into tmpDir and point
+	// the orchestrator at THAT, so the live mounted file is under our control and
+	// we can rewrite it in place mid-run. (A non-templated config would otherwise
+	// be bind-mounted straight from the read-only case source.)
+	mountedSrc := filepath.Join(tmpDir, subject.ConfigFile())
+	initialBytes, err := os.ReadFile(initialSrc)
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("reading initial config %s: %w", initialSrc, err)
+	}
+	if err := os.WriteFile(mountedSrc, initialBytes, 0o644); err != nil {
+		return results.RunResult{}, fmt.Errorf("staging initial config: %w", err)
+	}
+
+	caseDir, err := filepath.Abs(filepath.Join(r.opts.CasesDir, tc.Name))
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("resolving case directory: %w", err)
+	}
+
+	extraEnv := map[string]string{}
+	if cfg, ok := tc.Configurations[configName]; ok {
+		maps.Copy(extraEnv, cfg.Env)
+	}
+
+	runCfg := orchestrator.RunConfig{
+		TestCase:         tc,
+		Subject:          subject,
+		ConfigName:       configName,
+		ConfigSrcPath:    mountedSrc,
+		CaseDir:          caseDir,
+		TmpDir:           tmpDir,
+		GeneratorImage:   r.opts.GeneratorImage,
+		ReceiverImage:    r.opts.ReceiverImage,
+		CollectorImage:   r.opts.CollectorImage,
+		ReceiverHostPort: r.opts.ReceiverHostPort,
+		ExtraSubjectEnv:  extraEnv,
+		CPULimit:         r.opts.CPULimit,
+		MemLimit:         r.opts.MemLimit,
+	}
+
+	orch, err := orchestrator.NewComposeRunner(runCfg)
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("compose setup: %w", err)
+	}
+
+	cleanup := []string{"bench-receiver", "bench-collector", "bench-subject-" + subject.Name, "bench-agent"}
+	for _, c := range cleanup {
+		_ = exec.Command("docker", "rm", "-f", c).Run()
+	}
+	_ = orch.Down()
+
+	startTime := time.Now()
+	runDeadline := startTime.Add(r.opts.Timeout)
+	sleepWithinDeadline := func(d time.Duration) error {
+		rem := time.Until(runDeadline)
+		if rem <= 0 {
+			return fmt.Errorf("run timeout (%s) exceeded before the rotation wait completed", r.opts.Timeout)
+		}
+		if d > rem {
+			return fmt.Errorf("run timeout (%s) exceeded during the rotation wait", r.opts.Timeout)
+		}
+		time.Sleep(d)
+		return nil
+	}
+	defer func() {
+		if !r.opts.NoCleanup {
+			fmt.Println("  tearing down…")
+			_ = orch.Down()
+		}
+	}()
+
+	minRecv := tc.Correctness.MinReceived
+	if minRecv <= 0 {
+		minRecv = 1
+	}
+
+	fmt.Println("  starting all services (agent dials into the director; receiver UP throughout)…")
+	if err := orch.Up(); err != nil {
+		return results.RunResult{}, fmt.Errorf("starting services: %w", err)
+	}
+
+	metricsPort, stopPortFwd, err := orch.ReceiverMetricsPort()
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("setting up receiver access: %w", err)
+	}
+	defer stopPortFwd()
+
+	if present, conclusive := subjectHasAgentPackage(orch.SubjectContainer()); conclusive && !present {
+		return results.RunResult{}, fmt.Errorf(
+			"subject image %s:%s has no baked vmetric-agent (/opt/vmetric/package/agent missing): "+
+				"director↔agent ACL-rotation cases require the agent-capable image — "+
+				"re-run with VMETRIC_IMAGE=vmetric/director-enterprise",
+			subject.Image, subject.Version,
+		)
+	}
+
+	// rewriteConfig swaps the live mounted config in place. In-place truncate+write
+	// keeps the bind-mounted inode (a rename would orphan the mount) and advances
+	// the mtime, which is exactly what the director's refreshACL change-detection
+	// keys on.
+	rewriteConfig := func(b []byte) error {
+		return os.WriteFile(mountedSrc, b, 0o644)
+	}
+
+	settle := time.Duration(tc.ACLRotation.SettleSecondsOrDefault()) * time.Second
+	const aclLeak = 3 // tolerate a few in-flight records around the flip
+
+	var passed bool
+	var errs []string
+	var beforeCount, finalCount int64
+
+	switch tc.ACLRotation.Expect {
+	case config.ACLRotationRecover:
+		// Phase 0: confirm the agent is BLOCKED — the receiver count must stay at
+		// ~0 across the baseline window. This proves the case really starts blocked
+		// (otherwise "delivery after rotation" is vacuous). It also gives the agent
+		// time to attempt and retry while denied.
+		baseline := time.Duration(tc.ACLRotation.BaselineSecondsOrDefault()) * time.Second
+		fmt.Printf("  confirming the agent is BLOCKED for %s (receiver must stay ~0)…\n", baseline)
+		if err := sleepWithinDeadline(baseline); err != nil {
+			return results.RunResult{}, err
+		}
+		rmBlocked, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+		if qerr != nil {
+			return results.RunResult{}, fmt.Errorf("sampling receiver during the blocked window: %w", qerr)
+		}
+		fmt.Printf("    received while blocked: %s\n", formatCount(rmBlocked.LinesReceived))
+		blockedOK := rmBlocked.LinesReceived <= aclLeak
+		if !blockedOK {
+			errs = append(errs, fmt.Sprintf(
+				"agent was NOT blocked before rotation (%s records during the %s baseline) — the initial allowlist already admits it; the recover transition is untested",
+				formatCount(rmBlocked.LinesReceived), baseline))
+		}
+
+		// Phase 1: rotate to the allow config; the director's refreshACL must pick
+		// it up within acl.update_interval and admit the agent.
+		fmt.Println("  rotating director ACL to ADMIT the agent (config rewrite, no bounce)…")
+		if err := rewriteConfig(rotatedBytes); err != nil {
+			return results.RunResult{}, fmt.Errorf("rewriting director config for recover: %w", err)
+		}
+		if err := sleepWithinDeadline(settle); err != nil {
+			return results.RunResult{}, err
+		}
+
+		// Phase 2: delivery must START. Drain until min_received or deadline.
+		drainTimeout := 3 * time.Minute
+		if tc.Correctness.DrainSeconds > 0 {
+			drainTimeout = time.Duration(tc.Correctness.DrainSeconds) * time.Second
+		}
+		fmt.Printf("  waiting for delivery to start (receiver >= %s, up to %s)…\n", formatCount(minRecv), drainTimeout)
+		drainDeadline := time.Now().Add(drainTimeout)
+		if drainDeadline.After(runDeadline) {
+			drainDeadline = runDeadline
+		}
+		for time.Now().Before(drainDeadline) {
+			rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+			if qerr == nil {
+				fmt.Printf("    received: %s\n", formatCount(rm.LinesReceived))
+				finalCount = rm.LinesReceived
+				if rm.LinesReceived >= minRecv {
+					break
+				}
+			}
+			time.Sleep(3 * time.Second)
+		}
+		started := finalCount >= minRecv
+		if !started {
+			errs = append(errs, fmt.Sprintf(
+				"delivery did not start after admitting the agent — %s records (expected >= %s); the ACL hot-reload did not take effect",
+				formatCount(finalCount), formatCount(minRecv)))
+		}
+		passed = blockedOK && started
+
+	case config.ACLRotationRevoke:
+		// Phase 0: establish delivery — wait until the agent is enrolled and the
+		// receiver count clears min_received.
+		warmup := tc.WarmupOrDefault(30 * time.Second)
+		initialBudget := min(warmup+3*time.Minute, time.Until(runDeadline))
+		if initialBudget <= 0 {
+			return results.RunResult{}, fmt.Errorf("run timeout (%s) exceeded before the initial delivery wait", r.opts.Timeout)
+		}
+		fmt.Printf("  waiting for initial delivery (receiver >= %s, up to %s)…\n", formatCount(minRecv), initialBudget)
+		initialDeadline := time.Now().Add(initialBudget)
+		established := false
+		for time.Now().Before(initialDeadline) {
+			rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+			if qerr == nil {
+				fmt.Printf("    received: %s\n", formatCount(rm.LinesReceived))
+				if rm.LinesReceived >= minRecv {
+					beforeCount = rm.LinesReceived
+					established = true
+					break
+				}
+			}
+			time.Sleep(2 * time.Second)
+		}
+		if !established {
+			return results.RunResult{}, fmt.Errorf(
+				"agent never delivered the initial %s records — cannot test revocation (subject image %s:%s); "+
+					"if this is not the agent-capable image, re-run with VMETRIC_IMAGE=vmetric/director-enterprise",
+				formatCount(minRecv), subject.Image, subject.Version)
+		}
+		fmt.Printf("  delivery established — %s records before revocation ✓\n", formatCount(beforeCount))
+
+		// Phase 1: rotate to the block config; the next /agent/vmf POST after the
+		// refresh must be rejected, so delivery STOPS.
+		fmt.Println("  rotating director ACL to BLOCK the agent (config rewrite, no bounce)…")
+		if err := rewriteConfig(rotatedBytes); err != nil {
+			return results.RunResult{}, fmt.Errorf("rewriting director config for revoke: %w", err)
+		}
+		if err := sleepWithinDeadline(settle); err != nil {
+			return results.RunResult{}, err
+		}
+
+		// Phase 2: confirm delivery STOPPED. Sample once after settle, then again
+		// after a second settle; the count must not meaningfully advance between
+		// the two post-rotation samples (a few in-flight records right at the flip
+		// are tolerated, but no NEW records once the refresh has applied).
+		rmAfter1, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+		if qerr != nil {
+			return results.RunResult{}, fmt.Errorf("sampling receiver after revocation: %w", qerr)
+		}
+		if err := sleepWithinDeadline(settle); err != nil {
+			return results.RunResult{}, err
+		}
+		rmAfter2, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+		if qerr != nil {
+			return results.RunResult{}, fmt.Errorf("re-sampling receiver after revocation: %w", qerr)
+		}
+		finalCount = rmAfter2.LinesReceived
+		advanced := rmAfter2.LinesReceived - rmAfter1.LinesReceived
+		fmt.Printf("  post-revocation: before=%s after1=%s after2=%s (Δ across the block window: %s)\n",
+			formatCount(beforeCount), formatCount(rmAfter1.LinesReceived), formatCount(rmAfter2.LinesReceived), formatCount(advanced))
+		stopped := advanced <= aclLeak
+		if !stopped {
+			errs = append(errs, fmt.Sprintf(
+				"delivery did NOT stop after blocking the agent (%s new records across the block window) — the ACL was not enforced on the live data path",
+				formatCount(advanced)))
+		}
+		passed = stopped
+
+	default:
+		return results.RunResult{}, fmt.Errorf("unknown acl_rotation.expect %q", tc.ACLRotation.Expect)
+	}
+
+	if rm, qerr := r.queryReceiverMetrics(metricsPort, 30*time.Second); qerr == nil {
+		finalCount = rm.LinesReceived
+	}
+
+	elapsed := time.Since(startTime).Seconds()
+	if passed {
+		fmt.Printf("  director↔agent ACL rotation (%s): PASSED ✓\n", tc.ACLRotation.Expect)
+	} else {
+		fmt.Printf("  director↔agent ACL rotation (%s): FAILED ✗\n", tc.ACLRotation.Expect)
+	}
+
+	result := results.RunResult{
+		TestName:    tc.Name,
+		Config:      configName,
+		Subject:     subject.Name,
+		Version:     subject.Version,
+		Hardware:    hardwareID(),
+		Timestamp:   startTime,
+		DurationSec: elapsed,
+		LinesOut:    finalCount,
+		Passed:      &passed,
 	}
 	if !passed {
 		result.FailReason = strings.Join(errs, "; ")
