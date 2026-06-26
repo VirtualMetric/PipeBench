@@ -155,6 +155,9 @@ services:
       - "{{ .TLSCertsHost }}:{{ .SubjectCertDir }}:ro"
 {{- end }}
 {{- end }}
+{{- if .CaseCertsHost }}
+      - "{{ .CaseCertsHost }}:/opt/vmetric/certs:ro"
+{{- end }}
 {{- if .KrbHostDir }}
       - "{{ .KrbHostDir }}:/krb5:ro"
 {{- end }}
@@ -1415,6 +1418,13 @@ type composeVars struct {
 	SubjectUser       string
 	SubjectCertDir    string
 	SubjectVaultDir   string
+	// CaseCertsHost, when set, is the host path to a case's `configs/certs/`
+	// directory. The harness mounts it read-only at /opt/vmetric/certs in the
+	// subject so a case can ship its OWN cert material (PEM cert/key, a PFX
+	// bundle, CA) for the director to load via proxy_tls.cert_name/key_name/
+	// pfx_name/ca_name = "certs/<file>". Empty (no configs/certs/ dir) → no mount,
+	// so existing single-file-config cases are unaffected.
+	CaseCertsHost     string
 	SubjectEnv        map[string]string
 	HasResourceLimits bool
 	CPULimit          string
@@ -1711,6 +1721,19 @@ func writeCompose(path string, cfg RunConfig) error {
 		}
 	}
 
+	// Case-provided cert material: if the case ships a `configs/certs/` dir next
+	// to its config file, mount it read-only at the subject's cert root so the
+	// director can load case certs/keys/PFX by path (proxy_tls.cert_name =
+	// "certs/<file>"). Gated on the dir existing, so other cases are unchanged.
+	var caseCertsHost string
+	if cfg.ConfigSrcPath != "" {
+		if certsDir := filepath.Join(filepath.Dir(cfg.ConfigSrcPath), "certs"); certsDir != "" {
+			if info, err := os.Stat(certsDir); err == nil && info.IsDir() {
+				caseCertsHost = filepath.ToSlash(certsDir)
+			}
+		}
+	}
+
 	// When config source is a directory but ConfigPath points to a file,
 	// mount to the parent directory so all files in the config dir are available.
 	configDst := s.ConfigPath
@@ -1748,6 +1771,7 @@ func writeCompose(path string, cfg RunConfig) error {
 		SubjectUser:       s.User,
 		SubjectCertDir:    s.CertDir,
 		SubjectVaultDir:   s.VaultDir,
+		CaseCertsHost:     caseCertsHost,
 		SubjectEnv:        env,
 		HasResourceLimits: cfg.CPULimit != "" || cfg.MemLimit != "",
 		CPULimit:          defaultStr(cfg.CPULimit, "1"),
