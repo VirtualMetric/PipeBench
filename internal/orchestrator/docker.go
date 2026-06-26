@@ -46,12 +46,26 @@ type configTemplateContext struct {
 	CPUs int
 }
 
+// Harness template delimiters. Subject configs carry their OWN native
+// templating with the conventional "{{ }}"/"{{{ }}}" braces — e.g. vmetric
+// smart-routing tokens like {{{_vmetric.table}}} and file-target names like
+// {{.Timestamp}}. The harness therefore CANNOT use Go's default "{{ }}"
+// delimiters: the parser chokes on "{{{" ("unexpected \"{\" in command") and
+// would mangle a subject's own "{{ }}" tokens. Use a distinct, collision-free
+// pair instead so only harness-owned placeholders (e.g. {{@.CPUs@}}) are
+// rendered and every native "{{ }}"/"{{{ }}}" token passes through verbatim.
+const (
+	harnessTmplLeft  = "{{@"
+	harnessTmplRight = "@}}"
+)
+
 // renderSubjectConfig renders the subject config at srcPath as a Go
-// text/template when it contains template actions ("{{"), writing the result
-// into tmpDir and returning the rendered file's path. Configs with no template
-// actions, directory-form configs (e.g. cribl-stream), and missing paths are
-// returned unchanged — so non-templated subjects, and the existing
-// missing-path tolerance, are unaffected.
+// text/template when it contains harness template actions (harnessTmplLeft),
+// writing the result into tmpDir and returning the rendered file's path.
+// Configs with no harness actions, directory-form configs (e.g. cribl-stream),
+// and missing paths are returned unchanged — so non-templated subjects, configs
+// that use only their own native "{{ }}" tokens, and the existing missing-path
+// tolerance are unaffected.
 func renderSubjectConfig(srcPath, tmpDir string, ctx configTemplateContext) (string, error) {
 	info, err := os.Stat(srcPath)
 	if err != nil || info.IsDir() {
@@ -61,10 +75,10 @@ func renderSubjectConfig(srcPath, tmpDir string, ctx configTemplateContext) (str
 	if err != nil {
 		return "", err
 	}
-	if !strings.Contains(string(raw), "{{") {
+	if !strings.Contains(string(raw), harnessTmplLeft) {
 		return srcPath, nil
 	}
-	tmpl, err := template.New(filepath.Base(srcPath)).Parse(string(raw))
+	tmpl, err := template.New(filepath.Base(srcPath)).Delims(harnessTmplLeft, harnessTmplRight).Parse(string(raw))
 	if err != nil {
 		return "", fmt.Errorf("parsing config template %s: %w", srcPath, err)
 	}
