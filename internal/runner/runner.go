@@ -19,6 +19,7 @@ import (
 	"github.com/VirtualMetric/PipeBench/internal/config"
 	"github.com/VirtualMetric/PipeBench/internal/orchestrator"
 	"github.com/VirtualMetric/PipeBench/internal/results"
+	"gopkg.in/yaml.v3"
 )
 
 // Options configure a test run.
@@ -2417,7 +2418,7 @@ func (r *Runner) runDirectorAgentACLRotation(tc *config.TestCase, subject config
 		tc.Name, subject.Name, subject.Version, configName)
 
 	// Initial (pre-rotation) config and the rotated config we swap in mid-run.
-	// They must differ ONLY in acl.allowed_ips.
+	// The driver edits ONLY acl.allowed_ips in this single config mid-run.
 	initialSrc, err := tc.ConfigFilePath(r.opts.CasesDir, configName, subject)
 	if err != nil {
 		return results.RunResult{}, err
@@ -2425,15 +2426,6 @@ func (r *Runner) runDirectorAgentACLRotation(tc *config.TestCase, subject config
 	initialSrc, err = filepath.Abs(initialSrc)
 	if err != nil {
 		return results.RunResult{}, fmt.Errorf("resolving config path: %w", err)
-	}
-	rotatedSrc, err := filepath.Abs(filepath.Join(r.opts.CasesDir, tc.Name, "configs", tc.ACLRotation.ToConfigOrDefault(), subject.ConfigFile()))
-	if err != nil {
-		return results.RunResult{}, fmt.Errorf("resolving rotated config path: %w", err)
-	}
-	rotatedBytes, err := os.ReadFile(rotatedSrc)
-	if err != nil {
-		return results.RunResult{}, fmt.Errorf("reading rotated config %s (acl_rotation.to_config=%q): %w",
-			rotatedSrc, tc.ACLRotation.ToConfigOrDefault(), err)
 	}
 
 	tmpDir, err := os.MkdirTemp("", "bench-"+tc.Name+"-")
@@ -2544,12 +2536,30 @@ func (r *Runner) runDirectorAgentACLRotation(tc *config.TestCase, subject config
 		)
 	}
 
-	// rewriteConfig swaps the live mounted config in place. In-place truncate+write
-	// keeps the bind-mounted inode (a rename would orphan the mount) and advances
-	// the mtime, which is exactly what the director's refreshACL change-detection
-	// keys on.
-	rewriteConfig := func(b []byte) error {
-		return os.WriteFile(mountedSrc, b, 0o644)
+	// patchAllowedIPs reads the live mounted config, overwrites acl.allowed_ips
+	// (and only that key) at every `acl:` mapping, and rewrites the file in place.
+	// In-place truncate+write keeps the bind-mounted inode (a rename would orphan
+	// the mount) and advances the mtime — exactly what the director's refreshACL
+	// change-detection keys on. Editing only allowed_ips means the rotation cannot
+	// perturb anything else in the config, so the verdict is never confounded by
+	// an unrelated diff.
+	patchAllowedIPs := func(ips []string) error {
+		raw, err := os.ReadFile(mountedSrc)
+		if err != nil {
+			return err
+		}
+		var root map[string]any
+		if err := yaml.Unmarshal(raw, &root); err != nil {
+			return fmt.Errorf("parsing director config: %w", err)
+		}
+		if n := setAllowedIPs(root, ips); n == 0 {
+			return fmt.Errorf("no acl block found in director config %s — nothing to rotate", mountedSrc)
+		}
+		out, err := yaml.Marshal(root)
+		if err != nil {
+			return fmt.Errorf("re-marshaling director config: %w", err)
+		}
+		return os.WriteFile(mountedSrc, out, 0o644)
 	}
 
 	settle := time.Duration(tc.ACLRotation.SettleSecondsOrDefault()) * time.Second
@@ -2584,8 +2594,8 @@ func (r *Runner) runDirectorAgentACLRotation(tc *config.TestCase, subject config
 
 		// Phase 1: rotate to the allow config; the director's refreshACL must pick
 		// it up within acl.update_interval and admit the agent.
-		fmt.Println("  rotating director ACL to ADMIT the agent (config rewrite, no bounce)…")
-		if err := rewriteConfig(rotatedBytes); err != nil {
+		fmt.Println("  rotating director ACL to ADMIT the agent (acl.allowed_ips rewrite, no bounce)…")
+		if err := patchAllowedIPs(tc.ACLRotation.AllowedIPs); err != nil {
 			return results.RunResult{}, fmt.Errorf("rewriting director config for recover: %w", err)
 		}
 		if err := sleepWithinDeadline(settle); err != nil {
@@ -2654,8 +2664,8 @@ func (r *Runner) runDirectorAgentACLRotation(tc *config.TestCase, subject config
 
 		// Phase 1: rotate to the block config; the next /agent/vmf POST after the
 		// refresh must be rejected, so delivery STOPS.
-		fmt.Println("  rotating director ACL to BLOCK the agent (config rewrite, no bounce)…")
-		if err := rewriteConfig(rotatedBytes); err != nil {
+		fmt.Println("  rotating director ACL to BLOCK the agent (acl.allowed_ips rewrite, no bounce)…")
+		if err := patchAllowedIPs(tc.ACLRotation.AllowedIPs); err != nil {
 			return results.RunResult{}, fmt.Errorf("rewriting director config for revoke: %w", err)
 		}
 		if err := sleepWithinDeadline(settle); err != nil {
@@ -2681,8 +2691,15 @@ func (r *Runner) runDirectorAgentACLRotation(tc *config.TestCase, subject config
 		advanced := rmAfter2.LinesReceived - rmAfter1.LinesReceived
 		fmt.Printf("  post-revocation: before=%s after1=%s after2=%s (Δ across the block window: %s)\n",
 			formatCount(beforeCount), formatCount(rmAfter1.LinesReceived), formatCount(rmAfter2.LinesReceived), formatCount(advanced))
-		stopped := advanced <= aclLeak
-		if !stopped {
+		// A negative delta means the receiver counter regressed (e.g. a restart or
+		// metrics reset) — the monotonic-count assumption the "stopped" check rests
+		// on no longer holds, so the result is inconclusive rather than a pass.
+		stopped := advanced >= 0 && advanced <= aclLeak
+		if advanced < 0 {
+			errs = append(errs, fmt.Sprintf(
+				"inconclusive: receiver count decreased after blocking the agent (after1=%s after2=%s) — the counter regressed, cannot confirm delivery stopped",
+				formatCount(rmAfter1.LinesReceived), formatCount(rmAfter2.LinesReceived)))
+		} else if !stopped {
 			errs = append(errs, fmt.Sprintf(
 				"delivery did NOT stop after blocking the agent (%s new records across the block window) — the ACL was not enforced on the live data path",
 				formatCount(advanced)))
@@ -2726,6 +2743,36 @@ func (r *Runner) runDirectorAgentACLRotation(tc *config.TestCase, subject config
 	fmt.Printf("  done. results → %s\n", dir)
 
 	return result, nil
+}
+
+// setAllowedIPs sets acl.allowed_ips = ips on every `acl:` mapping reachable in
+// the decoded YAML tree (robust to env/cluster/node nesting), returning how many
+// it patched. Only that one key is touched; everything else round-trips
+// unchanged. Used by runDirectorAgentACLRotation to rotate the director's live
+// allowlist in place.
+func setAllowedIPs(node any, ips []string) int {
+	count := 0
+	switch n := node.(type) {
+	case map[string]any:
+		for k, v := range n {
+			if k == "acl" {
+				if aclMap, ok := v.(map[string]any); ok {
+					seq := make([]any, len(ips))
+					for i, s := range ips {
+						seq[i] = s
+					}
+					aclMap["allowed_ips"] = seq
+					count++
+				}
+			}
+			count += setAllowedIPs(v, ips)
+		}
+	case []any:
+		for _, e := range n {
+			count += setAllowedIPs(e, ips)
+		}
+	}
+	return count
 }
 
 // runKafkaOffsetCommitRestart verifies that delivery-bound source

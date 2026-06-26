@@ -547,8 +547,10 @@ func (rc *RotationConfig) StallSecondsOrDefault() int {
 // driver rewrites the director's mounted config in place mid-run and relies on
 // the director's own ACL hot-reload (refreshACL re-reads the config every
 // acl.update_interval seconds — no restart). The case ships two configs that
-// differ ONLY in acl.allowed_ips: the initial configs/<configName>/vmetric.yml
-// (or configs/vmetric.yml) and a rotated configs/<ToConfig>/vmetric.yml.
+// has a single config (configs/<configName>/vmetric.yml or configs/vmetric.yml)
+// holding the INITIAL allowed_ips; the driver edits only acl.allowed_ips in place
+// mid-run, setting it to AllowedIPs. Nothing else in the config can change, so
+// the verdict is never confounded by an unrelated config diff.
 type ACLRotationConfig struct {
 	// Expect selects the direction and verdict:
 	//   "recover" — start BLOCKED (initial allowed_ips excludes the agent → 0
@@ -560,9 +562,11 @@ type ACLRotationConfig struct {
 	//               >= min_received before, no meaningful new records after.
 	Expect string `yaml:"expect"`
 
-	// ToConfig is the configs/ subdirectory holding the rotated vmetric.yml the
-	// driver swaps in mid-run (default "rotated").
-	ToConfig string `yaml:"to_config"`
+	// AllowedIPs is the allowlist the driver rotates TO: mid-run it overwrites
+	// acl.allowed_ips in the (single) mounted director config with exactly this
+	// list. Required. recover sets it to ranges that ADMIT the agent's bench IP;
+	// revoke sets it to ranges that EXCLUDE it (e.g. ["192.0.2.1"]).
+	AllowedIPs []string `yaml:"allowed_ips"`
 
 	// SettleSeconds is how long to wait after rewriting the config before
 	// sampling the receiver. It MUST comfortably exceed the director's
@@ -582,15 +586,8 @@ const (
 	ACLRotationRevoke  = "revoke"
 )
 
-// ToConfigOrDefault / SettleSecondsOrDefault / BaselineSecondsOrDefault centralize
-// the ACL-rotation defaults so the driver and any caller agree.
-func (ac *ACLRotationConfig) ToConfigOrDefault() string {
-	if ac != nil && ac.ToConfig != "" {
-		return ac.ToConfig
-	}
-	return "rotated"
-}
-
+// SettleSecondsOrDefault / BaselineSecondsOrDefault centralize the ACL-rotation
+// defaults so the driver and any caller agree.
 func (ac *ACLRotationConfig) SettleSecondsOrDefault() int {
 	if ac != nil && ac.SettleSeconds > 0 {
 		return ac.SettleSeconds
@@ -906,6 +903,9 @@ func (tc *TestCase) validateACLRotation() error {
 	default:
 		return fmt.Errorf("case %q: acl_rotation.expect %q must be one of %s, %s",
 			tc.Name, tc.ACLRotation.Expect, ACLRotationRecover, ACLRotationRevoke)
+	}
+	if len(tc.ACLRotation.AllowedIPs) == 0 {
+		return fmt.Errorf("case %q: acl_rotation.allowed_ips must list the allowlist to rotate to (>= 1 entry)", tc.Name)
 	}
 	if tc.ACLRotation.SettleSeconds < 0 {
 		return fmt.Errorf("case %q: acl_rotation.settle_seconds must be >= 0 (0/unset defaults to 15), got %d", tc.Name, tc.ACLRotation.SettleSeconds)
