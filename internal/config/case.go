@@ -907,6 +907,15 @@ func (tc *TestCase) validateACLRotation() error {
 	if len(tc.ACLRotation.AllowedIPs) == 0 {
 		return fmt.Errorf("case %q: acl_rotation.allowed_ips must list the allowlist to rotate to (>= 1 entry)", tc.Name)
 	}
+	// A blank entry is silently skipped by the backend IP parser, which can
+	// collapse the allowlist to empty — read by the director as "no IP
+	// restrictions" (firewall off). Fail fast instead of writing it into the
+	// rotated acl.allowed_ips.
+	for i, ip := range tc.ACLRotation.AllowedIPs {
+		if strings.TrimSpace(ip) == "" {
+			return fmt.Errorf("case %q: acl_rotation.allowed_ips[%d] must be a non-empty IP or CIDR", tc.Name, i)
+		}
+	}
 	if tc.ACLRotation.SettleSeconds < 0 {
 		return fmt.Errorf("case %q: acl_rotation.settle_seconds must be >= 0 (0/unset defaults to 15), got %d", tc.Name, tc.ACLRotation.SettleSeconds)
 	}
