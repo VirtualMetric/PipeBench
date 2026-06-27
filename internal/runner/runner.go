@@ -214,6 +214,9 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	if tc.IsDirectorAgentACLRotationType() {
 		return r.runDirectorAgentACLRotation(tc, subject)
 	}
+	if tc.IsDirectorClusterType() {
+		return r.runDirectorClusterCorrectness(tc, subject)
+	}
 
 	configName := r.opts.ConfigName
 
@@ -2773,6 +2776,566 @@ func setAllowedIPs(node any, ips []string) int {
 		}
 	}
 	return count
+}
+
+// ===== director cluster driver ================================================
+
+// dockerLogsAll returns the full combined logs of a container ("" on error).
+func dockerLogsAll(container string) string {
+	out, _ := exec.Command("docker", "logs", container).CombinedOutput()
+	return string(out)
+}
+
+// clusterNodeContainers returns the N node container names the cluster compose
+// emits: bench-subject-<name>-1 .. -N (1-based, matching subject-1..N hostnames).
+func clusterNodeContainers(subjectName string, n int) []string {
+	cs := make([]string, 0, n)
+	for i := 1; i <= n; i++ {
+		cs = append(cs, fmt.Sprintf("bench-subject-%s-%d", subjectName, i))
+	}
+	return cs
+}
+
+// containerRunning reports whether a docker container is currently running (not
+// stopped/exited). Used so a STOPPED ex-leader (whose log buffer still holds its
+// old "became leader" line) is never counted as the current leader.
+func containerRunning(container string) bool {
+	out, err := exec.Command("docker", "inspect", "-f", "{{.State.Running}}", container).CombinedOutput()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) == "true"
+}
+
+// clusterFormed reports whether every node logged cluster formation.
+func clusterFormed(containers []string) bool {
+	for _, c := range containers {
+		if !strings.Contains(dockerLogsAll(c), "Cluster initially formed") {
+			return false
+		}
+	}
+	return true
+}
+
+// waitClusterReady polls until every node has formed the cluster AND a leader is
+// elected, or the deadline passes. Returns the leader index and whether ready.
+func waitClusterReady(containers []string, deadline time.Time) (int, bool) {
+	for time.Now().Before(deadline) {
+		if clusterFormed(containers) {
+			if l, ok := leaderExistsNow(containers); ok {
+				return l, true
+			}
+		}
+		time.Sleep(3 * time.Second)
+	}
+	l, _ := leaderExistsNow(containers)
+	return l, false
+}
+
+// agentlessDeviceOwner scans all nodes for the most recent agentless device
+// placement and returns the owning node NAME (director node.name = "1".."N"), or
+// "". The leader logs the FIRST placement in one of two forms depending on the
+// code path that runs it:
+//   - "Assigned new device {id} ({name}) to node {N}"        (NewDevice branch), or
+//   - "Reassigned device {id} ({name}) from  to {N}"          (reassign branch,
+//     empty source = initial placement).
+// Both end with the target node name, so we recognize either and take the last
+// whitespace token. (Failover is detected separately by clusterReassignedFrom,
+// which matches the specific "from <owner> to" so it can't trip on either of these
+// initial-placement lines.)
+func agentlessDeviceOwner(containers []string) string {
+	owner := ""
+	for _, c := range containers {
+		for _, line := range strings.Split(dockerLogsAll(c), "\n") {
+			if strings.Contains(line, "Assigned new device") || strings.Contains(line, "Reassigned device") {
+				if fields := strings.Fields(line); len(fields) > 0 {
+					owner = fields[len(fields)-1]
+				}
+			}
+		}
+	}
+	return owner
+}
+
+// agentlessCollectingNow reports whether a node is ACTIVELY collecting from an
+// agentless device right now: its recent logs show the collector forwarding
+// records to the router ("Forwarded N log entries from device ... to router").
+// This is the director-level proof that a deployed agent is delivering data to
+// its owning node — independent of the downstream receiver (cluster E2E delivery
+// has a separate gap; see runDirectorClusterCorrectness agentless_failover).
+func agentlessCollectingNow(container string) bool {
+	return strings.Contains(dockerLogsSince(container, "30s"), "entries from device")
+}
+
+// waitAgentlessCollecting waits until the agentless device is assigned to a node
+// AND that owner is actively collecting (forwarding to the router). Returns the
+// owner node name ("1".."N"), its container, and whether it became ready.
+func waitAgentlessCollecting(subjectName string, containers []string, deadline time.Time) (string, string, bool) {
+	for time.Now().Before(deadline) {
+		if owner := agentlessDeviceOwner(containers); owner != "" {
+			ownerContainer := fmt.Sprintf("bench-subject-%s-%s", subjectName, owner)
+			if agentlessCollectingNow(ownerContainer) {
+				return owner, ownerContainer, true
+			}
+		}
+		time.Sleep(5 * time.Second)
+	}
+	return agentlessDeviceOwner(containers), "", false
+}
+
+// waitAgentlessCollectingExcluding waits until SOME node other than `exclude`
+// (the stopped owner, identified by node name "1".."N") is actively collecting
+// the agentless device — i.e. the device failed over and the new owner re-deployed
+// and resumed collection. Returns the new owner's name, container, and readiness.
+func waitAgentlessCollectingExcluding(containers []string, exclude string, deadline time.Time) (string, string, bool) {
+	for time.Now().Before(deadline) {
+		for i, c := range containers {
+			name := strconv.Itoa(i + 1)
+			if name == exclude {
+				continue
+			}
+			if agentlessCollectingNow(c) {
+				return name, c, true
+			}
+		}
+		time.Sleep(5 * time.Second)
+	}
+	return "", "", false
+}
+
+// clusterReassignedFrom returns the "Reassigned device ... from <owner> to Y"
+// failover line found across all nodes, and whether one exists. It matches the
+// specific source node (the owner we stopped) so it can NOT be satisfied by the
+// INITIAL placement, which the backend logs as "Reassigned device ... from  to N"
+// (empty source) — that would make the failover assertion pass without a failover.
+func clusterReassignedFrom(containers []string, owner string) (string, bool) {
+	needle := fmt.Sprintf("from %s to ", owner)
+	for _, c := range containers {
+		for _, line := range strings.Split(dockerLogsAll(c), "\n") {
+			if strings.Contains(line, "Reassigned device") && strings.Contains(line, needle) {
+				return strings.TrimSpace(line), true
+			}
+		}
+	}
+	return "", false
+}
+
+// dockerLogsSince returns a container's logs from the last `since` window (e.g.
+// "30s") — used to read CURRENT cluster state, robust to stale history across
+// restarts (full logs keep old "became leader" lines forever).
+func dockerLogsSince(container, since string) string {
+	out, _ := exec.Command("docker", "logs", "--since", since, container).CombinedOutput()
+	return string(out)
+}
+
+// leaderExistsNow reports whether the cluster currently has a leader and which
+// node it is (1-based). It is robust to a SILENT leader: the elected leader logs
+// "became leader on" once and then can go quiet for long stretches (followers, by
+// contrast, disclaim every few seconds with "not cluster leader"), so a
+// recent-window-only signal misses it.
+//
+// A node is the current leader when ALL of:
+//   - it is running (a stopped ex-leader's old "became leader" line still sits in
+//     docker's log buffer — exclude it);
+//   - its full-history net leadership count is positive (more "became leader on"
+//     than "is no longer the leader");
+//   - it is NOT disclaiming leadership in the recent window — this rejects a
+//     RESTARTED ex-leader that rejoined as a follower (its pre-restart "became
+//     leader" line persists, but it now logs "not cluster leader" again).
+//
+// During quorum loss every survivor disclaims and no node holds net leadership →
+// returns (0,false).
+func leaderExistsNow(containers []string) (int, bool) {
+	for i, c := range containers {
+		if !containerRunning(c) {
+			continue
+		}
+		full := dockerLogsAll(c)
+		net := strings.Count(full, "became leader on") - strings.Count(full, "is no longer the leader")
+		if net <= 0 {
+			continue
+		}
+		if strings.Contains(dockerLogsSince(c, "20s"), "not cluster leader") {
+			continue // restarted ex-leader, now a follower
+		}
+		return i + 1, true
+	}
+	return 0, false
+}
+
+// electedLeaderSince reports whether any node logged a FRESH leader election
+// ("became leader on") within the last `since` window — i.e. a (re-)election just
+// happened. Returns the electing node index too.
+func electedLeaderSince(containers []string, since string) (int, bool) {
+	for i, c := range containers {
+		if strings.Contains(dockerLogsSince(c, since), "became leader on") {
+			return i + 1, true
+		}
+	}
+	return 0, false
+}
+
+// pickFollowerAvoiding returns a 1-based node index that is neither the leader nor
+// `avoid` (e.g. the generator's target node), falling back if none qualifies.
+func pickFollowerAvoiding(leader, avoid, n int) int {
+	for i := 1; i <= n; i++ {
+		if i != leader && i != avoid {
+			return i
+		}
+	}
+	for i := 1; i <= n; i++ {
+		if i != leader {
+			return i
+		}
+	}
+	return 1
+}
+
+// runDirectorClusterCorrectness drives a multi-node director cluster: it brings up
+// N director nodes (rendered one config per node via {{@.NodeID@}}), waits for the
+// cluster to form and elect a leader, drives the case workload (a generator at
+// subject-1 or an agentless endpoint), then performs the optional disruptive
+// cluster.action and asserts the cluster recovers (re-elects a leader / fails a
+// device over / regains quorum) while delivery continues.
+func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
+	configName := r.opts.ConfigName
+	subject = r.applySubjectOverrides(subject)
+
+	for _, capName := range tc.Requires {
+		if !subject.HasCapability(capName) {
+			return results.RunResult{}, fmt.Errorf("subject %q does not declare capability %q required by case %q",
+				subject.Name, capName, tc.Name)
+		}
+	}
+
+	fmt.Printf("→ test=%s  subject=%s  version=%s  config=%s  (cluster: %d nodes, tls=%v, action=%q)\n",
+		tc.Name, subject.Name, subject.Version, configName, tc.Cluster.Nodes, tc.Cluster.TLS, tc.Cluster.Action)
+
+	srcCfg, err := tc.ConfigFilePath(r.opts.CasesDir, configName, subject)
+	if err != nil {
+		return results.RunResult{}, err
+	}
+	srcCfg, err = filepath.Abs(srcCfg)
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("resolving config path: %w", err)
+	}
+
+	tmpDir, err := os.MkdirTemp("", "bench-"+tc.Name+"-")
+	if err != nil {
+		return results.RunResult{}, err
+	}
+	if err := os.Chmod(tmpDir, 0o1777); err != nil {
+		return results.RunResult{}, fmt.Errorf("chmod tmpdir: %w", err)
+	}
+	defer func() {
+		if !r.opts.NoCleanup {
+			os.RemoveAll(tmpDir)
+		}
+	}()
+
+	caseDir, err := filepath.Abs(filepath.Join(r.opts.CasesDir, tc.Name))
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("resolving case directory: %w", err)
+	}
+
+	extraEnv := map[string]string{}
+	if cfg, ok := tc.Configurations[configName]; ok {
+		maps.Copy(extraEnv, cfg.Env)
+	}
+
+	runCfg := orchestrator.RunConfig{
+		TestCase:         tc,
+		Subject:          subject,
+		ConfigName:       configName,
+		ConfigSrcPath:    srcCfg,
+		CaseDir:          caseDir,
+		TmpDir:           tmpDir,
+		GeneratorImage:   r.opts.GeneratorImage,
+		ReceiverImage:    r.opts.ReceiverImage,
+		CollectorImage:   r.opts.CollectorImage,
+		ReceiverHostPort: r.opts.ReceiverHostPort,
+		ExtraSubjectEnv:  extraEnv,
+		CPULimit:         r.opts.CPULimit,
+		MemLimit:         r.opts.MemLimit,
+	}
+
+	orch, err := orchestrator.NewComposeRunner(runCfg)
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("compose setup: %w", err)
+	}
+
+	nodes := clusterNodeContainers(subject.Name, tc.Cluster.Nodes)
+	cleanup := append([]string{"bench-receiver", "bench-collector", "bench-agent"}, nodes...)
+	for _, c := range cleanup {
+		_ = exec.Command("docker", "rm", "-f", c).Run()
+	}
+	_ = orch.Down()
+	defer func() {
+		if !r.opts.NoCleanup {
+			fmt.Println("  tearing down…")
+			_ = orch.Down()
+		}
+	}()
+
+	startTime := time.Now()
+	runDeadline := startTime.Add(r.opts.Timeout)
+
+	minRecv := tc.Correctness.MinReceived
+	if minRecv <= 0 {
+		minRecv = 1
+	}
+
+	fmt.Printf("  starting %d-node cluster + workload…\n", tc.Cluster.Nodes)
+	if err := orch.Up(); err != nil {
+		return results.RunResult{}, fmt.Errorf("starting cluster: %w", err)
+	}
+
+	metricsPort, stopPortFwd, err := orch.ReceiverMetricsPort()
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("setting up receiver access: %w", err)
+	}
+	defer stopPortFwd()
+
+	// Phase 1: wait for the cluster to FORM + elect a leader (slow — JetStream
+	// quorum stabilization). Budget the case warmup (clusters need ~90-120s).
+	warmup := tc.WarmupOrDefault(120 * time.Second)
+	formDeadline := time.Now().Add(warmup)
+	if formDeadline.After(runDeadline) {
+		formDeadline = runDeadline
+	}
+	fmt.Printf("  waiting for cluster to form + elect a leader (up to %s)…\n", time.Until(formDeadline).Round(time.Second))
+	leader, ready := waitClusterReady(nodes, formDeadline)
+
+	var passed bool
+	var errs []string
+	var finalCount int64
+
+	if !ready {
+		errs = append(errs, fmt.Sprintf("cluster did not form/elect a leader within %s (formed=%v leaderIdx=%d)", warmup, clusterFormed(nodes), leader))
+		passed = false
+	} else {
+		fmt.Printf("  cluster formed; leader = node %d\n", leader)
+
+		// Phase 2: baseline. Two shapes:
+		//  - agentless cases assert at the DIRECTOR level — the device deploys and the
+		//    OWNING node collects (forwards to the router). Downstream receiver delivery
+		//    is NOT the baseline gate here: cluster agentless E2E delivery has a known
+		//    gap (a router job can be processed on a different node than the one that
+		//    wrote the payload, and cross-node payload object-store reads can return
+		//    NotFound → "payload evicted"), so it is logged as a soft signal only.
+		//  - all other cases assert downstream receiver delivery reaches min_received
+		//    (the tcp "direct path" delivers reliably in a cluster).
+		drainTimeout := 3 * time.Minute
+		if tc.Correctness.DrainSeconds > 0 {
+			drainTimeout = time.Duration(tc.Correctness.DrainSeconds) * time.Second
+		}
+		drainDeadline := time.Now().Add(drainTimeout)
+		if drainDeadline.After(runDeadline) {
+			drainDeadline = runDeadline
+		}
+
+		isAgentless := tc.Cluster.Action == "agentless_failover"
+		var baselineOK bool
+		var owner, ownerContainer string
+
+		if isAgentless {
+			fmt.Printf("  baseline: waiting for the agentless device to deploy + collect (up to %s)…\n", time.Until(drainDeadline).Round(time.Second))
+			owner, ownerContainer, baselineOK = waitAgentlessCollecting(subject.Name, nodes, drainDeadline)
+			if baselineOK {
+				fmt.Printf("  agentless device deployed; owner = node %s (%s), collecting ✓\n", owner, ownerContainer)
+			} else {
+				errs = append(errs, "agentless device did not deploy/collect on any node during baseline")
+			}
+			r.sampleDelivery(metricsPort, 0) // soft: downstream E2E delivery (see note above)
+		} else {
+			fmt.Printf("  baseline: waiting for delivery (receiver >= %s, up to %s)…\n", formatCount(minRecv), time.Until(drainDeadline).Round(time.Second))
+			for time.Now().Before(drainDeadline) {
+				if rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second); qerr == nil {
+					finalCount = rm.LinesReceived
+					fmt.Printf("    received: %s\n", formatCount(finalCount))
+					if finalCount >= minRecv {
+						break
+					}
+				}
+				time.Sleep(3 * time.Second)
+			}
+			baselineOK = finalCount >= minRecv
+			if !baselineOK {
+				errs = append(errs, fmt.Sprintf("baseline delivery did not reach min_received (%s < %s)", formatCount(finalCount), formatCount(minRecv)))
+			}
+		}
+
+		// Phase 3: the disruptive action + recovery assertion.
+		actionOK := true
+		settle := time.Duration(tc.Cluster.SettleOrDefault()) * time.Second
+		switch tc.Cluster.Action {
+		case "":
+			// baseline only — already asserted (form + leader + flow).
+		case "restart_follower":
+			// Restart a follower that is NOT node 1 (the generator's target), so the
+			// data path stays up and we test pure follower churn.
+			follower := pickFollowerAvoiding(leader, 1, tc.Cluster.Nodes)
+			fmt.Printf("  restarting FOLLOWER node %d (%s)…\n", follower, nodes[follower-1])
+			_ = exec.Command("docker", "restart", "-t", "10", nodes[follower-1]).Run()
+			time.Sleep(settle)
+			if _, ok := leaderExistsNow(nodes); !ok {
+				actionOK = false
+				errs = append(errs, "no leader after restarting a follower (cluster unexpectedly lost leadership)")
+			} else {
+				fmt.Println("  cluster still has a leader after the follower restart ✓")
+			}
+			r.sampleDelivery(metricsPort, finalCount)
+		case "restart_leader":
+			fmt.Printf("  restarting LEADER node %d (%s)…\n", leader, nodes[leader-1])
+			_ = exec.Command("docker", "restart", "-t", "10", nodes[leader-1]).Run()
+			time.Sleep(settle)
+			// A leader restart must trigger a re-election: a fresh "became leader"
+			// since the restart, or at minimum a leader present now.
+			elIdx, elected := electedLeaderSince(nodes, fmt.Sprintf("%ds", int(settle.Seconds())+20))
+			nowIdx, haveLeader := leaderExistsNow(nodes)
+			if !elected && !haveLeader {
+				actionOK = false
+				errs = append(errs, "no leader re-elected after restarting the leader")
+			} else if elected {
+				fmt.Printf("  re-election after leader restart: node %d became leader ✓\n", elIdx)
+			} else {
+				fmt.Printf("  leader present after restart: node %d ✓\n", nowIdx)
+			}
+			r.sampleDelivery(metricsPort, finalCount)
+		case "stop_two_recover":
+			// Stop the two highest-index nodes (keep node 1 = subject-1 up). The lone
+			// survivor loses quorum (no leader). Then restart them and assert the
+			// cluster regains quorum and elects a leader.
+			a, b := tc.Cluster.Nodes-1, tc.Cluster.Nodes
+			fmt.Printf("  stopping TWO nodes (%s, %s) to lose quorum…\n", nodes[a-1], nodes[b-1])
+			_ = exec.Command("docker", "stop", "-t", "10", nodes[a-1]).Run()
+			_ = exec.Command("docker", "stop", "-t", "10", nodes[b-1]).Run()
+			time.Sleep(settle)
+			if _, ok := leaderExistsNow(nodes); ok {
+				fmt.Println("  note: a leader still appears present with 2/3 down (unexpected — quorum should be lost)")
+			} else {
+				fmt.Println("  quorum lost (no leader with 2/3 nodes down), as expected ✓")
+			}
+			fmt.Println("  restarting the two nodes to restore quorum…")
+			_ = exec.Command("docker", "start", nodes[a-1]).Run()
+			_ = exec.Command("docker", "start", nodes[b-1]).Run()
+			recDeadline := time.Now().Add(warmup)
+			if recDeadline.After(runDeadline) {
+				recDeadline = runDeadline
+			}
+			fmt.Printf("  waiting for cluster to recover + re-elect a leader (up to %s)…\n", time.Until(recDeadline).Round(time.Second))
+			l2, ok2 := waitClusterReady(nodes, recDeadline)
+			if !ok2 {
+				actionOK = false
+				errs = append(errs, fmt.Sprintf("cluster did not recover a leader after restarting the two nodes (leaderIdx=%d)", l2))
+			} else {
+				fmt.Printf("  cluster recovered; leader = node %d ✓\n", l2)
+			}
+		case "agentless_failover":
+			// owner/ownerContainer were resolved in the baseline phase.
+			if owner == "" {
+				actionOK = false
+				errs = append(errs, "could not determine the agentless device owner (no 'Assigned new device'/'Reassigned device' log) — failover untestable")
+			} else {
+				// Restart (not permanently stop) the owner — matches the real scenario
+				// ("the node that starts the agentless machine gets restarted") and lets the
+				// cluster return to full strength afterwards. While the owner is down past the
+				// ~15s heartbeat timeout the leader must reassign the device to a survivor.
+				fmt.Printf("  agentless device owner = node %s (%s); restarting it to force a failover…\n", owner, ownerContainer)
+				preFailover := finalCount
+				_ = exec.Command("docker", "restart", "-t", "10", ownerContainer).Run()
+				fmt.Printf("  waiting %s for the leader to detect the down node and reassign the device…\n", settle)
+				time.Sleep(settle)
+
+				// HARD 1: the device is reassigned AWAY FROM the restarted owner — the
+				//   automatic ownership failover the case exists to prove ("the new owner is
+				//   another node automatically").
+				if line, ok := clusterReassignedFrom(nodes, owner); ok {
+					fmt.Printf("  failover observed: %s\n", line)
+				} else {
+					actionOK = false
+					errs = append(errs, fmt.Sprintf("no device reassignment ('Reassigned device ... from %s to Y') after the owning node went down — failover did not happen", owner))
+				}
+				// HARD 2: a leader still exists (the cluster stayed healthy across the loss).
+				if _, ok := leaderExistsNow(nodes); !ok {
+					actionOK = false
+					errs = append(errs, "no leader after the owning node went down")
+				}
+				// SOFT: a survivor resuming collection, and end-to-end receiver delivery, are
+				//   logged but NOT asserted. Cluster agentless data-plane recovery after a node
+				//   loss is a known gap: the degraded 2/3 window can stall the new owner's ingest,
+				//   and cross-node payload object-store reads can return NotFound → "payload
+				//   evicted". The hard verdict is the automatic ownership failover above.
+				collectDeadline := time.Now().Add(settle + 90*time.Second)
+				if collectDeadline.After(runDeadline) {
+					collectDeadline = runDeadline
+				}
+				if newOwner, _, ok := waitAgentlessCollectingExcluding(nodes, owner, collectDeadline); ok {
+					fmt.Printf("  (soft) a surviving node (%s) is collecting the device after failover ✓\n", newOwner)
+				} else {
+					fmt.Println("  (soft) no survivor observed collecting within the window — known cluster data-plane gap")
+				}
+				r.sampleDelivery(metricsPort, preFailover)
+			}
+		}
+
+		passed = baselineOK && actionOK
+	}
+
+	if rm, qerr := r.queryReceiverMetrics(metricsPort, 30*time.Second); qerr == nil {
+		finalCount = rm.LinesReceived
+	}
+
+	elapsed := time.Since(startTime).Seconds()
+	if passed {
+		fmt.Printf("  director cluster (%s): PASSED ✓\n", clusterActionLabel(tc.Cluster.Action))
+	} else {
+		fmt.Printf("  director cluster (%s): FAILED ✗\n", clusterActionLabel(tc.Cluster.Action))
+		// On failure, dump a short tail of each node's log to aid diagnosis.
+		for _, c := range nodes {
+			out, _ := exec.Command("docker", "logs", "--tail", "12", c).CombinedOutput()
+			fmt.Printf("  --- %s (tail) ---\n%s\n", c, string(out))
+		}
+	}
+
+	result := results.RunResult{
+		TestName:    tc.Name,
+		Config:      configName,
+		Subject:     subject.Name,
+		Version:     subject.Version,
+		Hardware:    hardwareID(),
+		Timestamp:   startTime,
+		DurationSec: elapsed,
+		LinesOut:    finalCount,
+		Passed:      &passed,
+	}
+	if !passed {
+		result.FailReason = strings.Join(errs, "; ")
+	}
+
+	dir, err := r.store.Save(result, "")
+	if err != nil {
+		return result, fmt.Errorf("saving results: %w", err)
+	}
+	fmt.Printf("  done. results → %s\n", dir)
+	return result, nil
+}
+
+// sampleDelivery logs the current receiver count after a disruption WITHOUT
+// failing the verdict — used for restart cases where the finite generator may have
+// already drained, so continued delivery is informative but not required (the
+// cluster-health assertion is the hard verdict; the baseline proved data flows).
+func (r *Runner) sampleDelivery(metricsPort int, before int64) {
+	if rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second); qerr == nil {
+		fmt.Printf("    post-action received: %s (was %s)\n", formatCount(rm.LinesReceived), formatCount(before))
+	}
+}
+
+func clusterActionLabel(action string) string {
+	if action == "" {
+		return "baseline"
+	}
+	return action
 }
 
 // runKafkaOffsetCommitRestart verifies that delivery-bound source

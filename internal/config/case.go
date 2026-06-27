@@ -134,6 +134,15 @@ type TestCase struct {
 	// Required by (and only meaningful for) that type. See ACLRotationConfig and
 	// runDirectorAgentACLRotation.
 	ACLRotation *ACLRotationConfig `yaml:"acl_rotation"`
+
+	// Cluster, when set, makes the harness run the subject as an N-node director
+	// cluster — each node is its own container (bench-subject-<name>-1..N,
+	// hostnames subject-1..N), peers wired via the director cluster config, and
+	// the per-node identity (director.id / node.name) injected by rendering the
+	// subject config once per node with the {{@.NodeID@}} template var. It also
+	// parameterizes the director_cluster_correctness driver. See ClusterConfig and
+	// runDirectorClusterCorrectness.
+	Cluster *ClusterConfig `yaml:"cluster"`
 }
 
 // VerifierConfig configures the post-drain DuckDB verifier container (see
@@ -745,6 +754,15 @@ func (tc *TestCase) IsDirectorAgentACLRotationType() bool {
 	return tc.Type == "director_agent_acl_rotation_correctness"
 }
 
+// IsDirectorClusterType reports whether the case runs the subject as a multi-node
+// director cluster with the cluster-aware driver (runDirectorClusterCorrectness):
+// it brings up N director nodes, waits for the cluster to form + a leader to be
+// elected, drives a workload, optionally disrupts a node (restart/stop) and
+// asserts the cluster recovers / fails a device over to a surviving node.
+func (tc *TestCase) IsDirectorClusterType() bool {
+	return tc.Type == "director_cluster_correctness"
+}
+
 // IsPerformanceType reports whether the case is scored as a throughput test —
 // the plain `performance` type or the Kafka variant `kafka_performance`.
 func (tc *TestCase) IsPerformanceType() bool {
@@ -879,6 +897,73 @@ func (tc *TestCase) Validate() error {
 	}
 	if err := tc.validateACLRotation(); err != nil {
 		return err
+	}
+	if err := tc.validateCluster(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ClusterConfig parameterizes director_cluster_correctness: the harness starts
+// `Nodes` director containers wired as a cluster (peers on hostnames subject-1..N,
+// inter-node transport plaintext or TLS per `TLS`), waits for the cluster to form
+// and elect a leader, then optionally performs `Action` (a disruptive event) and
+// asserts recovery.
+type ClusterConfig struct {
+	// Nodes is the number of director nodes to start (>= 3 for a real quorum).
+	Nodes int `yaml:"nodes"`
+	// TLS enables the inter-node cluster transport over TLS (tls.status:true in the
+	// cluster config). false = plaintext nats:// routes. When true the case must
+	// ship the cluster cert material under configs/certs/ (mounted at
+	// /opt/vmetric/certs) referenced by the cluster config.
+	TLS bool `yaml:"tls"`
+	// Action is the disruptive edge-case the driver performs mid-run, then asserts
+	// the cluster recovers. "" = no disruption (baseline: form + leader + flow).
+	// Known values:
+	//   restart_follower   — restart a non-leader node; cluster stays up, flow continues.
+	//   restart_leader     — restart the leader; a NEW leader is elected, flow continues.
+	//   stop_two_recover   — stop 2 of 3 nodes (lose quorum), then start them again;
+	//                        the cluster comes back and elects a leader.
+	//   agentless_failover — restart the node that OWNS the agentless device; the
+	//                        leader must reassign it to ANOTHER node (the hard verdict,
+	//                        plus a leader still exists). Collection-resume + end-to-end
+	//                        delivery are soft-logged (cluster data-plane recovery after
+	//                        a node loss is a known director gap). Requires
+	//                        persistent_storage in the subject config (collector payloads
+	//                        must be cluster-shared via the NATS object store).
+	Action string `yaml:"action"`
+	// SettleSeconds is how long to wait after a disruptive Action before asserting
+	// recovery (default 45 — must exceed the 15s heartbeat timeout + reassignment).
+	SettleSeconds int `yaml:"settle_seconds"`
+}
+
+// SettleOrDefault returns SettleSeconds or 45 when unset.
+func (c *ClusterConfig) SettleOrDefault() int {
+	if c == nil || c.SettleSeconds <= 0 {
+		return 45
+	}
+	return c.SettleSeconds
+}
+
+// validateCluster checks the optional `cluster:` block and the
+// director_cluster_correctness type's structural requirements.
+func (tc *TestCase) validateCluster() error {
+	if !tc.IsDirectorClusterType() {
+		if tc.Cluster != nil {
+			return fmt.Errorf("case %q: `cluster:` is only valid for type director_cluster_correctness", tc.Name)
+		}
+		return nil
+	}
+	if tc.Cluster == nil {
+		return fmt.Errorf("case %q: type director_cluster_correctness requires a `cluster:` block", tc.Name)
+	}
+	if tc.Cluster.Nodes < 3 {
+		return fmt.Errorf("case %q: cluster.nodes must be >= 3, got %d", tc.Name, tc.Cluster.Nodes)
+	}
+	switch tc.Cluster.Action {
+	case "", "restart_follower", "restart_leader", "stop_two_recover", "agentless_failover":
+	default:
+		return fmt.Errorf("case %q: unknown cluster.action %q", tc.Name, tc.Cluster.Action)
 	}
 	return nil
 }
