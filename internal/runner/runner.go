@@ -2997,6 +2997,30 @@ func pickFollowerAvoiding(leader, avoid, n int) int {
 	return 1
 }
 
+// nodeHasClusterIP reports whether the node container currently has ip bound on one
+// of its interfaces. The director leader adds the cluster IP at runtime (ip addr
+// add), so it shows up as an "inet <ip>/<prefix>" line in `ip -o addr show`. Returns
+// false if the address is absent OR the lookup fails (e.g. the container is down
+// mid-restart).
+func nodeHasClusterIP(container, ip string) bool {
+	out, err := exec.Command("docker", "exec", container, "ip", "-o", "addr", "show").CombinedOutput()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(out), "inet "+ip+"/")
+}
+
+// waitNodeHasClusterIP polls until the node holds ip, or the deadline passes.
+func waitNodeHasClusterIP(container, ip string, deadline time.Time) bool {
+	for time.Now().Before(deadline) {
+		if nodeHasClusterIP(container, ip) {
+			return true
+		}
+		time.Sleep(3 * time.Second)
+	}
+	return false
+}
+
 // runDirectorClusterCorrectness drives a multi-node director cluster: it brings up
 // N director nodes (rendered one config per node via {{@.NodeID@}}), waits for the
 // cluster to form and elect a leader, drives the case workload (a generator at
@@ -3141,6 +3165,7 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 		}
 
 		isAgentless := tc.Cluster.Action == "agentless_failover"
+		isClusterIP := tc.Cluster.Action == "cluster_ip_failover"
 		var baselineOK bool
 		var owner, ownerContainer string
 
@@ -3153,6 +3178,16 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 				errs = append(errs, "agentless device did not deploy/collect on any node during baseline")
 			}
 			r.sampleDelivery(metricsPort, 0) // soft: downstream E2E delivery (see note above)
+		} else if isClusterIP {
+			// The VIP test's baseline is simply a formed cluster with a leader (already
+			// asserted by waitClusterReady above). Downstream delivery is a SOFT signal
+			// here — logged, not gated — so the verdict isolates VIP placement/migration
+			// from cluster data-plane behavior.
+			baselineOK = true
+			if rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second); qerr == nil {
+				finalCount = rm.LinesReceived
+				fmt.Printf("  (soft) baseline delivery: %s\n", formatCount(finalCount))
+			}
 		} else {
 			fmt.Printf("  baseline: waiting for delivery (receiver >= %s, up to %s)…\n", formatCount(minRecv), time.Until(drainDeadline).Round(time.Second))
 			for time.Now().Before(drainDeadline) {
@@ -3318,6 +3353,60 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 				}
 				r.sampleDelivery(metricsPort, preFailover)
 			}
+		case "cluster_ip_failover":
+			// The elected leader must hold the virtual IP; followers must not. Then
+			// restart the leader and assert the IP migrates to the newly elected leader
+			// (and the old leader, now a follower, no longer holds it).
+			vip := tc.Cluster.IP
+			ipDeadline := time.Now().Add(settle)
+			if ipDeadline.After(runDeadline) {
+				ipDeadline = runDeadline
+			}
+			fmt.Printf("  asserting leader node %d holds the cluster IP %s…\n", leader, vip)
+			if !waitNodeHasClusterIP(nodes[leader-1], vip, ipDeadline) {
+				actionOK = false
+				errs = append(errs, fmt.Sprintf("leader node %d did not bind the cluster IP %s", leader, vip))
+			} else {
+				fmt.Printf("  leader holds %s ✓\n", vip)
+			}
+			for i, c := range nodes {
+				if i+1 != leader && nodeHasClusterIP(c, vip) {
+					actionOK = false
+					errs = append(errs, fmt.Sprintf("follower node %d also holds the cluster IP %s (should be leader-only)", i+1, vip))
+				}
+			}
+			// Restart the leader to force a failover; the IP must move to the new leader.
+			oldLeader := leader
+			fmt.Printf("  restarting LEADER node %d (%s) to migrate the cluster IP…\n", oldLeader, nodes[oldLeader-1])
+			if rerr := exec.Command("docker", "restart", "-t", "10", nodes[oldLeader-1]).Run(); rerr != nil {
+				actionOK = false
+				errs = append(errs, fmt.Sprintf("docker restart %s failed: %v (disruption did not happen)", nodes[oldLeader-1], rerr))
+			}
+			time.Sleep(settle)
+			newLeader, haveLeader := leaderExistsNow(nodes)
+			if !haveLeader {
+				actionOK = false
+				errs = append(errs, "no leader re-elected after restarting the leader (cluster IP cannot migrate)")
+			} else {
+				fmt.Printf("  new leader = node %d\n", newLeader)
+				migDeadline := time.Now().Add(settle)
+				if migDeadline.After(runDeadline) {
+					migDeadline = runDeadline
+				}
+				if !waitNodeHasClusterIP(nodes[newLeader-1], vip, migDeadline) {
+					actionOK = false
+					errs = append(errs, fmt.Sprintf("cluster IP %s did not migrate to the new leader (node %d)", vip, newLeader))
+				} else {
+					fmt.Printf("  cluster IP %s migrated to node %d ✓\n", vip, newLeader)
+				}
+				// If the old leader rejoined as a follower it must have released the IP
+				// (skip when it was re-elected and legitimately holds it again).
+				if newLeader != oldLeader && nodeHasClusterIP(nodes[oldLeader-1], vip) {
+					actionOK = false
+					errs = append(errs, fmt.Sprintf("old leader node %d still holds the cluster IP %s after losing leadership", oldLeader, vip))
+				}
+			}
+			r.sampleDelivery(metricsPort, finalCount)
 		}
 
 		passed = baselineOK && actionOK

@@ -822,6 +822,94 @@ func TestValidateRejectsAgentNameAsEndpoint(t *testing.T) {
 	}
 }
 
+// TestClusterIPComposeRendersVIPPlumbing verifies a cluster_ip_failover case
+// renders the VIP plumbing: a pinned bench subnet (so the virtual IP is in range
+// and won't collide with an auto-assigned container address), NET_ADMIN + root
+// user on each director node (so the elected leader can `ip addr add` the VIP),
+// one service per node, and a per-node config with director.id injected via the
+// harness {{@.NodeID@}} placeholder.
+func TestClusterIPComposeRendersVIPPlumbing(t *testing.T) {
+	tmp, err := os.MkdirTemp("", "compose-clusterip-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmp)
+
+	// Keep the source config OUT of TmpDir (as real cases do: the source lives in
+	// the case dir, the bench renders into its own tmpdir) so the singular render
+	// doesn't overwrite it. Minimal per-node config carrying the NodeID placeholder.
+	srcDir, err := os.MkdirTemp("", "case-src-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(srcDir)
+	srcCfg := filepath.Join(srcDir, "vmetric.yml")
+	if err := os.WriteFile(srcCfg, []byte("director:\n  id: {{@.NodeID@}}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tc := &config.TestCase{
+		Name: "director_cluster_ip_failover_correctness",
+		Type: "director_cluster_correctness",
+		Cluster: &config.ClusterConfig{
+			Nodes:  3,
+			Action: "cluster_ip_failover",
+			IP:     "172.30.0.250",
+		},
+		Receiver: config.ReceiverConfig{Mode: "tcp", Listen: ":9001"},
+	}
+	subj := config.Subject{
+		Name:       "vmetric",
+		Image:      "vmetric/director-enterprise",
+		Version:    "2.0.5",
+		ConfigPath: "/config.yml",
+	}
+	composePath := filepath.Join(tmp, "compose.yaml")
+	cfg := RunConfig{
+		TestCase:         tc,
+		Subject:          subj,
+		ConfigName:       "default",
+		ConfigSrcPath:    srcCfg,
+		TmpDir:           tmp,
+		GeneratorImage:   "img-gen",
+		ReceiverImage:    "img-recv",
+		CollectorImage:   "img-coll",
+		ReceiverHostPort: 19001,
+	}
+	if err := writeCompose(composePath, cfg); err != nil {
+		t.Fatalf("writeCompose: %v", err)
+	}
+	data, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(data)
+
+	// Pinned subnet so the VIP is in range and won't collide with container IPs.
+	mustContain(t, out, "ipam:")
+	mustContain(t, out, "subnet: \"172.30.0.0/16\"")
+	// Each node can add the VIP: NET_ADMIN cap + root user (the director image
+	// runs as non-root, for whom the cap would not be effective).
+	mustContain(t, out, "- NET_ADMIN")
+	mustContain(t, out, "user: \"0:0\"")
+	// One service per node; the singular subject service is replaced.
+	mustContain(t, out, "container_name: \"bench-subject-vmetric-1\"")
+	mustContain(t, out, "container_name: \"bench-subject-vmetric-2\"")
+	mustContain(t, out, "container_name: \"bench-subject-vmetric-3\"")
+	mustNotContain(t, out, "container_name: \"bench-subject-vmetric\"\n")
+
+	// Per-node configs rendered with director.id taken from NodeID.
+	for _, n := range []struct{ id, want string }{
+		{"1", "id: 1"}, {"2", "id: 2"}, {"3", "id: 3"},
+	} {
+		b, err := os.ReadFile(filepath.Join(tmp, "cluster-node-"+n.id+".yml"))
+		if err != nil {
+			t.Fatalf("read node %s config: %v", n.id, err)
+		}
+		mustContain(t, string(b), n.want)
+	}
+}
+
 func mustContain(t *testing.T, hay, needle string) {
 	t.Helper()
 	if !strings.Contains(hay, needle) {
