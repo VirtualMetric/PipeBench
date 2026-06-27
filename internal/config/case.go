@@ -1021,7 +1021,7 @@ type FleetConfig struct {
 	RemoteUsername     string `yaml:"remote_username"`
 	RemotePassword     string `yaml:"remote_password"`
 	RemotePort         int    `yaml:"remote_port"`
-	ExpectRemoteResult int    `yaml:"expect_remote_result"` // 1 success, 0 failure (default 1)
+	ExpectRemoteResult *int   `yaml:"expect_remote_result"` // 1 success, 0 failure (nil → default 1)
 	// LiveWhere/LiveSource parameterize the live_data scenario (default
 	// before-pre-process / director).
 	LiveWhere  string `yaml:"live_where"`
@@ -1061,6 +1061,15 @@ func (f *FleetConfig) DirectorIDOrDefault() string {
 		return f.DirectorID
 	}
 	return "1"
+}
+
+// ExpectRemoteResultOrDefault returns the expected remote_check result, defaulting
+// to 1 (success) when the field is omitted, while still allowing an explicit 0.
+func (f *FleetConfig) ExpectRemoteResultOrDefault() int {
+	if f == nil || f.ExpectRemoteResult == nil {
+		return 1
+	}
+	return *f.ExpectRemoteResult
 }
 
 // validateFleet checks the optional `fleet:` block and the

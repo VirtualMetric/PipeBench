@@ -3415,12 +3415,17 @@ func (st *fleetStatus) lastData(id, key string) string {
 	return d.Inbound[key].LastData
 }
 
-// fleetSimStatus reads the simulator's observation snapshot via `docker exec curl`
-// (the simulator's control API is not host-published; it is reached inside the
-// bench network).
+// fleetSimStatus reads the simulator's observation snapshot via `docker exec wget`.
+// We use the busybox `wget` that ships in the simulator's alpine base rather than
+// curl, so the bench-fleetsim image needs no extra package (and carries no extra
+// CVE surface — it scores Docker Scout grade A like the other bench helpers). The
+// control API is not host-published; it is reached inside the bench network.
+// busybox wget has no request-timeout flag, so the exec is bounded by a context.
 func fleetSimStatus(simContainer string) (*fleetStatus, error) {
-	out, err := exec.Command("docker", "exec", simContainer, "curl", "-s", "--max-time", "5",
-		"http://127.0.0.1:8090/status").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "docker", "exec", simContainer,
+		"wget", "-q", "-O", "-", "http://127.0.0.1:8090/status").Output()
 	if err != nil {
 		return nil, err
 	}
@@ -3431,11 +3436,16 @@ func fleetSimStatus(simContainer string) (*fleetStatus, error) {
 	return &st, nil
 }
 
-// fleetSimSend tells the simulator to send a platform→director command.
+// fleetSimSend tells the simulator to send a platform→director command. busybox
+// wget POSTs the JSON body via --post-data (the sim's sendHandler reads the raw
+// body with json.Unmarshal, so the request content-type is irrelevant).
 func fleetSimSend(simContainer, dirID, command string, params map[string]any) (string, error) {
 	body, _ := json.Marshal(map[string]any{"director": dirID, "command": command, "params": params})
-	out, err := exec.Command("docker", "exec", simContainer, "curl", "-s", "--max-time", "10",
-		"-X", "POST", "-d", string(body), "http://127.0.0.1:8090/send").CombinedOutput()
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "docker", "exec", simContainer,
+		"wget", "-q", "-O", "-", "--post-data="+string(body),
+		"http://127.0.0.1:8090/send").CombinedOutput()
 	if err != nil {
 		return string(out), fmt.Errorf("sim send %s: %w (out: %.200s)", command, err, string(out))
 	}
@@ -3504,6 +3514,16 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 	configName := r.opts.ConfigName
 	subject = r.applySubjectOverrides(subject)
 	fc := tc.Fleet
+
+	// Dispatched before the generic capability guard in Run, so honor the case's
+	// requires: here too — otherwise a fleet case could start against a subject
+	// that lacks a required capability.
+	for _, capName := range tc.Requires {
+		if !subject.HasCapability(capName) {
+			return results.RunResult{}, fmt.Errorf("subject %q does not declare capability %q required by case %q",
+				subject.Name, capName, tc.Name)
+		}
+	}
 
 	fmt.Printf("→ test=%s  subject=%s  version=%s  (fleet scenario=%q)\n",
 		tc.Name, subject.Name, subject.Version, fc.Scenario)
@@ -3590,14 +3610,29 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 	var errs []string
 	var finalCount int64
 
-	// bad_token: the director's token is wrong; assert it NEVER connects.
+	// bad_token: the director's token is wrong; assert it NEVER connects. Watch
+	// the monotonic connects COUNTER (not just the current connected snapshot):
+	// a brief successful auth that drops between polls still bumps the counter,
+	// so any increase over the baseline means auth was not enforced.
 	if fc.Scenario == "bad_token" {
+		before := 0
+		if st0, e := fleetSimStatus(simContainer); e == nil {
+			before = st0.connects(dirID)
+		}
 		deadline := time.Now().Add(warmup + settle)
 		if deadline.After(runDeadline) {
 			deadline = runDeadline
 		}
 		fmt.Printf("  asserting the director does NOT connect with a bad token (up to %s)…\n", time.Until(deadline).Round(time.Second))
-		if fleetWaitConnected(simContainer, dirID, deadline) {
+		connected := false
+		for time.Now().Before(deadline) {
+			if st, e := fleetSimStatus(simContainer); e == nil && (st.connected(dirID) || st.connects(dirID) > before) {
+				connected = true
+				break
+			}
+			time.Sleep(3 * time.Second)
+		}
+		if connected {
 			errs = append(errs, "director connected despite a bad fleet token (auth not enforced)")
 		} else {
 			fmt.Println("  director did not connect with a bad token, as expected ✓")
@@ -3691,14 +3726,16 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 			fmt.Printf("  connection_state frames: %d ✓\n", cs)
 		}
 		// The director should also have requested its config on connect.
-		if st, e := fleetSimStatus(simContainer); e == nil && st.count(dirID, "req.config") < 1 {
+		if st, e := fleetSimStatus(simContainer); e != nil {
+			errs = append(errs, "could not read simulator status to confirm the initial config request: "+e.Error())
+		} else if st.count(dirID, "req.config") < 1 {
 			errs = append(errs, "director did not send an initial config request")
 		} else {
 			fmt.Println("  initial config request seen ✓")
 		}
 
 	case "remote_check":
-		expect := fc.ExpectRemoteResult
+		expect := fc.ExpectRemoteResultOrDefault()
 		params := map[string]any{
 			"address":  fc.RemoteAddress,
 			"username": fleetStr(fc.RemoteUsername, "root"),
@@ -3850,8 +3887,17 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 			map[string]any{"address": "10.255.255.1", "port": 22, "timeout": 5}); e != nil {
 			errs = append(errs, "failed to send remote_check: "+e.Error())
 		}
-		time.Sleep(settle)
-		if st, e := fleetSimStatus(simContainer); e == nil && st.count(dirID, "rep.remote_check") > 0 {
+		// Give the director a chance to (wrongly) reply, but never sleep past the
+		// overall run deadline the other waits respect.
+		if d := time.Until(runDeadline); d > 0 {
+			if d > settle {
+				d = settle
+			}
+			time.Sleep(d)
+		}
+		if st, e := fleetSimStatus(simContainer); e != nil {
+			errs = append(errs, "could not read simulator status to confirm the command was ignored: "+e.Error())
+		} else if st.count(dirID, "rep.remote_check") > 0 {
 			errs = append(errs, "self-managed director replied to a platform command (should ignore it)")
 		} else {
 			fmt.Println("  self-managed director ignored the platform command ✓")
