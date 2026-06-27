@@ -143,6 +143,14 @@ type TestCase struct {
 	// parameterizes the director_cluster_correctness driver. See ClusterConfig and
 	// runDirectorClusterCorrectness.
 	Cluster *ClusterConfig `yaml:"cluster"`
+
+	// Fleet, when set, parameterizes the fleet_automation_correctness driver
+	// (runFleetAutomationCorrectness): the director dials the bench fleet
+	// simulator (an `endpoints:` container running vmetric/bench-fleetsim) over a
+	// WebSocket and the driver asserts the platform<->director "automation"
+	// functions — heartbeat/health, connection state, config push, remote check,
+	// live data, console, stats — via the simulator's control API. See FleetConfig.
+	Fleet *FleetConfig `yaml:"fleet"`
 }
 
 // VerifierConfig configures the post-drain DuckDB verifier container (see
@@ -763,6 +771,16 @@ func (tc *TestCase) IsDirectorClusterType() bool {
 	return tc.Type == "director_cluster_correctness"
 }
 
+// IsFleetAutomationType reports whether the case exercises the director's "fleet"
+// automation path against the bench fleet simulator (runFleetAutomationCorrectness).
+// The director dials the simulator's WebSocket (fleet.type=vmetric + a custom ws
+// URL) and the driver, via the simulator's control API, asserts the
+// platform<->director automation functions (health/heartbeat, connection state,
+// config update, remote check, live data, console, stats).
+func (tc *TestCase) IsFleetAutomationType() bool {
+	return tc.Type == "fleet_automation_correctness"
+}
+
 // IsPerformanceType reports whether the case is scored as a throughput test —
 // the plain `performance` type or the Kafka variant `kafka_performance`.
 func (tc *TestCase) IsPerformanceType() bool {
@@ -901,6 +919,9 @@ func (tc *TestCase) Validate() error {
 	if err := tc.validateCluster(); err != nil {
 		return err
 	}
+	if err := tc.validateFleet(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -965,6 +986,121 @@ func (tc *TestCase) validateCluster() error {
 	case "", "restart_follower", "restart_leader", "stop_two_recover", "agentless_failover":
 	default:
 		return fmt.Errorf("case %q: unknown cluster.action %q", tc.Name, tc.Cluster.Action)
+	}
+	return nil
+}
+
+// FleetConfig parameterizes fleet_automation_correctness: the director connects to
+// the bench fleet simulator (an endpoints container, hostname fleet-sim, running
+// vmetric/bench-fleetsim) over a WebSocket, and the driver drives + asserts one
+// automation Scenario through the simulator's control API.
+type FleetConfig struct {
+	// Scenario selects what the driver does after the director connects:
+	//   connect       — assert heartbeat/health + connection_state are published.
+	//   config_update — push a new config (Update Triggered) and assert the
+	//                   director applies it (replies executed).
+	//   remote_check  — send a remote_check (SSH) command and assert the reply.
+	//   live_data     — start a live-data capture and assert the session replies.
+	//   console_log   — start a live-console capture and assert the session replies.
+	//   stats         — assert the director forwards stats/metrics partitions.
+	//   reconnect     — restart the simulator and assert the director reconnects.
+	//   bad_token     — the director's token mismatches; assert it never connects.
+	//   self_managed  — director is self-managed; assert it ignores platform commands
+	//                   (a sent remote_check gets no reply) while still publishing health.
+	Scenario string `yaml:"scenario"`
+	// SimContainer is the endpoints container name running the simulator
+	// (default "fleet-sim" → docker container "bench-fleet-sim").
+	SimContainer string `yaml:"sim_container"`
+	// DirectorID the simulator keys the director by (default "1").
+	DirectorID string `yaml:"director_id"`
+	// MinHealth is the minimum number of health frames the connect/self_managed
+	// scenarios require (default 2).
+	MinHealth int `yaml:"min_health"`
+	// Remote* parameterize the remote_check scenario (SSH target on the bench net).
+	RemoteAddress      string `yaml:"remote_address"`
+	RemoteUsername     string `yaml:"remote_username"`
+	RemotePassword     string `yaml:"remote_password"`
+	RemotePort         int    `yaml:"remote_port"`
+	ExpectRemoteResult *int   `yaml:"expect_remote_result"` // 1 success, 0 failure (nil → default 1)
+	// LiveWhere/LiveSource parameterize the live_data scenario (default
+	// before-pre-process / director).
+	LiveWhere  string `yaml:"live_where"`
+	LiveSource string `yaml:"live_source"`
+	// SettleSeconds is how long to wait for a scenario's effect (default 45).
+	SettleSeconds int `yaml:"settle_seconds"`
+	// DeliverConfig, when set, is a file under the case's configs/ dir holding an
+	// audited VMF operational config (environments/devices/targets/routes/proxy_tls)
+	// that the simulator delivers to the director after it connects — mirroring the
+	// real platform, since a fleet director rejects plain YAML and loads its
+	// operational config only from a platform-delivered, encoded vmetric.vmf. Needed
+	// by scenarios that require a real pipeline (live_data/stats) or the agent-comm
+	// interface (enrollment). Produce the VMF with the backend cmd/configencoder.
+	DeliverConfig string `yaml:"deliver_config"`
+}
+
+// SettleOrDefault returns SettleSeconds or 45 when unset.
+func (f *FleetConfig) SettleOrDefault() int {
+	if f == nil || f.SettleSeconds <= 0 {
+		return 45
+	}
+	return f.SettleSeconds
+}
+
+// SimContainerOrDefault returns the bench container name of the simulator.
+func (f *FleetConfig) SimContainerOrDefault() string {
+	name := "fleet-sim"
+	if f != nil && f.SimContainer != "" {
+		name = f.SimContainer
+	}
+	return "bench-" + name
+}
+
+// DirectorIDOrDefault returns the simulator's director key (default "1").
+func (f *FleetConfig) DirectorIDOrDefault() string {
+	if f != nil && f.DirectorID != "" {
+		return f.DirectorID
+	}
+	return "1"
+}
+
+// ExpectRemoteResultOrDefault returns the expected remote_check result, defaulting
+// to 1 (success) when the field is omitted, while still allowing an explicit 0.
+func (f *FleetConfig) ExpectRemoteResultOrDefault() int {
+	if f == nil || f.ExpectRemoteResult == nil {
+		return 1
+	}
+	return *f.ExpectRemoteResult
+}
+
+// validateFleet checks the optional `fleet:` block and the
+// fleet_automation_correctness type's structural requirements.
+func (tc *TestCase) validateFleet() error {
+	if !tc.IsFleetAutomationType() {
+		if tc.Fleet != nil {
+			return fmt.Errorf("case %q: `fleet:` is only valid for type fleet_automation_correctness", tc.Name)
+		}
+		return nil
+	}
+	if tc.Fleet == nil {
+		return fmt.Errorf("case %q: type fleet_automation_correctness requires a `fleet:` block", tc.Name)
+	}
+	switch tc.Fleet.Scenario {
+	case "connect", "config_update", "remote_check", "live_data", "console_log", "stats", "reconnect", "bad_token", "self_managed", "enrollment":
+	default:
+		return fmt.Errorf("case %q: unknown fleet.scenario %q", tc.Name, tc.Fleet.Scenario)
+	}
+	// The simulator must be declared as an endpoints container (unless bad_token,
+	// which still needs it to prove the rejection).
+	want := tc.Fleet.SimContainerOrDefault()[len("bench-"):]
+	found := false
+	for _, e := range tc.Endpoints {
+		if e.Name == want {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("case %q: fleet_automation_correctness requires an endpoints entry named %q (the simulator)", tc.Name, want)
 	}
 	return nil
 }
