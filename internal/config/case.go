@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -953,10 +954,20 @@ type ClusterConfig struct {
 	//                        a node loss is a known director gap). Requires
 	//                        persistent_storage in the subject config (collector payloads
 	//                        must be cluster-shared via the NATS object store).
+	//   cluster_ip_failover — the leader binds cluster.ip as a virtual IP on its
+	//                        interface; restart the leader and assert the IP migrates
+	//                        to the newly elected leader (and the old leader releases
+	//                        it). Requires cluster.ip; the harness grants the node
+	//                        containers NET_ADMIN and pins the bench subnet.
 	Action string `yaml:"action"`
 	// SettleSeconds is how long to wait after a disruptive Action before asserting
 	// recovery (default 45 — must exceed the 15s heartbeat timeout + reassignment).
 	SettleSeconds int `yaml:"settle_seconds"`
+	// IP is the virtual/cluster IP the elected leader binds (cluster_ip_failover).
+	// Must lie in the harness-pinned bench subnet 172.30.0.0/16. The harness grants
+	// the node containers NET_ADMIN so the director can add it; the driver asserts
+	// the leader holds it and that it migrates to the new leader on failover.
+	IP string `yaml:"ip"`
 }
 
 // SettleOrDefault returns SettleSeconds or 45 when unset.
@@ -983,9 +994,26 @@ func (tc *TestCase) validateCluster() error {
 		return fmt.Errorf("case %q: cluster.nodes must be >= 3, got %d", tc.Name, tc.Cluster.Nodes)
 	}
 	switch tc.Cluster.Action {
-	case "", "restart_follower", "restart_leader", "stop_two_recover", "agentless_failover":
+	case "", "restart_follower", "restart_leader", "stop_two_recover", "agentless_failover", "cluster_ip_failover":
 	default:
 		return fmt.Errorf("case %q: unknown cluster.action %q", tc.Name, tc.Cluster.Action)
+	}
+	if tc.Cluster.Action == "cluster_ip_failover" {
+		if tc.Cluster.IP == "" {
+			return fmt.Errorf("case %q: cluster.action cluster_ip_failover requires cluster.ip", tc.Name)
+		}
+		ip := net.ParseIP(tc.Cluster.IP)
+		if ip == nil || ip.To4() == nil {
+			return fmt.Errorf("case %q: cluster.ip %q must be an IPv4 address", tc.Name, tc.Cluster.IP)
+		}
+		// The harness pins the bench network to 172.30.0.0/16 (clusterBenchSubnet in
+		// internal/orchestrator/docker.go) so the VIP is in range; reject anything
+		// outside it up front rather than failing later when the director can't use it.
+		if _, benchNet, _ := net.ParseCIDR("172.30.0.0/16"); !benchNet.Contains(ip) {
+			return fmt.Errorf("case %q: cluster.ip %q must be within the pinned bench subnet 172.30.0.0/16", tc.Name, tc.Cluster.IP)
+		}
+	} else if tc.Cluster.IP != "" {
+		return fmt.Errorf("case %q: cluster.ip is only valid with cluster.action cluster_ip_failover", tc.Name)
 	}
 	return nil
 }
