@@ -3176,7 +3176,10 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 			// data path stays up and we test pure follower churn.
 			follower := pickFollowerAvoiding(leader, 1, tc.Cluster.Nodes)
 			fmt.Printf("  restarting FOLLOWER node %d (%s)…\n", follower, nodes[follower-1])
-			_ = exec.Command("docker", "restart", "-t", "10", nodes[follower-1]).Run()
+			if rerr := exec.Command("docker", "restart", "-t", "10", nodes[follower-1]).Run(); rerr != nil {
+				actionOK = false
+				errs = append(errs, fmt.Sprintf("docker restart %s failed: %v (disruption did not happen)", nodes[follower-1], rerr))
+			}
 			time.Sleep(settle)
 			if _, ok := leaderExistsNow(nodes); !ok {
 				actionOK = false
@@ -3187,11 +3190,16 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 			r.sampleDelivery(metricsPort, finalCount)
 		case "restart_leader":
 			fmt.Printf("  restarting LEADER node %d (%s)…\n", leader, nodes[leader-1])
-			_ = exec.Command("docker", "restart", "-t", "10", nodes[leader-1]).Run()
+			if rerr := exec.Command("docker", "restart", "-t", "10", nodes[leader-1]).Run(); rerr != nil {
+				actionOK = false
+				errs = append(errs, fmt.Sprintf("docker restart %s failed: %v (disruption did not happen)", nodes[leader-1], rerr))
+			}
+			restartedAt := time.Now()
 			time.Sleep(settle)
-			// A leader restart must trigger a re-election: a fresh "became leader"
-			// since the restart, or at minimum a leader present now.
-			elIdx, elected := electedLeaderSince(nodes, fmt.Sprintf("%ds", int(settle.Seconds())+20))
+			// A leader restart must trigger a re-election. Anchor the search window to
+			// the instant the restart completed so a stale pre-restart "became leader"
+			// line can't satisfy the check; fall back to a leader simply being present.
+			elIdx, elected := electedLeaderSince(nodes, fmt.Sprintf("%ds", int(time.Since(restartedAt).Seconds())+2))
 			nowIdx, haveLeader := leaderExistsNow(nodes)
 			if !elected && !haveLeader {
 				actionOK = false
@@ -3203,22 +3211,36 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 			}
 			r.sampleDelivery(metricsPort, finalCount)
 		case "stop_two_recover":
-			// Stop the two highest-index nodes (keep node 1 = subject-1 up). The lone
-			// survivor loses quorum (no leader). Then restart them and assert the
-			// cluster regains quorum and elects a leader.
-			a, b := tc.Cluster.Nodes-1, tc.Cluster.Nodes
-			fmt.Printf("  stopping TWO nodes (%s, %s) to lose quorum…\n", nodes[a-1], nodes[b-1])
-			_ = exec.Command("docker", "stop", "-t", "10", nodes[a-1]).Run()
-			_ = exec.Command("docker", "stop", "-t", "10", nodes[b-1]).Run()
+			// Stop a quorum-removing majority of the highest-index nodes (keep node 1 =
+			// subject-1, the generator target, up). For N nodes quorum is N/2+1, so
+			// stopping ceil(N/2) nodes leaves the survivors below quorum (no leader) —
+			// stopping a fixed two would NOT lose quorum for N>3. Then restart them and
+			// assert the cluster regains quorum and elects a leader.
+			toStop := (tc.Cluster.Nodes + 1) / 2
+			var stopped []string
+			for i := 0; i < toStop; i++ {
+				stopped = append(stopped, nodes[tc.Cluster.Nodes-1-i])
+			}
+			fmt.Printf("  stopping %d/%d nodes (%s) to lose quorum…\n", len(stopped), tc.Cluster.Nodes, strings.Join(stopped, ", "))
+			for _, c := range stopped {
+				if serr := exec.Command("docker", "stop", "-t", "10", c).Run(); serr != nil {
+					actionOK = false
+					errs = append(errs, fmt.Sprintf("docker stop %s failed: %v (disruption did not happen)", c, serr))
+				}
+			}
 			time.Sleep(settle)
 			if _, ok := leaderExistsNow(nodes); ok {
-				fmt.Println("  note: a leader still appears present with 2/3 down (unexpected — quorum should be lost)")
+				fmt.Printf("  note: a leader still appears present with %d/%d down (unexpected — quorum should be lost)\n", len(stopped), tc.Cluster.Nodes)
 			} else {
-				fmt.Println("  quorum lost (no leader with 2/3 nodes down), as expected ✓")
+				fmt.Printf("  quorum lost (no leader with %d/%d nodes down), as expected ✓\n", len(stopped), tc.Cluster.Nodes)
 			}
-			fmt.Println("  restarting the two nodes to restore quorum…")
-			_ = exec.Command("docker", "start", nodes[a-1]).Run()
-			_ = exec.Command("docker", "start", nodes[b-1]).Run()
+			fmt.Println("  restarting the stopped nodes to restore quorum…")
+			for _, c := range stopped {
+				if serr := exec.Command("docker", "start", c).Run(); serr != nil {
+					actionOK = false
+					errs = append(errs, fmt.Sprintf("docker start %s failed: %v", c, serr))
+				}
+			}
 			recDeadline := time.Now().Add(warmup)
 			if recDeadline.After(runDeadline) {
 				recDeadline = runDeadline
@@ -3237,17 +3259,24 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 				actionOK = false
 				errs = append(errs, "could not determine the agentless device owner (no 'Assigned new device'/'Reassigned device' log) — failover untestable")
 			} else {
-				// Restart (not permanently stop) the owner — matches the real scenario
-				// ("the node that starts the agentless machine gets restarted") and lets the
-				// cluster return to full strength afterwards. While the owner is down past the
-				// ~15s heartbeat timeout the leader must reassign the device to a survivor.
-				fmt.Printf("  agentless device owner = node %s (%s); restarting it to force a failover…\n", owner, ownerContainer)
+				// STOP the owner, wait past the heartbeat timeout for the leader to
+				// reassign the device, THEN start it again. A plain `docker restart`
+				// brings the node back within its ~10s graceful-stop window — shorter
+				// than the ~15s heartbeat timeout — so the leader may never see it as
+				// down and never reassign. The stop/wait/start sequence guarantees the
+				// owner is down long enough, while still returning the cluster to full
+				// strength afterwards (matching "the node that starts the agentless
+				// machine gets restarted").
+				fmt.Printf("  agentless device owner = node %s (%s); stopping it to force a failover…\n", owner, ownerContainer)
 				preFailover := finalCount
-				_ = exec.Command("docker", "restart", "-t", "10", ownerContainer).Run()
+				if serr := exec.Command("docker", "stop", "-t", "10", ownerContainer).Run(); serr != nil {
+					actionOK = false
+					errs = append(errs, fmt.Sprintf("docker stop %s failed: %v (disruption did not happen)", ownerContainer, serr))
+				}
 				fmt.Printf("  waiting %s for the leader to detect the down node and reassign the device…\n", settle)
 				time.Sleep(settle)
 
-				// HARD 1: the device is reassigned AWAY FROM the restarted owner — the
+				// HARD 1: the device is reassigned AWAY FROM the stopped owner — the
 				//   automatic ownership failover the case exists to prove ("the new owner is
 				//   another node automatically").
 				if line, ok := clusterReassignedFrom(nodes, owner); ok {
@@ -3260,6 +3289,12 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 				if _, ok := leaderExistsNow(nodes); !ok {
 					actionOK = false
 					errs = append(errs, "no leader after the owning node went down")
+				}
+				// Bring the owner back so the cluster returns to full strength.
+				fmt.Printf("  starting node %s again to restore the cluster…\n", ownerContainer)
+				if serr := exec.Command("docker", "start", ownerContainer).Run(); serr != nil {
+					actionOK = false
+					errs = append(errs, fmt.Sprintf("docker start %s failed: %v", ownerContainer, serr))
 				}
 				// SOFT: a survivor resuming collection, and end-to-end receiver delivery, are
 				//   logged but NOT asserted. Cluster agentless data-plane recovery after a node

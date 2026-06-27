@@ -922,8 +922,9 @@ type ClusterConfig struct {
 	// Known values:
 	//   restart_follower   — restart a non-leader node; cluster stays up, flow continues.
 	//   restart_leader     — restart the leader; a NEW leader is elected, flow continues.
-	//   stop_two_recover   — stop 2 of 3 nodes (lose quorum), then start them again;
-	//                        the cluster comes back and elects a leader.
+	//   stop_two_recover   — stop a quorum-removing majority (ceil(N/2) of N nodes,
+	//                        e.g. 2 of 3) to lose quorum, then start them again; the
+	//                        cluster comes back and elects a leader.
 	//   agentless_failover — restart the node that OWNS the agentless device; the
 	//                        leader must reassign it to ANOTHER node (the hard verdict,
 	//                        plus a leader still exists). Collection-resume + end-to-end

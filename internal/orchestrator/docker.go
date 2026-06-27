@@ -103,7 +103,7 @@ func renderSubjectConfig(srcPath, tmpDir string, ctx configTemplateContext) (str
 // it to produce one config per node (NodeID injected). Unlike renderSubjectConfig
 // the caller controls the output path, and it always renders (cluster configs
 // carry {{@.NodeID@}}).
-func renderConfigToFile(srcPath, outPath string, ctx configTemplateContext) error {
+func renderConfigToFile(srcPath, outPath string, ctx configTemplateContext) (err error) {
 	raw, err := os.ReadFile(srcPath)
 	if err != nil {
 		return err
@@ -116,7 +116,12 @@ func renderConfigToFile(srcPath, outPath string, ctx configTemplateContext) erro
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		// Surface a flush/close failure, but never mask an earlier error.
+		if cerr := f.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("closing cluster node config %s: %w", outPath, cerr)
+		}
+	}()
 	if err := tmpl.Execute(f, ctx); err != nil {
 		return fmt.Errorf("rendering cluster node config %s: %w", outPath, err)
 	}
