@@ -1,7 +1,10 @@
 package runner
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -216,6 +219,9 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	}
 	if tc.IsDirectorClusterType() {
 		return r.runDirectorClusterCorrectness(tc, subject)
+	}
+	if tc.IsFleetAutomationType() {
+		return r.runFleetAutomationCorrectness(tc, subject)
 	}
 
 	configName := r.opts.ConfigName
@@ -3371,6 +3377,544 @@ func clusterActionLabel(action string) string {
 		return "baseline"
 	}
 	return action
+}
+
+// ── Fleet automation simulator control ─────────────────────────────────────────
+
+// fleetStatus mirrors the bench fleet simulator's /status JSON. Each director's
+// inbound frames are keyed by "<action>.<command>" (e.g. "req.health",
+// "rep.remote_check") with a count and the last payload seen.
+type fleetStatus struct {
+	Directors map[string]struct {
+		Connected bool `json:"connected"`
+		Connects  int  `json:"connects"`
+		Inbound   map[string]struct {
+			Count    int    `json:"count"`
+			LastData string `json:"last_data"`
+		} `json:"inbound"`
+	} `json:"directors"`
+}
+
+func (st *fleetStatus) connected(id string) bool {
+	d, ok := st.Directors[id]
+	return ok && d.Connected
+}
+func (st *fleetStatus) connects(id string) int { return st.Directors[id].Connects }
+func (st *fleetStatus) count(id, key string) int {
+	d, ok := st.Directors[id]
+	if !ok {
+		return 0
+	}
+	return d.Inbound[key].Count
+}
+func (st *fleetStatus) lastData(id, key string) string {
+	d, ok := st.Directors[id]
+	if !ok {
+		return ""
+	}
+	return d.Inbound[key].LastData
+}
+
+// fleetSimStatus reads the simulator's observation snapshot via `docker exec curl`
+// (the simulator's control API is not host-published; it is reached inside the
+// bench network).
+func fleetSimStatus(simContainer string) (*fleetStatus, error) {
+	out, err := exec.Command("docker", "exec", simContainer, "curl", "-s", "--max-time", "5",
+		"http://127.0.0.1:8090/status").Output()
+	if err != nil {
+		return nil, err
+	}
+	var st fleetStatus
+	if err := json.Unmarshal(out, &st); err != nil {
+		return nil, fmt.Errorf("decode sim status: %w (raw: %.200s)", err, string(out))
+	}
+	return &st, nil
+}
+
+// fleetSimSend tells the simulator to send a platform→director command.
+func fleetSimSend(simContainer, dirID, command string, params map[string]any) (string, error) {
+	body, _ := json.Marshal(map[string]any{"director": dirID, "command": command, "params": params})
+	out, err := exec.Command("docker", "exec", simContainer, "curl", "-s", "--max-time", "10",
+		"-X", "POST", "-d", string(body), "http://127.0.0.1:8090/send").CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("sim send %s: %w (out: %.200s)", command, err, string(out))
+	}
+	return string(out), nil
+}
+
+// fleetWaitConnected polls until the director shows connected at the simulator.
+func fleetWaitConnected(simContainer, dirID string, deadline time.Time) bool {
+	for time.Now().Before(deadline) {
+		if st, err := fleetSimStatus(simContainer); err == nil && st.connected(dirID) {
+			return true
+		}
+		time.Sleep(3 * time.Second)
+	}
+	return false
+}
+
+// fleetWaitCount polls until inbound[key].count >= min for the director, returning
+// the final count and whether the threshold was reached.
+func fleetWaitCount(simContainer, dirID, key string, min int, deadline time.Time) (int, bool) {
+	last := 0
+	for time.Now().Before(deadline) {
+		if st, err := fleetSimStatus(simContainer); err == nil {
+			last = st.count(dirID, key)
+			if last >= min {
+				return last, true
+			}
+		}
+		time.Sleep(3 * time.Second)
+	}
+	return last, false
+}
+
+// fleetStr returns v, or def when v is empty.
+func fleetStr(v, def string) string {
+	if v == "" {
+		return def
+	}
+	return v
+}
+
+// zipSingleFile returns a ZIP archive containing one entry (name → content). Used
+// to package a config for the director's config-set path, which unzips + parses a
+// ZIP as a plain config tree (vs treating raw bytes as a packaged .vmf).
+func zipSingleFile(name string, content []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	w, err := zw.Create(name)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := w.Write(content); err != nil {
+		return nil, err
+	}
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// runFleetAutomationCorrectness drives the director's fleet/automation path against
+// the bench fleet simulator: the director dials the simulator's WebSocket
+// (fleet.type=vmetric + a custom ws URL to the fleet-sim endpoint), and the driver
+// asserts the platform<->director automation functions for tc.Fleet.Scenario.
+func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
+	configName := r.opts.ConfigName
+	subject = r.applySubjectOverrides(subject)
+	fc := tc.Fleet
+
+	fmt.Printf("→ test=%s  subject=%s  version=%s  (fleet scenario=%q)\n",
+		tc.Name, subject.Name, subject.Version, fc.Scenario)
+
+	srcCfg, err := tc.ConfigFilePath(r.opts.CasesDir, configName, subject)
+	if err != nil {
+		return results.RunResult{}, err
+	}
+	srcCfg, err = filepath.Abs(srcCfg)
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("resolving config path: %w", err)
+	}
+
+	tmpDir, err := os.MkdirTemp("", "bench-"+tc.Name+"-")
+	if err != nil {
+		return results.RunResult{}, err
+	}
+	if err := os.Chmod(tmpDir, 0o1777); err != nil {
+		return results.RunResult{}, fmt.Errorf("chmod tmpdir: %w", err)
+	}
+	defer func() {
+		if !r.opts.NoCleanup {
+			os.RemoveAll(tmpDir)
+		}
+	}()
+
+	caseDir, err := filepath.Abs(filepath.Join(r.opts.CasesDir, tc.Name))
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("resolving case directory: %w", err)
+	}
+
+	extraEnv := map[string]string{}
+	if cfg, ok := tc.Configurations[configName]; ok {
+		maps.Copy(extraEnv, cfg.Env)
+	}
+
+	runCfg := orchestrator.RunConfig{
+		TestCase:         tc,
+		Subject:          subject,
+		ConfigName:       configName,
+		ConfigSrcPath:    srcCfg,
+		CaseDir:          caseDir,
+		TmpDir:           tmpDir,
+		GeneratorImage:   r.opts.GeneratorImage,
+		ReceiverImage:    r.opts.ReceiverImage,
+		CollectorImage:   r.opts.CollectorImage,
+		ReceiverHostPort: r.opts.ReceiverHostPort,
+		ExtraSubjectEnv:  extraEnv,
+		CPULimit:         r.opts.CPULimit,
+		MemLimit:         r.opts.MemLimit,
+	}
+
+	orch, err := orchestrator.NewComposeRunner(runCfg)
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("compose setup: %w", err)
+	}
+
+	simContainer := fc.SimContainerOrDefault()
+	dirID := fc.DirectorIDOrDefault()
+	subjectContainer := "bench-subject-" + subject.Name
+	cleanup := []string{"bench-receiver", "bench-collector", "bench-agent", "bench-generator", subjectContainer, simContainer}
+	for _, c := range cleanup {
+		_ = exec.Command("docker", "rm", "-f", c).Run()
+	}
+	_ = orch.Down()
+	defer func() {
+		if !r.opts.NoCleanup {
+			fmt.Println("  tearing down…")
+			_ = orch.Down()
+		}
+	}()
+
+	startTime := time.Now()
+	runDeadline := startTime.Add(r.opts.Timeout)
+	settle := time.Duration(fc.SettleOrDefault()) * time.Second
+	warmup := tc.WarmupOrDefault(20 * time.Second)
+
+	fmt.Println("  starting director + fleet simulator…")
+	if err := orch.Up(); err != nil {
+		return results.RunResult{}, fmt.Errorf("starting fleet topology: %w", err)
+	}
+
+	var passed bool
+	var errs []string
+	var finalCount int64
+
+	// bad_token: the director's token is wrong; assert it NEVER connects.
+	if fc.Scenario == "bad_token" {
+		deadline := time.Now().Add(warmup + settle)
+		if deadline.After(runDeadline) {
+			deadline = runDeadline
+		}
+		fmt.Printf("  asserting the director does NOT connect with a bad token (up to %s)…\n", time.Until(deadline).Round(time.Second))
+		if fleetWaitConnected(simContainer, dirID, deadline) {
+			errs = append(errs, "director connected despite a bad fleet token (auth not enforced)")
+		} else {
+			fmt.Println("  director did not connect with a bad token, as expected ✓")
+		}
+		passed = len(errs) == 0
+		return r.saveFleetResult(tc, subject, configName, startTime, finalCount, passed, errs, simContainer, subjectContainer)
+	}
+
+	// All other scenarios: wait for the director to connect first.
+	connDeadline := time.Now().Add(warmup + 90*time.Second)
+	if connDeadline.After(runDeadline) {
+		connDeadline = runDeadline
+	}
+	fmt.Printf("  waiting for the director to connect to the fleet simulator (up to %s)…\n", time.Until(connDeadline).Round(time.Second))
+	if !fleetWaitConnected(simContainer, dirID, connDeadline) {
+		errs = append(errs, "director never connected to the fleet simulator")
+		passed = false
+		return r.saveFleetResult(tc, subject, configName, startTime, finalCount, passed, errs, simContainer, subjectContainer)
+	}
+	fmt.Println("  director connected to the fleet simulator ✓")
+
+	// Deliver the audited operational config (the platform's job). A fleet
+	// director loads its operational config (environments/devices/targets/routes/
+	// proxy_tls) only from an encoded vmetric.vmf delivered by the platform — it
+	// rejects plain YAML by design — so scenarios needing a real pipeline
+	// (live_data/stats) or the agent-comm interface (enrollment) must have it
+	// pushed here. The director writes it to Path.Config/vmetric.vmf, applies, and
+	// reloads (SystemDB), bringing up its listeners + agent-comm HTTPS server.
+	if fc.DeliverConfig != "" {
+		vmfPath := filepath.Join(caseDir, "configs", fc.DeliverConfig)
+		vmfBytes, e := os.ReadFile(vmfPath)
+		if e != nil {
+			errs = append(errs, "cannot read deliver_config "+fc.DeliverConfig+": "+e.Error())
+			passed = false
+			return r.saveFleetResult(tc, subject, configName, startTime, finalCount, passed, errs, simContainer, subjectContainer)
+		}
+		fmt.Printf("  delivering operational config (%s, %d bytes vmf)…\n", fc.DeliverConfig, len(vmfBytes))
+		b64 := base64.StdEncoding.EncodeToString(vmfBytes)
+		if _, se := fleetSimSend(simContainer, dirID, "config", map[string]any{"data_b64": b64}); se != nil {
+			errs = append(errs, "failed to deliver operational config: "+se.Error())
+		}
+		// Wait for the director to apply + reload it (its listeners / agent-comm
+		// HTTPS server come up once SystemDB is populated). Poll the subject's logs.
+		applyDeadline := time.Now().Add(settle + 60*time.Second)
+		if applyDeadline.After(runDeadline) {
+			applyDeadline = runDeadline
+		}
+		applied := false
+		for time.Now().Before(applyDeadline) {
+			out, _ := exec.Command("docker", "logs", "--tail", "200", subjectContainer).CombinedOutput()
+			s := string(out)
+			if strings.Contains(s, "Director HTTP Server started") || strings.Contains(s, "Listener (") {
+				applied = true
+				break
+			}
+			time.Sleep(3 * time.Second)
+		}
+		if applied {
+			fmt.Println("  director applied the delivered config (pipeline + agent-comm up) ✓")
+		} else {
+			fmt.Println("  (warning) did not observe the director bring up its pipeline/agent-comm after config delivery")
+		}
+	}
+
+	scenarioDeadline := func() time.Time {
+		d := time.Now().Add(settle + 60*time.Second)
+		if d.After(runDeadline) {
+			d = runDeadline
+		}
+		return d
+	}
+
+	switch fc.Scenario {
+	case "connect":
+		// Heartbeat/health + connection_state must be published periodically.
+		minHealth := fc.MinHealth
+		if minHealth <= 0 {
+			minHealth = 2
+		}
+		fmt.Printf("  waiting for >= %d health frames + connection_state…\n", minHealth)
+		hc, okH := fleetWaitCount(simContainer, dirID, "req.health", minHealth, scenarioDeadline())
+		finalCount = int64(hc)
+		if !okH {
+			errs = append(errs, fmt.Sprintf("director did not publish >= %d health frames (got %d)", minHealth, hc))
+		} else {
+			fmt.Printf("  health frames: %d ✓\n", hc)
+		}
+		if cs, okC := fleetWaitCount(simContainer, dirID, "req.connection_state", 1, scenarioDeadline()); !okC {
+			errs = append(errs, "director did not publish connection_state")
+		} else {
+			fmt.Printf("  connection_state frames: %d ✓\n", cs)
+		}
+		// The director should also have requested its config on connect.
+		if st, e := fleetSimStatus(simContainer); e == nil && st.count(dirID, "req.config") < 1 {
+			errs = append(errs, "director did not send an initial config request")
+		} else {
+			fmt.Println("  initial config request seen ✓")
+		}
+
+	case "remote_check":
+		expect := fc.ExpectRemoteResult
+		params := map[string]any{
+			"address":  fc.RemoteAddress,
+			"username": fleetStr(fc.RemoteUsername, "root"),
+			"password": fc.RemotePassword,
+			"port":     fc.RemotePort,
+			"timeout":  10,
+		}
+		fmt.Printf("  sending remote_check (ssh %s:%d), expecting result=%d…\n", fc.RemoteAddress, fc.RemotePort, expect)
+		if _, e := fleetSimSend(simContainer, dirID, "remote_check_ssh", params); e != nil {
+			errs = append(errs, "failed to send remote_check: "+e.Error())
+		}
+		if _, ok := fleetWaitCount(simContainer, dirID, "rep.remote_check", 1, scenarioDeadline()); !ok {
+			errs = append(errs, "no remote_check reply from director")
+		} else {
+			last := ""
+			if st, e := fleetSimStatus(simContainer); e == nil {
+				last = st.lastData(dirID, "rep.remote_check")
+			}
+			fmt.Printf("  remote_check reply: %s\n", last)
+			needle := fmt.Sprintf("\"result\":%d", expect)
+			if !strings.Contains(last, needle) {
+				errs = append(errs, fmt.Sprintf("remote_check reply did not report result=%d: %s", expect, last))
+			} else {
+				fmt.Printf("  remote_check result=%d ✓\n", expect)
+			}
+		}
+
+	case "config_update":
+		// Push a new config (Update Triggered). The new config is read from the
+		// case's configs/update.yml and shipped as a ZIP containing vmetric.yml —
+		// the director's config-set path treats a non-zip payload as a packaged
+		// .vmf, while a ZIP is unzipped and parsed as a plain config tree. The
+		// director validates + atomically swaps it in and replies executed=true.
+		updPath := filepath.Join(caseDir, "configs", "update.yml")
+		raw, e := os.ReadFile(updPath)
+		if e != nil {
+			errs = append(errs, "cannot read configs/update.yml for config_update: "+e.Error())
+		} else if zipped, ze := zipSingleFile("vmetric.yml", raw); ze != nil {
+			errs = append(errs, "cannot zip update config: "+ze.Error())
+		} else {
+			b64 := base64.StdEncoding.EncodeToString(zipped)
+			fmt.Printf("  pushing config update (%d bytes raw, %d zipped)…\n", len(raw), len(zipped))
+			if _, se := fleetSimSend(simContainer, dirID, "config", map[string]any{"data_b64": b64}); se != nil {
+				errs = append(errs, "failed to push config: "+se.Error())
+			}
+			if _, ok := fleetWaitCount(simContainer, dirID, "rep.config", 1, scenarioDeadline()); !ok {
+				errs = append(errs, "no config reply from director after push")
+			} else {
+				last := ""
+				if st, e := fleetSimStatus(simContainer); e == nil {
+					last = st.lastData(dirID, "rep.config")
+				}
+				fmt.Printf("  config reply: %.300s\n", last)
+				if !strings.Contains(last, "\"executed\":true") {
+					errs = append(errs, "director did not report the config as executed: "+last)
+				} else {
+					fmt.Println("  config applied (executed) ✓")
+				}
+			}
+		}
+
+	case "live_data", "console_log":
+		cmd := "live_data"
+		params := map[string]any{
+			"capture_time": 15,
+			"capture_line": 100,
+			"where":        fleetStr(fc.LiveWhere, "before-pre-process"),
+			"source_type":  fleetStr(fc.LiveSource, "director"),
+		}
+		if fc.Scenario == "console_log" {
+			cmd = "console_log"
+			params = map[string]any{"capture_time": 15, "capture_line": 100}
+		}
+		fmt.Printf("  starting %s capture session…\n", cmd)
+		if _, e := fleetSimSend(simContainer, dirID, cmd, params); e != nil {
+			errs = append(errs, "failed to start "+cmd+": "+e.Error())
+		}
+		// The capture streams results back on a "<cmd>_reply" subject (action req),
+		// e.g. vmetric.fleet.req.platform.director.<id>.<reqID>.live_data_reply.
+		// Generator traffic (if the case ships one) flows through the director so
+		// records get captured.
+		key := "req." + cmd + "_reply"
+		if c, ok := fleetWaitCount(simContainer, dirID, key, 1, scenarioDeadline()); !ok {
+			errs = append(errs, fmt.Sprintf("no %s capture data streamed back (got %d frames)", cmd, c))
+		} else {
+			finalCount = int64(c)
+			fmt.Printf("  %s streamed %d frame(s) ✓\n", cmd, c)
+		}
+
+	case "stats":
+		// The director forwards stats/metrics partitions as traffic flows. The case
+		// ships a generator → director pipeline; assert metrics frames arrive.
+		fmt.Println("  waiting for stats/metrics frames…")
+		c1, ok1 := fleetWaitCount(simContainer, dirID, "req.metricsvmf", 1, scenarioDeadline())
+		c2 := 0
+		if !ok1 {
+			c2, _ = fleetWaitCount(simContainer, dirID, "req.metrics", 1, scenarioDeadline())
+		}
+		finalCount = int64(c1 + c2)
+		if c1 < 1 && c2 < 1 {
+			errs = append(errs, "director did not forward any stats/metrics frames")
+		} else {
+			fmt.Printf("  stats frames: metricsvmf=%d metrics=%d ✓\n", c1, c2)
+		}
+
+	case "reconnect":
+		st0, _ := fleetSimStatus(simContainer)
+		before := 0
+		if st0 != nil {
+			before = st0.connects(dirID)
+		}
+		fmt.Printf("  restarting the fleet simulator (connects=%d)…\n", before)
+		_ = exec.Command("docker", "restart", "-t", "5", simContainer).Run()
+		// After the sim restarts, the director must redial and re-register.
+		fmt.Println("  waiting for the director to reconnect…")
+		reconnected := false
+		rd := scenarioDeadline()
+		for time.Now().Before(rd) {
+			if st, e := fleetSimStatus(simContainer); e == nil && st.connected(dirID) && st.connects(dirID) >= 1 {
+				reconnected = true
+				break
+			}
+			time.Sleep(3 * time.Second)
+		}
+		if !reconnected {
+			errs = append(errs, "director did not reconnect after the simulator restarted")
+		} else {
+			// And resume publishing health on the fresh connection.
+			if hc, ok := fleetWaitCount(simContainer, dirID, "req.health", 1, scenarioDeadline()); ok {
+				finalCount = int64(hc)
+				fmt.Printf("  director reconnected and resumed health (%d) ✓\n", hc)
+			} else {
+				errs = append(errs, "director reconnected but did not resume health publishing")
+			}
+		}
+
+	case "self_managed":
+		// A self-managed director still publishes health but must IGNORE platform
+		// commands (ListenRequests is not started). Send a remote_check and assert
+		// NO reply, while health keeps flowing.
+		if hc, ok := fleetWaitCount(simContainer, dirID, "req.health", 1, scenarioDeadline()); ok {
+			fmt.Printf("  self-managed director still publishes health (%d) ✓\n", hc)
+			finalCount = int64(hc)
+		} else {
+			errs = append(errs, "self-managed director did not publish health")
+		}
+		fmt.Println("  sending remote_check; it must be IGNORED…")
+		if _, e := fleetSimSend(simContainer, dirID, "remote_check_ssh",
+			map[string]any{"address": "10.255.255.1", "port": 22, "timeout": 5}); e != nil {
+			errs = append(errs, "failed to send remote_check: "+e.Error())
+		}
+		time.Sleep(settle)
+		if st, e := fleetSimStatus(simContainer); e == nil && st.count(dirID, "rep.remote_check") > 0 {
+			errs = append(errs, "self-managed director replied to a platform command (should ignore it)")
+		} else {
+			fmt.Println("  self-managed director ignored the platform command ✓")
+		}
+
+	case "enrollment":
+		// Agent → platform connectivity. An agent (an agent: container in enrollment
+		// mode — config hash device_id 0, enrollment_id != 0) connects to the
+		// director and sends a check_enrollment request; the director (as JetStream
+		// leader of its own node) forwards it to the platform over the fleet link.
+		// The simulator auto-approves (FLEETSIM_AUTOENROLL=1) and the director relays
+		// the approval to the agent. Verdict: the simulator observes the forwarded
+		// enrollment (rep.check_enrollment), proving the agent→director→platform path.
+		fmt.Println("  waiting for the agent's enrollment to be forwarded to the platform…")
+		if c, ok := fleetWaitCount(simContainer, dirID, "rep.check_enrollment", 1, scenarioDeadline()); !ok {
+			errs = append(errs, fmt.Sprintf("director did not forward agent enrollment to the platform (got %d frames)", c))
+		} else {
+			finalCount = int64(c)
+			fmt.Printf("  agent enrollment forwarded to platform (%d) ✓\n", c)
+		}
+	}
+
+	passed = len(errs) == 0
+	return r.saveFleetResult(tc, subject, configName, startTime, finalCount, passed, errs, simContainer, subjectContainer)
+}
+
+// saveFleetResult records the verdict and, on failure, dumps short log tails of
+// the simulator and director to aid diagnosis.
+func (r *Runner) saveFleetResult(tc *config.TestCase, subject config.Subject, configName string,
+	startTime time.Time, finalCount int64, passed bool, errs []string, simContainer, subjectContainer string) (results.RunResult, error) {
+
+	elapsed := time.Since(startTime).Seconds()
+	label := tc.Fleet.Scenario
+	if passed {
+		fmt.Printf("  fleet automation (%s): PASSED ✓\n", label)
+	} else {
+		fmt.Printf("  fleet automation (%s): FAILED ✗\n", label)
+		for _, c := range []string{simContainer, subjectContainer} {
+			out, _ := exec.Command("docker", "logs", "--tail", "20", c).CombinedOutput()
+			fmt.Printf("  --- %s (tail) ---\n%s\n", c, string(out))
+		}
+	}
+
+	result := results.RunResult{
+		TestName:    tc.Name,
+		Config:      configName,
+		Subject:     subject.Name,
+		Version:     subject.Version,
+		Hardware:    hardwareID(),
+		Timestamp:   startTime,
+		DurationSec: elapsed,
+		LinesOut:    finalCount,
+		Passed:      &passed,
+	}
+	if !passed {
+		result.FailReason = strings.Join(errs, "; ")
+	}
+	dir, err := r.store.Save(result, "")
+	if err != nil {
+		return result, fmt.Errorf("saving results: %w", err)
+	}
+	fmt.Printf("  done. results → %s\n", dir)
+	return result, nil
 }
 
 // runKafkaOffsetCommitRestart verifies that delivery-bound source
