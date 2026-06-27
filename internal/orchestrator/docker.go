@@ -1791,9 +1791,10 @@ func writeCompose(path string, cfg RunConfig) error {
 	if tc.Cluster != nil && tc.Cluster.IP != "" {
 		benchSubnet = clusterBenchSubnet
 		nodesNeedNetAdmin = true
-		if subjectUser == "" {
-			subjectUser = "0:0"
-		}
+		// VIP bind (`ip addr add`) needs an effective NET_ADMIN, which only root
+		// has — force root for the cluster-IP path regardless of any subject-defined
+		// user, else the bind fails with EPERM.
+		subjectUser = "0:0"
 	}
 
 	// Cloud emulator env. Injected into the subject whenever the case

@@ -53,7 +53,17 @@ func TestValidateCluster(t *testing.T) {
 		{
 			name:    "cluster_ip_failover with invalid ip",
 			mutate:  func(tc *TestCase) { tc.Cluster.IP = "not-an-ip" },
-			wantErr: "not a valid IP",
+			wantErr: "must be an IPv4 address",
+		},
+		{
+			name:    "cluster_ip_failover with IPv6 ip",
+			mutate:  func(tc *TestCase) { tc.Cluster.IP = "fd00::1" },
+			wantErr: "must be an IPv4 address",
+		},
+		{
+			name:    "cluster_ip_failover ip outside bench subnet",
+			mutate:  func(tc *TestCase) { tc.Cluster.IP = "10.0.0.5" },
+			wantErr: "within the pinned bench subnet",
 		},
 		{
 			name: "ip set without cluster_ip_failover action",

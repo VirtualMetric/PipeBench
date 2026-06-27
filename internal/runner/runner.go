@@ -3375,19 +3375,29 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 					errs = append(errs, fmt.Sprintf("follower node %d also holds the cluster IP %s (should be leader-only)", i+1, vip))
 				}
 			}
-			// Restart the leader to force a failover; the IP must move to the new leader.
+			// STOP the leader (not `docker restart`): a restart's brief downtime can be
+			// shorter than the RAFT election window, letting the same node regain
+			// leadership so the VIP never actually moves (and the "released" check below
+			// would be skipped). Stopping it guarantees a DIFFERENT survivor wins and
+			// binds the VIP; we then start it again and assert it rejoined WITHOUT the IP.
 			oldLeader := leader
-			fmt.Printf("  restarting LEADER node %d (%s) to migrate the cluster IP…\n", oldLeader, nodes[oldLeader-1])
-			if rerr := exec.Command("docker", "restart", "-t", "10", nodes[oldLeader-1]).Run(); rerr != nil {
+			fmt.Printf("  stopping LEADER node %d (%s) to force the cluster IP to migrate…\n", oldLeader, nodes[oldLeader-1])
+			if serr := exec.Command("docker", "stop", "-t", "10", nodes[oldLeader-1]).Run(); serr != nil {
 				actionOK = false
-				errs = append(errs, fmt.Sprintf("docker restart %s failed: %v (disruption did not happen)", nodes[oldLeader-1], rerr))
+				errs = append(errs, fmt.Sprintf("docker stop %s failed: %v (disruption did not happen)", nodes[oldLeader-1], serr))
 			}
 			time.Sleep(settle)
 			newLeader, haveLeader := leaderExistsNow(nodes)
-			if !haveLeader {
+			switch {
+			case !haveLeader:
 				actionOK = false
-				errs = append(errs, "no leader re-elected after restarting the leader (cluster IP cannot migrate)")
-			} else {
+				errs = append(errs, "no leader elected among survivors after stopping the leader (cluster IP cannot migrate)")
+			case newLeader == oldLeader:
+				// The stopped node is excluded by leaderExistsNow (containerRunning);
+				// reaching here would mean leadership never actually moved.
+				actionOK = false
+				errs = append(errs, fmt.Sprintf("leadership did not move off the stopped node %d", oldLeader))
+			default:
 				fmt.Printf("  new leader = node %d\n", newLeader)
 				migDeadline := time.Now().Add(settle)
 				if migDeadline.After(runDeadline) {
@@ -3399,11 +3409,24 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 				} else {
 					fmt.Printf("  cluster IP %s migrated to node %d ✓\n", vip, newLeader)
 				}
-				// If the old leader rejoined as a follower it must have released the IP
-				// (skip when it was re-elected and legitimately holds it again).
-				if newLeader != oldLeader && nodeHasClusterIP(nodes[oldLeader-1], vip) {
+			}
+			// Bring the old leader back; it must rejoin as a follower WITHOUT the VIP.
+			fmt.Printf("  starting node %s again to restore the cluster…\n", nodes[oldLeader-1])
+			if serr := exec.Command("docker", "start", nodes[oldLeader-1]).Run(); serr != nil {
+				actionOK = false
+				errs = append(errs, fmt.Sprintf("docker start %s failed: %v", nodes[oldLeader-1], serr))
+			} else {
+				// Brief wait for the container to come up: a fresh start wipes the netns
+				// and a follower never binds the VIP, so it must be absent. Check soon
+				// (before any later re-election could legitimately move leadership back).
+				if d := time.Until(runDeadline); d > 0 {
+					time.Sleep(min(10*time.Second, d))
+				}
+				if nodeHasClusterIP(nodes[oldLeader-1], vip) {
 					actionOK = false
-					errs = append(errs, fmt.Sprintf("old leader node %d still holds the cluster IP %s after losing leadership", oldLeader, vip))
+					errs = append(errs, fmt.Sprintf("restarted node %d (former leader) holds the cluster IP %s despite being a follower", oldLeader, vip))
+				} else {
+					fmt.Printf("  former leader node %d does not hold the cluster IP ✓\n", oldLeader)
 				}
 			}
 			r.sampleDelivery(metricsPort, finalCount)

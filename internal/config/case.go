@@ -1002,8 +1002,15 @@ func (tc *TestCase) validateCluster() error {
 		if tc.Cluster.IP == "" {
 			return fmt.Errorf("case %q: cluster.action cluster_ip_failover requires cluster.ip", tc.Name)
 		}
-		if net.ParseIP(tc.Cluster.IP) == nil {
-			return fmt.Errorf("case %q: cluster.ip %q is not a valid IP", tc.Name, tc.Cluster.IP)
+		ip := net.ParseIP(tc.Cluster.IP)
+		if ip == nil || ip.To4() == nil {
+			return fmt.Errorf("case %q: cluster.ip %q must be an IPv4 address", tc.Name, tc.Cluster.IP)
+		}
+		// The harness pins the bench network to 172.30.0.0/16 (clusterBenchSubnet in
+		// internal/orchestrator/docker.go) so the VIP is in range; reject anything
+		// outside it up front rather than failing later when the director can't use it.
+		if _, benchNet, _ := net.ParseCIDR("172.30.0.0/16"); !benchNet.Contains(ip) {
+			return fmt.Errorf("case %q: cluster.ip %q must be within the pinned bench subnet 172.30.0.0/16", tc.Name, tc.Cluster.IP)
 		}
 	} else if tc.Cluster.IP != "" {
 		return fmt.Errorf("case %q: cluster.ip is only valid with cluster.action cluster_ip_failover", tc.Name)
