@@ -152,6 +152,14 @@ type TestCase struct {
 	// functions — heartbeat/health, connection state, config push, remote check,
 	// live data, console, stats — via the simulator's control API. See FleetConfig.
 	Fleet *FleetConfig `yaml:"fleet"`
+
+	// CCF, when set, parameterizes the ccf_correctness driver (runCCFCorrectness):
+	// the director runs a `ccf` poller device that polls the bench mock CCF API (an
+	// `endpoints:` container running vmetric/bench-ccfapi) using a real Sentinel
+	// RestApiPoller connector definition, and forwards events to a TCP target the
+	// bench receiver collects. The driver seeds the mock, then asserts pagination
+	// completeness and time-cursor incrementality at the receiver. See CCFConfig.
+	CCF *CCFConfig `yaml:"ccf"`
 }
 
 // VerifierConfig configures the post-drain DuckDB verifier container (see
@@ -782,6 +790,15 @@ func (tc *TestCase) IsFleetAutomationType() bool {
 	return tc.Type == "fleet_automation_correctness"
 }
 
+// IsCCFType reports whether the case exercises the director's "ccf" poller device
+// (Codeless Connector Framework / Sentinel RestApiPoller) against the bench mock
+// CCF API (runCCFCorrectness): the director polls the mock with a real connector
+// definition and forwards events to the receiver, and the driver asserts
+// pagination completeness and time-cursor incrementality.
+func (tc *TestCase) IsCCFType() bool {
+	return tc.Type == "ccf_correctness"
+}
+
 // IsPerformanceType reports whether the case is scored as a throughput test —
 // the plain `performance` type or the Kafka variant `kafka_performance`.
 func (tc *TestCase) IsPerformanceType() bool {
@@ -921,6 +938,9 @@ func (tc *TestCase) Validate() error {
 		return err
 	}
 	if err := tc.validateFleet(); err != nil {
+		return err
+	}
+	if err := tc.validateCCF(); err != nil {
 		return err
 	}
 	return nil
@@ -1129,6 +1149,133 @@ func (tc *TestCase) validateFleet() error {
 	}
 	if !found {
 		return fmt.Errorf("case %q: fleet_automation_correctness requires an endpoints entry named %q (the simulator)", tc.Name, want)
+	}
+	return nil
+}
+
+// CCFConfig parameterizes ccf_correctness: the director runs a `ccf` poller device
+// against the bench mock CCF API (an endpoints container, hostname ccf-api, running
+// vmetric/bench-ccfapi). The driver seeds the mock over its control API, lets the
+// director poll + forward to the receiver, and asserts the Scenario.
+type CCFConfig struct {
+	// Scenario selects what the driver asserts:
+	//   pagination   — seed SeedCount events spanning multiple pages; assert all
+	//                  SeedCount arrive at the receiver exactly once (no page lost
+	//                  or duplicated). Covers the paging type set in the connector.
+	//   time_window  — seed SeedCount, let the first poll deliver them, then add
+	//                  AddCount newer events; assert exactly AddCount more arrive on
+	//                  the next poll (cursor advanced, no re-delivery of the first batch).
+	//   auth         — like pagination, but the case exercises an auth mode
+	//                  (apikey/basic/bearer/oauth2); correct creds must deliver all.
+	//   format       — like pagination, but a csv/gzip response body.
+	//   bad_auth     — negative: the device credential mismatches the mock; assert
+	//                  NOTHING is delivered (the poller's requests are rejected 401).
+	Scenario string `yaml:"scenario"`
+	// APIContainer is the endpoints container name running the mock CCF API
+	// (default "ccf-api" → docker container "bench-ccf-api").
+	APIContainer string `yaml:"api_container"`
+	// CtrlPort is the mock's control API port (default 9090).
+	CtrlPort int `yaml:"ctrl_port"`
+	// SeedCount is how many events to preload before the director first polls.
+	SeedCount int `yaml:"seed_count"`
+	// AddCount (time_window) is how many newer events to add after the first delivery.
+	AddCount int `yaml:"add_count"`
+	// ExpectRecords overrides the expected distinct record count at the receiver.
+	// Defaults: pagination/auth/format → SeedCount; time_window → SeedCount+AddCount;
+	// bad_auth → 0. A pointer so an explicit 0 is honored.
+	ExpectRecords *int `yaml:"expect_records"`
+	// MarkerPrefix is the substring every delivered record must contain
+	// (default "CCFEVT-"); also used as the receiver's required-substring gate.
+	MarkerPrefix string `yaml:"marker_prefix"`
+	// SettleSeconds is how long to wait for delivery to settle (default 60).
+	SettleSeconds int `yaml:"settle_seconds"`
+}
+
+// APIContainerOrDefault returns the bench container name of the mock CCF API.
+func (c *CCFConfig) APIContainerOrDefault() string {
+	name := "ccf-api"
+	if c != nil && c.APIContainer != "" {
+		name = c.APIContainer
+	}
+	return "bench-" + name
+}
+
+// CtrlPortOrDefault returns the mock's control API port (default 9090).
+func (c *CCFConfig) CtrlPortOrDefault() int {
+	if c != nil && c.CtrlPort > 0 {
+		return c.CtrlPort
+	}
+	return 9090
+}
+
+// MarkerPrefixOrDefault returns the per-record marker substring (default "CCFEVT-").
+func (c *CCFConfig) MarkerPrefixOrDefault() string {
+	if c != nil && c.MarkerPrefix != "" {
+		return c.MarkerPrefix
+	}
+	return "CCFEVT-"
+}
+
+// SettleOrDefault returns SettleSeconds or 60 when unset.
+func (c *CCFConfig) SettleOrDefault() int {
+	if c == nil || c.SettleSeconds <= 0 {
+		return 60
+	}
+	return c.SettleSeconds
+}
+
+// ExpectRecordsOrDefault returns the expected distinct record count for the scenario.
+func (c *CCFConfig) ExpectRecordsOrDefault() int {
+	if c == nil {
+		return 0
+	}
+	if c.ExpectRecords != nil {
+		return *c.ExpectRecords
+	}
+	switch c.Scenario {
+	case "time_window":
+		return c.SeedCount + c.AddCount
+	case "bad_auth":
+		return 0
+	default:
+		return c.SeedCount
+	}
+}
+
+// validateCCF checks the optional `ccf:` block and the ccf_correctness type's
+// structural requirements.
+func (tc *TestCase) validateCCF() error {
+	if !tc.IsCCFType() {
+		if tc.CCF != nil {
+			return fmt.Errorf("case %q: `ccf:` is only valid for type ccf_correctness", tc.Name)
+		}
+		return nil
+	}
+	if tc.CCF == nil {
+		return fmt.Errorf("case %q: type ccf_correctness requires a `ccf:` block", tc.Name)
+	}
+	switch tc.CCF.Scenario {
+	case "pagination", "time_window", "auth", "format", "bad_auth":
+	default:
+		return fmt.Errorf("case %q: unknown ccf.scenario %q", tc.Name, tc.CCF.Scenario)
+	}
+	if tc.CCF.Scenario != "bad_auth" && tc.CCF.SeedCount <= 0 {
+		return fmt.Errorf("case %q: ccf.seed_count must be > 0", tc.Name)
+	}
+	if tc.CCF.Scenario == "time_window" && tc.CCF.AddCount <= 0 {
+		return fmt.Errorf("case %q: ccf.add_count must be > 0 for the time_window scenario", tc.Name)
+	}
+	// The mock CCF API must be declared as an endpoints container.
+	want := tc.CCF.APIContainerOrDefault()[len("bench-"):]
+	found := false
+	for _, e := range tc.Endpoints {
+		if e.Name == want {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("case %q: ccf_correctness requires an endpoints entry named %q (the mock CCF API)", tc.Name, want)
 	}
 	return nil
 }

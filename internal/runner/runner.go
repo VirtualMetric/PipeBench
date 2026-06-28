@@ -223,6 +223,9 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	if tc.IsFleetAutomationType() {
 		return r.runFleetAutomationCorrectness(tc, subject)
 	}
+	if tc.IsCCFType() {
+		return r.runCCFCorrectness(tc, subject)
+	}
 
 	configName := r.opts.ConfigName
 
@@ -4049,6 +4052,360 @@ func (r *Runner) saveFleetResult(tc *config.TestCase, subject config.Subject, co
 		fmt.Printf("  fleet automation (%s): FAILED ✗\n", label)
 		for _, c := range []string{simContainer, subjectContainer} {
 			out, _ := exec.Command("docker", "logs", "--tail", "20", c).CombinedOutput()
+			fmt.Printf("  --- %s (tail) ---\n%s\n", c, string(out))
+		}
+	}
+
+	result := results.RunResult{
+		TestName:    tc.Name,
+		Config:      configName,
+		Subject:     subject.Name,
+		Version:     subject.Version,
+		Hardware:    hardwareID(),
+		Timestamp:   startTime,
+		DurationSec: elapsed,
+		LinesOut:    finalCount,
+		Passed:      &passed,
+	}
+	if !passed {
+		result.FailReason = strings.Join(errs, "; ")
+	}
+	dir, err := r.store.Save(result, "")
+	if err != nil {
+		return result, fmt.Errorf("saving results: %w", err)
+	}
+	fmt.Printf("  done. results → %s\n", dir)
+	return result, nil
+}
+
+// ── CCF (Sentinel RestApiPoller) poller correctness ──────────────────────────
+
+// ccfStats reads the mock CCF API's control-plane stats via `docker exec wget`
+// (busybox wget ships in the bench-ccfapi alpine base; the control API is not
+// host-published, it is reached inside the bench network).
+func ccfStats(apiContainer string, ctrlPort int) (map[string]any, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	url := fmt.Sprintf("http://127.0.0.1:%d/admin/stats", ctrlPort)
+	out, err := exec.CommandContext(ctx, "docker", "exec", apiContainer,
+		"wget", "-q", "-O", "-", url).Output()
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		return nil, fmt.Errorf("decode ccf stats: %w (raw: %.200s)", err, string(out))
+	}
+	return m, nil
+}
+
+// ccfSeed loads events into the mock: path "/admin/seed" replaces the store,
+// "/admin/add" appends newer events (used by the time_window scenario).
+func ccfSeed(apiContainer string, ctrlPort int, path string, count int) error {
+	body, _ := json.Marshal(map[string]any{"count": count})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	url := fmt.Sprintf("http://127.0.0.1:%d%s", ctrlPort, path)
+	out, err := exec.CommandContext(ctx, "docker", "exec", apiContainer,
+		"wget", "-q", "-O", "-", "--post-data="+string(body), url).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ccf seed %s: %w (out: %.200s)", path, err, string(out))
+	}
+	return nil
+}
+
+// ccfWaitLines polls the receiver until LinesReceived >= target or the deadline.
+// Returns the last observed count and whether the target was reached.
+func (r *Runner) ccfWaitLines(metricsPort int, target int64, deadline time.Time) (int64, bool) {
+	var last int64
+	for time.Now().Before(deadline) {
+		if rm, err := r.queryReceiverMetrics(metricsPort, 5*time.Second); err == nil {
+			last = rm.LinesReceived
+			if last >= target {
+				return last, true
+			}
+		}
+		time.Sleep(3 * time.Second)
+	}
+	return last, false
+}
+
+// ccfWaitStable polls the receiver until LinesReceived stops growing for two
+// consecutive reads (or the deadline). Used to let over-delivery surface before
+// asserting an exact count.
+func (r *Runner) ccfWaitStable(metricsPort int, deadline time.Time) int64 {
+	var last int64 = -1
+	stable := 0
+	for time.Now().Before(deadline) {
+		rm, err := r.queryReceiverMetrics(metricsPort, 5*time.Second)
+		if err == nil {
+			if rm.LinesReceived == last {
+				stable++
+				if stable >= 2 && last >= 0 {
+					return last
+				}
+			} else {
+				stable = 0
+				last = rm.LinesReceived
+			}
+		}
+		time.Sleep(3 * time.Second)
+	}
+	if last < 0 {
+		return 0
+	}
+	return last
+}
+
+// runCCFCorrectness drives the director's `ccf` poller device against the bench
+// mock CCF API. The director polls the mock with a real Sentinel RestApiPoller
+// connector and forwards events to a TCP target the receiver collects. The driver
+// seeds the mock, then asserts the scenario: pagination completeness (every seeded
+// event delivered exactly once across pages), time-cursor incrementality (a second
+// batch is delivered without re-delivering the first), auth, response format, or a
+// negative bad-auth rejection.
+func (r *Runner) runCCFCorrectness(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
+	configName := r.opts.ConfigName
+	subject = r.applySubjectOverrides(subject)
+	cc := tc.CCF
+
+	for _, capName := range tc.Requires {
+		if !subject.HasCapability(capName) {
+			return results.RunResult{}, fmt.Errorf("subject %q does not declare capability %q required by case %q",
+				subject.Name, capName, tc.Name)
+		}
+	}
+
+	fmt.Printf("→ test=%s  subject=%s  version=%s  (ccf scenario=%q)\n",
+		tc.Name, subject.Name, subject.Version, cc.Scenario)
+
+	srcCfg, err := tc.ConfigFilePath(r.opts.CasesDir, configName, subject)
+	if err != nil {
+		return results.RunResult{}, err
+	}
+	srcCfg, err = filepath.Abs(srcCfg)
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("resolving config path: %w", err)
+	}
+
+	tmpDir, err := os.MkdirTemp("", "bench-"+tc.Name+"-")
+	if err != nil {
+		return results.RunResult{}, err
+	}
+	if err := os.Chmod(tmpDir, 0o1777); err != nil {
+		return results.RunResult{}, fmt.Errorf("chmod tmpdir: %w", err)
+	}
+	defer func() {
+		if !r.opts.NoCleanup {
+			os.RemoveAll(tmpDir)
+		}
+	}()
+
+	caseDir, err := filepath.Abs(filepath.Join(r.opts.CasesDir, tc.Name))
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("resolving case directory: %w", err)
+	}
+
+	extraEnv := map[string]string{}
+	if cfg, ok := tc.Configurations[configName]; ok {
+		maps.Copy(extraEnv, cfg.Env)
+	}
+
+	runCfg := orchestrator.RunConfig{
+		TestCase:         tc,
+		Subject:          subject,
+		ConfigName:       configName,
+		ConfigSrcPath:    srcCfg,
+		CaseDir:          caseDir,
+		TmpDir:           tmpDir,
+		GeneratorImage:   r.opts.GeneratorImage,
+		ReceiverImage:    r.opts.ReceiverImage,
+		CollectorImage:   r.opts.CollectorImage,
+		ReceiverHostPort: r.opts.ReceiverHostPort,
+		ExtraSubjectEnv:  extraEnv,
+		CPULimit:         r.opts.CPULimit,
+		MemLimit:         r.opts.MemLimit,
+	}
+
+	orch, err := orchestrator.NewComposeRunner(runCfg)
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("compose setup: %w", err)
+	}
+
+	apiContainer := cc.APIContainerOrDefault()
+	ctrlPort := cc.CtrlPortOrDefault()
+	subjectContainer := "bench-subject-" + subject.Name
+	cleanup := []string{"bench-receiver", "bench-collector", "bench-generator", subjectContainer, apiContainer}
+	for _, c := range cleanup {
+		_ = exec.Command("docker", "rm", "-f", c).Run()
+	}
+	_ = orch.Down()
+	defer func() {
+		if !r.opts.NoCleanup {
+			fmt.Println("  tearing down…")
+			_ = orch.Down()
+		}
+	}()
+
+	startTime := time.Now()
+	runDeadline := startTime.Add(r.opts.Timeout)
+	settle := time.Duration(cc.SettleOrDefault()) * time.Second
+	warmup := tc.WarmupOrDefault(20 * time.Second)
+	expected := int64(cc.ExpectRecordsOrDefault())
+
+	fmt.Println("  starting director + mock CCF API + receiver…")
+	if err := orch.Up(); err != nil {
+		return results.RunResult{}, fmt.Errorf("starting ccf topology: %w", err)
+	}
+
+	metricsPort, stopPortFwd, err := orch.ReceiverMetricsPort()
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("receiver metrics port: %w", err)
+	}
+	defer stopPortFwd()
+
+	var passed bool
+	var errs []string
+	var finalCount int64
+
+	// Wait for the mock CCF API control plane to answer (container booted).
+	apiDeadline := time.Now().Add(warmup + 30*time.Second)
+	apiReady := false
+	for time.Now().Before(apiDeadline) {
+		if _, e := ccfStats(apiContainer, ctrlPort); e == nil {
+			apiReady = true
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if !apiReady {
+		errs = append(errs, "mock CCF API never became reachable")
+		return r.saveCCFResult(tc, subject, configName, startTime, finalCount, false, errs, apiContainer, subjectContainer)
+	}
+
+	// Seed the mock BEFORE the director's first poll fetches data.
+	if cc.Scenario != "bad_auth" {
+		fmt.Printf("  seeding mock CCF API with %d events…\n", cc.SeedCount)
+		if e := ccfSeed(apiContainer, ctrlPort, "/admin/seed", cc.SeedCount); e != nil {
+			errs = append(errs, "seed failed: "+e.Error())
+			return r.saveCCFResult(tc, subject, configName, startTime, finalCount, false, errs, apiContainer, subjectContainer)
+		}
+	} else {
+		// bad_auth: still seed so that, if auth were NOT enforced, events WOULD
+		// flow — making the negative test meaningful.
+		_ = ccfSeed(apiContainer, ctrlPort, "/admin/seed", 50)
+	}
+
+	deliverDeadline := time.Now().Add(warmup + settle)
+	if deliverDeadline.After(runDeadline) {
+		deliverDeadline = runDeadline
+	}
+
+	switch cc.Scenario {
+	case "bad_auth":
+		// Negative: the device credential mismatches the mock. First wait until the
+		// mock records an auth failure — proof the director actually polled and was
+		// rejected (401), not that it simply hadn't started polling yet. (Don't use
+		// the receiver-stable wait here: a receiver pinned at 0 looks "stable"
+		// within seconds, long before the director's first poll.) Then assert
+		// nothing was delivered.
+		fmt.Printf("  waiting for the director to poll + be rejected (up to %s)…\n", time.Until(deliverDeadline).Round(time.Second))
+		rejected := false
+		for time.Now().Before(deliverDeadline) {
+			if st, e := ccfStats(apiContainer, ctrlPort); e == nil {
+				if af, _ := st["auth_failures"].(float64); af > 0 {
+					rejected = true
+					fmt.Printf("  mock rejected the bad credential with 401 (auth_failures=%d) ✓\n", int(af))
+					break
+				}
+			}
+			time.Sleep(3 * time.Second)
+		}
+		if !rejected {
+			errs = append(errs, "mock recorded no auth failures within the window — the director never polled")
+		}
+		// Give any (erroneous) delivery a moment to surface, then assert zero.
+		got := r.ccfWaitStable(metricsPort, time.Now().Add(12*time.Second))
+		finalCount = got
+		if got > 0 {
+			errs = append(errs, fmt.Sprintf("delivered %d records despite a bad credential (auth not enforced)", got))
+		} else {
+			fmt.Println("  no events delivered with a bad credential ✓")
+		}
+
+	case "time_window":
+		// Phase 1: the first poll delivers the seeded batch.
+		fmt.Printf("  waiting for the first batch (%d) to be delivered…\n", cc.SeedCount)
+		c1, ok1 := r.ccfWaitLines(metricsPort, int64(cc.SeedCount), deliverDeadline)
+		if !ok1 {
+			errs = append(errs, fmt.Sprintf("first batch incomplete: got %d of %d", c1, cc.SeedCount))
+			finalCount = c1
+			return r.saveCCFResult(tc, subject, configName, startTime, finalCount, false, errs, apiContainer, subjectContainer)
+		}
+		fmt.Printf("  first batch delivered: %d ✓\n", c1)
+
+		// Add a newer batch; only these (ts > cursor) must arrive next poll.
+		fmt.Printf("  adding %d newer events (after the cursor)…\n", cc.AddCount)
+		if e := ccfSeed(apiContainer, ctrlPort, "/admin/add", cc.AddCount); e != nil {
+			errs = append(errs, "add failed: "+e.Error())
+			finalCount = c1
+			return r.saveCCFResult(tc, subject, configName, startTime, finalCount, false, errs, apiContainer, subjectContainer)
+		}
+		incDeadline := time.Now().Add(settle + 30*time.Second)
+		if incDeadline.After(runDeadline) {
+			incDeadline = runDeadline
+		}
+		c2, ok2 := r.ccfWaitLines(metricsPort, expected, incDeadline)
+		// Let any erroneous re-delivery settle before judging exactness.
+		c2 = r.ccfWaitStable(metricsPort, time.Now().Add(15*time.Second))
+		finalCount = c2
+		if !ok2 && c2 < expected {
+			errs = append(errs, fmt.Sprintf("incremental batch incomplete: got %d of %d (cursor may not advance)", c2, expected))
+		} else if c2 > expected {
+			errs = append(errs, fmt.Sprintf("over-delivery: got %d, expected %d (cursor re-delivered prior events)", c2, expected))
+		} else {
+			fmt.Printf("  incremental delivery exact: %d (= %d seeded + %d new), no re-delivery ✓\n", c2, cc.SeedCount, cc.AddCount)
+		}
+
+	default: // pagination, auth, format
+		fmt.Printf("  waiting for all %d events to be delivered across pages (up to %s)…\n", expected, time.Until(deliverDeadline).Round(time.Second))
+		got, ok := r.ccfWaitLines(metricsPort, expected, deliverDeadline)
+		// Allow a couple extra reads so duplicate pages (over-delivery) surface.
+		got = r.ccfWaitStable(metricsPort, time.Now().Add(15*time.Second))
+		finalCount = got
+		if !ok && got < expected {
+			errs = append(errs, fmt.Sprintf("under-delivery: got %d of %d (a page may have been dropped)", got, expected))
+		} else if got > expected {
+			errs = append(errs, fmt.Sprintf("over-delivery: got %d, expected %d (a page may have been re-fetched)", got, expected))
+		} else {
+			fmt.Printf("  delivered exactly %d events across pages ✓\n", got)
+		}
+	}
+
+	// Secondary check: the receiver's own content validation (required substring +
+	// JSON), if the case enabled it. A failed receiver verdict means records were
+	// delivered but malformed / missing the marker.
+	if rm, e := r.queryReceiverMetrics(metricsPort, 5*time.Second); e == nil && rm.Passed != nil && !*rm.Passed && len(rm.Errors) > 0 && cc.Scenario != "bad_auth" {
+		errs = append(errs, "receiver content validation failed: "+strings.Join(rm.Errors, ", "))
+	}
+
+	passed = len(errs) == 0
+	return r.saveCCFResult(tc, subject, configName, startTime, finalCount, passed, errs, apiContainer, subjectContainer)
+}
+
+// saveCCFResult records the CCF verdict and, on failure, dumps short log tails of
+// the mock API and director to aid diagnosis.
+func (r *Runner) saveCCFResult(tc *config.TestCase, subject config.Subject, configName string,
+	startTime time.Time, finalCount int64, passed bool, errs []string, apiContainer, subjectContainer string) (results.RunResult, error) {
+
+	elapsed := time.Since(startTime).Seconds()
+	label := tc.CCF.Scenario
+	if passed {
+		fmt.Printf("  ccf poller (%s): PASSED ✓\n", label)
+	} else {
+		fmt.Printf("  ccf poller (%s): FAILED ✗\n", label)
+		for _, c := range []string{apiContainer, subjectContainer} {
+			out, _ := exec.Command("docker", "logs", "--tail", "30", c).CombinedOutput()
 			fmt.Printf("  --- %s (tail) ---\n%s\n", c, string(out))
 		}
 	}
