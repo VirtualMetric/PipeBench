@@ -4,7 +4,7 @@
 # the realm DB, principals, and keytabs are created at runtime by the bootstrap
 # command the harness renders (see internal/orchestrator/kerberos.go) into the
 # mounted /krb5 dir (chmod 0777 there so this non-root user can write to it).
-FROM alpine:3.22.4@sha256:310c62b5e7ca5b08167e4384c68db0fd2905dd9c7493756d356e893909057601
+FROM alpine:3.22.5@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
 RUN apk upgrade --no-cache && apk add --no-cache krb5-server && adduser -D -u 10001 app
 
 # Run non-root (uid matches the other helpers). krb5kdc binds privileged port 88
