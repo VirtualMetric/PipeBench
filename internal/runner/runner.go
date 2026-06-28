@@ -4253,9 +4253,15 @@ func (r *Runner) runCCFCorrectness(tc *config.TestCase, subject config.Subject) 
 	warmup := tc.WarmupOrDefault(20 * time.Second)
 	expected := int64(cc.ExpectRecordsOrDefault())
 
-	fmt.Println("  starting director + mock CCF API + receiver…")
-	if err := orch.Up(); err != nil {
-		return results.RunResult{}, fmt.Errorf("starting ccf topology: %w", err)
+	// Start the mock CCF API + receiver FIRST and seed the mock BEFORE the director
+	// begins polling. If the director came up alongside an empty mock, its first
+	// poll could consume an empty page and advance its time cursor past the events
+	// we then seed — so bring up the API + receiver, wait for the control plane,
+	// seed, and only THEN start the director.
+	apiService := strings.TrimPrefix(apiContainer, "bench-")
+	fmt.Println("  starting mock CCF API + receiver…")
+	if err := orch.UpServices(apiService, "receiver"); err != nil {
+		return results.RunResult{}, fmt.Errorf("starting ccf api + receiver: %w", err)
 	}
 
 	metricsPort, stopPortFwd, err := orch.ReceiverMetricsPort()
@@ -4294,6 +4300,12 @@ func (r *Runner) runCCFCorrectness(tc *config.TestCase, subject config.Subject) 
 		// bad_auth: still seed so that, if auth were NOT enforced, events WOULD
 		// flow — making the negative test meaningful.
 		_ = ccfSeed(apiContainer, ctrlPort, "/admin/seed", 50)
+	}
+
+	// Now start the director (+ metrics collector); it polls the already-seeded mock.
+	fmt.Println("  starting director…")
+	if err := orch.UpServices("subject", "collector"); err != nil {
+		return results.RunResult{}, fmt.Errorf("starting director: %w", err)
 	}
 
 	deliverDeadline := time.Now().Add(warmup + settle)
@@ -4355,9 +4367,10 @@ func (r *Runner) runCCFCorrectness(tc *config.TestCase, subject config.Subject) 
 		if incDeadline.After(runDeadline) {
 			incDeadline = runDeadline
 		}
-		c2, ok2 := r.ccfWaitLines(metricsPort, expected, incDeadline)
-		// Let any erroneous re-delivery settle before judging exactness.
-		c2 = r.ccfWaitStable(metricsPort, time.Now().Add(15*time.Second))
+		_, ok2 := r.ccfWaitLines(metricsPort, expected, incDeadline)
+		// The waited count is superseded — let any erroneous re-delivery settle and
+		// take the stabilized count as the value to judge.
+		c2 := r.ccfWaitStable(metricsPort, time.Now().Add(15*time.Second))
 		finalCount = c2
 		if !ok2 && c2 < expected {
 			errs = append(errs, fmt.Sprintf("incremental batch incomplete: got %d of %d (cursor may not advance)", c2, expected))
@@ -4369,9 +4382,10 @@ func (r *Runner) runCCFCorrectness(tc *config.TestCase, subject config.Subject) 
 
 	default: // pagination, auth, format
 		fmt.Printf("  waiting for all %d events to be delivered across pages (up to %s)…\n", expected, time.Until(deliverDeadline).Round(time.Second))
-		got, ok := r.ccfWaitLines(metricsPort, expected, deliverDeadline)
-		// Allow a couple extra reads so duplicate pages (over-delivery) surface.
-		got = r.ccfWaitStable(metricsPort, time.Now().Add(15*time.Second))
+		_, ok := r.ccfWaitLines(metricsPort, expected, deliverDeadline)
+		// The waited count is superseded — allow a couple extra reads so duplicate
+		// pages (over-delivery) surface, and take the stabilized count.
+		got := r.ccfWaitStable(metricsPort, time.Now().Add(15*time.Second))
 		finalCount = got
 		if !ok && got < expected {
 			errs = append(errs, fmt.Sprintf("under-delivery: got %d of %d (a page may have been dropped)", got, expected))

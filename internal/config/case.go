@@ -1265,6 +1265,12 @@ func (tc *TestCase) validateCCF() error {
 	if tc.CCF.Scenario == "time_window" && tc.CCF.AddCount <= 0 {
 		return fmt.Errorf("case %q: ccf.add_count must be > 0 for the time_window scenario", tc.Name)
 	}
+	// expect_records is a pointer so an explicit 0 is honored (bad_auth), but a
+	// negative override is meaningless — reject it up front so ExpectRecordsOrDefault
+	// only ever yields nil-default or a non-negative count.
+	if tc.CCF.ExpectRecords != nil && *tc.CCF.ExpectRecords < 0 {
+		return fmt.Errorf("case %q: ccf.expect_records must be >= 0, got %d", tc.Name, *tc.CCF.ExpectRecords)
+	}
 	// The mock CCF API must be declared as an endpoints container.
 	want := tc.CCF.APIContainerOrDefault()[len("bench-"):]
 	found := false
