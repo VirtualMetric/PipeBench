@@ -160,6 +160,47 @@ type TestCase struct {
 	// bench receiver collects. The driver seeds the mock, then asserts pagination
 	// completeness and time-cursor incrementality at the receiver. See CCFConfig.
 	CCF *CCFConfig `yaml:"ccf"`
+
+	// HTTPSource, when set, parameterizes the http_source_correctness driver
+	// (runHTTPSourceCorrectness): the bench-httpsender container POSTs one event
+	// per request (with optional HMAC/basic/header/HEC-token auth, gzip, TLS) to
+	// the director's HTTP/Splunk-HEC source, which forwards to the receiver. The
+	// driver asserts delivery (deliver) or rejection (reject). See HTTPSourceConfig.
+	HTTPSource *HTTPSourceConfig `yaml:"http_source"`
+
+	// ClickHouseTarget, when set, parameterizes the clickhouse_target_correctness
+	// driver (runClickHouseTargetCorrectness): the generator drives TCP into a
+	// director whose clickhouse target ingests via HTTP JSONEachRow into a real
+	// clickhouse-server (an `endpoints:` container); the driver creates the table,
+	// then verifies the row count by SQL. See ClickHouseTargetConfig.
+	ClickHouseTarget *ClickHouseTargetConfig `yaml:"clickhouse_target"`
+
+	// MQTTTarget parameterizes mqtt_target_correctness (runMQTTTargetCorrectness):
+	// the generator drives TCP into a director whose mqtt target publishes to a
+	// mosquitto broker (an `endpoints:` container); a mosquitto_sub sidecar records
+	// every message and the driver verifies the count. See MQTTTargetConfig.
+	MQTTTarget *MQTTTargetConfig `yaml:"mqtt_target"`
+
+	// RedisSource parameterizes redis_source_correctness (runRedisSourceCorrectness):
+	// a publisher sidecar PUBLISHes to a redis channel; the director's redis source
+	// consumes and forwards to the receiver, which the driver counts. See RedisSourceConfig.
+	RedisSource *RedisSourceConfig `yaml:"redis_source"`
+
+	// HTTPVaultRotation parameterizes http_vault_rotation_correctness
+	// (runHTTPVaultCertRotation): the http source serves HTTPS from a Vault-sourced
+	// cert ($secret refs); the bench-httpsender posts continuously and records the
+	// served cert fingerprint; the driver rotates the cert in Vault and asserts the
+	// director hot-reloads it (fingerprint changes) while delivery continues. Requires
+	// a `vault:` block. See HTTPVaultRotationConfig.
+	HTTPVaultRotation *HTTPVaultRotationConfig `yaml:"http_vault_rotation"`
+
+	// EndpointSource parameterizes endpoint_source_correctness
+	// (runEndpointSourceCorrectness): a generic CLI-sender sidecar (snmptrap, tftp,
+	// smtp, …) feeds the director's matching source, which forwards to the receiver;
+	// the driver asserts the receiver count reaches expect_min and (optionally) sees
+	// a required substring. One driver for any source the bench generator can't
+	// drive. See EndpointSourceConfig.
+	EndpointSource *EndpointSourceConfig `yaml:"endpoint_source"`
 }
 
 // VerifierConfig configures the post-drain DuckDB verifier container (see
@@ -799,6 +840,42 @@ func (tc *TestCase) IsCCFType() bool {
 	return tc.Type == "ccf_correctness"
 }
 
+// IsHTTPSourceType reports whether the case drives the director's HTTP / Splunk-HEC
+// SOURCE listener with the bench-httpsender (runHTTPSourceCorrectness).
+func (tc *TestCase) IsHTTPSourceType() bool {
+	return tc.Type == "http_source_correctness"
+}
+
+// IsClickHouseTargetType reports whether the case verifies the director's
+// clickhouse target against a real clickhouse-server (runClickHouseTargetCorrectness).
+func (tc *TestCase) IsClickHouseTargetType() bool {
+	return tc.Type == "clickhouse_target_correctness"
+}
+
+// IsMQTTTargetType reports whether the case verifies the director's mqtt target
+// against a real mosquitto broker (runMQTTTargetCorrectness).
+func (tc *TestCase) IsMQTTTargetType() bool {
+	return tc.Type == "mqtt_target_correctness"
+}
+
+// IsRedisSourceType reports whether the case drives the director's redis source
+// via a redis publisher sidecar (runRedisSourceCorrectness).
+func (tc *TestCase) IsRedisSourceType() bool {
+	return tc.Type == "redis_source_correctness"
+}
+
+// IsHTTPVaultRotationType reports whether the case verifies the http source's
+// Vault-sourced cert hot-reload (runHTTPVaultCertRotation).
+func (tc *TestCase) IsHTTPVaultRotationType() bool {
+	return tc.Type == "http_vault_rotation_correctness"
+}
+
+// IsEndpointSourceType reports whether the case drives a director source via a
+// generic CLI-sender sidecar and counts at the receiver (runEndpointSourceCorrectness).
+func (tc *TestCase) IsEndpointSourceType() bool {
+	return tc.Type == "endpoint_source_correctness"
+}
+
 // IsPerformanceType reports whether the case is scored as a throughput test —
 // the plain `performance` type or the Kafka variant `kafka_performance`.
 func (tc *TestCase) IsPerformanceType() bool {
@@ -941,6 +1018,24 @@ func (tc *TestCase) Validate() error {
 		return err
 	}
 	if err := tc.validateCCF(); err != nil {
+		return err
+	}
+	if err := tc.validateHTTPSource(); err != nil {
+		return err
+	}
+	if err := tc.validateClickHouseTarget(); err != nil {
+		return err
+	}
+	if err := tc.validateMQTTTarget(); err != nil {
+		return err
+	}
+	if err := tc.validateRedisSource(); err != nil {
+		return err
+	}
+	if err := tc.validateHTTPVaultRotation(); err != nil {
+		return err
+	}
+	if err := tc.validateEndpointSource(); err != nil {
 		return err
 	}
 	return nil
@@ -1282,6 +1377,414 @@ func (tc *TestCase) validateCCF() error {
 	}
 	if !found {
 		return fmt.Errorf("case %q: ccf_correctness requires an endpoints entry named %q (the mock CCF API)", tc.Name, want)
+	}
+	return nil
+}
+
+// HTTPSourceConfig parameterizes http_source_correctness: the bench-httpsender
+// (an endpoints container) POSTs Count single-event requests to the director's
+// HTTP/Splunk-HEC source; the source forwards to the receiver.
+type HTTPSourceConfig struct {
+	// Scenario: "deliver" (a valid credential → all Count events reach the
+	// receiver) or "reject" (a bad credential → the source rejects every request,
+	// nothing is delivered, and the sender records Count rejections).
+	Scenario string `yaml:"scenario"`
+	// Count is how many requests the sender sends (must match the endpoints
+	// HTTPSENDER_COUNT env so the driver knows the expected delivery).
+	Count int `yaml:"count"`
+	// SenderContainer is the endpoints container running the sender
+	// (default "http-sender" → docker container "bench-http-sender").
+	SenderContainer string `yaml:"sender_container"`
+	// SenderCtrlPort is the sender's /stats control port (default 9099).
+	SenderCtrlPort int `yaml:"sender_ctrl_port"`
+	// SettleSeconds is how long to wait for delivery to settle (default 60).
+	SettleSeconds int `yaml:"settle_seconds"`
+}
+
+func (h *HTTPSourceConfig) SenderContainerOrDefault() string {
+	name := "http-sender"
+	if h != nil && h.SenderContainer != "" {
+		name = h.SenderContainer
+	}
+	return "bench-" + name
+}
+func (h *HTTPSourceConfig) SenderCtrlPortOrDefault() int {
+	if h != nil && h.SenderCtrlPort > 0 {
+		return h.SenderCtrlPort
+	}
+	return 9099
+}
+func (h *HTTPSourceConfig) SettleOrDefault() int {
+	if h == nil || h.SettleSeconds <= 0 {
+		return 60
+	}
+	return h.SettleSeconds
+}
+
+// validateHTTPSource checks the optional `http_source:` block and the
+// http_source_correctness type's structural requirements.
+func (tc *TestCase) validateHTTPSource() error {
+	if !tc.IsHTTPSourceType() {
+		if tc.HTTPSource != nil {
+			return fmt.Errorf("case %q: `http_source:` is only valid for type http_source_correctness", tc.Name)
+		}
+		return nil
+	}
+	if tc.HTTPSource == nil {
+		return fmt.Errorf("case %q: type http_source_correctness requires an `http_source:` block", tc.Name)
+	}
+	switch tc.HTTPSource.Scenario {
+	case "deliver", "reject":
+	default:
+		return fmt.Errorf("case %q: unknown http_source.scenario %q", tc.Name, tc.HTTPSource.Scenario)
+	}
+	if tc.HTTPSource.Count <= 0 {
+		return fmt.Errorf("case %q: http_source.count must be > 0", tc.Name)
+	}
+	want := tc.HTTPSource.SenderContainerOrDefault()[len("bench-"):]
+	found := false
+	for _, e := range tc.Endpoints {
+		if e.Name == want {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("case %q: http_source_correctness requires an endpoints entry named %q (the bench-httpsender)", tc.Name, want)
+	}
+	return nil
+}
+
+// ClickHouseTargetConfig parameterizes clickhouse_target_correctness: a generator
+// drives TCP into the director's clickhouse target (HTTP JSONEachRow) writing to a
+// real clickhouse-server endpoint; the driver creates the table then verifies the
+// row count by SQL.
+type ClickHouseTargetConfig struct {
+	// CHContainer is the endpoints container running clickhouse-server
+	// (default "clickhouse" → docker container "bench-clickhouse").
+	CHContainer string `yaml:"ch_container"`
+	// Database / Table the director's target writes to (and the driver creates + queries).
+	Database string `yaml:"database"`
+	Table    string `yaml:"table"`
+	// ExpectRecords is the row count to assert in ClickHouse after the run
+	// (normally the generator's total_lines).
+	ExpectRecords int `yaml:"expect_records"`
+	// SettleSeconds is how long to wait for the row count to reach ExpectRecords (default 60).
+	SettleSeconds int `yaml:"settle_seconds"`
+	// CreateTableSQL optionally overrides the default `(message, @timestamp, ts)`
+	// table DDL — used by custom-table cases to define columns the event JSON maps
+	// onto. Use {{TABLE}} as a placeholder for the fully-qualified db.table name.
+	CreateTableSQL string `yaml:"create_table_sql"`
+	// RestartMidRun, when true, `docker restart`s the clickhouse-server container
+	// once mid-run (after the table exists and some rows have landed). The director's
+	// CH target must reconnect and its queue must retry the failed batches so the
+	// final row count still reaches ExpectRecords — the resilience dimension.
+	RestartMidRun bool `yaml:"restart_mid_run"`
+}
+
+func (c *ClickHouseTargetConfig) CHContainerOrDefault() string {
+	name := "clickhouse"
+	if c != nil && c.CHContainer != "" {
+		name = c.CHContainer
+	}
+	return "bench-" + name
+}
+func (c *ClickHouseTargetConfig) DatabaseOrDefault() string {
+	if c != nil && c.Database != "" {
+		return c.Database
+	}
+	return "bench"
+}
+func (c *ClickHouseTargetConfig) TableOrDefault() string {
+	if c != nil && c.Table != "" {
+		return c.Table
+	}
+	return "logs"
+}
+func (c *ClickHouseTargetConfig) SettleOrDefault() int {
+	if c == nil || c.SettleSeconds <= 0 {
+		return 60
+	}
+	return c.SettleSeconds
+}
+
+// validateClickHouseTarget checks the optional `clickhouse_target:` block.
+func (tc *TestCase) validateClickHouseTarget() error {
+	if !tc.IsClickHouseTargetType() {
+		if tc.ClickHouseTarget != nil {
+			return fmt.Errorf("case %q: `clickhouse_target:` is only valid for type clickhouse_target_correctness", tc.Name)
+		}
+		return nil
+	}
+	if tc.ClickHouseTarget == nil {
+		return fmt.Errorf("case %q: type clickhouse_target_correctness requires a `clickhouse_target:` block", tc.Name)
+	}
+	if tc.ClickHouseTarget.ExpectRecords <= 0 {
+		return fmt.Errorf("case %q: clickhouse_target.expect_records must be > 0", tc.Name)
+	}
+	want := tc.ClickHouseTarget.CHContainerOrDefault()[len("bench-"):]
+	found := false
+	for _, e := range tc.Endpoints {
+		if e.Name == want {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("case %q: clickhouse_target_correctness requires an endpoints entry named %q (clickhouse-server)", tc.Name, want)
+	}
+	return nil
+}
+
+// MQTTTargetConfig parameterizes mqtt_target_correctness.
+type MQTTTargetConfig struct {
+	// SubContainer is the endpoints container running mosquitto_sub that records
+	// received messages (default "mqtt-sub" → docker container "bench-mqtt-sub").
+	SubContainer string `yaml:"sub_container"`
+	// RecvFile is the file inside SubContainer that mosquitto_sub appends to
+	// (default "/tmp/recv.txt"); the driver counts its lines.
+	RecvFile string `yaml:"recv_file"`
+	// ExpectRecords is the message count to assert (normally generator total_lines).
+	ExpectRecords int `yaml:"expect_records"`
+	// SettleSeconds is how long to wait for the count to settle (default 60).
+	SettleSeconds int `yaml:"settle_seconds"`
+}
+
+func (c *MQTTTargetConfig) SubContainerOrDefault() string {
+	name := "mqtt-sub"
+	if c != nil && c.SubContainer != "" {
+		name = c.SubContainer
+	}
+	return "bench-" + name
+}
+func (c *MQTTTargetConfig) RecvFileOrDefault() string {
+	if c != nil && c.RecvFile != "" {
+		return c.RecvFile
+	}
+	return "/tmp/recv.txt"
+}
+func (c *MQTTTargetConfig) SettleOrDefault() int {
+	if c == nil || c.SettleSeconds <= 0 {
+		return 60
+	}
+	return c.SettleSeconds
+}
+
+func (tc *TestCase) validateMQTTTarget() error {
+	if !tc.IsMQTTTargetType() {
+		if tc.MQTTTarget != nil {
+			return fmt.Errorf("case %q: `mqtt_target:` is only valid for type mqtt_target_correctness", tc.Name)
+		}
+		return nil
+	}
+	if tc.MQTTTarget == nil {
+		return fmt.Errorf("case %q: type mqtt_target_correctness requires a `mqtt_target:` block", tc.Name)
+	}
+	if tc.MQTTTarget.ExpectRecords <= 0 {
+		return fmt.Errorf("case %q: mqtt_target.expect_records must be > 0", tc.Name)
+	}
+	want := tc.MQTTTarget.SubContainerOrDefault()[len("bench-"):]
+	found := false
+	for _, e := range tc.Endpoints {
+		if e.Name == want {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("case %q: mqtt_target_correctness requires an endpoints entry named %q (mosquitto_sub)", tc.Name, want)
+	}
+	return nil
+}
+
+// RedisSourceConfig parameterizes redis_source_correctness.
+type RedisSourceConfig struct {
+	// PubContainer is the endpoints container that PUBLISHes (default "redis-pub"
+	// → docker container "bench-redis-pub"). The driver counts at the bench receiver.
+	PubContainer string `yaml:"pub_container"`
+	// ExpectRecords is the published/expected message count.
+	ExpectRecords int `yaml:"expect_records"`
+	// SettleSeconds is how long to wait for delivery (default 60).
+	SettleSeconds int `yaml:"settle_seconds"`
+	// Reject inverts the verdict for a NEGATIVE test (e.g. wrong redis auth): the
+	// source must NOT subscribe, so the driver asserts the receiver count stays
+	// <= ExpectMax (default 0) after the settle window. Proves redis auth is enforced.
+	Reject    bool `yaml:"reject"`
+	ExpectMax int  `yaml:"expect_max"`
+}
+
+func (c *RedisSourceConfig) PubContainerOrDefault() string {
+	name := "redis-pub"
+	if c != nil && c.PubContainer != "" {
+		name = c.PubContainer
+	}
+	return "bench-" + name
+}
+func (c *RedisSourceConfig) SettleOrDefault() int {
+	if c == nil || c.SettleSeconds <= 0 {
+		return 60
+	}
+	return c.SettleSeconds
+}
+
+func (tc *TestCase) validateRedisSource() error {
+	if !tc.IsRedisSourceType() {
+		if tc.RedisSource != nil {
+			return fmt.Errorf("case %q: `redis_source:` is only valid for type redis_source_correctness", tc.Name)
+		}
+		return nil
+	}
+	if tc.RedisSource == nil {
+		return fmt.Errorf("case %q: type redis_source_correctness requires a `redis_source:` block", tc.Name)
+	}
+	if !tc.RedisSource.Reject && tc.RedisSource.ExpectRecords <= 0 {
+		return fmt.Errorf("case %q: redis_source.expect_records must be > 0 (or set reject: true)", tc.Name)
+	}
+	want := tc.RedisSource.PubContainerOrDefault()[len("bench-"):]
+	found := false
+	for _, e := range tc.Endpoints {
+		if e.Name == want {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("case %q: redis_source_correctness requires an endpoints entry named %q (the redis publisher)", tc.Name, want)
+	}
+	return nil
+}
+
+// EndpointSourceConfig parameterizes endpoint_source_correctness — a generic
+// driver for any director source the bench generator can't drive (snmptrap, tftp,
+// smtp, …). A CLI-sender endpoint feeds the source; the driver counts at the
+// receiver and asserts the count reaches expect_min.
+type EndpointSourceConfig struct {
+	// SenderContainer is the endpoints container running the CLI sender (default
+	// "source-sender" → docker container "bench-source-sender"). Its logs are
+	// tailed on failure.
+	SenderContainer string `yaml:"sender_container"`
+	// ExpectMin is the minimum records the receiver must collect. A "min" (not
+	// exact) bound tolerates the inherent best-effort loss of UDP senders like
+	// snmptrap; set it equal to the sent count for reliable senders (tftp/smtp).
+	ExpectMin int `yaml:"expect_min"`
+	// SettleSeconds is how long to wait for delivery (default 60).
+	SettleSeconds int `yaml:"settle_seconds"`
+	// Reject inverts the assertion: a NEGATIVE test (e.g. wrong auth) where the
+	// source must NOT deliver. The driver waits the settle window then asserts the
+	// receiver count stays <= ExpectMax. Proves auth/validation is load-bearing.
+	Reject bool `yaml:"reject"`
+	// ExpectMax is the ceiling for a reject case (default 0 — nothing delivered).
+	ExpectMax int `yaml:"expect_max"`
+}
+
+func (c *EndpointSourceConfig) SenderContainerOrDefault() string {
+	name := "source-sender"
+	if c != nil && c.SenderContainer != "" {
+		name = c.SenderContainer
+	}
+	return "bench-" + name
+}
+func (c *EndpointSourceConfig) SettleOrDefault() int {
+	if c == nil || c.SettleSeconds <= 0 {
+		return 60
+	}
+	return c.SettleSeconds
+}
+
+func (tc *TestCase) validateEndpointSource() error {
+	if !tc.IsEndpointSourceType() {
+		if tc.EndpointSource != nil {
+			return fmt.Errorf("case %q: `endpoint_source:` is only valid for type endpoint_source_correctness", tc.Name)
+		}
+		return nil
+	}
+	if tc.EndpointSource == nil {
+		return fmt.Errorf("case %q: type endpoint_source_correctness requires an `endpoint_source:` block", tc.Name)
+	}
+	if !tc.EndpointSource.Reject && tc.EndpointSource.ExpectMin <= 0 {
+		return fmt.Errorf("case %q: endpoint_source.expect_min must be > 0 (or set reject: true)", tc.Name)
+	}
+	want := tc.EndpointSource.SenderContainerOrDefault()[len("bench-"):]
+	found := false
+	for _, e := range tc.Endpoints {
+		if e.Name == want {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("case %q: endpoint_source_correctness requires an endpoints entry named %q (the CLI sender)", tc.Name, want)
+	}
+	return nil
+}
+
+// HTTPVaultRotationConfig parameterizes http_vault_rotation_correctness.
+type HTTPVaultRotationConfig struct {
+	// SenderContainer is the bench-httpsender endpoints container (default
+	// "http-sender" → "bench-http-sender"); CtrlPort is its /stats+/certfp port (9099).
+	SenderContainer string `yaml:"sender_container"`
+	CtrlPort        int    `yaml:"ctrl_port"`
+	// SecretPath is the Vault KV path holding the cert/key (default "bench/http-tls").
+	SecretPath string `yaml:"secret_path"`
+	// ExpectMin is the minimum records the receiver must collect across the run
+	// (delivery must survive the rotation; allows a small loss during reload).
+	ExpectMin int `yaml:"expect_min"`
+	// SettleSeconds bounds the per-phase waits (default 60).
+	SettleSeconds int `yaml:"settle_seconds"`
+}
+
+func (c *HTTPVaultRotationConfig) SenderContainerOrDefault() string {
+	name := "http-sender"
+	if c != nil && c.SenderContainer != "" {
+		name = c.SenderContainer
+	}
+	return "bench-" + name
+}
+func (c *HTTPVaultRotationConfig) CtrlPortOrDefault() int {
+	if c != nil && c.CtrlPort > 0 {
+		return c.CtrlPort
+	}
+	return 9099
+}
+func (c *HTTPVaultRotationConfig) SecretPathOrDefault() string {
+	if c != nil && c.SecretPath != "" {
+		return c.SecretPath
+	}
+	return "bench/http-tls"
+}
+func (c *HTTPVaultRotationConfig) SettleOrDefault() int {
+	if c == nil || c.SettleSeconds <= 0 {
+		return 60
+	}
+	return c.SettleSeconds
+}
+
+func (tc *TestCase) validateHTTPVaultRotation() error {
+	if !tc.IsHTTPVaultRotationType() {
+		if tc.HTTPVaultRotation != nil {
+			return fmt.Errorf("case %q: `http_vault_rotation:` is only valid for type http_vault_rotation_correctness", tc.Name)
+		}
+		return nil
+	}
+	if tc.HTTPVaultRotation == nil {
+		return fmt.Errorf("case %q: type http_vault_rotation_correctness requires an `http_vault_rotation:` block", tc.Name)
+	}
+	if tc.Vault == nil {
+		return fmt.Errorf("case %q: http_vault_rotation_correctness requires a `vault:` block", tc.Name)
+	}
+	if tc.HTTPVaultRotation.ExpectMin <= 0 {
+		return fmt.Errorf("case %q: http_vault_rotation.expect_min must be > 0", tc.Name)
+	}
+	want := tc.HTTPVaultRotation.SenderContainerOrDefault()[len("bench-"):]
+	found := false
+	for _, e := range tc.Endpoints {
+		if e.Name == want {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("case %q: http_vault_rotation_correctness requires an endpoints entry named %q (the bench-httpsender)", tc.Name, want)
 	}
 	return nil
 }
