@@ -1640,6 +1640,9 @@ func (tc *TestCase) validateRedisSource() error {
 	if !tc.RedisSource.Reject && tc.RedisSource.ExpectRecords <= 0 {
 		return fmt.Errorf("case %q: redis_source.expect_records must be > 0 (or set reject: true)", tc.Name)
 	}
+	if tc.RedisSource.Reject && tc.RedisSource.ExpectMax < 0 {
+		return fmt.Errorf("case %q: redis_source.expect_max must be >= 0", tc.Name)
+	}
 	want := tc.RedisSource.PubContainerOrDefault()[len("bench-"):]
 	found := false
 	for _, e := range tc.Endpoints {
@@ -1703,6 +1706,9 @@ func (tc *TestCase) validateEndpointSource() error {
 	}
 	if !tc.EndpointSource.Reject && tc.EndpointSource.ExpectMin <= 0 {
 		return fmt.Errorf("case %q: endpoint_source.expect_min must be > 0 (or set reject: true)", tc.Name)
+	}
+	if tc.EndpointSource.Reject && tc.EndpointSource.ExpectMax < 0 {
+		return fmt.Errorf("case %q: endpoint_source.expect_max must be >= 0", tc.Name)
 	}
 	want := tc.EndpointSource.SenderContainerOrDefault()[len("bench-"):]
 	found := false

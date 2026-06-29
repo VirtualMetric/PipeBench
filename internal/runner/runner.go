@@ -4615,16 +4615,25 @@ func (r *Runner) runHTTPSourceCorrectness(tc *config.TestCase, subject config.Su
 		} else {
 			fmt.Println("  no events delivered with a bad credential ✓")
 		}
-		if e == nil && rejected < expected {
+		// The reject verdict must rest on positive sender-side evidence: if /stats
+		// is unavailable we can't confirm the requests were actually sent + rejected,
+		// so fail rather than pass on "nothing delivered" alone.
+		if e != nil {
+			errs = append(errs, "could not read sender /stats to confirm rejections: "+e.Error())
+		} else if rejected < expected {
 			errs = append(errs, fmt.Sprintf("sender saw only %d/%d rejections (accepted=%d) — source may not be enforcing auth", rejected, expected, accepted))
-		} else if e == nil {
+		} else {
 			fmt.Printf("  source rejected all %d requests ✓\n", rejected)
 		}
 	} else {
 		// deliver: every posted event must reach the receiver.
 		fmt.Printf("  waiting for all %d events to be delivered (up to %s)…\n", expected, time.Until(deadline).Round(time.Second))
 		got, ok := r.ccfWaitLines(metricsPort, expected, deadline)
-		got = r.ccfWaitStable(metricsPort, time.Now().Add(12*time.Second))
+		// Keep the reached count; only let a higher stabilized read (over-delivery)
+		// replace it, so the exact-count checks below stay meaningful.
+		if stable := r.ccfWaitStable(metricsPort, time.Now().Add(12*time.Second)); stable > got {
+			got = stable
+		}
 		finalCount = got
 		_, accepted, rejected, _ := httpSenderStats(senderContainer, ctrlPort)
 		if !ok && got < expected {
@@ -4692,6 +4701,13 @@ func (r *Runner) runClickHouseTargetCorrectness(tc *config.TestCase, subject con
 	configName := r.opts.ConfigName
 	subject = r.applySubjectOverrides(subject)
 	ch := tc.ClickHouseTarget
+
+	for _, capName := range tc.Requires {
+		if !subject.HasCapability(capName) {
+			return results.RunResult{}, fmt.Errorf("subject %q does not declare capability %q required by case %q",
+				subject.Name, capName, tc.Name)
+		}
+	}
 
 	fmt.Printf("→ test=%s  subject=%s  version=%s  (clickhouse target verify)\n", tc.Name, subject.Name, subject.Version)
 
@@ -4805,14 +4821,31 @@ func (r *Runner) runClickHouseTargetCorrectness(tc *config.TestCase, subject con
 	// The director's CH target must reconnect and retry the batches that failed
 	// during the downtime so the final count still reaches ExpectRecords.
 	if ch.RestartMidRun {
+		// Bound the resilience goroutine to THIS run: `stop` is closed when the run
+		// returns and we then wait on `done`, so it can never restart the
+		// fixed-name (shared) clickhouse container into a later run or during teardown.
+		stop := make(chan struct{})
+		done := make(chan struct{})
+		defer func() { close(stop); <-done }()
 		go func() {
+			defer close(done)
 			for i := 0; i < 40; i++ {
 				if out, e := chExec(chContainer, "SELECT count() FROM "+fqTable); e == nil {
 					if n, perr := strconv.ParseInt(strings.TrimSpace(out), 10, 64); perr == nil && n > 0 {
 						break
 					}
 				}
-				time.Sleep(time.Second)
+				select {
+				case <-stop:
+					return
+				case <-time.After(time.Second):
+				}
+			}
+			// Don't restart if the run already ended (no bleed into teardown/next run).
+			select {
+			case <-stop:
+				return
+			default:
 			}
 			fmt.Println("  restart_mid_run: restarting clickhouse-server…")
 			_ = exec.Command("docker", "restart", "-t", "2", chContainer).Run()
@@ -4889,15 +4922,22 @@ func (r *Runner) saveClickHouseTargetResult(tc *config.TestCase, subject config.
 // ── MQTT target correctness (mosquitto + mosquitto_sub counter) ───────────────
 
 // mqttSubLineCount counts the lines mosquitto_sub has appended to its recv file.
+// `file` comes from the case YAML, so it is passed as a separate argument (no
+// `sh -c` interpolation) to avoid shell injection; a missing file makes `wc`
+// exit non-zero, which we treat as 0.
 func mqttSubLineCount(subContainer, file string) int64 {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "docker", "exec", subContainer, "sh", "-c",
-		"wc -l < "+file+" 2>/dev/null || echo 0").Output()
+	out, err := exec.CommandContext(ctx, "docker", "exec", subContainer, "wc", "-l", file).Output()
 	if err != nil {
 		return 0
 	}
-	n, _ := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+	// `wc -l <file>` prints "<count> <file>"; take the leading count.
+	fields := strings.Fields(string(out))
+	if len(fields) == 0 {
+		return 0
+	}
+	n, _ := strconv.ParseInt(fields[0], 10, 64)
 	return n
 }
 
@@ -4908,6 +4948,13 @@ func (r *Runner) runMQTTTargetCorrectness(tc *config.TestCase, subject config.Su
 	configName := r.opts.ConfigName
 	subject = r.applySubjectOverrides(subject)
 	mc := tc.MQTTTarget
+
+	for _, capName := range tc.Requires {
+		if !subject.HasCapability(capName) {
+			return results.RunResult{}, fmt.Errorf("subject %q does not declare capability %q required by case %q",
+				subject.Name, capName, tc.Name)
+		}
+	}
 
 	orch, caseDir, tmpDir, err := r.setupAuxRun(tc, subject, configName)
 	if err != nil {
@@ -4985,6 +5032,13 @@ func (r *Runner) runRedisSourceCorrectness(tc *config.TestCase, subject config.S
 	subject = r.applySubjectOverrides(subject)
 	rc := tc.RedisSource
 
+	for _, capName := range tc.Requires {
+		if !subject.HasCapability(capName) {
+			return results.RunResult{}, fmt.Errorf("subject %q does not declare capability %q required by case %q",
+				subject.Name, capName, tc.Name)
+		}
+	}
+
 	orch, _, tmpDir, err := r.setupAuxRun(tc, subject, configName)
 	if err != nil {
 		return results.RunResult{}, err
@@ -5054,7 +5108,10 @@ func (r *Runner) runRedisSourceCorrectness(tc *config.TestCase, subject config.S
 	}
 	fmt.Printf("  waiting for %d records delivered from the redis source (up to %s)…\n", expected, time.Until(deadline).Round(time.Second))
 	got, _ := r.ccfWaitLines(metricsPort, expected, deadline)
-	got = r.ccfWaitStable(metricsPort, time.Now().Add(12*time.Second))
+	// Keep the reached count; only a higher stabilized read (over-delivery) replaces it.
+	if stable := r.ccfWaitStable(metricsPort, time.Now().Add(12*time.Second)); stable > got {
+		got = stable
+	}
 	finalCount := got
 	if got < expected {
 		errs = append(errs, fmt.Sprintf("under-delivery: %d of %d records from the redis source", got, expected))
@@ -5077,6 +5134,13 @@ func (r *Runner) runEndpointSourceCorrectness(tc *config.TestCase, subject confi
 	configName := r.opts.ConfigName
 	subject = r.applySubjectOverrides(subject)
 	es := tc.EndpointSource
+
+	for _, capName := range tc.Requires {
+		if !subject.HasCapability(capName) {
+			return results.RunResult{}, fmt.Errorf("subject %q does not declare capability %q required by case %q",
+				subject.Name, capName, tc.Name)
+		}
+	}
 
 	orch, _, tmpDir, err := r.setupAuxRun(tc, subject, configName)
 	if err != nil {
@@ -5245,6 +5309,15 @@ func httpSenderCertFP(senderContainer string, ctrlPort int) string {
 	return strings.TrimSpace(string(out))
 }
 
+// fpShort returns a short, log-friendly prefix of a cert fingerprint without
+// panicking on a short/truncated /certfp response (fp[:12] would).
+func fpShort(fp string) string {
+	if len(fp) > 12 {
+		return fp[:12]
+	}
+	return fp
+}
+
 // runHTTPVaultCertRotation verifies the http source hot-reloads its TLS cert from
 // Vault: the source serves HTTPS from a Vault-sourced cert ($secret refs), the
 // bench-httpsender posts continuously and records the served cert fingerprint, and
@@ -5254,6 +5327,13 @@ func (r *Runner) runHTTPVaultCertRotation(tc *config.TestCase, subject config.Su
 	configName := r.opts.ConfigName
 	subject = r.applySubjectOverrides(subject)
 	vr := tc.HTTPVaultRotation
+
+	for _, capName := range tc.Requires {
+		if !subject.HasCapability(capName) {
+			return results.RunResult{}, fmt.Errorf("subject %q does not declare capability %q required by case %q",
+				subject.Name, capName, tc.Name)
+		}
+	}
 
 	fmt.Printf("→ test=%s  subject=%s  version=%s  (http vault cert rotation)\n", tc.Name, subject.Name, subject.Version)
 
@@ -5376,7 +5456,7 @@ func (r *Runner) runHTTPVaultCertRotation(tc *config.TestCase, subject config.Su
 		errs = append(errs, "never observed initial HTTPS delivery + server cert (vault-sourced cert may have failed to load)")
 		return r.saveAuxResult(tc, subject, configName, "http vault cert rotation", startTime, 0, false, errs, senderContainer, subjectContainer)
 	}
-	fmt.Printf("  initial HTTPS delivery up; served cert fp=%s… ✓\n", fp1[:12])
+	fmt.Printf("  initial HTTPS delivery up; served cert fp=%s… ✓\n", fpShort(fp1))
 
 	// Phase 1: rotate the cert in Vault (new leaf).
 	if err := orchestrator.RotateServerCert(certsDir, hosts); err != nil {
@@ -5413,7 +5493,7 @@ func (r *Runner) runHTTPVaultCertRotation(tc *config.TestCase, subject config.Su
 		time.Sleep(3 * time.Second)
 	}
 	if rotated {
-		fmt.Printf("  director hot-reloaded the rotated cert (fp %s… → %s…) ✓\n", fp1[:12], fp2[:12])
+		fmt.Printf("  director hot-reloaded the rotated cert (fp %s… → %s…) ✓\n", fpShort(fp1), fpShort(fp2))
 	} else {
 		errs = append(errs, "server cert fingerprint did not change after Vault rotation — the director did not hot-reload the cert")
 	}
