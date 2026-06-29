@@ -1228,7 +1228,15 @@ func (tc *TestCase) validateFleet() error {
 		return fmt.Errorf("case %q: type fleet_automation_correctness requires a `fleet:` block", tc.Name)
 	}
 	switch tc.Fleet.Scenario {
-	case "connect", "config_update", "config_change", "remote_check", "live_data", "console_log", "stats", "reconnect", "bad_token", "self_managed", "enrollment":
+	case "config_change":
+		// config_change asserts a live A→B target config transition: deliver_config
+		// provides config A (the pre-step) and configs/update.vmf is the mid-run B.
+		// Without a prior delivered config there is no transition to prove — the test
+		// would only validate an initial config, so require deliver_config.
+		if tc.Fleet.DeliverConfig == "" {
+			return fmt.Errorf("case %q: fleet.scenario config_change requires fleet.deliver_config (the prior config A to transition away from)", tc.Name)
+		}
+	case "connect", "config_update", "remote_check", "live_data", "console_log", "stats", "reconnect", "bad_token", "self_managed", "enrollment":
 	default:
 		return fmt.Errorf("case %q: unknown fleet.scenario %q", tc.Name, tc.Fleet.Scenario)
 	}

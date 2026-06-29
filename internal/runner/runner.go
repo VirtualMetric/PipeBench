@@ -4002,24 +4002,29 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		if dd.After(runDeadline) {
 			dd = runDeadline
 		}
-		fmt.Printf("  waiting for delivery to START after the change (receiver >= %s, up to %s)…\n", formatCount(minRecv), drainTimeout)
+		// Require delivery to grow by minRecv ABOVE the pre-change baseline, so
+		// success proves new lines arrived after the change rather than letting
+		// pre-existing (leaked) traffic satisfy an absolute total.
+		target := rmB.LinesReceived + minRecv
+		fmt.Printf("  waiting for delivery to START after the change (receiver >= %s = baseline %s + %s, up to %s)…\n",
+			formatCount(target), formatCount(rmB.LinesReceived), formatCount(minRecv), drainTimeout)
 		for time.Now().Before(dd) {
 			rm, qe := r.queryReceiverMetrics(metricsPort, 10*time.Second)
 			if qe == nil {
 				finalCount = rm.LinesReceived
 				fmt.Printf("    received: %s\n", formatCount(finalCount))
-				if rm.LinesReceived >= minRecv {
+				if rm.LinesReceived >= target {
 					break
 				}
 			}
 			time.Sleep(3 * time.Second)
 		}
-		if finalCount < minRecv {
+		if finalCount < target {
 			errs = append(errs, fmt.Sprintf(
-				"delivery did not start after the pushed config change — %s received (expected >= %s); the fleet-delivered VMF change did not reconcile onto the live data path",
-				formatCount(finalCount), formatCount(minRecv)))
+				"delivery did not start after the pushed config change — %s received (expected >= %s = baseline %s + %s); the fleet-delivered VMF change did not reconcile onto the live data path",
+				formatCount(finalCount), formatCount(target), formatCount(rmB.LinesReceived), formatCount(minRecv)))
 		} else {
-			fmt.Printf("  delivery started after the VMF config change (%s received) ✓\n", formatCount(finalCount))
+			fmt.Printf("  delivery started after the VMF config change (%s received, baseline %s) ✓\n", formatCount(finalCount), formatCount(rmB.LinesReceived))
 		}
 
 	case "live_data", "console_log":
