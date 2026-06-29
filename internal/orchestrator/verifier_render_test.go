@@ -98,6 +98,64 @@ func TestComposeRendersVerifierAvro(t *testing.T) {
 	mustContain(t, out, "VERIFIER_OBJECT_FORMAT: \"avro\"")
 }
 
+// localVerifierCase is a minimal local-file columnar correctness case: TCP in,
+// a `file` target (configured in the subject config) writing to the shared
+// /data volume, and a verifier: block with local_dir (no aws:/minio:).
+func localVerifierCase(format string) *config.TestCase {
+	return &config.TestCase{
+		Name: "file_target_" + format + "_correctness",
+		Type: "correctness",
+		Generator: config.GeneratorConfig{
+			Mode: "tcp", Target: "subject:9000",
+			TotalLines: 1000, LineSize: 256, Format: "json",
+		},
+		Verifier: &config.VerifierConfig{
+			LocalDir: "/data/out", Format: format,
+			MsgField: "msg", NullFields: []string{"msg"},
+		},
+		Subjects: []string{"vmetric"},
+	}
+}
+
+func TestComposeRendersLocalVerifier(t *testing.T) {
+	out, parsed := renderVerifierCompose(t, localVerifierCase("parquet"))
+	services := parsed["services"].(map[string]any)
+
+	verifier, ok := services["verifier"].(map[string]any)
+	if !ok {
+		t.Fatalf("verifier service not rendered:\n%s", out)
+	}
+	// Local mode: reads the shared volume, no S3 bucket/credentials.
+	mustContain(t, out, "VERIFIER_LOCAL_DIR: \"/data/out\"")
+	mustContain(t, out, "VERIFIER_OBJECT_FORMAT: \"parquet\"")
+	mustNotContain(t, out, "VERIFIER_S3_BUCKET")
+	mustNotContain(t, out, "AWS_ENDPOINT_URL")
+
+	// The verifier must mount the shared-data volume to read the file target's
+	// output.
+	if !hasSharedDataMount(verifier) {
+		t.Errorf("verifier missing shared-data:/data mount:\n%s", out)
+	}
+
+	// The subject must also mount shared-data so its file target can write there.
+	subject := services["subject"].(map[string]any)
+	if !hasSharedDataMount(subject) {
+		t.Errorf("subject missing shared-data:/data mount for local verifier:\n%s", out)
+	}
+}
+
+// hasSharedDataMount reports whether a rendered compose service mounts the
+// shared-data named volume at /data.
+func hasSharedDataMount(svc map[string]any) bool {
+	vols, _ := svc["volumes"].([]any)
+	for _, v := range vols {
+		if s, _ := v.(string); s == "shared-data:/data" {
+			return true
+		}
+	}
+	return false
+}
+
 // TestComposeOmitsVerifierByDefault guards existing cases: no verifier service
 // appears when the case has no verifier: block, and the receiver still renders.
 func TestComposeOmitsVerifierByDefault(t *testing.T) {

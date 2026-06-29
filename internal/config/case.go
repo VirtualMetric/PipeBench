@@ -208,10 +208,19 @@ type TestCase struct {
 // until the row count settles), then asserts exact row count, no duplicates,
 // and no NULL payload fields over the columnar data.
 type VerifierConfig struct {
-	// S3Bucket is the bucket the subject wrote to (required). S3Prefix is an
-	// optional key prefix to scope the scan to.
+	// S3Bucket is the bucket the subject wrote to. S3Prefix is an optional key
+	// prefix to scope the scan to. Exactly one of S3Bucket / LocalDir must be
+	// set (see validateVerifier).
 	S3Bucket string `yaml:"s3_bucket"`
 	S3Prefix string `yaml:"s3_prefix"`
+
+	// LocalDir is the directory the subject's local `file` target wrote to,
+	// reachable on the shared `/data` volume the harness mounts into both the
+	// subject and the verifier. Set this instead of S3Bucket to verify a local
+	// columnar file target: the verifier reads the files directly off disk
+	// (read_parquet/read_avro, no httpfs/S3), so the case needs no aws:/minio:
+	// emulator. Mutually exclusive with S3Bucket.
+	LocalDir string `yaml:"local_dir"`
 
 	// Format is the object format to read: "avro" | "parquet" (required).
 	Format string `yaml:"format"`
@@ -232,6 +241,12 @@ type VerifierConfig struct {
 	// whole verify (default 5m).
 	QuietWindow string `yaml:"quiet_window"`
 	Timeout     string `yaml:"timeout"`
+}
+
+// IsLocal reports whether the verifier reads a local file target's output off
+// the shared volume (LocalDir set) rather than the S3 emulator.
+func (v *VerifierConfig) IsLocal() bool {
+	return v != nil && v.LocalDir != ""
 }
 
 // QuietWindowOrDefault returns the configured quiet window or 15s.
@@ -1886,13 +1901,19 @@ func (tc *TestCase) validateVerifier() error {
 	if tc.MultiReceiver() || tc.Receiver.Mode != "" || tc.Receiver.Listen != "" {
 		return fmt.Errorf("case %q: verifier replaces the receiver — remove the `receiver:`/`receivers:` block (the subject's sink is S3)", tc.Name)
 	}
-	if tc.Verifier.S3Bucket == "" {
-		return fmt.Errorf("case %q: verifier requires `s3_bucket`", tc.Name)
+	// Source: exactly one of s3_bucket (S3 emulator) / local_dir (shared volume).
+	switch {
+	case tc.Verifier.S3Bucket == "" && tc.Verifier.LocalDir == "":
+		return fmt.Errorf("case %q: verifier requires exactly one of `s3_bucket` or `local_dir`", tc.Name)
+	case tc.Verifier.S3Bucket != "" && tc.Verifier.LocalDir != "":
+		return fmt.Errorf("case %q: verifier `s3_bucket` and `local_dir` are mutually exclusive", tc.Name)
 	}
 	if tc.Verifier.Format != "avro" && tc.Verifier.Format != "parquet" {
 		return fmt.Errorf("case %q: verifier.format must be \"avro\" or \"parquet\", got %q", tc.Name, tc.Verifier.Format)
 	}
-	if !tc.UsesAWS() && !tc.UsesMinio() {
+	// The S3 source needs an emulator; the local source reads the shared volume
+	// directly and needs neither aws: nor minio:.
+	if !tc.Verifier.IsLocal() && !tc.UsesAWS() && !tc.UsesMinio() {
 		return fmt.Errorf("case %q: verifier requires an `aws:` or `minio:` block for S3 access", tc.Name)
 	}
 	if _, err := time.ParseDuration(tc.Verifier.QuietWindowOrDefault()); err != nil {

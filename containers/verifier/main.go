@@ -38,6 +38,7 @@ type config struct {
 	Endpoint     string // S3 endpoint URL, e.g. http://localstack:4566
 	Bucket       string // bucket the subject wrote to
 	Prefix       string // optional key prefix inside the bucket
+	LocalDir     string // local directory (shared /data volume) the subject's file target wrote to; set instead of Bucket for the local-file path
 	Format       string // "avro" | "parquet"
 	AccessKey    string
 	SecretKey    string
@@ -173,31 +174,47 @@ func buildVerdict(st stats, cfg config) verdict {
 	return v
 }
 
-// sourceExpr is the DuckDB table function + glob the queries read from.
+// sourceExpr is the DuckDB table function + glob the queries read from. In
+// local mode (LocalDir set) it reads the file target's output directly from the
+// shared volume; otherwise it reads the S3 objects via httpfs.
 func sourceExpr(cfg config) string {
-	glob := fmt.Sprintf("s3://%s/%s**/*.%s", cfg.Bucket, cfg.Prefix, cfg.Format)
+	var glob string
+	if cfg.LocalDir != "" {
+		// Recursive glob so files written directly in the dir or in any
+		// subdir (e.g. date-templated paths) are all matched.
+		glob = fmt.Sprintf("%s/**/*.%s", strings.TrimSuffix(cfg.LocalDir, "/"), cfg.Format)
+	} else {
+		glob = fmt.Sprintf("s3://%s/%s**/*.%s", cfg.Bucket, cfg.Prefix, cfg.Format)
+	}
 	reader := "read_parquet"
 	if cfg.Format == "avro" {
 		reader = "read_avro"
 	}
 	// sqlQuote escapes the glob for a single-quoted SQL literal. The glob is
-	// built from our own config (bucket/prefix/format), never untrusted input.
+	// built from our own config (bucket/prefix/dir/format), never untrusted input.
 	return fmt.Sprintf("%s(%s)", reader, sqlQuote(glob))
 }
 
 // prelude is the DuckDB session setup: load the bundled extensions and point
 // httpfs at the (internal, fixed) S3 endpoint. Returns the SQL and a redacted
-// form safe to log (credentials stripped).
+// form safe to log (credentials stripped). In local mode the httpfs/S3 setup is
+// skipped entirely — DuckDB reads local parquet/avro files directly (parquet is
+// built in; avro still needs its extension loaded).
 func (cfg config) prelude() (sql, redacted string) {
-	host, useSSL := splitEndpoint(cfg.Endpoint)
 	var b strings.Builder
 	if cfg.ExtDir != "" {
 		fmt.Fprintf(&b, "SET extension_directory=%s;", sqlQuote(cfg.ExtDir))
 	}
-	b.WriteString("LOAD httpfs;")
 	if cfg.Format == "avro" {
 		b.WriteString("LOAD avro;")
 	}
+	if cfg.LocalDir != "" {
+		// Local files: no httpfs, no S3 endpoint/credentials. Nothing to
+		// redact — the whole prelude is safe to log.
+		return b.String(), b.String()
+	}
+	host, useSSL := splitEndpoint(cfg.Endpoint)
+	b.WriteString("LOAD httpfs;")
 	fmt.Fprintf(&b, "SET s3_region=%s;", sqlQuote(cfg.Region))
 	fmt.Fprintf(&b, "SET s3_endpoint=%s;", sqlQuote(host))
 	fmt.Fprintf(&b, "SET s3_use_ssl=%t;", useSSL)
@@ -387,6 +404,7 @@ func loadConfig() config {
 		Endpoint:     getEnv("VERIFIER_S3_ENDPOINT", getEnv("AWS_ENDPOINT_URL", "http://localstack:4566")),
 		Bucket:       os.Getenv("VERIFIER_S3_BUCKET"),
 		Prefix:       os.Getenv("VERIFIER_S3_PREFIX"),
+		LocalDir:     os.Getenv("VERIFIER_LOCAL_DIR"),
 		Format:       getEnv("VERIFIER_OBJECT_FORMAT", "parquet"),
 		AccessKey:    getEnv("AWS_ACCESS_KEY_ID", "test"),
 		SecretKey:    getEnv("AWS_SECRET_ACCESS_KEY", "test"),
@@ -400,8 +418,12 @@ func loadConfig() config {
 		Timeout:      getEnvDuration("VERIFIER_TIMEOUT", 5*time.Minute),
 		VerdictPath:  getEnv("VERIFIER_VERDICT_PATH", "/results/verdict.json"),
 	}
-	if cfg.Bucket == "" {
-		fmt.Fprintln(os.Stderr, "verifier: VERIFIER_S3_BUCKET is required")
+	if cfg.Bucket == "" && cfg.LocalDir == "" {
+		fmt.Fprintln(os.Stderr, "verifier: one of VERIFIER_S3_BUCKET or VERIFIER_LOCAL_DIR is required")
+		os.Exit(2)
+	}
+	if cfg.Bucket != "" && cfg.LocalDir != "" {
+		fmt.Fprintln(os.Stderr, "verifier: VERIFIER_S3_BUCKET and VERIFIER_LOCAL_DIR are mutually exclusive")
 		os.Exit(2)
 	}
 	if cfg.Format != "avro" && cfg.Format != "parquet" {
