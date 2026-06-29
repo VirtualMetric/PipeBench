@@ -3930,6 +3930,98 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 			}
 		}
 
+	case "config_change":
+		// deliver_config (the pre-step) already delivered operational config A,
+		// which points the target at a DEAD endpoint so delivery is blocked. Here
+		// we confirm it is blocked, push the SECOND VMF (configs/update.vmf) which
+		// repoints the target at the working receiver, and assert delivery STARTS —
+		// proving a live target config change pushed over the real fleet/platform
+		// link is applied AND reconciled (pool rebuild) on a running director, with
+		// no restart.
+		// The changed config (B) is pushed from configs/update.vmf — reusing the
+		// "update config" file convention (config_update reads configs/update.yml),
+		// so no new case field is needed. deliver_config provided the initial
+		// config (A); this is the mid-run change.
+		changePath := filepath.Join(caseDir, "configs", "update.vmf")
+		if _, statErr := os.Stat(changePath); statErr != nil {
+			errs = append(errs, "config_change scenario requires configs/update.vmf (the changed VMF to push): "+statErr.Error())
+			break
+		}
+		metricsPort, stopPortFwd, mErr := orch.ReceiverMetricsPort()
+		if mErr != nil {
+			errs = append(errs, "config_change: receiver metrics unavailable: "+mErr.Error())
+			break
+		}
+		defer stopPortFwd()
+		minRecv := tc.Correctness.MinReceived
+		if minRecv <= 0 {
+			minRecv = 1
+		}
+		const leak = 5
+
+		// Phase 0: confirm delivery is BLOCKED under config A (dead target), so
+		// post-change delivery is attributable to the pushed change.
+		if d := min(15*time.Second, time.Until(runDeadline)); d > 0 {
+			time.Sleep(d)
+		}
+		rmB, _ := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+		fmt.Printf("  before config change: received=%s (expected ~0; target A is a dead endpoint)\n", formatCount(rmB.LinesReceived))
+		if rmB.LinesReceived > leak {
+			errs = append(errs, fmt.Sprintf(
+				"delivery was not blocked before the change (%s received) — config A is not pointing at a dead target; the change is untested",
+				formatCount(rmB.LinesReceived)))
+		}
+
+		// Phase 1: push the changed VMF (config B → working target) over the fleet link.
+		raw, e := os.ReadFile(changePath)
+		if e != nil {
+			errs = append(errs, "cannot read configs/update.vmf: "+e.Error())
+			break
+		}
+		before := 0
+		if st, se := fleetSimStatus(simContainer); se == nil {
+			before = st.count(dirID, "rep.config")
+		}
+		fmt.Printf("  pushing changed VMF config (configs/update.vmf, %d bytes) over the fleet link…\n", len(raw))
+		if _, se := fleetSimSend(simContainer, dirID, "config",
+			map[string]any{"data_b64": base64.StdEncoding.EncodeToString(raw)}); se != nil {
+			errs = append(errs, "failed to push changed config: "+se.Error())
+			break
+		}
+		if _, ok := fleetWaitCount(simContainer, dirID, "rep.config", before+1, scenarioDeadline()); !ok {
+			errs = append(errs, "no config reply from director after the change push")
+		}
+
+		// Phase 2: delivery must START — the new working target took effect via
+		// the director's config reload + sender reconcile (pool rebuild).
+		drainTimeout := time.Duration(tc.Correctness.DrainSeconds) * time.Second
+		if drainTimeout <= 0 {
+			drainTimeout = 2 * time.Minute
+		}
+		dd := time.Now().Add(drainTimeout)
+		if dd.After(runDeadline) {
+			dd = runDeadline
+		}
+		fmt.Printf("  waiting for delivery to START after the change (receiver >= %s, up to %s)…\n", formatCount(minRecv), drainTimeout)
+		for time.Now().Before(dd) {
+			rm, qe := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+			if qe == nil {
+				finalCount = rm.LinesReceived
+				fmt.Printf("    received: %s\n", formatCount(finalCount))
+				if rm.LinesReceived >= minRecv {
+					break
+				}
+			}
+			time.Sleep(3 * time.Second)
+		}
+		if finalCount < minRecv {
+			errs = append(errs, fmt.Sprintf(
+				"delivery did not start after the pushed config change — %s received (expected >= %s); the fleet-delivered VMF change did not reconcile onto the live data path",
+				formatCount(finalCount), formatCount(minRecv)))
+		} else {
+			fmt.Printf("  delivery started after the VMF config change (%s received) ✓\n", formatCount(finalCount))
+		}
+
 	case "live_data", "console_log":
 		cmd := "live_data"
 		params := map[string]any{

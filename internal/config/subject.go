@@ -35,6 +35,17 @@ type Subject struct {
 	// at /vault-tls (subjects whose root is "/").
 	VaultDir string
 
+	// FleetServiceConfigPath supports subjects that follow a fleet/managed
+	// model: the SERVICE/bootstrap config (how to reach the control plane)
+	// lives in the working dir, while the OPERATIONAL config (the data
+	// pipeline) is delivered out-of-band by that control plane at runtime.
+	// When set AND a case enables fleet.deliver_config, the harness mounts the
+	// case config as the service config at this in-container path and starts
+	// the subject with NO config-path override (Command), so the delivered
+	// operational config governs the pipeline. Empty (the default) means the
+	// subject takes a single config file via ConfigPath/Command as usual.
+	FleetServiceConfigPath string
+
 	// Capabilities is a free-form set of feature tags the subject is known
 	// to support end-to-end through PipeBench (e.g. "tls_tcp", "tls_syslog").
 	// The harness consults these when a case opts into a transport that
@@ -212,6 +223,11 @@ var Registry = map[string]Subject{
 		Entrypoint: []string{"/opt/vmetric/director"},
 		Command:    []string{"-config-path", "/config.yml"},
 		ConfigRW:   true,
+		// In fleet mode the director reads its bootstrap from the working-dir
+		// vmetric.yml and loads the operational config from the platform-
+		// delivered Path.Config/vmetric.vmf — so a case using fleet.deliver_config
+		// mounts the service config here and runs without -config-path.
+		FleetServiceConfigPath: "/opt/vmetric/vmetric.yml",
 		// Cloud capabilities require a director build with emulator
 		// endpoint support (awss3 listener `endpoint`/`use_path_style`,
 		// azblob target `connection_string`) — 2.0.3 is the first

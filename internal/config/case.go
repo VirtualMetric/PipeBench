@@ -1228,7 +1228,7 @@ func (tc *TestCase) validateFleet() error {
 		return fmt.Errorf("case %q: type fleet_automation_correctness requires a `fleet:` block", tc.Name)
 	}
 	switch tc.Fleet.Scenario {
-	case "connect", "config_update", "remote_check", "live_data", "console_log", "stats", "reconnect", "bad_token", "self_managed", "enrollment":
+	case "connect", "config_update", "config_change", "remote_check", "live_data", "console_log", "stats", "reconnect", "bad_token", "self_managed", "enrollment":
 	default:
 		return fmt.Errorf("case %q: unknown fleet.scenario %q", tc.Name, tc.Fleet.Scenario)
 	}

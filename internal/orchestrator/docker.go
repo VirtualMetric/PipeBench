@@ -1894,6 +1894,22 @@ func writeCompose(path string, cfg RunConfig) error {
 	sequenced := boolStr(tc.Correctness.ValidateDedup || tc.Correctness.ValidateContent || tc.UsesVerifier())
 	tlsCertsHost := filepath.ToSlash(cfg.TLSCertsHost)
 
+	// Fleet/managed subjects that receive a platform-delivered operational
+	// config (fleet.deliver_config set, and the subject declares
+	// FleetServiceConfigPath): mount the case config as the SERVICE config at
+	// that path and drop the config-path override, so the OPERATIONAL config
+	// arrives out-of-band from the control plane and governs the data pipeline.
+	// If both the service and operational config were the same mounted single
+	// file, the delivered config would never take effect and the pipeline would
+	// never start. Fleet cases WITHOUT deliver_config keep the normal single
+	// mounted config file and Command. The in-container path lives on the
+	// subject definition, not here, so this stays subject-agnostic.
+	subjectCmd := formatYAMLList(s.Command)
+	if tc.Fleet != nil && tc.Fleet.DeliverConfig != "" && s.FleetServiceConfigPath != "" {
+		configDst = s.FleetServiceConfigPath
+		subjectCmd = "" // no config-path override; subject finds the service config in its workdir
+	}
+
 	vars := composeVars{
 		SubjectImage:      s.ImageRef(),
 		SubjectContainer:  subjectContainer,
@@ -1901,7 +1917,7 @@ func writeCompose(path string, cfg RunConfig) error {
 		ConfigDst:         configDst,
 		ConfigMountOpts:   configMountOpts(s),
 		TmpDir:            tmpDir,
-		SubjectCmd:        formatYAMLList(s.Command),
+		SubjectCmd:        subjectCmd,
 		SubjectEntrypoint: formatYAMLList(s.Entrypoint),
 		SubjectUser:       subjectUser,
 		SubjectCertDir:    s.CertDir,
