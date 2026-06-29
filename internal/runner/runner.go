@@ -226,6 +226,24 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	if tc.IsCCFType() {
 		return r.runCCFCorrectness(tc, subject)
 	}
+	if tc.IsHTTPSourceType() {
+		return r.runHTTPSourceCorrectness(tc, subject)
+	}
+	if tc.IsClickHouseTargetType() {
+		return r.runClickHouseTargetCorrectness(tc, subject)
+	}
+	if tc.IsMQTTTargetType() {
+		return r.runMQTTTargetCorrectness(tc, subject)
+	}
+	if tc.IsRedisSourceType() {
+		return r.runRedisSourceCorrectness(tc, subject)
+	}
+	if tc.IsHTTPVaultRotationType() {
+		return r.runHTTPVaultCertRotation(tc, subject)
+	}
+	if tc.IsEndpointSourceType() {
+		return r.runEndpointSourceCorrectness(tc, subject)
+	}
 
 	configName := r.opts.ConfigName
 
@@ -4444,6 +4462,1060 @@ func (r *Runner) saveCCFResult(tc *config.TestCase, subject config.Subject, conf
 	}
 	fmt.Printf("  done. results → %s\n", dir)
 	return result, nil
+}
+
+// ── HTTP / Splunk-HEC source correctness ─────────────────────────────────────
+
+// httpSenderStats reads the bench-httpsender's /stats over the bench network.
+func httpSenderStats(senderContainer string, ctrlPort int) (sent, accepted, rejected int64, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	url := fmt.Sprintf("http://127.0.0.1:%d/stats", ctrlPort)
+	out, e := exec.CommandContext(ctx, "docker", "exec", senderContainer,
+		"wget", "-q", "-O", "-", url).Output()
+	if e != nil {
+		return 0, 0, 0, e
+	}
+	var m map[string]int64
+	if e := json.Unmarshal(out, &m); e != nil {
+		return 0, 0, 0, fmt.Errorf("decode sender stats: %w (raw: %.200s)", e, string(out))
+	}
+	return m["sent"], m["accepted"], m["rejected"], nil
+}
+
+// runHTTPSourceCorrectness drives the director's HTTP / Splunk-HEC SOURCE listener
+// with the bench-httpsender: the sender POSTs one event per request (HMAC/basic/
+// header/HEC-token auth, optional gzip/TLS) and the director forwards each to the
+// receiver. For "deliver" the driver asserts every event arrives; for "reject" it
+// asserts nothing arrives AND the sender saw the requests rejected.
+func (r *Runner) runHTTPSourceCorrectness(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
+	configName := r.opts.ConfigName
+	subject = r.applySubjectOverrides(subject)
+	hs := tc.HTTPSource
+
+	for _, capName := range tc.Requires {
+		if !subject.HasCapability(capName) {
+			return results.RunResult{}, fmt.Errorf("subject %q does not declare capability %q required by case %q",
+				subject.Name, capName, tc.Name)
+		}
+	}
+
+	fmt.Printf("→ test=%s  subject=%s  version=%s  (http_source scenario=%q)\n",
+		tc.Name, subject.Name, subject.Version, hs.Scenario)
+
+	srcCfg, err := tc.ConfigFilePath(r.opts.CasesDir, configName, subject)
+	if err != nil {
+		return results.RunResult{}, err
+	}
+	srcCfg, err = filepath.Abs(srcCfg)
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("resolving config path: %w", err)
+	}
+
+	tmpDir, err := os.MkdirTemp("", "bench-"+tc.Name+"-")
+	if err != nil {
+		return results.RunResult{}, err
+	}
+	if err := os.Chmod(tmpDir, 0o1777); err != nil {
+		return results.RunResult{}, fmt.Errorf("chmod tmpdir: %w", err)
+	}
+	defer func() {
+		if !r.opts.NoCleanup {
+			os.RemoveAll(tmpDir)
+		}
+	}()
+
+	caseDir, err := filepath.Abs(filepath.Join(r.opts.CasesDir, tc.Name))
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("resolving case directory: %w", err)
+	}
+
+	extraEnv := map[string]string{}
+	if cfg, ok := tc.Configurations[configName]; ok {
+		maps.Copy(extraEnv, cfg.Env)
+	}
+
+	runCfg := orchestrator.RunConfig{
+		TestCase:         tc,
+		Subject:          subject,
+		ConfigName:       configName,
+		ConfigSrcPath:    srcCfg,
+		CaseDir:          caseDir,
+		TmpDir:           tmpDir,
+		GeneratorImage:   r.opts.GeneratorImage,
+		ReceiverImage:    r.opts.ReceiverImage,
+		CollectorImage:   r.opts.CollectorImage,
+		ReceiverHostPort: r.opts.ReceiverHostPort,
+		ExtraSubjectEnv:  extraEnv,
+		CPULimit:         r.opts.CPULimit,
+		MemLimit:         r.opts.MemLimit,
+	}
+
+	orch, err := orchestrator.NewComposeRunner(runCfg)
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("compose setup: %w", err)
+	}
+
+	senderContainer := hs.SenderContainerOrDefault()
+	ctrlPort := hs.SenderCtrlPortOrDefault()
+	subjectContainer := "bench-subject-" + subject.Name
+	cleanup := []string{"bench-receiver", "bench-collector", "bench-generator", subjectContainer, senderContainer}
+	for _, c := range cleanup {
+		_ = exec.Command("docker", "rm", "-f", c).Run()
+	}
+	_ = orch.Down()
+	defer func() {
+		if !r.opts.NoCleanup {
+			fmt.Println("  tearing down…")
+			_ = orch.Down()
+		}
+	}()
+
+	startTime := time.Now()
+	runDeadline := startTime.Add(r.opts.Timeout)
+	settle := time.Duration(hs.SettleOrDefault()) * time.Second
+	warmup := tc.WarmupOrDefault(20 * time.Second)
+	expected := int64(hs.Count)
+
+	fmt.Println("  starting director + http sender + receiver…")
+	if err := orch.Up(); err != nil {
+		return results.RunResult{}, fmt.Errorf("starting http_source topology: %w", err)
+	}
+
+	metricsPort, stopPortFwd, err := orch.ReceiverMetricsPort()
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("receiver metrics port: %w", err)
+	}
+	defer stopPortFwd()
+
+	var passed bool
+	var errs []string
+	var finalCount int64
+
+	deadline := time.Now().Add(warmup + settle)
+	if deadline.After(runDeadline) {
+		deadline = runDeadline
+	}
+
+	if hs.Scenario == "reject" {
+		// Wait until the sender finished POSTing (all rejected), then assert nothing
+		// was delivered. Poll the sender's /stats for sent>=count.
+		fmt.Printf("  asserting the source REJECTS every request (up to %s)…\n", time.Until(deadline).Round(time.Second))
+		for time.Now().Before(deadline) {
+			if s, _, _, e := httpSenderStats(senderContainer, ctrlPort); e == nil && s >= expected {
+				break
+			}
+			time.Sleep(3 * time.Second)
+		}
+		got := r.ccfWaitStable(metricsPort, time.Now().Add(12*time.Second))
+		finalCount = got
+		_, accepted, rejected, e := httpSenderStats(senderContainer, ctrlPort)
+		if got > 0 {
+			errs = append(errs, fmt.Sprintf("delivered %d records despite a bad credential (auth not enforced)", got))
+		} else {
+			fmt.Println("  no events delivered with a bad credential ✓")
+		}
+		// The reject verdict must rest on positive sender-side evidence: if /stats
+		// is unavailable we can't confirm the requests were actually sent + rejected,
+		// so fail rather than pass on "nothing delivered" alone.
+		if e != nil {
+			errs = append(errs, "could not read sender /stats to confirm rejections: "+e.Error())
+		} else if rejected < expected {
+			errs = append(errs, fmt.Sprintf("sender saw only %d/%d rejections (accepted=%d) — source may not be enforcing auth", rejected, expected, accepted))
+		} else {
+			fmt.Printf("  source rejected all %d requests ✓\n", rejected)
+		}
+	} else {
+		// deliver: every posted event must reach the receiver.
+		fmt.Printf("  waiting for all %d events to be delivered (up to %s)…\n", expected, time.Until(deadline).Round(time.Second))
+		got, ok := r.ccfWaitLines(metricsPort, expected, deadline)
+		// Keep the reached count; only let a higher stabilized read (over-delivery)
+		// replace it, so the exact-count checks below stay meaningful.
+		if stable := r.ccfWaitStable(metricsPort, time.Now().Add(12*time.Second)); stable > got {
+			got = stable
+		}
+		finalCount = got
+		_, accepted, rejected, _ := httpSenderStats(senderContainer, ctrlPort)
+		if !ok && got < expected {
+			errs = append(errs, fmt.Sprintf("under-delivery: got %d of %d (sender accepted=%d rejected=%d)", got, expected, accepted, rejected))
+		} else if got > expected {
+			errs = append(errs, fmt.Sprintf("over-delivery: got %d, expected %d", got, expected))
+		} else {
+			fmt.Printf("  delivered exactly %d events (sender accepted=%d) ✓\n", got, accepted)
+		}
+		if rm, e := r.queryReceiverMetrics(metricsPort, 5*time.Second); e == nil && rm.Passed != nil && !*rm.Passed && len(rm.Errors) > 0 {
+			errs = append(errs, "receiver content validation failed: "+strings.Join(rm.Errors, ", "))
+		}
+	}
+
+	passed = len(errs) == 0
+	return r.saveHTTPSourceResult(tc, subject, configName, startTime, finalCount, passed, errs, senderContainer, subjectContainer)
+}
+
+func (r *Runner) saveHTTPSourceResult(tc *config.TestCase, subject config.Subject, configName string,
+	startTime time.Time, finalCount int64, passed bool, errs []string, senderContainer, subjectContainer string) (results.RunResult, error) {
+
+	elapsed := time.Since(startTime).Seconds()
+	if passed {
+		fmt.Printf("  http source (%s): PASSED ✓\n", tc.HTTPSource.Scenario)
+	} else {
+		fmt.Printf("  http source (%s): FAILED ✗\n", tc.HTTPSource.Scenario)
+		for _, c := range []string{senderContainer, subjectContainer} {
+			out, _ := exec.Command("docker", "logs", "--tail", "30", c).CombinedOutput()
+			fmt.Printf("  --- %s (tail) ---\n%s\n", c, string(out))
+		}
+	}
+	result := results.RunResult{
+		TestName: tc.Name, Config: configName, Subject: subject.Name, Version: subject.Version,
+		Hardware: hardwareID(), Timestamp: startTime, DurationSec: elapsed, LinesOut: finalCount, Passed: &passed,
+	}
+	if !passed {
+		result.FailReason = strings.Join(errs, "; ")
+	}
+	dir, err := r.store.Save(result, "")
+	if err != nil {
+		return result, fmt.Errorf("saving results: %w", err)
+	}
+	fmt.Printf("  done. results → %s\n", dir)
+	return result, nil
+}
+
+// ── ClickHouse target correctness (real clickhouse-server + SQL verify) ───────
+
+// chExec runs a clickhouse-client query inside the clickhouse-server container.
+func chExec(chContainer, query string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "docker", "exec", chContainer,
+		"clickhouse-client", "--query", query).CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("clickhouse-client: %w (out: %.300s)", err, string(out))
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// runClickHouseTargetCorrectness drives TCP into a director whose clickhouse target
+// ingests (HTTP JSONEachRow) into a real clickhouse-server, then verifies the row
+// count by SQL — proving the high-throughput log-ingest path end to end.
+func (r *Runner) runClickHouseTargetCorrectness(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
+	configName := r.opts.ConfigName
+	subject = r.applySubjectOverrides(subject)
+	ch := tc.ClickHouseTarget
+
+	for _, capName := range tc.Requires {
+		if !subject.HasCapability(capName) {
+			return results.RunResult{}, fmt.Errorf("subject %q does not declare capability %q required by case %q",
+				subject.Name, capName, tc.Name)
+		}
+	}
+
+	fmt.Printf("→ test=%s  subject=%s  version=%s  (clickhouse target verify)\n", tc.Name, subject.Name, subject.Version)
+
+	srcCfg, err := tc.ConfigFilePath(r.opts.CasesDir, configName, subject)
+	if err != nil {
+		return results.RunResult{}, err
+	}
+	srcCfg, err = filepath.Abs(srcCfg)
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("resolving config path: %w", err)
+	}
+	tmpDir, err := os.MkdirTemp("", "bench-"+tc.Name+"-")
+	if err != nil {
+		return results.RunResult{}, err
+	}
+	if err := os.Chmod(tmpDir, 0o1777); err != nil {
+		return results.RunResult{}, fmt.Errorf("chmod tmpdir: %w", err)
+	}
+	defer func() {
+		if !r.opts.NoCleanup {
+			os.RemoveAll(tmpDir)
+		}
+	}()
+	caseDir, err := filepath.Abs(filepath.Join(r.opts.CasesDir, tc.Name))
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("resolving case directory: %w", err)
+	}
+	extraEnv := map[string]string{}
+	if cfg, ok := tc.Configurations[configName]; ok {
+		maps.Copy(extraEnv, cfg.Env)
+	}
+	runCfg := orchestrator.RunConfig{
+		TestCase: tc, Subject: subject, ConfigName: configName, ConfigSrcPath: srcCfg, CaseDir: caseDir, TmpDir: tmpDir,
+		GeneratorImage: r.opts.GeneratorImage, ReceiverImage: r.opts.ReceiverImage, CollectorImage: r.opts.CollectorImage,
+		ReceiverHostPort: r.opts.ReceiverHostPort, ExtraSubjectEnv: extraEnv, CPULimit: r.opts.CPULimit, MemLimit: r.opts.MemLimit,
+	}
+	orch, err := orchestrator.NewComposeRunner(runCfg)
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("compose setup: %w", err)
+	}
+
+	chContainer := ch.CHContainerOrDefault()
+	db, table := ch.DatabaseOrDefault(), ch.TableOrDefault()
+	fqTable := db + "." + table
+	subjectContainer := "bench-subject-" + subject.Name
+	cleanup := []string{"bench-receiver", "bench-collector", "bench-generator", subjectContainer, chContainer}
+	for _, c := range cleanup {
+		_ = exec.Command("docker", "rm", "-f", c).Run()
+	}
+	_ = orch.Down()
+	defer func() {
+		if !r.opts.NoCleanup {
+			fmt.Println("  tearing down…")
+			_ = orch.Down()
+		}
+	}()
+
+	startTime := time.Now()
+	runDeadline := startTime.Add(r.opts.Timeout)
+	settle := time.Duration(ch.SettleOrDefault()) * time.Second
+	warmup := tc.WarmupOrDefault(30 * time.Second)
+	expected := int64(ch.ExpectRecords)
+
+	fmt.Println("  starting director + clickhouse-server + generator…")
+	if err := orch.Up(); err != nil {
+		return results.RunResult{}, fmt.Errorf("starting clickhouse topology: %w", err)
+	}
+
+	var passed bool
+	var errs []string
+	var finalCount int64
+
+	// Wait for ClickHouse to accept queries, then create the DB + table BEFORE the
+	// generator's data reaches the director's clickhouse target (held by warmup).
+	chDeadline := time.Now().Add(warmup + 30*time.Second)
+	ready := false
+	for time.Now().Before(chDeadline) {
+		if _, e := chExec(chContainer, "SELECT 1"); e == nil {
+			ready = true
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if !ready {
+		errs = append(errs, "clickhouse-server never became reachable")
+		return r.saveClickHouseTargetResult(tc, subject, configName, startTime, 0, false, errs, chContainer, subjectContainer)
+	}
+	if _, e := chExec(chContainer, "CREATE DATABASE IF NOT EXISTS "+db); e != nil {
+		errs = append(errs, "create database: "+e.Error())
+		return r.saveClickHouseTargetResult(tc, subject, configName, startTime, 0, false, errs, chContainer, subjectContainer)
+	}
+	// Flexible log table: the director sends {"message": "...", "@timestamp": "..."}
+	// (raw) or normalized JSON; skip_unknown_fields tolerates extra keys, so a
+	// minimal message+timestamp table captures every event for the count check.
+	// A case may override the DDL (custom_table cases) via create_table_sql with a
+	// {{TABLE}} placeholder. The default table also serves the raw-message formats
+	// (tabseparatedraw/parquet/native write only `message`; the rest DEFAULT).
+	createTable := fmt.Sprintf(
+		"CREATE TABLE IF NOT EXISTS %s (message String, `@timestamp` String DEFAULT '', ts DateTime DEFAULT now()) ENGINE = MergeTree ORDER BY ts",
+		fqTable)
+	if ch.CreateTableSQL != "" {
+		createTable = strings.ReplaceAll(ch.CreateTableSQL, "{{TABLE}}", fqTable)
+	}
+	if _, e := chExec(chContainer, createTable); e != nil {
+		errs = append(errs, "create table: "+e.Error())
+		return r.saveClickHouseTargetResult(tc, subject, configName, startTime, 0, false, errs, chContainer, subjectContainer)
+	}
+	fmt.Printf("  clickhouse ready; table %s created ✓\n", fqTable)
+
+	// Resilience: restart the clickhouse-server mid-run once some rows have landed.
+	// The director's CH target must reconnect and retry the batches that failed
+	// during the downtime so the final count still reaches ExpectRecords.
+	if ch.RestartMidRun {
+		// Bound the resilience goroutine to THIS run: `stop` is closed when the run
+		// returns and we then wait on `done`, so it can never restart the
+		// fixed-name (shared) clickhouse container into a later run or during teardown.
+		stop := make(chan struct{})
+		done := make(chan struct{})
+		defer func() { close(stop); <-done }()
+		go func() {
+			defer close(done)
+			for i := 0; i < 40; i++ {
+				if out, e := chExec(chContainer, "SELECT count() FROM "+fqTable); e == nil {
+					if n, perr := strconv.ParseInt(strings.TrimSpace(out), 10, 64); perr == nil && n > 0 {
+						break
+					}
+				}
+				select {
+				case <-stop:
+					return
+				case <-time.After(time.Second):
+				}
+			}
+			// Don't restart if the run already ended (no bleed into teardown/next run).
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			fmt.Println("  restart_mid_run: restarting clickhouse-server…")
+			_ = exec.Command("docker", "restart", "-t", "2", chContainer).Run()
+			fmt.Println("  restart_mid_run: clickhouse-server restarted; target must reconnect + retry")
+		}()
+	}
+
+	// Poll the row count until it reaches the expected total (or the deadline).
+	countDeadline := time.Now().Add(warmup + settle)
+	if countDeadline.After(runDeadline) {
+		countDeadline = runDeadline
+	}
+	fmt.Printf("  waiting for %d rows in %s (up to %s)…\n", expected, fqTable, time.Until(countDeadline).Round(time.Second))
+	for time.Now().Before(countDeadline) {
+		out, e := chExec(chContainer, "SELECT count() FROM "+fqTable)
+		if e == nil {
+			if n, perr := strconv.ParseInt(strings.TrimSpace(out), 10, 64); perr == nil {
+				finalCount = n
+				if n >= expected {
+					break
+				}
+			}
+		}
+		time.Sleep(3 * time.Second)
+	}
+	// Let any late/duplicate inserts settle, then re-read for an exact check.
+	time.Sleep(5 * time.Second)
+	if out, e := chExec(chContainer, "SELECT count() FROM "+fqTable); e == nil {
+		if n, perr := strconv.ParseInt(strings.TrimSpace(out), 10, 64); perr == nil {
+			finalCount = n
+		}
+	}
+
+	if finalCount < expected {
+		errs = append(errs, fmt.Sprintf("under-ingest: %d of %d rows in clickhouse", finalCount, expected))
+	} else if finalCount > expected {
+		errs = append(errs, fmt.Sprintf("over-ingest: %d rows, expected %d (duplicate inserts?)", finalCount, expected))
+	} else {
+		fmt.Printf("  clickhouse ingested exactly %d rows ✓\n", finalCount)
+	}
+
+	passed = len(errs) == 0
+	return r.saveClickHouseTargetResult(tc, subject, configName, startTime, finalCount, passed, errs, chContainer, subjectContainer)
+}
+
+func (r *Runner) saveClickHouseTargetResult(tc *config.TestCase, subject config.Subject, configName string,
+	startTime time.Time, finalCount int64, passed bool, errs []string, chContainer, subjectContainer string) (results.RunResult, error) {
+
+	elapsed := time.Since(startTime).Seconds()
+	if passed {
+		fmt.Println("  clickhouse target: PASSED ✓")
+	} else {
+		fmt.Println("  clickhouse target: FAILED ✗")
+		for _, c := range []string{chContainer, subjectContainer} {
+			out, _ := exec.Command("docker", "logs", "--tail", "30", c).CombinedOutput()
+			fmt.Printf("  --- %s (tail) ---\n%s\n", c, string(out))
+		}
+	}
+	result := results.RunResult{
+		TestName: tc.Name, Config: configName, Subject: subject.Name, Version: subject.Version,
+		Hardware: hardwareID(), Timestamp: startTime, DurationSec: elapsed, LinesOut: finalCount, Passed: &passed,
+	}
+	if !passed {
+		result.FailReason = strings.Join(errs, "; ")
+	}
+	dir, err := r.store.Save(result, "")
+	if err != nil {
+		return result, fmt.Errorf("saving results: %w", err)
+	}
+	fmt.Printf("  done. results → %s\n", dir)
+	return result, nil
+}
+
+// ── MQTT target correctness (mosquitto + mosquitto_sub counter) ───────────────
+
+// mqttSubLineCount counts the lines mosquitto_sub has appended to its recv file.
+// `file` comes from the case YAML, so it is passed as a separate argument (no
+// `sh -c` interpolation) to avoid shell injection; a missing file makes `wc`
+// exit non-zero, which we treat as 0.
+func mqttSubLineCount(subContainer, file string) int64 {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "docker", "exec", subContainer, "wc", "-l", file).Output()
+	if err != nil {
+		return 0
+	}
+	// `wc -l <file>` prints "<count> <file>"; take the leading count.
+	fields := strings.Fields(string(out))
+	if len(fields) == 0 {
+		return 0
+	}
+	n, _ := strconv.ParseInt(fields[0], 10, 64)
+	return n
+}
+
+// runMQTTTargetCorrectness drives TCP into a director whose mqtt target publishes
+// to a mosquitto broker; a mosquitto_sub sidecar records every message and the
+// driver verifies the count.
+func (r *Runner) runMQTTTargetCorrectness(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
+	configName := r.opts.ConfigName
+	subject = r.applySubjectOverrides(subject)
+	mc := tc.MQTTTarget
+
+	for _, capName := range tc.Requires {
+		if !subject.HasCapability(capName) {
+			return results.RunResult{}, fmt.Errorf("subject %q does not declare capability %q required by case %q",
+				subject.Name, capName, tc.Name)
+		}
+	}
+
+	orch, caseDir, tmpDir, err := r.setupAuxRun(tc, subject, configName)
+	if err != nil {
+		return results.RunResult{}, err
+	}
+	_ = caseDir
+	defer func() {
+		if !r.opts.NoCleanup {
+			os.RemoveAll(tmpDir)
+		}
+	}()
+
+	fmt.Printf("→ test=%s  subject=%s  version=%s  (mqtt target verify)\n", tc.Name, subject.Name, subject.Version)
+
+	subContainer := mc.SubContainerOrDefault()
+	recvFile := mc.RecvFileOrDefault()
+	subjectContainer := "bench-subject-" + subject.Name
+	for _, c := range []string{"bench-receiver", "bench-collector", "bench-generator", subjectContainer, subContainer} {
+		_ = exec.Command("docker", "rm", "-f", c).Run()
+	}
+	_ = orch.Down()
+	defer func() {
+		if !r.opts.NoCleanup {
+			fmt.Println("  tearing down…")
+			_ = orch.Down()
+		}
+	}()
+
+	startTime := time.Now()
+	runDeadline := startTime.Add(r.opts.Timeout)
+	settle := time.Duration(mc.SettleOrDefault()) * time.Second
+	warmup := tc.WarmupOrDefault(25 * time.Second)
+	expected := int64(mc.ExpectRecords)
+
+	fmt.Println("  starting director + mosquitto + subscriber + generator…")
+	if err := orch.Up(); err != nil {
+		return results.RunResult{}, fmt.Errorf("starting mqtt topology: %w", err)
+	}
+
+	var errs []string
+	var finalCount int64
+	deadline := time.Now().Add(warmup + settle)
+	if deadline.After(runDeadline) {
+		deadline = runDeadline
+	}
+	fmt.Printf("  waiting for %d messages at the mqtt subscriber (up to %s)…\n", expected, time.Until(deadline).Round(time.Second))
+	for time.Now().Before(deadline) {
+		finalCount = mqttSubLineCount(subContainer, recvFile)
+		if finalCount >= expected {
+			break
+		}
+		time.Sleep(3 * time.Second)
+	}
+	time.Sleep(5 * time.Second)
+	finalCount = mqttSubLineCount(subContainer, recvFile)
+	if finalCount < expected {
+		errs = append(errs, fmt.Sprintf("under-delivery: %d of %d messages received by the subscriber", finalCount, expected))
+	} else if finalCount > expected {
+		errs = append(errs, fmt.Sprintf("over-delivery: %d messages, expected %d", finalCount, expected))
+	} else {
+		fmt.Printf("  mqtt subscriber received exactly %d messages ✓\n", finalCount)
+	}
+
+	passed := len(errs) == 0
+	return r.saveAuxResult(tc, subject, configName, "mqtt target", startTime, finalCount, passed, errs, subContainer, subjectContainer)
+}
+
+// ── Redis source correctness (publisher sidecar → receiver) ───────────────────
+
+// runRedisSourceCorrectness has a publisher sidecar PUBLISH to a redis channel;
+// the director's redis source consumes and forwards to the receiver, which the
+// driver counts.
+func (r *Runner) runRedisSourceCorrectness(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
+	configName := r.opts.ConfigName
+	subject = r.applySubjectOverrides(subject)
+	rc := tc.RedisSource
+
+	for _, capName := range tc.Requires {
+		if !subject.HasCapability(capName) {
+			return results.RunResult{}, fmt.Errorf("subject %q does not declare capability %q required by case %q",
+				subject.Name, capName, tc.Name)
+		}
+	}
+
+	orch, _, tmpDir, err := r.setupAuxRun(tc, subject, configName)
+	if err != nil {
+		return results.RunResult{}, err
+	}
+	defer func() {
+		if !r.opts.NoCleanup {
+			os.RemoveAll(tmpDir)
+		}
+	}()
+
+	fmt.Printf("→ test=%s  subject=%s  version=%s  (redis source verify)\n", tc.Name, subject.Name, subject.Version)
+
+	pubContainer := rc.PubContainerOrDefault()
+	subjectContainer := "bench-subject-" + subject.Name
+	for _, c := range []string{"bench-receiver", "bench-collector", "bench-generator", subjectContainer, pubContainer} {
+		_ = exec.Command("docker", "rm", "-f", c).Run()
+	}
+	_ = orch.Down()
+	defer func() {
+		if !r.opts.NoCleanup {
+			fmt.Println("  tearing down…")
+			_ = orch.Down()
+		}
+	}()
+
+	startTime := time.Now()
+	runDeadline := startTime.Add(r.opts.Timeout)
+	settle := time.Duration(rc.SettleOrDefault()) * time.Second
+	warmup := tc.WarmupOrDefault(25 * time.Second)
+	expected := int64(rc.ExpectRecords)
+
+	fmt.Println("  starting director + redis + publisher + receiver…")
+	if err := orch.Up(); err != nil {
+		return results.RunResult{}, fmt.Errorf("starting redis topology: %w", err)
+	}
+	metricsPort, stopPortFwd, err := orch.ReceiverMetricsPort()
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("receiver metrics port: %w", err)
+	}
+	defer stopPortFwd()
+
+	var errs []string
+
+	// Reject (negative): the source must NOT subscribe (e.g. wrong auth). Wait the
+	// settle window, then assert the receiver count stays <= ExpectMax.
+	if rc.Reject {
+		settleDeadline := time.Now().Add(warmup + settle)
+		if settleDeadline.After(runDeadline) {
+			settleDeadline = runDeadline
+		}
+		for time.Now().Before(settleDeadline) {
+			time.Sleep(5 * time.Second)
+		}
+		got := r.ccfWaitStable(metricsPort, time.Now().Add(10*time.Second))
+		if got > int64(rc.ExpectMax) {
+			errs = append(errs, fmt.Sprintf("reject failed: %d records reached the receiver (expected <= %d) — the redis source accepted input it should have rejected", got, rc.ExpectMax))
+		} else {
+			fmt.Printf("  redis source correctly rejected (no subscribe): %d <= %d ✓\n", got, rc.ExpectMax)
+		}
+		passed := len(errs) == 0
+		return r.saveAuxResult(tc, subject, configName, "redis source (reject)", startTime, got, passed, errs, pubContainer, subjectContainer)
+	}
+
+	deadline := time.Now().Add(warmup + settle)
+	if deadline.After(runDeadline) {
+		deadline = runDeadline
+	}
+	fmt.Printf("  waiting for %d records delivered from the redis source (up to %s)…\n", expected, time.Until(deadline).Round(time.Second))
+	got, _ := r.ccfWaitLines(metricsPort, expected, deadline)
+	// Keep the reached count; only a higher stabilized read (over-delivery) replaces it.
+	if stable := r.ccfWaitStable(metricsPort, time.Now().Add(12*time.Second)); stable > got {
+		got = stable
+	}
+	finalCount := got
+	if got < expected {
+		errs = append(errs, fmt.Sprintf("under-delivery: %d of %d records from the redis source", got, expected))
+	} else if got > expected {
+		errs = append(errs, fmt.Sprintf("over-delivery: %d records, expected %d", got, expected))
+	} else {
+		fmt.Printf("  redis source delivered exactly %d records ✓\n", got)
+	}
+
+	passed := len(errs) == 0
+	return r.saveAuxResult(tc, subject, configName, "redis source", startTime, finalCount, passed, errs, pubContainer, subjectContainer)
+}
+
+// runEndpointSourceCorrectness drives a director source the bench generator can't
+// feed (snmptrap, tftp, smtp, …) via a generic CLI-sender endpoint and counts at
+// the receiver. The sender is an `endpoints:` container in the case; the driver
+// just waits for the receiver to reach endpoint_source.expect_min. Tolerant of the
+// best-effort loss of UDP senders (expect_min, not exact).
+func (r *Runner) runEndpointSourceCorrectness(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
+	configName := r.opts.ConfigName
+	subject = r.applySubjectOverrides(subject)
+	es := tc.EndpointSource
+
+	for _, capName := range tc.Requires {
+		if !subject.HasCapability(capName) {
+			return results.RunResult{}, fmt.Errorf("subject %q does not declare capability %q required by case %q",
+				subject.Name, capName, tc.Name)
+		}
+	}
+
+	orch, _, tmpDir, err := r.setupAuxRun(tc, subject, configName)
+	if err != nil {
+		return results.RunResult{}, err
+	}
+	defer func() {
+		if !r.opts.NoCleanup {
+			os.RemoveAll(tmpDir)
+		}
+	}()
+
+	fmt.Printf("→ test=%s  subject=%s  version=%s  (endpoint source verify)\n", tc.Name, subject.Name, subject.Version)
+
+	senderContainer := es.SenderContainerOrDefault()
+	subjectContainer := "bench-subject-" + subject.Name
+	for _, c := range []string{"bench-receiver", "bench-collector", "bench-generator", subjectContainer, senderContainer} {
+		_ = exec.Command("docker", "rm", "-f", c).Run()
+	}
+	_ = orch.Down()
+	defer func() {
+		if !r.opts.NoCleanup {
+			fmt.Println("  tearing down…")
+			_ = orch.Down()
+		}
+	}()
+
+	startTime := time.Now()
+	runDeadline := startTime.Add(r.opts.Timeout)
+	settle := time.Duration(es.SettleOrDefault()) * time.Second
+	warmup := tc.WarmupOrDefault(30 * time.Second)
+	expectMin := int64(es.ExpectMin)
+
+	fmt.Println("  starting director + CLI sender + receiver…")
+	if err := orch.Up(); err != nil {
+		return results.RunResult{}, fmt.Errorf("starting endpoint-source topology: %w", err)
+	}
+	metricsPort, stopPortFwd, err := orch.ReceiverMetricsPort()
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("receiver metrics port: %w", err)
+	}
+	defer stopPortFwd()
+
+	var errs []string
+
+	// Reject (negative): the source must NOT deliver. Wait the settle window for
+	// the sender to finish, then assert the receiver count stays <= expect_max.
+	if es.Reject {
+		settleDeadline := time.Now().Add(warmup + settle)
+		if settleDeadline.After(runDeadline) {
+			settleDeadline = runDeadline
+		}
+		fmt.Printf("  reject case: waiting %s then asserting ≤ %d records reached the receiver…\n", time.Until(settleDeadline).Round(time.Second), es.ExpectMax)
+		for time.Now().Before(settleDeadline) {
+			time.Sleep(5 * time.Second)
+		}
+		got := r.ccfWaitStable(metricsPort, time.Now().Add(10*time.Second))
+		if got > int64(es.ExpectMax) {
+			errs = append(errs, fmt.Sprintf("reject failed: %d records reached the receiver (expected ≤ %d) — the source accepted input it should have rejected", got, es.ExpectMax))
+		} else {
+			fmt.Printf("  source correctly rejected input: %d ≤ %d ✓\n", got, es.ExpectMax)
+		}
+		passed := len(errs) == 0
+		return r.saveAuxResult(tc, subject, configName, "endpoint source (reject)", startTime, got, passed, errs, senderContainer, subjectContainer)
+	}
+
+	deadline := time.Now().Add(warmup + settle)
+	if deadline.After(runDeadline) {
+		deadline = runDeadline
+	}
+	fmt.Printf("  waiting for ≥ %d records delivered from the source (up to %s)…\n", expectMin, time.Until(deadline).Round(time.Second))
+	got, reached := r.ccfWaitLines(metricsPort, expectMin, deadline)
+	// Let it settle a little past the threshold to surface the final count.
+	if stable := r.ccfWaitStable(metricsPort, time.Now().Add(10*time.Second)); stable > got {
+		got = stable
+	}
+	finalCount := got
+	if !reached {
+		errs = append(errs, fmt.Sprintf("under-delivery: %d of ≥%d records from the source", got, expectMin))
+	} else {
+		fmt.Printf("  source delivered %d records (≥ %d) ✓\n", got, expectMin)
+	}
+
+	passed := len(errs) == 0
+	return r.saveAuxResult(tc, subject, configName, "endpoint source", startTime, finalCount, passed, errs, senderContainer, subjectContainer)
+}
+
+// setupAuxRun builds the orchestrator + temp/case dirs shared by the small
+// aux-container correctness drivers (clickhouse/mqtt/redis style).
+func (r *Runner) setupAuxRun(tc *config.TestCase, subject config.Subject, configName string) (*orchestrator.ComposeRunner, string, string, error) {
+	srcCfg, err := tc.ConfigFilePath(r.opts.CasesDir, configName, subject)
+	if err != nil {
+		return nil, "", "", err
+	}
+	srcCfg, err = filepath.Abs(srcCfg)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("resolving config path: %w", err)
+	}
+	tmpDir, err := os.MkdirTemp("", "bench-"+tc.Name+"-")
+	if err != nil {
+		return nil, "", "", err
+	}
+	if err := os.Chmod(tmpDir, 0o1777); err != nil {
+		return nil, "", "", fmt.Errorf("chmod tmpdir: %w", err)
+	}
+	caseDir, err := filepath.Abs(filepath.Join(r.opts.CasesDir, tc.Name))
+	if err != nil {
+		return nil, "", tmpDir, fmt.Errorf("resolving case directory: %w", err)
+	}
+	extraEnv := map[string]string{}
+	if cfg, ok := tc.Configurations[configName]; ok {
+		maps.Copy(extraEnv, cfg.Env)
+	}
+	runCfg := orchestrator.RunConfig{
+		TestCase: tc, Subject: subject, ConfigName: configName, ConfigSrcPath: srcCfg, CaseDir: caseDir, TmpDir: tmpDir,
+		GeneratorImage: r.opts.GeneratorImage, ReceiverImage: r.opts.ReceiverImage, CollectorImage: r.opts.CollectorImage,
+		ReceiverHostPort: r.opts.ReceiverHostPort, ExtraSubjectEnv: extraEnv, CPULimit: r.opts.CPULimit, MemLimit: r.opts.MemLimit,
+	}
+	orch, err := orchestrator.NewComposeRunner(runCfg)
+	if err != nil {
+		return nil, caseDir, tmpDir, fmt.Errorf("compose setup: %w", err)
+	}
+	return orch, caseDir, tmpDir, nil
+}
+
+// saveAuxResult records the verdict for the small aux-container drivers.
+func (r *Runner) saveAuxResult(tc *config.TestCase, subject config.Subject, configName, label string,
+	startTime time.Time, finalCount int64, passed bool, errs []string, auxContainer, subjectContainer string) (results.RunResult, error) {
+
+	elapsed := time.Since(startTime).Seconds()
+	if passed {
+		fmt.Printf("  %s: PASSED ✓\n", label)
+	} else {
+		fmt.Printf("  %s: FAILED ✗\n", label)
+		for _, c := range []string{auxContainer, subjectContainer} {
+			out, _ := exec.Command("docker", "logs", "--tail", "30", c).CombinedOutput()
+			fmt.Printf("  --- %s (tail) ---\n%s\n", c, string(out))
+		}
+	}
+	result := results.RunResult{
+		TestName: tc.Name, Config: configName, Subject: subject.Name, Version: subject.Version,
+		Hardware: hardwareID(), Timestamp: startTime, DurationSec: elapsed, LinesOut: finalCount, Passed: &passed,
+	}
+	if !passed {
+		result.FailReason = strings.Join(errs, "; ")
+	}
+	dir, err := r.store.Save(result, "")
+	if err != nil {
+		return result, fmt.Errorf("saving results: %w", err)
+	}
+	fmt.Printf("  done. results → %s\n", dir)
+	return result, nil
+}
+
+// ── HTTP source Vault cert-rotation correctness ───────────────────────────────
+
+// httpSenderCertFP reads the SHA-256 of the server leaf cert the bench-httpsender
+// last saw on a TLS response (its /certfp endpoint).
+func httpSenderCertFP(senderContainer string, ctrlPort int) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "docker", "exec", senderContainer,
+		"wget", "-q", "-O", "-", fmt.Sprintf("http://127.0.0.1:%d/certfp", ctrlPort)).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// fpShort returns a short, log-friendly prefix of a cert fingerprint without
+// panicking on a short/truncated /certfp response (fp[:12] would).
+func fpShort(fp string) string {
+	if len(fp) > 12 {
+		return fp[:12]
+	}
+	return fp
+}
+
+// runHTTPVaultCertRotation verifies the http source hot-reloads its TLS cert from
+// Vault: the source serves HTTPS from a Vault-sourced cert ($secret refs), the
+// bench-httpsender posts continuously and records the served cert fingerprint, and
+// mid-run the driver rotates the cert in Vault. The director must re-fetch + serve
+// the new cert (the sender's observed fingerprint changes) while delivery continues.
+func (r *Runner) runHTTPVaultCertRotation(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
+	configName := r.opts.ConfigName
+	subject = r.applySubjectOverrides(subject)
+	vr := tc.HTTPVaultRotation
+
+	for _, capName := range tc.Requires {
+		if !subject.HasCapability(capName) {
+			return results.RunResult{}, fmt.Errorf("subject %q does not declare capability %q required by case %q",
+				subject.Name, capName, tc.Name)
+		}
+	}
+
+	fmt.Printf("→ test=%s  subject=%s  version=%s  (http vault cert rotation)\n", tc.Name, subject.Name, subject.Version)
+
+	srcCfg, err := tc.ConfigFilePath(r.opts.CasesDir, configName, subject)
+	if err != nil {
+		return results.RunResult{}, err
+	}
+	srcCfg, err = filepath.Abs(srcCfg)
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("resolving config path: %w", err)
+	}
+	tmpDir, err := os.MkdirTemp("", "bench-"+tc.Name+"-")
+	if err != nil {
+		return results.RunResult{}, err
+	}
+	if err := os.Chmod(tmpDir, 0o1777); err != nil {
+		return results.RunResult{}, fmt.Errorf("chmod tmpdir: %w", err)
+	}
+	defer func() {
+		if !r.opts.NoCleanup {
+			os.RemoveAll(tmpDir)
+		}
+	}()
+	caseDir, err := filepath.Abs(filepath.Join(r.opts.CasesDir, tc.Name))
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("resolving case directory: %w", err)
+	}
+
+	// Generate the initial (trusted) cert set and seed it into the case's Vault
+	// secret BEFORE building the compose project (vault-init seeds from it).
+	hosts := []string{"subject", "localhost"}
+	certsDir := filepath.Join(tmpDir, "certs")
+	if _, err := orchestrator.GenerateTLSCerts(certsDir, hosts); err != nil {
+		return results.RunResult{}, fmt.Errorf("generating initial TLS certs: %w", err)
+	}
+	certPEM, keyPEM, err := readServerCertAndKey(certsDir)
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("reading initial certs: %w", err)
+	}
+	if tc.Vault == nil {
+		return results.RunResult{}, fmt.Errorf("case %q requires a vault: block", tc.Name)
+	}
+	if tc.Vault.Secrets == nil {
+		tc.Vault.Secrets = make(map[string]map[string]string)
+	}
+	secretPath := vr.SecretPathOrDefault()
+	tc.Vault.Secrets[secretPath] = map[string]string{"cert": certPEM, "key": keyPEM}
+
+	extraEnv := map[string]string{}
+	if cfg, ok := tc.Configurations[configName]; ok {
+		maps.Copy(extraEnv, cfg.Env)
+	}
+	runCfg := orchestrator.RunConfig{
+		TestCase: tc, Subject: subject, ConfigName: configName, ConfigSrcPath: srcCfg, CaseDir: caseDir, TmpDir: tmpDir,
+		GeneratorImage: r.opts.GeneratorImage, ReceiverImage: r.opts.ReceiverImage, CollectorImage: r.opts.CollectorImage,
+		ReceiverHostPort: r.opts.ReceiverHostPort, ExtraSubjectEnv: extraEnv, CPULimit: r.opts.CPULimit, MemLimit: r.opts.MemLimit,
+	}
+	orch, err := orchestrator.NewComposeRunner(runCfg)
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("compose setup: %w", err)
+	}
+
+	senderContainer := vr.SenderContainerOrDefault()
+	ctrlPort := vr.CtrlPortOrDefault()
+	subjectContainer := "bench-subject-" + subject.Name
+	for _, c := range []string{"bench-receiver", "bench-collector", "bench-generator", subjectContainer, senderContainer, "bench-vault", "bench-vault-init"} {
+		_ = exec.Command("docker", "rm", "-f", c).Run()
+	}
+	_ = orch.Down()
+	defer func() {
+		if !r.opts.NoCleanup {
+			fmt.Println("  tearing down…")
+			_ = orch.Down()
+		}
+	}()
+
+	startTime := time.Now()
+	runDeadline := startTime.Add(r.opts.Timeout)
+	settle := time.Duration(vr.SettleOrDefault()) * time.Second
+	warmup := tc.WarmupOrDefault(30 * time.Second)
+	mount := tc.Vault.Mount
+	if mount == "" {
+		mount = "secret"
+	}
+	token := tc.Vault.Token
+	if token == "" {
+		token = "pipebench-dev-root"
+	}
+
+	fmt.Println("  starting director + vault + http sender + receiver…")
+	if err := orch.Up(); err != nil {
+		return results.RunResult{}, fmt.Errorf("starting http-vault topology: %w", err)
+	}
+	metricsPort, stopPortFwd, err := orch.ReceiverMetricsPort()
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("receiver metrics port: %w", err)
+	}
+	defer stopPortFwd()
+
+	var errs []string
+	var finalCount int64
+
+	// Phase 0: wait for the https source to serve traffic (delivery climbing) and
+	// capture the initial served cert fingerprint.
+	initDeadline := time.Now().Add(warmup + settle + 30*time.Second)
+	if initDeadline.After(runDeadline) {
+		initDeadline = runDeadline
+	}
+	var fp1 string
+	for time.Now().Before(initDeadline) {
+		if rm, e := r.queryReceiverMetrics(metricsPort, 5*time.Second); e == nil && rm.LinesReceived >= 10 {
+			if fp := httpSenderCertFP(senderContainer, ctrlPort); fp != "" {
+				fp1 = fp
+				break
+			}
+		}
+		time.Sleep(3 * time.Second)
+	}
+	if fp1 == "" {
+		errs = append(errs, "never observed initial HTTPS delivery + server cert (vault-sourced cert may have failed to load)")
+		return r.saveAuxResult(tc, subject, configName, "http vault cert rotation", startTime, 0, false, errs, senderContainer, subjectContainer)
+	}
+	fmt.Printf("  initial HTTPS delivery up; served cert fp=%s… ✓\n", fpShort(fp1))
+
+	// Phase 1: rotate the cert in Vault (new leaf).
+	if err := orchestrator.RotateServerCert(certsDir, hosts); err != nil {
+		errs = append(errs, "rotate server cert: "+err.Error())
+		return r.saveAuxResult(tc, subject, configName, "http vault cert rotation", startTime, 0, false, errs, senderContainer, subjectContainer)
+	}
+	certPEM, keyPEM, err = readServerCertAndKey(certsDir)
+	if err != nil {
+		errs = append(errs, "read rotated cert: "+err.Error())
+		return r.saveAuxResult(tc, subject, configName, "http vault cert rotation", startTime, 0, false, errs, senderContainer, subjectContainer)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	reErr := orchestrator.ReseedVaultSecret(ctx, "bench-vault", mount, token, secretPath, map[string]string{"cert": certPEM, "key": keyPEM})
+	cancel()
+	if reErr != nil {
+		errs = append(errs, "reseed vault with rotated cert: "+reErr.Error())
+		return r.saveAuxResult(tc, subject, configName, "http vault cert rotation", startTime, 0, false, errs, senderContainer, subjectContainer)
+	}
+	fmt.Println("  rotated cert seeded in Vault — waiting for the director to hot-reload it…")
+
+	// Phase 2: the served cert fingerprint must change (director re-fetched from Vault).
+	rotDeadline := time.Now().Add(settle + 60*time.Second)
+	if rotDeadline.After(runDeadline) {
+		rotDeadline = runDeadline
+	}
+	var fp2 string
+	rotated := false
+	for time.Now().Before(rotDeadline) {
+		fp2 = httpSenderCertFP(senderContainer, ctrlPort)
+		if fp2 != "" && fp2 != fp1 {
+			rotated = true
+			break
+		}
+		time.Sleep(3 * time.Second)
+	}
+	if rotated {
+		fmt.Printf("  director hot-reloaded the rotated cert (fp %s… → %s…) ✓\n", fpShort(fp1), fpShort(fp2))
+	} else {
+		errs = append(errs, "server cert fingerprint did not change after Vault rotation — the director did not hot-reload the cert")
+	}
+
+	// Phase 3: delivery survives the rotation. The bench-httpsender posts
+	// continuously (HTTPSENDER_INTERVAL_MS), so after the brief listener bounce
+	// the receiver count must keep climbing to expect_min — wait for it rather
+	// than sampling once (the rotation completes well before all posts are sent).
+	deliveryDeadline := time.Now().Add(settle + 90*time.Second)
+	if deliveryDeadline.After(runDeadline) {
+		deliveryDeadline = runDeadline
+	}
+	var reached bool
+	finalCount, reached = r.ccfWaitLines(metricsPort, int64(vr.ExpectMin), deliveryDeadline)
+	if !reached {
+		errs = append(errs, fmt.Sprintf("delivery did not survive rotation: %d < expect_min %d", finalCount, vr.ExpectMin))
+	} else {
+		fmt.Printf("  delivery survived rotation: %d records (≥ %d) ✓\n", finalCount, vr.ExpectMin)
+	}
+
+	passed := len(errs) == 0
+	return r.saveAuxResult(tc, subject, configName, "http vault cert rotation", startTime, finalCount, passed, errs, senderContainer, subjectContainer)
 }
 
 // runKafkaOffsetCommitRestart verifies that delivery-bound source
