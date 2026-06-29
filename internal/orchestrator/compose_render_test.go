@@ -861,7 +861,7 @@ func TestClusterIPComposeRendersVIPPlumbing(t *testing.T) {
 	subj := config.Subject{
 		Name:       "vmetric",
 		Image:      "vmetric/director-enterprise",
-		Version:    "2.0.5",
+		Version:    "2.0.6",
 		ConfigPath: "/config.yml",
 	}
 	composePath := filepath.Join(tmp, "compose.yaml")
