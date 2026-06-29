@@ -1236,6 +1236,46 @@ func (tc *TestCase) validateFleet() error {
 		if tc.Fleet.DeliverConfig == "" {
 			return fmt.Errorf("case %q: fleet.scenario config_change requires fleet.deliver_config (the prior config A to transition away from)", tc.Name)
 		}
+	case "pipeline_data":
+		// pipeline_data delivers an operational config carrying a real pipeline
+		// (and any library assets it references) via deliver_config, drives the
+		// generator through it, and asserts the transformed records reach the
+		// receiver AND pass its content checks (required_substring / dedup). The
+		// pipeline arrives only over the fleet VMF, so deliver_config is required;
+		// the content assertion is what makes it a transform verdict rather than a
+		// bytes-flowed one.
+		if tc.Fleet.DeliverConfig == "" {
+			return fmt.Errorf("case %q: fleet.scenario pipeline_data requires fleet.deliver_config (the VMF carrying the pipeline/library to apply)", tc.Name)
+		}
+		if tc.Correctness.RequiredSubstring == "" {
+			return fmt.Errorf("case %q: fleet.scenario pipeline_data requires correctness.required_substring (the value the delivered pipeline/library must produce on every record)", tc.Name)
+		}
+	case "pipeline_verify":
+		// pipeline_verify delivers an operational config whose TARGET writes columnar
+		// objects (parquet/avro) using a delivered library schema, then runs the
+		// DuckDB verifier (reused from the generic path) against the object store.
+		// The verifier's intrinsic checks (no duplicates, non-NULL columns) are the
+		// verdict — a library-defined column surviving the round-trip proves the
+		// schema was delivered + applied. Needs the VMF and a verifier block.
+		if tc.Fleet.DeliverConfig == "" {
+			return fmt.Errorf("case %q: fleet.scenario pipeline_verify requires fleet.deliver_config (the VMF carrying the target/library schema)", tc.Name)
+		}
+		if !tc.UsesVerifier() {
+			return fmt.Errorf("case %q: fleet.scenario pipeline_verify requires a `verifier:` block (the object-store verdict)", tc.Name)
+		}
+	case "pipeline_verify_change":
+		// Live UPDATE of a target/library schema, verified via the object store.
+		// deliver_config is config A (the target writes nothing — e.g. its library
+		// schema is absent); configs/update.vmf is config B (adds the schema so the
+		// target writes). After the push the DuckDB verifier asserts objects exist
+		// with the library-defined columns intact. Needs the VMF + a verifier block;
+		// configs/update.vmf is checked at run time (as config_change does).
+		if tc.Fleet.DeliverConfig == "" {
+			return fmt.Errorf("case %q: fleet.scenario pipeline_verify_change requires fleet.deliver_config (config A)", tc.Name)
+		}
+		if !tc.UsesVerifier() {
+			return fmt.Errorf("case %q: fleet.scenario pipeline_verify_change requires a `verifier:` block (the object-store verdict)", tc.Name)
+		}
 	case "connect", "config_update", "remote_check", "live_data", "console_log", "stats", "reconnect", "bad_token", "self_managed", "enrollment":
 	default:
 		return fmt.Errorf("case %q: unknown fleet.scenario %q", tc.Name, tc.Fleet.Scenario)
