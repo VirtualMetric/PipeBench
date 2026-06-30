@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -208,10 +209,19 @@ type TestCase struct {
 // until the row count settles), then asserts exact row count, no duplicates,
 // and no NULL payload fields over the columnar data.
 type VerifierConfig struct {
-	// S3Bucket is the bucket the subject wrote to (required). S3Prefix is an
-	// optional key prefix to scope the scan to.
+	// S3Bucket is the bucket the subject wrote to. S3Prefix is an optional key
+	// prefix to scope the scan to. Exactly one of S3Bucket / LocalDir must be
+	// set (see validateVerifier).
 	S3Bucket string `yaml:"s3_bucket"`
 	S3Prefix string `yaml:"s3_prefix"`
+
+	// LocalDir is the directory the subject's local `file` target wrote to,
+	// reachable on the shared `/data` volume the harness mounts into both the
+	// subject and the verifier. Set this instead of S3Bucket to verify a local
+	// columnar file target: the verifier reads the files directly off disk
+	// (read_parquet/read_avro, no httpfs/S3), so the case needs no aws:/minio:
+	// emulator. Mutually exclusive with S3Bucket.
+	LocalDir string `yaml:"local_dir"`
 
 	// Format is the object format to read: "avro" | "parquet" (required).
 	Format string `yaml:"format"`
@@ -232,6 +242,12 @@ type VerifierConfig struct {
 	// whole verify (default 5m).
 	QuietWindow string `yaml:"quiet_window"`
 	Timeout     string `yaml:"timeout"`
+}
+
+// IsLocal reports whether the verifier reads a local file target's output off
+// the shared volume (LocalDir set) rather than the S3 emulator.
+func (v *VerifierConfig) IsLocal() bool {
+	return v != nil && v.LocalDir != ""
 }
 
 // QuietWindowOrDefault returns the configured quiet window or 15s.
@@ -1195,6 +1211,33 @@ type FleetConfig struct {
 	// EXACT match (deterministic: same input + same pipeline ⇒ same counts).
 	// Example: {route.in: {events_in: 500, dropped_count: 500, events_out: 0}}.
 	ExpectStats map[string]map[string]int64 `yaml:"expect_stats"`
+
+	// BaselineSeconds (config_update data-plane mode only) is how long the driver
+	// confirms delivery is suppressed after the BEFORE config is delivered, before
+	// pushing the AFTER config. It proves the case really starts suppressed
+	// (otherwise "delivery after the update" is vacuous). Default 20.
+	BaselineSeconds int `yaml:"baseline_seconds"`
+}
+
+// BaselineSecondsOrDefault returns BaselineSeconds or 20 when unset.
+func (f *FleetConfig) BaselineSecondsOrDefault() int {
+	if f == nil || f.BaselineSeconds <= 0 {
+		return 20
+	}
+	return f.BaselineSeconds
+}
+
+// IsConfigUpdateDataPlane reports whether the config_update scenario is in
+// DATA-PLANE mode: a fleet director loads its operational pipeline only from an
+// encoded vmetric.vmf, so the BEFORE pipeline is delivered via deliver_config
+// (an encoded .vmf, like the live_data/stats scenarios). In that mode the driver
+// confirms delivery is suppressed, pushes the AFTER .vmf (configs/update.vmf),
+// and confirms delivery starts — proving a device/target/route/pipeline update
+// takes effect on the data plane, not just that the director ACKs it. Without a
+// deliver_config the scenario keeps its legacy control-plane (executed-only)
+// behavior.
+func (f *FleetConfig) IsConfigUpdateDataPlane() bool {
+	return f != nil && f.Scenario == "config_update" && f.DeliverConfig != ""
 }
 
 // SettleOrDefault returns SettleSeconds or 45 when unset.
@@ -1244,6 +1287,54 @@ func (tc *TestCase) validateFleet() error {
 		return fmt.Errorf("case %q: type fleet_automation_correctness requires a `fleet:` block", tc.Name)
 	}
 	switch tc.Fleet.Scenario {
+	case "config_change":
+		// config_change asserts a live A→B target config transition: deliver_config
+		// provides config A (the pre-step) and configs/update.vmf is the mid-run B.
+		// Without a prior delivered config there is no transition to prove — the test
+		// would only validate an initial config, so require deliver_config.
+		if tc.Fleet.DeliverConfig == "" {
+			return fmt.Errorf("case %q: fleet.scenario config_change requires fleet.deliver_config (the prior config A to transition away from)", tc.Name)
+		}
+	case "pipeline_data":
+		// pipeline_data delivers an operational config carrying a real pipeline
+		// (and any library assets it references) via deliver_config, drives the
+		// generator through it, and asserts the transformed records reach the
+		// receiver AND pass its content checks (required_substring / dedup). The
+		// pipeline arrives only over the fleet VMF, so deliver_config is required;
+		// the content assertion is what makes it a transform verdict rather than a
+		// bytes-flowed one.
+		if tc.Fleet.DeliverConfig == "" {
+			return fmt.Errorf("case %q: fleet.scenario pipeline_data requires fleet.deliver_config (the VMF carrying the pipeline/library to apply)", tc.Name)
+		}
+		if tc.Correctness.RequiredSubstring == "" {
+			return fmt.Errorf("case %q: fleet.scenario pipeline_data requires correctness.required_substring (the value the delivered pipeline/library must produce on every record)", tc.Name)
+		}
+	case "pipeline_verify":
+		// pipeline_verify delivers an operational config whose TARGET writes columnar
+		// objects (parquet/avro) using a delivered library schema, then runs the
+		// DuckDB verifier (reused from the generic path) against the object store.
+		// The verifier's intrinsic checks (no duplicates, non-NULL columns) are the
+		// verdict — a library-defined column surviving the round-trip proves the
+		// schema was delivered + applied. Needs the VMF and a verifier block.
+		if tc.Fleet.DeliverConfig == "" {
+			return fmt.Errorf("case %q: fleet.scenario pipeline_verify requires fleet.deliver_config (the VMF carrying the target/library schema)", tc.Name)
+		}
+		if !tc.UsesVerifier() {
+			return fmt.Errorf("case %q: fleet.scenario pipeline_verify requires a `verifier:` block (the object-store verdict)", tc.Name)
+		}
+	case "pipeline_verify_change":
+		// Live UPDATE of a target/library schema, verified via the object store.
+		// deliver_config is config A (the target writes nothing — e.g. its library
+		// schema is absent); configs/update.vmf is config B (adds the schema so the
+		// target writes). After the push the DuckDB verifier asserts objects exist
+		// with the library-defined columns intact. Needs the VMF + a verifier block;
+		// configs/update.vmf is checked at run time (as config_change does).
+		if tc.Fleet.DeliverConfig == "" {
+			return fmt.Errorf("case %q: fleet.scenario pipeline_verify_change requires fleet.deliver_config (config A)", tc.Name)
+		}
+		if !tc.UsesVerifier() {
+			return fmt.Errorf("case %q: fleet.scenario pipeline_verify_change requires a `verifier:` block (the object-store verdict)", tc.Name)
+		}
 	case "connect", "config_update", "remote_check", "live_data", "console_log", "stats", "reconnect", "bad_token", "self_managed", "enrollment":
 	default:
 		return fmt.Errorf("case %q: unknown fleet.scenario %q", tc.Name, tc.Fleet.Scenario)
@@ -1260,6 +1351,18 @@ func (tc *TestCase) validateFleet() error {
 	}
 	if !found {
 		return fmt.Errorf("case %q: fleet_automation_correctness requires an endpoints entry named %q (the simulator)", tc.Name, want)
+	}
+	// config_update data-plane mode (deliver_config set): the BEFORE pipeline is
+	// delivered as an encoded .vmf, the driver drives traffic, then pushes the
+	// AFTER .vmf (configs/update.vmf) and asserts the receiver count. It therefore
+	// needs a generator and a positive min_received threshold.
+	if tc.Fleet.IsConfigUpdateDataPlane() {
+		if !tc.HasGenerator() {
+			return fmt.Errorf("case %q: data-plane config_update requires a generator to drive traffic", tc.Name)
+		}
+		if tc.Correctness.MinReceived <= 0 {
+			return fmt.Errorf("case %q: data-plane config_update requires correctness.min_received > 0", tc.Name)
+		}
 	}
 	return nil
 }
@@ -1902,13 +2005,29 @@ func (tc *TestCase) validateVerifier() error {
 	if tc.MultiReceiver() || tc.Receiver.Mode != "" || tc.Receiver.Listen != "" {
 		return fmt.Errorf("case %q: verifier replaces the receiver — remove the `receiver:`/`receivers:` block (the subject's sink is S3)", tc.Name)
 	}
-	if tc.Verifier.S3Bucket == "" {
-		return fmt.Errorf("case %q: verifier requires `s3_bucket`", tc.Name)
+	// Source: exactly one of s3_bucket (S3 emulator) / local_dir (shared volume).
+	switch {
+	case tc.Verifier.S3Bucket == "" && tc.Verifier.LocalDir == "":
+		return fmt.Errorf("case %q: verifier requires exactly one of `s3_bucket` or `local_dir`", tc.Name)
+	case tc.Verifier.S3Bucket != "" && tc.Verifier.LocalDir != "":
+		return fmt.Errorf("case %q: verifier `s3_bucket` and `local_dir` are mutually exclusive", tc.Name)
+	}
+	// The verifier container only mounts the shared volume at /data, so a
+	// local_dir outside it would validate here and then deterministically fail
+	// at runtime. Reject it up front. (path, not filepath: these are container
+	// paths, always slash-separated; Clean also collapses any ".." traversal.)
+	if tc.Verifier.LocalDir != "" {
+		clean := path.Clean(tc.Verifier.LocalDir)
+		if clean != "/data" && !strings.HasPrefix(clean, "/data/") {
+			return fmt.Errorf("case %q: verifier.local_dir %q must be under the shared /data mount", tc.Name, tc.Verifier.LocalDir)
+		}
 	}
 	if tc.Verifier.Format != "avro" && tc.Verifier.Format != "parquet" {
 		return fmt.Errorf("case %q: verifier.format must be \"avro\" or \"parquet\", got %q", tc.Name, tc.Verifier.Format)
 	}
-	if !tc.UsesAWS() && !tc.UsesMinio() {
+	// The S3 source needs an emulator; the local source reads the shared volume
+	// directly and needs neither aws: nor minio:.
+	if !tc.Verifier.IsLocal() && !tc.UsesAWS() && !tc.UsesMinio() {
 		return fmt.Errorf("case %q: verifier requires an `aws:` or `minio:` block for S3 access", tc.Name)
 	}
 	if _, err := time.ParseDuration(tc.Verifier.QuietWindowOrDefault()); err != nil {
