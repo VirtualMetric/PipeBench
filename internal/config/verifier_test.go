@@ -127,6 +127,17 @@ func TestValidateVerifierLocal(t *testing.T) {
 			mutate:  func(tc *TestCase) { tc.Verifier.Format = "orc" },
 			wantErr: "format",
 		},
+		{name: "local_dir is /data root", mutate: func(tc *TestCase) { tc.Verifier.LocalDir = "/data" }},
+		{
+			name:    "local_dir outside /data rejected",
+			mutate:  func(tc *TestCase) { tc.Verifier.LocalDir = "/tmp/out" },
+			wantErr: "/data mount",
+		},
+		{
+			name:    "local_dir traversal escaping /data rejected",
+			mutate:  func(tc *TestCase) { tc.Verifier.LocalDir = "/data/../etc" },
+			wantErr: "/data mount",
+		},
 	}
 
 	for _, tt := range tests {

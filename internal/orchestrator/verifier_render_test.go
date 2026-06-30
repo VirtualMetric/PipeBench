@@ -142,6 +142,16 @@ func TestComposeRendersLocalVerifier(t *testing.T) {
 	if !hasSharedDataMount(subject) {
 		t.Errorf("subject missing shared-data:/data mount for local verifier:\n%s", out)
 	}
+
+	// data-init passes the case-controlled dir via an env var and quotes it in
+	// the root shell command, so a value with shell metacharacters can't alter
+	// the command (the $$ escapes compose interpolation -> a literal $ for sh).
+	mustContain(t, out, `command: ["mkdir -p -- \"$${VERIFIER_LOCAL_DIR}\" && chmod -R 0777 /data"]`)
+	dataInit := services["data-init"].(map[string]any)
+	env := dataInit["environment"].(map[string]any)
+	if env["VERIFIER_LOCAL_DIR"] != "/data/out" {
+		t.Errorf("data-init VERIFIER_LOCAL_DIR = %v, want /data/out:\n%s", env["VERIFIER_LOCAL_DIR"], out)
+	}
 }
 
 // hasSharedDataMount reports whether a rendered compose service mounts the
@@ -154,6 +164,62 @@ func hasSharedDataMount(svc map[string]any) bool {
 		}
 	}
 	return false
+}
+
+// TestComposeRendersClusteredLocalVerifier guards the cluster + local_dir combo:
+// every clustered subject node must wait for data-init and mount shared-data so
+// the local verifier doesn't read an empty volume (the singular subject branch
+// already does this). Calls writeCompose directly to render per-node services
+// without going through Validate (mirrors the cluster failover render test).
+func TestComposeRendersClusteredLocalVerifier(t *testing.T) {
+	tmp := t.TempDir()
+	srcCfg := filepath.Join(tmp, "vmetric.yml")
+	if err := os.WriteFile(srcCfg, []byte("director:\n  id: {{@.NodeID@}}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tc := &config.TestCase{
+		Name:      "director_cluster_local_verifier_correctness",
+		Type:      "director_cluster_correctness",
+		Cluster:   &config.ClusterConfig{Nodes: 3, Action: "none"},
+		Generator: config.GeneratorConfig{Mode: "tcp", Target: "subject-1:9000", TotalLines: 1000, LineSize: 256, Format: "json"},
+		Verifier:  &config.VerifierConfig{LocalDir: "/data/out", Format: "parquet", MsgField: "msg"},
+	}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.3", ConfigPath: "/config.yml"}
+	composePath := filepath.Join(tmp, "compose.yaml")
+	cfg := RunConfig{
+		TestCase: tc, Subject: subj, ConfigName: "default",
+		ConfigSrcPath: srcCfg, TmpDir: tmp,
+		GeneratorImage: "img-gen", ReceiverImage: "img-recv",
+		CollectorImage: "img-coll", VerifierImage: "img-verifier",
+		ReceiverHostPort: 19001,
+	}
+	if err := writeCompose(composePath, cfg); err != nil {
+		t.Fatalf("writeCompose: %v", err)
+	}
+	data, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(data)
+	var parsed map[string]any
+	if err := yaml.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("rendered compose is not valid YAML: %v\n%s", err, out)
+	}
+	services := parsed["services"].(map[string]any)
+
+	for _, host := range []string{"subject-1", "subject-2", "subject-3"} {
+		svc, ok := services[host].(map[string]any)
+		if !ok {
+			t.Fatalf("clustered node %q not rendered:\n%s", host, out)
+		}
+		if !hasSharedDataMount(svc) {
+			t.Errorf("node %q missing shared-data:/data mount for local verifier:\n%s", host, out)
+		}
+		deps, _ := svc["depends_on"].(map[string]any)
+		if _, ok := deps["data-init"]; !ok {
+			t.Errorf("node %q missing data-init dependency for local verifier:\n%s", host, out)
+		}
+	}
 }
 
 // TestComposeOmitsVerifierByDefault guards existing cases: no verifier service

@@ -154,9 +154,17 @@ services:
     cap_add:
       - NET_ADMIN
 {{- end }}
+{{- if $.VerifierLocalDir }}
+    depends_on:
+      data-init:
+        condition: service_completed_successfully
+{{- end }}
     volumes:
       - "{{ .ConfigSrc }}:{{ $.ConfigDst }}{{ $.ConfigMountOpts }}"
       - "{{ $.TmpDir }}:/results"
+{{- if $.UseSharedData }}
+      - "shared-data:/data"
+{{- end }}
 {{- if $.CaseCertsHost }}
       - "{{ $.CaseCertsHost }}:/opt/vmetric/certs:ro"
 {{- end }}
@@ -592,8 +600,13 @@ services:
     container_name: "bench-data-init"
     networks: [bench]
     user: "0:0"
+    # Pass the case-controlled dir via an env var and quote it in the shell so a
+    # value with shell metacharacters can't alter the root command. ($$ -> $
+    # after compose interpolation; -- guards a dir starting with "-".)
     entrypoint: ["/bin/sh", "-c"]
-    command: ["mkdir -p {{ .VerifierLocalDir }} && chmod -R 0777 /data"]
+    command: ["mkdir -p -- \"$${VERIFIER_LOCAL_DIR}\" && chmod -R 0777 /data"]
+    environment:
+      VERIFIER_LOCAL_DIR: "{{ .VerifierLocalDir }}"
     volumes:
       - "shared-data:/data"
     restart: "no"

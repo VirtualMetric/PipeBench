@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -1907,6 +1908,16 @@ func (tc *TestCase) validateVerifier() error {
 		return fmt.Errorf("case %q: verifier requires exactly one of `s3_bucket` or `local_dir`", tc.Name)
 	case tc.Verifier.S3Bucket != "" && tc.Verifier.LocalDir != "":
 		return fmt.Errorf("case %q: verifier `s3_bucket` and `local_dir` are mutually exclusive", tc.Name)
+	}
+	// The verifier container only mounts the shared volume at /data, so a
+	// local_dir outside it would validate here and then deterministically fail
+	// at runtime. Reject it up front. (path, not filepath: these are container
+	// paths, always slash-separated; Clean also collapses any ".." traversal.)
+	if tc.Verifier.LocalDir != "" {
+		clean := path.Clean(tc.Verifier.LocalDir)
+		if clean != "/data" && !strings.HasPrefix(clean, "/data/") {
+			return fmt.Errorf("case %q: verifier.local_dir %q must be under the shared /data mount", tc.Name, tc.Verifier.LocalDir)
+		}
 	}
 	if tc.Verifier.Format != "avro" && tc.Verifier.Format != "parquet" {
 		return fmt.Errorf("case %q: verifier.format must be \"avro\" or \"parquet\", got %q", tc.Name, tc.Verifier.Format)
