@@ -40,7 +40,7 @@ func TestValidateVerifier(t *testing.T) {
 			wantErr: "generators",
 		},
 		{
-			name:    "missing bucket",
+			name:    "missing source",
 			mutate:  func(tc *TestCase) { tc.Verifier.S3Bucket = "" },
 			wantErr: "s3_bucket",
 		},
@@ -80,6 +80,78 @@ func TestValidateVerifier(t *testing.T) {
 			if tt.wantErr == "" {
 				if err != nil {
 					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Validate() = %v, want error containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestValidateVerifierLocal covers the local-file verifier path (LocalDir set
+// instead of S3Bucket): it needs no aws:/minio: emulator, and the two sources
+// are mutually exclusive.
+func TestValidateVerifierLocal(t *testing.T) {
+	t.Parallel()
+
+	// base is a valid local verifier case: no aws: block, a LocalDir source.
+	base := func() TestCase {
+		return TestCase{
+			Name:      "file_target_parquet_correctness",
+			Type:      "correctness",
+			Generator: GeneratorConfig{Mode: "tcp", Target: "subject:9000", TotalLines: 1000},
+			Verifier:  &VerifierConfig{LocalDir: "/data/out", Format: "parquet"},
+		}
+	}
+
+	tests := []struct {
+		name    string
+		mutate  func(tc *TestCase)
+		wantErr string
+	}{
+		{name: "valid local verifier needs no emulator", mutate: func(*TestCase) {}},
+		{
+			name:    "both sources rejected",
+			mutate:  func(tc *TestCase) { tc.Verifier.S3Bucket = "bench-out" },
+			wantErr: "mutually exclusive",
+		},
+		{
+			name:    "neither source rejected",
+			mutate:  func(tc *TestCase) { tc.Verifier.LocalDir = "" },
+			wantErr: "exactly one",
+		},
+		{
+			name:    "bad format still checked",
+			mutate:  func(tc *TestCase) { tc.Verifier.Format = "orc" },
+			wantErr: "format",
+		},
+		{name: "local_dir is /data root", mutate: func(tc *TestCase) { tc.Verifier.LocalDir = "/data" }},
+		{
+			name:    "local_dir outside /data rejected",
+			mutate:  func(tc *TestCase) { tc.Verifier.LocalDir = "/tmp/out" },
+			wantErr: "/data mount",
+		},
+		{
+			name:    "local_dir traversal escaping /data rejected",
+			mutate:  func(tc *TestCase) { tc.Verifier.LocalDir = "/data/../etc" },
+			wantErr: "/data mount",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			tc := base()
+			tt.mutate(&tc)
+			err := tc.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				if !tc.Verifier.IsLocal() {
+					t.Errorf("IsLocal() = false, want true for LocalDir case")
 				}
 				return
 			}

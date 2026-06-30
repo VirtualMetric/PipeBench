@@ -154,9 +154,17 @@ services:
     cap_add:
       - NET_ADMIN
 {{- end }}
+{{- if $.VerifierLocalDir }}
+    depends_on:
+      data-init:
+        condition: service_completed_successfully
+{{- end }}
     volumes:
       - "{{ .ConfigSrc }}:{{ $.ConfigDst }}{{ $.ConfigMountOpts }}"
       - "{{ $.TmpDir }}:/results"
+{{- if $.UseSharedData }}
+      - "shared-data:/data"
+{{- end }}
 {{- if $.CaseCertsHost }}
       - "{{ $.CaseCertsHost }}:/opt/vmetric/certs:ro"
 {{- end }}
@@ -176,8 +184,12 @@ services:
     image: "{{ .SubjectImage }}"
     container_name: "{{ .SubjectContainer }}"
     networks: [bench]
-{{- if or .KafkaEnabled .AWSEnabled .AzureEnabled .VaultEnabled .MinioEnabled .PipelineBrokerEnabled }}
+{{- if or .KafkaEnabled .AWSEnabled .AzureEnabled .VaultEnabled .MinioEnabled .PipelineBrokerEnabled .VerifierLocalDir }}
     depends_on:
+{{- if .VerifierLocalDir }}
+      data-init:
+        condition: service_completed_successfully
+{{- end }}
 {{- if .KafkaGSSAPIEnabled }}
       kafka-init:
         condition: service_completed_successfully
@@ -576,13 +588,37 @@ services:
       COLLECTOR_INTERVAL_SECS: "1"
       COLLECTOR_OUTPUT: "/results/metrics.csv"
     restart: "no"
+{{- if .VerifierLocalDir }}
+
+  # One-shot: the subject (director) runs as a non-root user, but the
+  # shared-data volume is root-owned, so the director can't create its
+  # file-target output directory there. This makes {{ .VerifierLocalDir }}
+  # world-writable before the subject starts. Reuses the subject image (already
+  # present) as root purely for the chmod — no extra image to pull.
+  data-init:
+    image: "{{ .SubjectImage }}"
+    container_name: "bench-data-init"
+    networks: [bench]
+    user: "0:0"
+    # Pass the case-controlled dir via an env var and quote it in the shell so a
+    # value with shell metacharacters can't alter the root command. ($$ -> $
+    # after compose interpolation; -- guards a dir starting with "-".)
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["mkdir -p -- \"$${VERIFIER_LOCAL_DIR}\" && chmod -R 0777 /data"]
+    environment:
+      VERIFIER_LOCAL_DIR: "{{ .VerifierLocalDir }}"
+    volumes:
+      - "shared-data:/data"
+    restart: "no"
+{{- end }}
 {{- if .VerifierEnabled }}
 
   # One-shot DuckDB verifier under the compose profile "verify", so the
   # initial up skips it; the runner starts it (UpServices) after the generator
-  # exits. It reads the subject's {{ .VerifierFormat }} objects from the S3
-  # emulator via httpfs, waits for the bucket to settle, then asserts row count
-  # / duplicates / NULL payloads and writes /results/verdict.json.
+  # exits. It reads the subject's {{ .VerifierFormat }} objects — from the S3
+  # emulator via httpfs, or (local mode) straight off the shared /data volume —
+  # waits for the output to settle, then asserts row count / duplicates / NULL
+  # payloads and writes /results/verdict.json.
   verifier:
     image: "{{ .VerifierImage }}"
     container_name: "bench-verifier"
@@ -590,11 +626,18 @@ services:
     profiles: ["verify"]
     volumes:
       - "{{ .TmpDir }}:/results"
+{{- if .VerifierLocalDir }}
+      - "shared-data:/data"
+{{- end }}
     user: "0:0"
     environment:
+{{- if .VerifierLocalDir }}
+      VERIFIER_LOCAL_DIR: "{{ .VerifierLocalDir }}"
+{{- else }}
       VERIFIER_S3_BUCKET: "{{ .VerifierBucket }}"
 {{- if .VerifierPrefix }}
       VERIFIER_S3_PREFIX: "{{ .VerifierPrefix }}"
+{{- end }}
 {{- end }}
       VERIFIER_OBJECT_FORMAT: "{{ .VerifierFormat }}"
       VERIFIER_EXPECTED_LINES: "{{ .VerifierExpected }}"
@@ -1504,7 +1547,7 @@ type composeVars struct {
 	// bundle, CA) for the director to load via proxy_tls.cert_name/key_name/
 	// pfx_name/ca_name = "certs/<file>". Empty (no configs/certs/ dir) → no mount,
 	// so existing single-file-config cases are unaffected.
-	CaseCertsHost     string
+	CaseCertsHost string
 	// Subjects, when non-empty, replaces the single subject service with one
 	// service per director cluster node (director_cluster_correctness). Each entry
 	// carries that node's container name, hostname, and rendered config path; the
@@ -1653,10 +1696,14 @@ type composeVars struct {
 	// starts it via UpServices("verifier") after the generator exits, it reads
 	// the subject's columnar objects from the S3 emulator via httpfs, and emits
 	// /results/verdict.json. When enabled the singular receiver is not rendered.
-	VerifierEnabled      bool
-	VerifierImage        string
-	VerifierBucket       string
-	VerifierPrefix       string
+	VerifierEnabled bool
+	VerifierImage   string
+	VerifierBucket  string
+	VerifierPrefix  string
+	// VerifierLocalDir is set (instead of VerifierBucket) for the local-file
+	// verifier path: the verifier mounts the shared /data volume and reads the
+	// subject's file target output directly, with no S3 emulator.
+	VerifierLocalDir     string
 	VerifierFormat       string
 	VerifierExpected     int64
 	VerifierAllowOverDel string
@@ -1702,10 +1749,10 @@ type composeVars struct {
 	// When AgentEnabled is true the template renders an `agent:` service with
 	// depends_on: subject (service_started) so the director's WebSocket + HTTP
 	// endpoints are bound before the agent dials in.
-	AgentEnabled         bool
-	AgentImage           string
-	AgentCommand         string
-	AgentEnv             map[string]string
+	AgentEnabled          bool
+	AgentImage            string
+	AgentCommand          string
+	AgentEnv              map[string]string
 	AgentMountsSharedData bool
 
 	// TLSCertsHost is the host directory holding the auto-generated cert
@@ -1854,6 +1901,12 @@ func writeCompose(path string, cfg RunConfig) error {
 				break
 			}
 		}
+	}
+	// The local-file verifier reads the subject's columnar output off the shared
+	// /data volume, so the subject (whose `file` target writes there) needs it
+	// mounted too.
+	if tc.UsesVerifier() && tc.Verifier.IsLocal() {
+		useSharedData = true
 	}
 
 	// Case-provided cert material: if the case ships a `configs/certs/` dir next
@@ -2227,6 +2280,7 @@ func writeCompose(path string, cfg RunConfig) error {
 		vars.VerifierImage = cfg.VerifierImage
 		vars.VerifierBucket = tc.Verifier.S3Bucket
 		vars.VerifierPrefix = tc.Verifier.S3Prefix
+		vars.VerifierLocalDir = tc.Verifier.LocalDir
 		vars.VerifierFormat = tc.Verifier.Format
 		vars.VerifierExpected = tc.Generator.TotalLines
 		vars.VerifierAllowOverDel = boolStr(tc.Verifier.AllowOverDelivery)
@@ -2234,10 +2288,14 @@ func writeCompose(path string, cfg RunConfig) error {
 		vars.VerifierTimeout = tc.Verifier.TimeoutOrDefault()
 		vars.VerifierMsgField = defaultStr(tc.Verifier.MsgField, "msg")
 		vars.VerifierNullFields = strings.Join(tc.Verifier.NullFields, ",")
-		if tc.UsesMinio() {
-			vars.VerifierEnv = minioEnv
-		} else {
-			vars.VerifierEnv = awsEnv
+		// The local-file verifier reads the shared /data volume directly and
+		// needs no S3 emulator credentials; only the S3 path injects them.
+		if !tc.Verifier.IsLocal() {
+			if tc.UsesMinio() {
+				vars.VerifierEnv = minioEnv
+			} else {
+				vars.VerifierEnv = awsEnv
+			}
 		}
 	}
 

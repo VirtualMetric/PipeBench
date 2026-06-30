@@ -107,6 +107,16 @@ func TestSourceExpr(t *testing.T) {
 			cfg:  config{Bucket: "bench-out", Prefix: "out/", Format: "avro"},
 			want: "read_avro('s3://bench-out/out/**/*.avro')",
 		},
+		{
+			name: "local parquet dir",
+			cfg:  config{LocalDir: "/data/out", Format: "parquet"},
+			want: "read_parquet('/data/out/**/*.parquet')",
+		},
+		{
+			name: "local avro dir trims trailing slash",
+			cfg:  config{LocalDir: "/data/out/", Format: "avro"},
+			want: "read_avro('/data/out/**/*.avro')",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -148,6 +158,30 @@ func TestPrelude(t *testing.T) {
 		}
 		if !contains(sql, "s3_use_ssl=true") {
 			t.Errorf("https endpoint should set ssl true: %q", sql)
+		}
+	})
+
+	t.Run("local parquet skips httpfs and S3 setup", func(t *testing.T) {
+		t.Parallel()
+		cfg := config{LocalDir: "/data/out", Format: "parquet", AccessKey: "ak", SecretKey: "sk"}
+		sql, redacted := cfg.prelude()
+		if contains(sql, "httpfs") || contains(sql, "s3_endpoint") || contains(sql, "s3_secret_access_key") {
+			t.Errorf("local prelude must not touch httpfs/S3: %q", sql)
+		}
+		if sql != redacted {
+			t.Errorf("local prelude has nothing to redact, want sql == redacted; got %q vs %q", sql, redacted)
+		}
+	})
+
+	t.Run("local avro still loads avro extension", func(t *testing.T) {
+		t.Parallel()
+		cfg := config{LocalDir: "/data/out", Format: "avro"}
+		sql, _ := cfg.prelude()
+		if !contains(sql, "LOAD avro") {
+			t.Errorf("local avro prelude must LOAD avro: %q", sql)
+		}
+		if contains(sql, "httpfs") {
+			t.Errorf("local avro prelude must not LOAD httpfs: %q", sql)
 		}
 	})
 }
