@@ -4001,6 +4001,16 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 			return nil
 		}
 
+		// Snapshot the receiver's lifetime count at baseline start so the
+		// suppression check below compares the delta over the window rather than
+		// the cumulative total (consistent with the AFTER phase).
+		rmStart, qErr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+		if qErr != nil {
+			errs = append(errs, "sampling receiver at baseline start: "+qErr.Error())
+			break
+		}
+		startCount := rmStart.LinesReceived
+
 		// Phase 1: confirm delivery is SUPPRESSED across the baseline window (the
 		// BEFORE .vmf is already live). Proves the case really starts suppressed;
 		// otherwise "delivery after the update" would be vacuous.
@@ -4018,11 +4028,12 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 			break
 		}
 		baseCount := rmBase.LinesReceived
-		fmt.Printf("    received while suppressed: %s\n", formatCount(baseCount))
-		if baseCount > cfgUpdateLeak {
+		leakedDuringBaseline := baseCount - startCount
+		fmt.Printf("    received while suppressed: %s\n", formatCount(leakedDuringBaseline))
+		if leakedDuringBaseline > cfgUpdateLeak {
 			errs = append(errs, fmt.Sprintf(
 				"delivery was NOT suppressed by the BEFORE config (%s records during the %s baseline) — the update verdict would be vacuous",
-				formatCount(baseCount), baseline))
+				formatCount(leakedDuringBaseline), baseline))
 		}
 
 		// Phase 2: AFTER pipeline (configs/update.vmf) — enables delivery.
