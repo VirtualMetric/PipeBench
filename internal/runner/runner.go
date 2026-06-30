@@ -3537,6 +3537,7 @@ type fleetStatus struct {
 		Inbound   map[string]struct {
 			Count    int    `json:"count"`
 			LastData string `json:"last_data"`
+			MaxLen   int    `json:"max_len"`
 		} `json:"inbound"`
 		// Stats are decoded from the director's forwarded VMF metric frames by
 		// the simulator (see fleetsim/vmfstats.go), keyed by "<inputtype>.<type>"
@@ -3600,6 +3601,16 @@ func (st *fleetStatus) lastData(id, key string) string {
 	return d.Inbound[key].LastData
 }
 
+// maxLen returns the largest frame (bytes) seen for the director's inbound key,
+// or 0 if absent. Used to distinguish a real data frame from tiny lifecycle markers.
+func (st *fleetStatus) maxLen(id, key string) int {
+	d, ok := st.Directors[id]
+	if !ok {
+		return 0
+	}
+	return d.Inbound[key].MaxLen
+}
+
 // fleetSimStatus reads the simulator's observation snapshot via `docker exec wget`.
 // We use the busybox `wget` that ships in the simulator's alpine base rather than
 // curl, so the bench-fleetsim image needs no extra package (and carries no extra
@@ -3655,6 +3666,25 @@ func fleetWaitCount(simContainer, dirID, key string, min int, deadline time.Time
 	for time.Now().Before(deadline) {
 		if st, err := fleetSimStatus(simContainer); err == nil {
 			last = st.count(dirID, key)
+			if last >= min {
+				return last, true
+			}
+		}
+		time.Sleep(3 * time.Second)
+	}
+	return last, false
+}
+
+// fleetWaitMaxLen polls until the largest frame seen for inbound[key] is >= min
+// bytes (or the deadline passes), returning the final max and whether it was
+// reached. A capture's lifecycle markers ("Capture Started/Completed", tiny)
+// arrive immediately on session start, while real captured data only flushes on
+// the session's periodic (≈5s) ticker — so this must POLL, not sample once.
+func fleetWaitMaxLen(simContainer, dirID, key string, min int, deadline time.Time) (int, bool) {
+	last := 0
+	for time.Now().Before(deadline) {
+		if st, err := fleetSimStatus(simContainer); err == nil {
+			last = st.maxLen(dirID, key)
 			if last >= min {
 				return last, true
 			}
@@ -4343,6 +4373,7 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 			"capture_line": 100,
 			"where":        fleetStr(fc.LiveWhere, "before-pre-process"),
 			"source_type":  fleetStr(fc.LiveSource, "director"),
+			"source_id":    fc.LiveSourceID,
 		}
 		if fc.Scenario == "console_log" {
 			cmd = "console_log"
@@ -4362,6 +4393,20 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		} else {
 			finalCount = int64(c)
 			fmt.Printf("  %s streamed %d frame(s) ✓\n", cmd, c)
+
+			// Discriminating check: a capture that returns only lifecycle markers
+			// ("Capture Started/Completed", ~40 bytes) still produces frames, so a
+			// bare count >= 1 can pass even when NO real data was captured (e.g.
+			// mis-framed input that a normal where never sees). live_min_frame_bytes
+			// asserts at least one frame carried real captured data. Used by the
+			// where:raw mis-frame case.
+			if fc.LiveMinFrameBytes > 0 {
+				if maxLen, ok := fleetWaitMaxLen(simContainer, dirID, key, fc.LiveMinFrameBytes, scenarioDeadline()); !ok {
+					errs = append(errs, fmt.Sprintf("%s returned only small frames (max %d bytes < live_min_frame_bytes %d) — capture saw lifecycle markers, no real data", cmd, maxLen, fc.LiveMinFrameBytes))
+				} else {
+					fmt.Printf("  %s largest frame %d bytes (>= %d) — real data captured ✓\n", cmd, maxLen, fc.LiveMinFrameBytes)
+				}
+			}
 		}
 
 	case "stats":

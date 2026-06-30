@@ -1185,6 +1185,16 @@ type FleetConfig struct {
 	// before-pre-process / director).
 	LiveWhere  string `yaml:"live_where"`
 	LiveSource string `yaml:"live_source"`
+	// LiveMinFrameBytes, when > 0, asserts the largest live_data/console_log
+	// reply frame is at least this many bytes — i.e. a REAL data frame came back,
+	// not just the tiny "Capture Started/Completed" lifecycle markers. Used by the
+	// where:raw mis-frame case so a marker-only capture can't pass on count alone.
+	LiveMinFrameBytes int `yaml:"live_min_frame_bytes"`
+	// LiveSourceID targets a specific source for the live_data scenario: the
+	// device id when live_source=device, the route id when live_source=advanced-route
+	// (0 = "no specific route", which the director normalizes to a director-wide
+	// routing-boundary capture). Ignored for live_source=director. Defaults to 0.
+	LiveSourceID int `yaml:"live_source_id"`
 	// SettleSeconds is how long to wait for a scenario's effect (default 45).
 	SettleSeconds int `yaml:"settle_seconds"`
 	// DeliverConfig, when set, is a file under the case's configs/ dir holding an
