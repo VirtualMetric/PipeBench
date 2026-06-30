@@ -1179,6 +1179,33 @@ type FleetConfig struct {
 	// by scenarios that require a real pipeline (live_data/stats) or the agent-comm
 	// interface (enrollment). Produce the VMF with the backend cmd/configencoder.
 	DeliverConfig string `yaml:"deliver_config"`
+
+	// BaselineSeconds (config_update data-plane mode only) is how long the driver
+	// confirms delivery is suppressed after the BEFORE config is delivered, before
+	// pushing the AFTER config. It proves the case really starts suppressed
+	// (otherwise "delivery after the update" is vacuous). Default 20.
+	BaselineSeconds int `yaml:"baseline_seconds"`
+}
+
+// BaselineSecondsOrDefault returns BaselineSeconds or 20 when unset.
+func (f *FleetConfig) BaselineSecondsOrDefault() int {
+	if f == nil || f.BaselineSeconds <= 0 {
+		return 20
+	}
+	return f.BaselineSeconds
+}
+
+// IsConfigUpdateDataPlane reports whether the config_update scenario is in
+// DATA-PLANE mode: a fleet director loads its operational pipeline only from an
+// encoded vmetric.vmf, so the BEFORE pipeline is delivered via deliver_config
+// (an encoded .vmf, like the live_data/stats scenarios). In that mode the driver
+// confirms delivery is suppressed, pushes the AFTER .vmf (configs/update.vmf),
+// and confirms delivery starts — proving a device/target/route/pipeline update
+// takes effect on the data plane, not just that the director ACKs it. Without a
+// deliver_config the scenario keeps its legacy control-plane (executed-only)
+// behavior.
+func (f *FleetConfig) IsConfigUpdateDataPlane() bool {
+	return f != nil && f.Scenario == "config_update" && f.DeliverConfig != ""
 }
 
 // SettleOrDefault returns SettleSeconds or 45 when unset.
@@ -1292,6 +1319,18 @@ func (tc *TestCase) validateFleet() error {
 	}
 	if !found {
 		return fmt.Errorf("case %q: fleet_automation_correctness requires an endpoints entry named %q (the simulator)", tc.Name, want)
+	}
+	// config_update data-plane mode (deliver_config set): the BEFORE pipeline is
+	// delivered as an encoded .vmf, the driver drives traffic, then pushes the
+	// AFTER .vmf (configs/update.vmf) and asserts the receiver count. It therefore
+	// needs a generator and a positive min_received threshold.
+	if tc.Fleet.IsConfigUpdateDataPlane() {
+		if !tc.HasGenerator() {
+			return fmt.Errorf("case %q: data-plane config_update requires a generator to drive traffic", tc.Name)
+		}
+		if tc.Correctness.MinReceived <= 0 {
+			return fmt.Errorf("case %q: data-plane config_update requires correctness.min_received > 0", tc.Name)
+		}
 	}
 	return nil
 }

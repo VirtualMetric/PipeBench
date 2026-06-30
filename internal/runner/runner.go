@@ -2866,6 +2866,7 @@ func waitClusterReady(containers []string, deadline time.Time) (int, bool) {
 //   - "Assigned new device {id} ({name}) to node {N}"        (NewDevice branch), or
 //   - "Reassigned device {id} ({name}) from  to {N}"          (reassign branch,
 //     empty source = initial placement).
+//
 // Both end with the target node name, so we recognize either and take the last
 // whitespace token. (Failover is detected separately by clusterReassignedFrom,
 // which matches the specific "from <owner> to" so it can't trip on either of these
@@ -3898,37 +3899,193 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		}
 
 	case "config_update":
-		// Push a new config (Update Triggered). The new config is read from the
-		// case's configs/update.yml and shipped as a ZIP containing vmetric.yml —
-		// the director's config-set path treats a non-zip payload as a packaged
-		// .vmf, while a ZIP is unzipped and parsed as a plain config tree. The
-		// director validates + atomically swaps it in and replies executed=true.
-		updPath := filepath.Join(caseDir, "configs", "update.yml")
-		raw, e := os.ReadFile(updPath)
-		if e != nil {
-			errs = append(errs, "cannot read configs/update.yml for config_update: "+e.Error())
-		} else if zipped, ze := zipSingleFile("vmetric.yml", raw); ze != nil {
-			errs = append(errs, "cannot zip update config: "+ze.Error())
-		} else {
+		// pushConfig ships configs/<filename> to the director as a ZIP containing
+		// vmetric.yml. The director's config-set path treats a non-zip payload as a
+		// packaged .vmf, while a ZIP is unzipped and parsed as a plain config tree;
+		// it validates + atomically swaps it in and replies executed=true. The
+		// director keys one rep.config per push, so wantReplies is the cumulative
+		// reply count to wait for (1 for the first push, 2 for the second).
+		pushConfig := func(filename string, wantReplies int) error {
+			p := filepath.Join(caseDir, "configs", filename)
+			raw, e := os.ReadFile(p)
+			if e != nil {
+				return fmt.Errorf("reading configs/%s: %w", filename, e)
+			}
+			zipped, ze := zipSingleFile("vmetric.yml", raw)
+			if ze != nil {
+				return fmt.Errorf("zipping %s: %w", filename, ze)
+			}
+			fmt.Printf("  pushing config %s (%d bytes raw, %d zipped)…\n", filename, len(raw), len(zipped))
 			b64 := base64.StdEncoding.EncodeToString(zipped)
-			fmt.Printf("  pushing config update (%d bytes raw, %d zipped)…\n", len(raw), len(zipped))
 			if _, se := fleetSimSend(simContainer, dirID, "config", map[string]any{"data_b64": b64}); se != nil {
-				errs = append(errs, "failed to push config: "+se.Error())
+				return fmt.Errorf("pushing %s: %w", filename, se)
 			}
-			if _, ok := fleetWaitCount(simContainer, dirID, "rep.config", 1, scenarioDeadline()); !ok {
-				errs = append(errs, "no config reply from director after push")
+			if _, ok := fleetWaitCount(simContainer, dirID, "rep.config", wantReplies, scenarioDeadline()); !ok {
+				return fmt.Errorf("no config reply from director after pushing %s", filename)
+			}
+			last := ""
+			if st, e := fleetSimStatus(simContainer); e == nil {
+				last = st.lastData(dirID, "rep.config")
+			}
+			fmt.Printf("  config reply: %.300s\n", last)
+			if !strings.Contains(last, "\"executed\":true") {
+				return fmt.Errorf("director did not apply %s (executed!=true): %s", filename, last)
+			}
+			return nil
+		}
+
+		if !fc.IsConfigUpdateDataPlane() {
+			// Legacy control-plane check (Update Triggered): push configs/update.yml
+			// and assert the director applies it (executed=true). No data-plane
+			// sampling — this only proves the platform→director config-apply path.
+			if e := pushConfig("update.yml", 1); e != nil {
+				errs = append(errs, e.Error())
 			} else {
-				last := ""
-				if st, e := fleetSimStatus(simContainer); e == nil {
-					last = st.lastData(dirID, "rep.config")
-				}
-				fmt.Printf("  config reply: %.300s\n", last)
-				if !strings.Contains(last, "\"executed\":true") {
-					errs = append(errs, "director did not report the config as executed: "+last)
-				} else {
-					fmt.Println("  config applied (executed) ✓")
+				fmt.Println("  config applied (executed) ✓")
+			}
+			break
+		}
+
+		// Data-plane check: prove a device/target/route/pipeline config UPDATE
+		// actually changes what the receiver sees, not merely that the director
+		// ACKs it. The BEFORE pipeline arrived as an encoded .vmf via deliver_config
+		// (delivered above, before this switch) — a fleet director loads its
+		// operational pipeline ONLY from an encoded vmetric.vmf, so a zipped plain
+		// YAML push never brings the pipeline up. Here we confirm the receiver stays
+		// ~0, push the AFTER .vmf (configs/update.vmf, RAW — not zipped, so the
+		// config-set path treats it as a packaged vmf), and confirm delivery STARTS
+		// (>= min_received, plus required_substring if set). A generator (started by
+		// orch.Up) drives traffic throughout.
+		const cfgUpdateLeak = 3 // tolerate a few in-flight records around the flip
+		minRecv := tc.Correctness.MinReceived
+		if minRecv <= 0 {
+			minRecv = 1
+		}
+
+		metricsPort, stopPortFwd, mErr := orch.ReceiverMetricsPort()
+		if mErr != nil {
+			errs = append(errs, "setting up receiver access: "+mErr.Error())
+			break
+		}
+		defer stopPortFwd()
+
+		// pushVMF ships configs/<filename> (an encoded .vmf) to the director as RAW
+		// bytes (no zip), so the config-set path applies it as the operational
+		// config and the director's encoded-change poll reloads it. deliver_config
+		// already produced one rep.config reply, so wait for the count to advance.
+		pushVMF := func(filename string) error {
+			p := filepath.Join(caseDir, "configs", filename)
+			raw, e := os.ReadFile(p)
+			if e != nil {
+				return fmt.Errorf("reading configs/%s: %w", filename, e)
+			}
+			before := 0
+			if st, e := fleetSimStatus(simContainer); e == nil {
+				before = st.count(dirID, "rep.config")
+			}
+			fmt.Printf("  pushing config %s (%d bytes vmf)…\n", filename, len(raw))
+			b64 := base64.StdEncoding.EncodeToString(raw)
+			if _, se := fleetSimSend(simContainer, dirID, "config", map[string]any{"data_b64": b64}); se != nil {
+				return fmt.Errorf("pushing %s: %w", filename, se)
+			}
+			if _, ok := fleetWaitCount(simContainer, dirID, "rep.config", before+1, scenarioDeadline()); !ok {
+				return fmt.Errorf("no config reply from director after pushing %s", filename)
+			}
+			last := ""
+			if st, e := fleetSimStatus(simContainer); e == nil {
+				last = st.lastData(dirID, "rep.config")
+			}
+			fmt.Printf("  config reply: %.300s\n", last)
+			if !strings.Contains(last, "\"executed\":true") {
+				return fmt.Errorf("director did not apply %s (executed!=true): %s", filename, last)
+			}
+			return nil
+		}
+
+		// Snapshot the receiver's lifetime count at baseline start so the
+		// suppression check below compares the delta over the window rather than
+		// the cumulative total (consistent with the AFTER phase).
+		rmStart, qErr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+		if qErr != nil {
+			errs = append(errs, "sampling receiver at baseline start: "+qErr.Error())
+			break
+		}
+		startCount := rmStart.LinesReceived
+
+		// Phase 1: confirm delivery is SUPPRESSED across the baseline window (the
+		// BEFORE .vmf is already live). Proves the case really starts suppressed;
+		// otherwise "delivery after the update" would be vacuous.
+		baseline := time.Duration(fc.BaselineSecondsOrDefault()) * time.Second
+		if rem := time.Until(runDeadline); rem < baseline {
+			baseline = rem
+		}
+		fmt.Printf("  confirming delivery is SUPPRESSED for %s (receiver must stay ~0)…\n", baseline)
+		if baseline > 0 {
+			time.Sleep(baseline)
+		}
+		rmBase, qErr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+		if qErr != nil {
+			errs = append(errs, "sampling receiver during the baseline window: "+qErr.Error())
+			break
+		}
+		baseCount := rmBase.LinesReceived
+		leakedDuringBaseline := baseCount - startCount
+		fmt.Printf("    received while suppressed: %s\n", formatCount(leakedDuringBaseline))
+		if leakedDuringBaseline > cfgUpdateLeak {
+			errs = append(errs, fmt.Sprintf(
+				"delivery was NOT suppressed by the BEFORE config (%s records during the %s baseline) — the update verdict would be vacuous",
+				formatCount(leakedDuringBaseline), baseline))
+		}
+
+		// Phase 2: AFTER pipeline (configs/update.vmf) — enables delivery.
+		fmt.Println("  pushing the AFTER pipeline (update.vmf)…")
+		if e := pushVMF("update.vmf"); e != nil {
+			errs = append(errs, "AFTER config: "+e.Error())
+			break
+		}
+
+		// Phase 4: delivery must START — drain until min_received NEW records (over
+		// the baseline) arrive, or the deadline passes.
+		drainTimeout := time.Duration(fc.SettleOrDefault()) * time.Second
+		if tc.Correctness.DrainSeconds > 0 {
+			drainTimeout = time.Duration(tc.Correctness.DrainSeconds) * time.Second
+		}
+		fmt.Printf("  waiting for delivery to start (receiver >= %s new, up to %s)…\n", formatCount(minRecv), drainTimeout)
+		drainDeadline := time.Now().Add(drainTimeout)
+		if drainDeadline.After(runDeadline) {
+			drainDeadline = runDeadline
+		}
+		var lastRM ReceiverMetrics
+		for time.Now().Before(drainDeadline) {
+			rm, e := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+			if e == nil {
+				lastRM = rm
+				finalCount = rm.LinesReceived
+				fmt.Printf("    received: %s\n", formatCount(rm.LinesReceived))
+				if rm.LinesReceived-baseCount >= minRecv {
+					break
 				}
 			}
+			time.Sleep(3 * time.Second)
+		}
+		delivered := finalCount - baseCount
+		if delivered < minRecv {
+			errs = append(errs, fmt.Sprintf(
+				"delivery did not start after the config update — %s new records (expected >= %s); the update did not take effect on the data plane",
+				formatCount(delivered), formatCount(minRecv)))
+		} else {
+			fmt.Printf("  delivery started after the update — %s new records ✓\n", formatCount(delivered))
+		}
+
+		// Content check: when a required_substring is set, the receiver enforces it
+		// on every received line and reports Passed=false on any miss (e.g. a
+		// pre-process/post-process pipeline whose update did not actually apply).
+		if tc.Correctness.RequiredSubstring != "" && lastRM.Passed != nil && !*lastRM.Passed {
+			msg := "receiver content check failed (required_substring not satisfied on every line)"
+			if len(lastRM.Errors) > 0 {
+				msg += ": " + strings.Join(lastRM.Errors, "; ")
+			}
+			errs = append(errs, msg)
 		}
 
 	case "config_change":
