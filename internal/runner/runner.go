@@ -3703,6 +3703,7 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		GeneratorImage:   r.opts.GeneratorImage,
 		ReceiverImage:    r.opts.ReceiverImage,
 		CollectorImage:   r.opts.CollectorImage,
+		VerifierImage:    r.opts.VerifierImage, // pipeline_verify reuses the DuckDB verifier
 		ReceiverHostPort: r.opts.ReceiverHostPort,
 		ExtraSubjectEnv:  extraEnv,
 		CPULimit:         r.opts.CPULimit,
@@ -3930,6 +3931,103 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 			}
 		}
 
+	case "config_change":
+		// deliver_config (the pre-step) already delivered operational config A,
+		// which points the target at a DEAD endpoint so delivery is blocked. Here
+		// we confirm it is blocked, push the SECOND VMF (configs/update.vmf) which
+		// repoints the target at the working receiver, and assert delivery STARTS —
+		// proving a live target config change pushed over the real fleet/platform
+		// link is applied AND reconciled (pool rebuild) on a running director, with
+		// no restart.
+		// The changed config (B) is pushed from configs/update.vmf — reusing the
+		// "update config" file convention (config_update reads configs/update.yml),
+		// so no new case field is needed. deliver_config provided the initial
+		// config (A); this is the mid-run change.
+		changePath := filepath.Join(caseDir, "configs", "update.vmf")
+		if _, statErr := os.Stat(changePath); statErr != nil {
+			errs = append(errs, "config_change scenario requires configs/update.vmf (the changed VMF to push): "+statErr.Error())
+			break
+		}
+		metricsPort, stopPortFwd, mErr := orch.ReceiverMetricsPort()
+		if mErr != nil {
+			errs = append(errs, "config_change: receiver metrics unavailable: "+mErr.Error())
+			break
+		}
+		defer stopPortFwd()
+		minRecv := tc.Correctness.MinReceived
+		if minRecv <= 0 {
+			minRecv = 1
+		}
+		const leak = 5
+
+		// Phase 0: confirm delivery is BLOCKED under config A (dead target), so
+		// post-change delivery is attributable to the pushed change.
+		if d := min(15*time.Second, time.Until(runDeadline)); d > 0 {
+			time.Sleep(d)
+		}
+		rmB, _ := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+		fmt.Printf("  before config change: received=%s (expected ~0; target A is a dead endpoint)\n", formatCount(rmB.LinesReceived))
+		if rmB.LinesReceived > leak {
+			errs = append(errs, fmt.Sprintf(
+				"delivery was not blocked before the change (%s received) — config A is not pointing at a dead target; the change is untested",
+				formatCount(rmB.LinesReceived)))
+		}
+
+		// Phase 1: push the changed VMF (config B → working target) over the fleet link.
+		raw, e := os.ReadFile(changePath)
+		if e != nil {
+			errs = append(errs, "cannot read configs/update.vmf: "+e.Error())
+			break
+		}
+		before := 0
+		if st, se := fleetSimStatus(simContainer); se == nil {
+			before = st.count(dirID, "rep.config")
+		}
+		fmt.Printf("  pushing changed VMF config (configs/update.vmf, %d bytes) over the fleet link…\n", len(raw))
+		if _, se := fleetSimSend(simContainer, dirID, "config",
+			map[string]any{"data_b64": base64.StdEncoding.EncodeToString(raw)}); se != nil {
+			errs = append(errs, "failed to push changed config: "+se.Error())
+			break
+		}
+		if _, ok := fleetWaitCount(simContainer, dirID, "rep.config", before+1, scenarioDeadline()); !ok {
+			errs = append(errs, "no config reply from director after the change push")
+		}
+
+		// Phase 2: delivery must START — the new working target took effect via
+		// the director's config reload + sender reconcile (pool rebuild).
+		drainTimeout := time.Duration(tc.Correctness.DrainSeconds) * time.Second
+		if drainTimeout <= 0 {
+			drainTimeout = 2 * time.Minute
+		}
+		dd := time.Now().Add(drainTimeout)
+		if dd.After(runDeadline) {
+			dd = runDeadline
+		}
+		// Require delivery to grow by minRecv ABOVE the pre-change baseline, so
+		// success proves new lines arrived after the change rather than letting
+		// pre-existing (leaked) traffic satisfy an absolute total.
+		target := rmB.LinesReceived + minRecv
+		fmt.Printf("  waiting for delivery to START after the change (receiver >= %s = baseline %s + %s, up to %s)…\n",
+			formatCount(target), formatCount(rmB.LinesReceived), formatCount(minRecv), drainTimeout)
+		for time.Now().Before(dd) {
+			rm, qe := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+			if qe == nil {
+				finalCount = rm.LinesReceived
+				fmt.Printf("    received: %s\n", formatCount(finalCount))
+				if rm.LinesReceived >= target {
+					break
+				}
+			}
+			time.Sleep(3 * time.Second)
+		}
+		if finalCount < target {
+			errs = append(errs, fmt.Sprintf(
+				"delivery did not start after the pushed config change — %s received (expected >= %s = baseline %s + %s); the fleet-delivered VMF change did not reconcile onto the live data path",
+				formatCount(finalCount), formatCount(target), formatCount(rmB.LinesReceived), formatCount(minRecv)))
+		} else {
+			fmt.Printf("  delivery started after the VMF config change (%s received, baseline %s) ✓\n", formatCount(finalCount), formatCount(rmB.LinesReceived))
+		}
+
 	case "live_data", "console_log":
 		cmd := "live_data"
 		params := map[string]any{
@@ -4050,6 +4148,169 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		} else {
 			finalCount = int64(c)
 			fmt.Printf("  agent enrollment forwarded to platform (%d) ✓\n", c)
+		}
+
+	case "pipeline_data":
+		// Delivered-pipeline / library content correctness. deliver_config pushed
+		// an operational config carrying a real pipeline (and any library assets it
+		// references — lookup CSV, grok pattern, schema) over the fleet VMF; the
+		// generator floods the director's device. Two-part verdict:
+		//   1. transformed records actually reach the receiver (count >= min), and
+		//   2. they PASS the receiver's content check (required_substring / dedup /
+		//      JSON) — which is what proves the pipeline + library were applied
+		//      (e.g. a lookup added the enriched value to every record), not merely
+		//      that bytes flowed through.
+		// The fleet path otherwise ignores the receiver's content verdict; this is
+		// the only scenario that folds it in.
+		metricsPort, stopPortFwd, mErr := orch.ReceiverMetricsPort()
+		if mErr != nil {
+			errs = append(errs, "pipeline_data: receiver metrics unavailable: "+mErr.Error())
+			break
+		}
+		defer stopPortFwd()
+		minRecv := tc.Correctness.MinReceived
+		if minRecv <= 0 {
+			minRecv = 1
+		}
+		drainTimeout := time.Duration(tc.Correctness.DrainSeconds) * time.Second
+		if drainTimeout <= 0 {
+			drainTimeout = 2 * time.Minute
+		}
+		dd := time.Now().Add(drainTimeout)
+		if dd.After(runDeadline) {
+			dd = runDeadline
+		}
+		fmt.Printf("  waiting for transformed records through the delivered pipeline (receiver >= %s, up to %s)…\n",
+			formatCount(minRecv), drainTimeout)
+		var rm ReceiverMetrics
+		for time.Now().Before(dd) {
+			cur, qe := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+			if qe == nil {
+				rm = cur
+				finalCount = cur.LinesReceived
+				if cur.LinesReceived >= minRecv {
+					break
+				}
+			}
+			time.Sleep(3 * time.Second)
+		}
+		// One final read so the content verdict reflects the settled receiver state.
+		if cur, qe := r.queryReceiverMetrics(metricsPort, 10*time.Second); qe == nil {
+			rm = cur
+			finalCount = cur.LinesReceived
+		}
+
+		if finalCount < minRecv {
+			errs = append(errs, fmt.Sprintf(
+				"delivered pipeline produced too few records at the receiver — %s received (expected >= %s); the VMF-delivered pipeline/library did not apply on the data path",
+				formatCount(finalCount), formatCount(minRecv)))
+		} else {
+			fmt.Printf("  delivered pipeline produced %s record(s) at the receiver ✓\n", formatCount(finalCount))
+		}
+
+		// Honor the receiver's content check — required_substring is mandatory for
+		// this scenario (validated in case.go), so the receiver always runs a
+		// verdict. A nil verdict means the receiver never evaluated content (a
+		// misconfiguration), which must fail rather than pass silently.
+		switch {
+		case rm.Passed == nil:
+			errs = append(errs, "receiver reported no content verdict despite required_substring being set (content was not validated)")
+		case !*rm.Passed:
+			if len(rm.Errors) > 0 {
+				errs = append(errs, "receiver content check failed (delivered pipeline/library did not produce the expected value): "+strings.Join(rm.Errors, "; "))
+			} else {
+				errs = append(errs, "receiver content check failed (delivered pipeline/library did not produce the expected value)")
+			}
+		default:
+			fmt.Printf("  receiver content check passed (every record carries %q) ✓\n", tc.Correctness.RequiredSubstring)
+		}
+
+	case "pipeline_verify":
+		// Delivered-target / library-schema correctness. deliver_config pushed an
+		// operational config whose target writes columnar objects (parquet/avro) to
+		// the object store using a delivered library schema; the generator floods the
+		// director's device. The verdict reuses the generic DuckDB verifier
+		// (runVerifier): it drains the bucket on its quiet-window and asserts no
+		// duplicates + non-NULL columns. A column defined ONLY by the delivered
+		// library schema surviving the columnar round-trip proves the schema was
+		// delivered over the fleet link and applied by the target. The fleet path
+		// otherwise never runs the verifier; this is the only scenario that does.
+		fmt.Println("  running the DuckDB verifier against the delivered target's objects…")
+		m, verr := r.runVerifier(orch, tc, tmpDir, runDeadline)
+		if verr != nil {
+			errs = append(errs, "verifier failed: "+verr.Error())
+			break
+		}
+		finalCount = m.LinesReceived
+		switch {
+		case m.LinesReceived <= 0:
+			errs = append(errs, "verifier found no rows in the object store — the delivered target/library schema did not produce output")
+		case m.Passed == nil:
+			errs = append(errs, "verifier returned no verdict")
+		case !*m.Passed:
+			if len(m.Errors) > 0 {
+				errs = append(errs, "verifier verdict failed (delivered library schema not applied): "+strings.Join(m.Errors, "; "))
+			} else {
+				errs = append(errs, "verifier verdict failed (delivered library schema not applied)")
+			}
+		default:
+			fmt.Printf("  verifier passed: %d rows, library-schema columns intact ✓\n", m.LinesReceived)
+		}
+
+	case "pipeline_verify_change":
+		// Live UPDATE of a target/library schema, verified via the object store.
+		// deliver_config (config A) was already delivered above and writes nothing
+		// (its target's library schema is absent). Push config B (configs/update.vmf),
+		// which adds the schema so the target starts writing, then run the DuckDB
+		// verifier: rows with the library-defined columns appear only because the
+		// pushed schema took effect live. A and B differ only in the schema file.
+		changePath := filepath.Join(caseDir, "configs", "update.vmf")
+		if _, statErr := os.Stat(changePath); statErr != nil {
+			errs = append(errs, "pipeline_verify_change requires configs/update.vmf (config B with the added schema): "+statErr.Error())
+			break
+		}
+		raw, e := os.ReadFile(changePath)
+		if e != nil {
+			errs = append(errs, "cannot read configs/update.vmf: "+e.Error())
+			break
+		}
+		before := 0
+		if st, se := fleetSimStatus(simContainer); se == nil {
+			before = st.count(dirID, "rep.config")
+		}
+		fmt.Printf("  pushing changed VMF config (configs/update.vmf, %d bytes) — adds the target's library schema…\n", len(raw))
+		if _, se := fleetSimSend(simContainer, dirID, "config",
+			map[string]any{"data_b64": base64.StdEncoding.EncodeToString(raw)}); se != nil {
+			errs = append(errs, "failed to push changed config: "+se.Error())
+			break
+		}
+		if _, ok := fleetWaitCount(simContainer, dirID, "rep.config", before+1, scenarioDeadline()); !ok {
+			errs = append(errs, "no config reply from director after the change push")
+		}
+		// Let the director reload + the target write under config B before verifying.
+		if d := min(settle, time.Until(runDeadline)); d > 0 {
+			time.Sleep(d)
+		}
+		fmt.Println("  running the DuckDB verifier against the post-update target objects…")
+		m, verr := r.runVerifier(orch, tc, tmpDir, runDeadline)
+		if verr != nil {
+			errs = append(errs, "verifier failed: "+verr.Error())
+			break
+		}
+		finalCount = m.LinesReceived
+		switch {
+		case m.LinesReceived <= 0:
+			errs = append(errs, "verifier found no rows after the schema update — the pushed library schema did not take effect on the target")
+		case m.Passed == nil:
+			errs = append(errs, "verifier returned no verdict")
+		case !*m.Passed:
+			if len(m.Errors) > 0 {
+				errs = append(errs, "verifier verdict failed after the schema update: "+strings.Join(m.Errors, "; "))
+			} else {
+				errs = append(errs, "verifier verdict failed after the schema update")
+			}
+		default:
+			fmt.Printf("  delivery + verify after the live schema update: %d rows, columns intact ✓\n", m.LinesReceived)
 		}
 	}
 

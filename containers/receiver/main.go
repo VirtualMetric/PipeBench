@@ -450,6 +450,22 @@ func (v *validator) validate(cfg config, totalLines int64) (bool, []string) {
 		}
 	}
 
+	// Required-substring — every emitted line must contain the configured
+	// token (e.g. an IP prefix embedded by the generator, or an enrichment
+	// value a delivered pipeline/library must produce on every record).
+	// Without this the per-line check only SAMPLES violators; the verdict
+	// never fails on them.
+	if cfg.RequiredSubstring != "" {
+		if m := v.missingSubstr.Load(); m > 0 {
+			msg := fmt.Sprintf("required substring %q missing from %d line(s)", cfg.RequiredSubstring, m)
+			if len(v.missingSubstrSamp) > 0 {
+				msg += "; samples: " + strings.Join(v.missingSubstrSamp, " | ")
+			}
+			errors = append(errors, msg)
+			passed = false
+		}
+	}
+
 	return passed, errors
 }
 
@@ -876,7 +892,7 @@ func serveMetrics(port string, cnt *counters, val *validator, cfg config) {
 			"last_received_ns":  lastNs,
 		}
 		// Include correctness data if validation is enabled
-		if cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.ExpectedLines > 0 {
+		if cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.ExpectedLines > 0 || cfg.RequiredSubstring != "" {
 			passed, errors := val.validate(cfg, totalLines)
 			resp["passed"] = passed
 			if len(errors) > 0 {
