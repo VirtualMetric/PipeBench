@@ -1195,6 +1195,22 @@ type FleetConfig struct {
 	// by scenarios that require a real pipeline (live_data/stats) or the agent-comm
 	// interface (enrollment). Produce the VMF with the backend cmd/configencoder.
 	DeliverConfig string `yaml:"deliver_config"`
+	// RestartMidRun (stats scenario) stops the director container partway
+	// through the run and restarts it, to validate resilience: an agent that is
+	// streaming should buffer + retry across the restart (no error storm), and
+	// once the director is back every record should be accounted for in the
+	// decoded stats (ExpectStats is asserted AFTER the restart). Pair with a
+	// persistent_storage director so staged payloads survive the bounce.
+	RestartMidRun bool `yaml:"restart_mid_run"`
+	// ExpectStats (stats scenario only) asserts on the stats the simulator
+	// DECODES from the director's forwarded VMF metric frames — not just that
+	// frames arrived. Keyed by bucket "<inputtype>.<type>" (e.g. "route.in") →
+	// counter name ("dropped_count" | "error_count" | "events_in" |
+	// "events_out" | "bytes_in" | "bytes_out" | "events") → expected value. The
+	// driver polls until every expected counter is reached and then requires an
+	// EXACT match (deterministic: same input + same pipeline ⇒ same counts).
+	// Example: {route.in: {events_in: 500, dropped_count: 500, events_out: 0}}.
+	ExpectStats map[string]map[string]int64 `yaml:"expect_stats"`
 
 	// BaselineSeconds (config_update data-plane mode only) is how long the driver
 	// confirms delivery is suppressed after the BEFORE config is delivered, before

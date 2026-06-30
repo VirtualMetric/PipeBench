@@ -3518,6 +3518,18 @@ func clusterActionLabel(action string) string {
 // fleetStatus mirrors the bench fleet simulator's /status JSON. Each director's
 // inbound frames are keyed by "<action>.<command>" (e.g. "req.health",
 // "rep.remote_check") with a count and the last payload seen.
+type fleetStatBucket struct {
+	Events       int64 `json:"events"`
+	EventsIn     int64 `json:"events_in"`
+	EventsOut    int64 `json:"events_out"`
+	ErrorCount   int64 `json:"error_count"`
+	DroppedCount int64 `json:"dropped_count"`
+	BytesIn      int64 `json:"bytes_in"`
+	BytesOut     int64 `json:"bytes_out"`
+	ExecCount    int64 `json:"exec_count"`    // pipeline.* only: per-processor execution count
+	ExecTimeNs   int64 `json:"exec_time_ns"`  // pipeline.* only: per-processor execution time
+}
+
 type fleetStatus struct {
 	Directors map[string]struct {
 		Connected bool `json:"connected"`
@@ -3526,7 +3538,46 @@ type fleetStatus struct {
 			Count    int    `json:"count"`
 			LastData string `json:"last_data"`
 		} `json:"inbound"`
+		// Stats are decoded from the director's forwarded VMF metric frames by
+		// the simulator (see fleetsim/vmfstats.go), keyed by "<inputtype>.<type>"
+		// e.g. "route.in", "target.out".
+		Stats        map[string]fleetStatBucket `json:"stats"`
+		StatsFrames  int                        `json:"stats_frames"`
+		StatsRecords int                        `json:"stats_records"`
 	} `json:"directors"`
+}
+
+// statField returns the named counter of a decoded stats bucket for a director.
+func (st *fleetStatus) statField(id, bucket, field string) (int64, bool) {
+	d, ok := st.Directors[id]
+	if !ok {
+		return 0, false
+	}
+	b, ok := d.Stats[bucket]
+	if !ok {
+		return 0, false
+	}
+	switch field {
+	case "events_in":
+		return b.EventsIn, true
+	case "events_out":
+		return b.EventsOut, true
+	case "error_count":
+		return b.ErrorCount, true
+	case "dropped_count":
+		return b.DroppedCount, true
+	case "bytes_in":
+		return b.BytesIn, true
+	case "bytes_out":
+		return b.BytesOut, true
+	case "events":
+		return b.Events, true
+	case "exec_count":
+		return b.ExecCount, true
+	case "exec_time_ns":
+		return b.ExecTimeNs, true
+	}
+	return 0, false
 }
 
 func (st *fleetStatus) connected(id string) bool {
@@ -3611,6 +3662,47 @@ func fleetWaitCount(simContainer, dirID, key string, min int, deadline time.Time
 		time.Sleep(3 * time.Second)
 	}
 	return last, false
+}
+
+// fleetWaitStats polls the simulator's DECODED stats until every expected
+// bucket/counter is reached, then requires an EXACT match — the counters are
+// deterministic for a fixed, replayed input, so an over-count is as much a
+// failure as an under-count. Returns nil on success, or an error describing the
+// outstanding mismatch when the deadline passes.
+func fleetWaitStats(simContainer, dirID string, expect map[string]map[string]int64, deadline time.Time) error {
+	var lastErr error
+	for {
+		st, err := fleetSimStatus(simContainer)
+		if err != nil {
+			lastErr = err
+		} else {
+			lastErr = nil
+			reached := true
+			for bucket, fields := range expect {
+				for field, want := range fields {
+					got, ok := st.statField(dirID, bucket, field)
+					switch {
+					case got > want:
+						// Stats must be exact — an over-count is a hard failure.
+						return fmt.Errorf("%s.%s = %d, want exactly %d (over-counted)", bucket, field, got, want)
+					case !ok || got < want:
+						reached = false
+						lastErr = fmt.Errorf("%s.%s = %d, want %d", bucket, field, got, want)
+					}
+				}
+			}
+			if reached {
+				return nil
+			}
+		}
+		if !time.Now().Before(deadline) {
+			if lastErr == nil {
+				lastErr = fmt.Errorf("stats not reached by deadline")
+			}
+			return lastErr
+		}
+		time.Sleep(3 * time.Second)
+	}
 }
 
 // fleetStr returns v, or def when v is empty.
@@ -3808,27 +3900,86 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		b64 := base64.StdEncoding.EncodeToString(vmfBytes)
 		if _, se := fleetSimSend(simContainer, dirID, "config", map[string]any{"data_b64": b64}); se != nil {
 			errs = append(errs, "failed to deliver operational config: "+se.Error())
+			passed = false
+			return r.saveFleetResult(tc, subject, configName, startTime, finalCount, passed, errs, simContainer, subjectContainer)
 		}
-		// Wait for the director to apply + reload it (its listeners / agent-comm
-		// HTTPS server come up once SystemDB is populated). Poll the subject's logs.
+		// Confirm the director APPLIED the config via its fleet-link
+		// acknowledgment (a rep.config reply with executed=true), not by grepping
+		// the subject's logs. The director's data listeners come up as part of the
+		// apply, so the ack is an equivalent readiness signal — and crucially it is
+		// CONFIG-INDEPENDENT: the old log-grep read `docker logs` (container
+		// stdout), which is SILENT unless the case sets debug.console/log.status, so
+		// it spuriously warned on a director that had in fact applied the config and
+		// brought its pipeline up (confirmed: a debug.level-only config writes logs
+		// to neither stdout nor a file). The rep.config ack is emitted regardless of
+		// the director's logging configuration. A missing ack, or a reply that is
+		// not executed=true, is a fatal setup failure: the delivered config never
+		// took effect, so the scenario below would assert against an un-applied
+		// director and could report a false success. Mirrors the hard-fail in the
+		// config_update scenario.
 		applyDeadline := time.Now().Add(settle + 60*time.Second)
 		if applyDeadline.After(runDeadline) {
 			applyDeadline = runDeadline
 		}
-		applied := false
-		for time.Now().Before(applyDeadline) {
-			out, _ := exec.Command("docker", "logs", "--tail", "200", subjectContainer).CombinedOutput()
-			s := string(out)
-			if strings.Contains(s, "Director HTTP Server started") || strings.Contains(s, "Listener (") {
-				applied = true
-				break
-			}
-			time.Sleep(3 * time.Second)
+		if _, ok := fleetWaitCount(simContainer, dirID, "rep.config", 1, applyDeadline); !ok {
+			errs = append(errs, "director did not acknowledge the delivered config over the fleet link")
+			passed = false
+			return r.saveFleetResult(tc, subject, configName, startTime, finalCount, passed, errs, simContainer, subjectContainer)
 		}
-		if applied {
-			fmt.Println("  director applied the delivered config (pipeline + agent-comm up) ✓")
+		last := ""
+		if st, e := fleetSimStatus(simContainer); e == nil {
+			last = st.lastData(dirID, "rep.config")
+		}
+		if !strings.Contains(last, "\"executed\":true") {
+			errs = append(errs, fmt.Sprintf("director replied to the delivered config but did not report it executed: %.200s", last))
+			passed = false
+			return r.saveFleetResult(tc, subject, configName, startTime, finalCount, passed, errs, simContainer, subjectContainer)
+		}
+		fmt.Println("  director applied the delivered config (executed) ✓")
+	}
+
+	// Resilience: bounce the director mid-stream. An agent that is streaming must
+	// buffer + retry across the restart (no error storm — the agent controls its
+	// own retry cadence, there is no server-side NAK redelivery on the
+	// /agent/vmf path), and once the director is back every record must still be
+	// accounted for in the decoded stats (ExpectStats is asserted AFTER this).
+	// Pair with a persistent_storage director so staged payloads survive the
+	// bounce. Stop+start restarts the SAME container, so the director's storage +
+	// last-applied config survive; we re-deliver the config anyway in case it
+	// waits for the platform after a restart.
+	if fc.RestartMidRun {
+		// restart_mid_run only makes sense for the stats scenario: it asserts
+		// ExpectStats AFTER the bounce (resilience of the decoded stats). For any
+		// other scenario the restart would run but nothing downstream validates it,
+		// so reject the combination up front rather than silently bouncing the
+		// director and proceeding.
+		if fc.Scenario != "stats" {
+			errs = append(errs, fmt.Sprintf("restart_mid_run is only supported for the stats scenario, not %q", fc.Scenario))
+			passed = false
+			return r.saveFleetResult(tc, subject, configName, startTime, finalCount, passed, errs, simContainer, subjectContainer)
+		}
+		fmt.Println("  letting the agent stream before the restart…")
+		time.Sleep(25 * time.Second)
+		fmt.Println("  restarting the director (stop + start) mid-stream…")
+		if err := orch.StopServices(30*time.Second, "subject"); err != nil {
+			errs = append(errs, "failed to stop director for restart: "+err.Error())
+		}
+		time.Sleep(8 * time.Second) // director-down window — the agent should retry, not storm
+		if err := orch.UpServices("subject"); err != nil {
+			errs = append(errs, "failed to restart director: "+err.Error())
+		}
+		if !fleetWaitConnected(simContainer, dirID, time.Now().Add(90*time.Second)) {
+			errs = append(errs, "director did not reconnect to the fleet simulator after restart")
 		} else {
-			fmt.Println("  (warning) did not observe the director bring up its pipeline/agent-comm after config delivery")
+			fmt.Println("  director reconnected after restart ✓")
+			if fc.DeliverConfig != "" {
+				if vmfBytes, e := os.ReadFile(filepath.Join(caseDir, "configs", fc.DeliverConfig)); e == nil {
+					b64 := base64.StdEncoding.EncodeToString(vmfBytes)
+					_, _ = fleetSimSend(simContainer, dirID, "config", map[string]any{"data_b64": b64})
+					_, _ = fleetWaitCount(simContainer, dirID, "rep.config", 2, time.Now().Add(60*time.Second))
+					fmt.Println("  re-delivered operational config after restart ✓")
+				}
+			}
 		}
 	}
 
@@ -4227,6 +4378,23 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 			errs = append(errs, "director did not forward any stats/metrics frames")
 		} else {
 			fmt.Printf("  stats frames: metricsvmf=%d metrics=%d ✓\n", c1, c2)
+		}
+
+		// Deep validation: assert on the stats the simulator DECODED from the
+		// forwarded VMF (drop/error/in/out counters), not merely that frames
+		// arrived. This is what proves the director's pipeline-error / dropped
+		// counters increment correctly and surface on the stats path.
+		if len(fc.ExpectStats) > 0 {
+			if serr := fleetWaitStats(simContainer, dirID, fc.ExpectStats, scenarioDeadline()); serr != nil {
+				errs = append(errs, "decoded stats mismatch: "+serr.Error())
+			} else {
+				fmt.Println("  decoded stats match expectations ✓")
+				if st, e := fleetSimStatus(simContainer); e == nil {
+					if d, ok := st.Directors[dirID]; ok {
+						fmt.Printf("  decoded %d stat records in %d frames\n", d.StatsRecords, d.StatsFrames)
+					}
+				}
+			}
 		}
 
 	case "reconnect":
