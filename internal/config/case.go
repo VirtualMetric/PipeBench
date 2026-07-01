@@ -1563,7 +1563,7 @@ func (tc *TestCase) validateHTTPSource() error {
 		return fmt.Errorf("case %q: type http_source_correctness requires an `http_source:` block", tc.Name)
 	}
 	switch tc.HTTPSource.Scenario {
-	case "deliver", "reject":
+	case "deliver", "reject", "drop":
 	default:
 		return fmt.Errorf("case %q: unknown http_source.scenario %q", tc.Name, tc.HTTPSource.Scenario)
 	}
