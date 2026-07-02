@@ -3648,6 +3648,29 @@ func fleetSimSend(simContainer, dirID, command string, params map[string]any) (s
 	return string(out), nil
 }
 
+// fleetSimDLProbe asks the simulator to fire GET probes at the director's /dl
+// endpoint (params: url, device_id, token, count, concurrency) and returns the
+// observed HTTP status histogram (status-code string → count). Status "0" means
+// the request never got an HTTP response (director not up / connection error).
+func fleetSimDLProbe(simContainer string, params map[string]any) (map[string]int, error) {
+	body, _ := json.Marshal(params)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "docker", "exec", simContainer,
+		"wget", "-q", "-T", "100", "-O", "-", "--post-data="+string(body),
+		"http://127.0.0.1:8090/dlprobe").CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("dlprobe: %w (out: %.200s)", err, string(out))
+	}
+	var resp struct {
+		Histogram map[string]int `json:"histogram"`
+	}
+	if err := json.Unmarshal(out, &resp); err != nil {
+		return nil, fmt.Errorf("decode dlprobe: %w (raw: %.200s)", err, string(out))
+	}
+	return resp.Histogram, nil
+}
+
 // fleetWaitConnected polls until the director shows connected at the simulator.
 func fleetWaitConnected(simContainer, dirID string, deadline time.Time) bool {
 	for time.Now().Before(deadline) {
@@ -3899,17 +3922,23 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 	}
 
 	// All other scenarios: wait for the director to connect first.
-	connDeadline := time.Now().Add(warmup + 90*time.Second)
-	if connDeadline.After(runDeadline) {
-		connDeadline = runDeadline
+	// EXCEPTION: agent_download_gate does not use the fleet link at all — the
+	// director serves /dl straight from its own mounted config (which carries an
+	// environments block) and the simulator only probes /dl. Skip the connect
+	// gate (and the deliver_config step below is already a no-op without one).
+	if fc.Scenario != "agent_download_gate" {
+		connDeadline := time.Now().Add(warmup + 90*time.Second)
+		if connDeadline.After(runDeadline) {
+			connDeadline = runDeadline
+		}
+		fmt.Printf("  waiting for the director to connect to the fleet simulator (up to %s)…\n", time.Until(connDeadline).Round(time.Second))
+		if !fleetWaitConnected(simContainer, dirID, connDeadline) {
+			errs = append(errs, "director never connected to the fleet simulator")
+			passed = false
+			return r.saveFleetResult(tc, subject, configName, startTime, finalCount, passed, errs, simContainer, subjectContainer)
+		}
+		fmt.Println("  director connected to the fleet simulator ✓")
 	}
-	fmt.Printf("  waiting for the director to connect to the fleet simulator (up to %s)…\n", time.Until(connDeadline).Round(time.Second))
-	if !fleetWaitConnected(simContainer, dirID, connDeadline) {
-		errs = append(errs, "director never connected to the fleet simulator")
-		passed = false
-		return r.saveFleetResult(tc, subject, configName, startTime, finalCount, passed, errs, simContainer, subjectContainer)
-	}
-	fmt.Println("  director connected to the fleet simulator ✓")
 
 	// Deliver the audited operational config (the platform's job). A fleet
 	// director loads its operational config (environments/devices/targets/routes/
@@ -4048,6 +4077,92 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 			errs = append(errs, "director did not send an initial config request")
 		} else {
 			fmt.Println("  initial config request seen ✓")
+		}
+
+	case "agent_download_gate":
+		// The director serves /dl over plain HTTP on its discovery port (8080).
+		// It authorizes each agent binary download from the device's update policy
+		// in the subject config (immediate/scheduled/authorized → 200; user-action
+		// without authorization → 403), and throttles concurrent downloads (429).
+		// fleetsim probes /dl by the subject's network hostname.
+		osArch := fleetStr(fc.DownloadOSArch, "linux/amd64")
+		dlURL := "http://subject:8080/dl/agent/" + osArch
+		probe := func(devID string, count, conc int) (map[string]int, error) {
+			return fleetSimDLProbe(simContainer, map[string]any{
+				"url": dlURL, "device_id": devID, "count": count, "concurrency": conc,
+			})
+		}
+
+		// Readiness: the director needs its environment config + listeners up
+		// before /dl serves. An unmanaged probe returns a real HTTP status (403),
+		// while a connection error is bucketed as "0".
+		fmt.Println("  waiting for the director's /dl endpoint to serve…")
+		ready := false
+		// Snapshot the deadline once so the wait expires at a fixed settle-based
+		// point; recomputing scenarioDeadline() each iteration would slide it
+		// forward (to runDeadline) instead of failing fast like the other waits.
+		readyDeadline := scenarioDeadline()
+		for time.Now().Before(readyDeadline) {
+			if h, e := probe("0", 1, 1); e == nil && len(h) > 0 && h["0"] == 0 {
+				ready = true
+				break
+			}
+			time.Sleep(3 * time.Second)
+		}
+		if !ready {
+			errs = append(errs, "director /dl endpoint never returned an HTTP response")
+			break
+		}
+		fmt.Println("  /dl endpoint is serving ✓")
+
+		// Per-device gate assertions.
+		for _, p := range fc.DownloadGate {
+			h, e := probe(p.DeviceID, 1, 1)
+			if e != nil {
+				errs = append(errs, fmt.Sprintf("dl probe device=%s failed: %v", p.DeviceID, e))
+				continue
+			}
+			// probe(_, 1, 1) fires exactly one request, so the histogram must have
+			// exactly one nonzero bucket — the observed status. Require that
+			// explicitly rather than depending on map-iteration order.
+			got, nonzero := 0, 0
+			for codeStr, n := range h {
+				if n > 0 {
+					got, _ = strconv.Atoi(codeStr)
+					nonzero++
+				}
+			}
+			if nonzero != 1 {
+				errs = append(errs, fmt.Sprintf("device %s: /dl probe returned %d nonzero status buckets, want exactly 1 (hist %v)", p.DeviceID, nonzero, h))
+				continue
+			}
+			if got != p.ExpectCode {
+				errs = append(errs, fmt.Sprintf("device %s: /dl returned %d, want %d", p.DeviceID, got, p.ExpectCode))
+			} else {
+				fmt.Printf("  device %s -> %d ✓\n", p.DeviceID, got)
+			}
+		}
+
+		// Throttle burst: fire N concurrent downloads for an ALLOWED device (a
+		// blocked device 403s before acquiring a slot, so it can't exercise the
+		// throttle) and assert at least ThrottleMin429 come back 429.
+		if fc.ThrottleCount > 0 {
+			// validateFleet guarantees ThrottleDeviceID is set (an allowed device)
+			// whenever ThrottleCount > 0, so there is no blocked-"0" fallback here —
+			// that would 403 before acquiring a slot and never reach the 429 check.
+			tdev := fc.ThrottleDeviceID
+			h, e := probe(tdev, fc.ThrottleCount, fc.ThrottleCount)
+			if e != nil {
+				errs = append(errs, "throttle probe failed: "+e.Error())
+			} else {
+				got429 := h["429"]
+				finalCount = int64(got429)
+				if got429 < fc.ThrottleMin429 {
+					errs = append(errs, fmt.Sprintf("throttle: got %d×429 across %d concurrent, want >= %d (hist %v)", got429, fc.ThrottleCount, fc.ThrottleMin429, h))
+				} else {
+					fmt.Printf("  throttle: %d/%d concurrent downloads got 429 ✓\n", got429, fc.ThrottleCount)
+				}
+			}
 		}
 
 	case "remote_check":
