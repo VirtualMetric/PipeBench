@@ -1227,6 +1227,30 @@ type FleetConfig struct {
 	// pushing the AFTER config. It proves the case really starts suppressed
 	// (otherwise "delivery after the update" is vacuous). Default 20.
 	BaselineSeconds int `yaml:"baseline_seconds"`
+
+	// DownloadGate (agent_download_gate scenario) lists the per-device probes the
+	// driver fires at the director's /dl/agent/<os>/<arch> endpoint: each GET
+	// carries X-VM-Device-Id and must return ExpectCode (200 = served, 403 =
+	// blocked). This exercises the director's authoritative update-download gate
+	// against devices whose update policy is set in the subject's config.
+	DownloadGate []DownloadGateProbe `yaml:"download_gate"`
+	// DownloadOSArch is the "<os>/<arch>" path segment probed (default "linux/amd64").
+	DownloadOSArch string `yaml:"download_os_arch"`
+	// ThrottleCount (agent_download_gate) fires this many CONCURRENT downloads for
+	// an allowed device; ThrottleMin429 asserts at least this many come back 429
+	// (the director's download throttle engaged). 0 skips the throttle check.
+	ThrottleCount  int `yaml:"throttle_count"`
+	ThrottleMin429 int `yaml:"throttle_min_429"`
+	// ThrottleDeviceID is the (allowed) device id used for the throttle burst
+	// (default "0" would be blocked; set it to an immediate/authorized device).
+	ThrottleDeviceID string `yaml:"throttle_device_id"`
+}
+
+// DownloadGateProbe is one agent_download_gate assertion: GET /dl as DeviceID,
+// expect HTTP ExpectCode.
+type DownloadGateProbe struct {
+	DeviceID   string `yaml:"device_id"`
+	ExpectCode int    `yaml:"expect_code"`
 }
 
 // BaselineSecondsOrDefault returns BaselineSeconds or 20 when unset.
@@ -1344,6 +1368,15 @@ func (tc *TestCase) validateFleet() error {
 		}
 		if !tc.UsesVerifier() {
 			return fmt.Errorf("case %q: fleet.scenario pipeline_verify_change requires a `verifier:` block (the object-store verdict)", tc.Name)
+		}
+	case "agent_download_gate":
+		// The director serves /dl for agent binary downloads; the driver probes it
+		// per-device and asserts the authorization gate (200/403) + throttle (429).
+		// The subject config carries the device update policies directly (plain
+		// YAML with an environments block — no deliver_config), so nothing extra is
+		// required here beyond the download_gate probe list.
+		if len(tc.Fleet.DownloadGate) == 0 && tc.Fleet.ThrottleCount == 0 {
+			return fmt.Errorf("case %q: fleet.scenario agent_download_gate requires fleet.download_gate probes and/or fleet.throttle_count", tc.Name)
 		}
 	case "connect", "config_update", "remote_check", "live_data", "console_log", "stats", "reconnect", "bad_token", "self_managed", "enrollment":
 	default:
