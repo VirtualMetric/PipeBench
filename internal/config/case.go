@@ -1378,6 +1378,18 @@ func (tc *TestCase) validateFleet() error {
 		if len(tc.Fleet.DownloadGate) == 0 && tc.Fleet.ThrottleCount == 0 {
 			return fmt.Errorf("case %q: fleet.scenario agent_download_gate requires fleet.download_gate probes and/or fleet.throttle_count", tc.Name)
 		}
+		// When the throttle burst is enabled it must actually be able to engage the
+		// throttle: require a positive 429 threshold (otherwise the 429 assertion is
+		// vacuous) and an explicit allowed device (the default "0" is blocked and
+		// would 403 before ever acquiring a download slot).
+		if tc.Fleet.ThrottleCount > 0 {
+			if tc.Fleet.ThrottleMin429 <= 0 {
+				return fmt.Errorf("case %q: fleet.scenario agent_download_gate with throttle_count > 0 requires throttle_min_429 > 0 (else the 429 assertion is vacuous)", tc.Name)
+			}
+			if tc.Fleet.ThrottleDeviceID == "" {
+				return fmt.Errorf("case %q: fleet.scenario agent_download_gate with throttle_count > 0 requires throttle_device_id (an allowed device; the default \"0\" is blocked and never reaches the throttle)", tc.Name)
+			}
+		}
 	case "connect", "config_update", "remote_check", "live_data", "console_log", "stats", "reconnect", "bad_token", "self_managed", "enrollment":
 	default:
 		return fmt.Errorf("case %q: unknown fleet.scenario %q", tc.Name, tc.Fleet.Scenario)

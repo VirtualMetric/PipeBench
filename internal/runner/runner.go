@@ -4098,7 +4098,11 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		// while a connection error is bucketed as "0".
 		fmt.Println("  waiting for the director's /dl endpoint to serve…")
 		ready := false
-		for time.Now().Before(scenarioDeadline()) {
+		// Snapshot the deadline once so the wait expires at a fixed settle-based
+		// point; recomputing scenarioDeadline() each iteration would slide it
+		// forward (to runDeadline) instead of failing fast like the other waits.
+		readyDeadline := scenarioDeadline()
+		for time.Now().Before(readyDeadline) {
 			if h, e := probe("0", 1, 1); e == nil && len(h) > 0 && h["0"] == 0 {
 				ready = true
 				break
@@ -4118,11 +4122,19 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 				errs = append(errs, fmt.Sprintf("dl probe device=%s failed: %v", p.DeviceID, e))
 				continue
 			}
-			got := 0
+			// probe(_, 1, 1) fires exactly one request, so the histogram must have
+			// exactly one nonzero bucket — the observed status. Require that
+			// explicitly rather than depending on map-iteration order.
+			got, nonzero := 0, 0
 			for codeStr, n := range h {
 				if n > 0 {
 					got, _ = strconv.Atoi(codeStr)
+					nonzero++
 				}
+			}
+			if nonzero != 1 {
+				errs = append(errs, fmt.Sprintf("device %s: /dl probe returned %d nonzero status buckets, want exactly 1 (hist %v)", p.DeviceID, nonzero, h))
+				continue
 			}
 			if got != p.ExpectCode {
 				errs = append(errs, fmt.Sprintf("device %s: /dl returned %d, want %d", p.DeviceID, got, p.ExpectCode))
@@ -4135,7 +4147,10 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		// blocked device 403s before acquiring a slot, so it can't exercise the
 		// throttle) and assert at least ThrottleMin429 come back 429.
 		if fc.ThrottleCount > 0 {
-			tdev := fleetStr(fc.ThrottleDeviceID, "0")
+			// validateFleet guarantees ThrottleDeviceID is set (an allowed device)
+			// whenever ThrottleCount > 0, so there is no blocked-"0" fallback here —
+			// that would 403 before acquiring a slot and never reach the 429 check.
+			tdev := fc.ThrottleDeviceID
 			h, e := probe(tdev, fc.ThrottleCount, fc.ThrottleCount)
 			if e != nil {
 				errs = append(errs, "throttle probe failed: "+e.Error())
