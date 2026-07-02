@@ -5118,7 +5118,9 @@ func httpSenderStats(senderContainer string, ctrlPort int) (sent, accepted, reje
 // with the bench-httpsender: the sender POSTs one event per request (HMAC/basic/
 // header/HEC-token auth, optional gzip/TLS) and the director forwards each to the
 // receiver. For "deliver" the driver asserts every event arrives; for "reject" it
-// asserts nothing arrives AND the sender saw the requests rejected.
+// asserts nothing arrives AND the sender saw the requests rejected (4xx); for
+// "drop" it asserts nothing arrives BUT the sender was accepted (200) — an
+// accept-then-drop path such as a tenant-gate route pipeline.
 func (r *Runner) runHTTPSourceCorrectness(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
 	configName := r.opts.ConfigName
 	subject = r.applySubjectOverrides(subject)
@@ -5255,6 +5257,38 @@ func (r *Runner) runHTTPSourceCorrectness(tc *config.TestCase, subject config.Su
 			errs = append(errs, fmt.Sprintf("sender saw only %d/%d rejections (accepted=%d) — source may not be enforcing auth", rejected, expected, accepted))
 		} else {
 			fmt.Printf("  source rejected all %d requests ✓\n", rejected)
+		}
+	} else if hs.Scenario == "drop" {
+		// The source ACCEPTS every request (valid credential) but a downstream
+		// pipeline DROPS the records — e.g. a tenant-gate route pipeline that
+		// drops records whose _vmetric.event.tenant_id doesn't match. Nothing
+		// reaches the receiver. Unlike "reject", the verdict rests on the sender
+		// being ACCEPTED (not 4xx) AND the receiver getting nothing — that is what
+		// distinguishes a pipeline drop from an auth rejection.
+		fmt.Printf("  asserting the source ACCEPTS every request but the pipeline DROPS them (up to %s)…\n", time.Until(deadline).Round(time.Second))
+		for time.Now().Before(deadline) {
+			if s, _, _, e := httpSenderStats(senderContainer, ctrlPort); e == nil && s >= expected {
+				break
+			}
+			time.Sleep(3 * time.Second)
+		}
+		got := r.ccfWaitStable(metricsPort, time.Now().Add(12*time.Second))
+		finalCount = got
+		_, accepted, rejected, e := httpSenderStats(senderContainer, ctrlPort)
+		if got > 0 {
+			errs = append(errs, fmt.Sprintf("delivered %d records; expected the pipeline to drop all of them", got))
+		} else {
+			fmt.Println("  no events delivered (accepted, then dropped by the pipeline) ✓")
+		}
+		// Positive sender-side evidence: the requests must have been ACCEPTED
+		// (a pipeline drop, not an auth reject). If /stats is unavailable or the
+		// sender saw rejections, this isn't the accept-then-drop path we intend.
+		if e != nil {
+			errs = append(errs, "could not read sender /stats to confirm acceptance: "+e.Error())
+		} else if accepted < expected {
+			errs = append(errs, fmt.Sprintf("sender saw only %d/%d accepted (rejected=%d) — requests were not accepted at the source; expected accept-then-drop, not an auth reject", accepted, expected, rejected))
+		} else {
+			fmt.Printf("  source accepted all %d requests; pipeline dropped them ✓\n", accepted)
 		}
 	} else {
 		// deliver: every posted event must reach the receiver.
