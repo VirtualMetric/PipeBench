@@ -242,6 +242,9 @@ services:
 {{- if .CaseCertsHost }}
       - "{{ .CaseCertsHost }}:/opt/vmetric/certs:ro"
 {{- end }}
+{{- if .DatabaseCAHost }}
+      - "{{ .DatabaseCAHost }}:/opt/vmetric/certs/ca.pem:ro"
+{{- end }}
 {{- if .KrbHostDir }}
       - "{{ .KrbHostDir }}:/krb5:ro"
 {{- end }}
@@ -1006,6 +1009,12 @@ services:
 {{- range $k, $v := .DatabaseEnv }}
       {{ $k }}: "{{ $v }}"
 {{- end }}
+{{- if .DatabaseTLSEnabled }}
+    volumes:
+      - "{{ .DatabaseServerCertHost }}:{{ .DatabaseServerCertPath }}:ro"
+      - "{{ .DatabaseServerKeyHost }}:{{ .DatabaseServerKeyPath }}:ro"
+      - "{{ .DatabaseConfHost }}:{{ .DatabaseConfPath }}:ro"
+{{- end }}
     healthcheck:
       test: ["CMD-SHELL", "{{ .DatabaseHealthCmd }}"]
       interval: 5s
@@ -1168,6 +1177,12 @@ type RunConfig struct {
 	// PrepareDatabase for a `database:`-enabled case. NewComposeRunner
 	// populates it when empty; tests may set it directly.
 	DatabaseSeedHost string
+	// DatabaseCertDir / DatabaseConfHost are provisioned by PrepareDatabaseTLS
+	// for a `database.tls: true` case: DatabaseCertDir holds ca.crt +
+	// server.crt + server.key, DatabaseConfHost is the engine TLS config file.
+	// NewComposeRunner populates them when empty.
+	DatabaseCertDir  string
+	DatabaseConfHost string
 	// KrbHostDir / KerberosInitCmd are provisioned by PrepareKerberos for a
 	// `kafka.auth.mechanism: gssapi` case. NewComposeRunner populates them when
 	// empty; tests may set them directly to render without touching the KDC.
@@ -1223,6 +1238,21 @@ func NewComposeRunner(cfg RunConfig) (*ComposeRunner, error) {
 			return nil, fmt.Errorf("preparing database topology: %w", err)
 		}
 		cfg.DatabaseSeedHost = seedPath
+	}
+
+	// Database TLS prep: generate a CA + RSA server cert and the engine TLS
+	// config so the database container presents a verifiable cert and the
+	// subject can trust the CA. Same populate-when-empty pattern.
+	if cfg.TestCase.UsesDatabaseTLS() && cfg.DatabaseCertDir == "" {
+		engine, ok := config.DatabaseEngines[cfg.TestCase.Database.Engine]
+		if !ok {
+			return nil, fmt.Errorf("preparing database tls: unknown engine %q", cfg.TestCase.Database.Engine)
+		}
+		tp, err := PrepareDatabaseTLS(cfg.TmpDir, engine)
+		if err != nil {
+			return nil, fmt.Errorf("preparing database tls: %w", err)
+		}
+		cfg.DatabaseCertDir, cfg.DatabaseConfHost = tp.CertDir, tp.ConfPath
 	}
 
 	// Kerberos topology prep, same pattern as Vault: a gssapi case needs the
@@ -1755,6 +1785,18 @@ type composeVars struct {
 	DatabaseHealthCmd string
 	DatabaseInitCmd   string
 	DatabaseSeedHost  string
+
+	// Database TLS (gated by DatabaseTLSEnabled). *Host are host paths bind-
+	// mounted into the database container at the engine's *Path targets;
+	// DatabaseCAHost is the CA mounted into the subject so a device can verify.
+	DatabaseTLSEnabled     bool
+	DatabaseServerCertHost string
+	DatabaseServerKeyHost  string
+	DatabaseConfHost       string
+	DatabaseServerCertPath string
+	DatabaseServerKeyPath  string
+	DatabaseConfPath       string
+	DatabaseCAHost         string
 
 	RecvMode              string
 	RecvListen            string
@@ -2323,6 +2365,24 @@ func writeCompose(path string, cfg RunConfig) error {
 		vars.DatabaseHealthCmd = engine.BuildHealthCmd(password)
 		vars.DatabaseInitCmd = engine.BuildInitCmd(password, dbName)
 		vars.DatabaseSeedHost = filepath.ToSlash(cfg.DatabaseSeedHost)
+
+		// Database TLS: mount the generated server cert/key + engine TLS conf
+		// into the database container and the CA into the subject so a device
+		// can verify the server certificate instead of skipping verification.
+		if tc.UsesDatabaseTLS() {
+			if cfg.DatabaseCertDir == "" || engine.TLSServerCertPath == "" {
+				return fmt.Errorf("case %q uses database.tls but the tls certs were not prepared (or engine %q lacks TLS support)", tc.Name, tc.Database.Engine)
+			}
+			confMount, _ := engine.BuildTLSConf()
+			vars.DatabaseTLSEnabled = true
+			vars.DatabaseServerCertHost = filepath.ToSlash(filepath.Join(cfg.DatabaseCertDir, "server.crt"))
+			vars.DatabaseServerKeyHost = filepath.ToSlash(filepath.Join(cfg.DatabaseCertDir, "server.key"))
+			vars.DatabaseConfHost = filepath.ToSlash(cfg.DatabaseConfHost)
+			vars.DatabaseServerCertPath = engine.TLSServerCertPath
+			vars.DatabaseServerKeyPath = engine.TLSServerKeyPath
+			vars.DatabaseConfPath = confMount
+			vars.DatabaseCAHost = filepath.ToSlash(filepath.Join(cfg.DatabaseCertDir, "ca.crt"))
+		}
 	}
 
 	if tc.MultiReceiver() {

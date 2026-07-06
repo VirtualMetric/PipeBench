@@ -553,6 +553,12 @@ type DatabaseConfig struct {
 	// engine's CLI against Database. Mounted as a file — never rendered
 	// inline into a command line.
 	SeedSQL string `yaml:"seed_sql"`
+	// TLS makes the database container present a per-run CA-signed server
+	// certificate (SAN "database") so a device can verify it instead of using
+	// insecure_skip_verify. The CA is mounted into the subject at
+	// /opt/vmetric/certs/ca.crt; whether a device trusts it is the device's
+	// own config choice (a negative case can withhold the CA to prove reject).
+	TLS bool `yaml:"tls"`
 }
 
 // ImageOrDefault, PasswordOrDefault, DatabaseOrDefault centralize the
@@ -864,6 +870,10 @@ func (tc *TestCase) UsesVault() bool { return tc.Vault != nil }
 
 // UsesDatabase reports whether the case adds a database backend to the topology.
 func (tc *TestCase) UsesDatabase() bool { return tc.Database != nil }
+
+// UsesDatabaseTLS reports whether the database container should terminate TLS
+// with a per-run CA-signed cert (so devices can verify instead of skip-verify).
+func (tc *TestCase) UsesDatabaseTLS() bool { return tc.Database != nil && tc.Database.TLS }
 
 // UsesVerifier reports whether the case drives correctness through the one-shot
 // DuckDB verifier container instead of a receiver.

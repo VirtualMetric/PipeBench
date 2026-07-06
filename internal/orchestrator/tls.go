@@ -4,6 +4,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -130,6 +131,94 @@ func GenerateTLSCerts(outDir string, serverHosts []string) (string, error) {
 	}
 
 	return abs, nil
+}
+
+// GenerateDatabaseTLSCerts writes a self-signed CA plus an RSA server leaf
+// (SAN = serverHosts) to outDir, for a database container that terminates TLS.
+// Unlike GenerateTLSCerts (ECDSA), the keys are RSA-2048: SQL Server on Linux
+// only accepts RSA certificates for its TLS endpoint. Files written:
+//
+//	ca.crt      — root CA certificate (PEM); the director trusts this to verify the server
+//	server.crt  — server leaf with SAN serverHosts (PEM), signed by ca.crt
+//	server.key  — server leaf private key (RSA, PEM)
+//
+// server.key is world-readable (0644): the SQL Server container runs as a
+// non-root user and must read the mounted key. Per-run throwaway cert in a
+// temp dir, removed with it — never real key material.
+func GenerateDatabaseTLSCerts(outDir string, serverHosts []string) (string, error) {
+	abs, err := filepath.Abs(outDir)
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(abs, 0o755); err != nil {
+		return "", fmt.Errorf("creating cert dir: %w", err)
+	}
+
+	// 1. Root CA
+	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return "", fmt.Errorf("generate ca key: %w", err)
+	}
+	caTpl := &x509.Certificate{
+		SerialNumber:          bigSerial(),
+		Subject:               pkix.Name{CommonName: "PipeBench Database CA"},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTpl, caTpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		return "", fmt.Errorf("sign ca cert: %w", err)
+	}
+	if err := writePEMCert(filepath.Join(abs, "ca.crt"), caDER); err != nil {
+		return "", err
+	}
+
+	// 2. Server leaf (the database endpoint)
+	if len(serverHosts) == 0 {
+		serverHosts = []string{"database"}
+	}
+	serverDNS, serverIP := splitHosts(serverHosts)
+	srvKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return "", fmt.Errorf("generate server key: %w", err)
+	}
+	srvTpl := &x509.Certificate{
+		SerialNumber: bigSerial(),
+		Subject:      pkix.Name{CommonName: serverHosts[0]},
+		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     serverDNS,
+		IPAddresses:  serverIP,
+	}
+	srvDER, err := x509.CreateCertificate(rand.Reader, srvTpl, caTpl, &srvKey.PublicKey, caKey)
+	if err != nil {
+		return "", fmt.Errorf("sign server cert: %w", err)
+	}
+	if err := writePEMCert(filepath.Join(abs, "server.crt"), srvDER); err != nil {
+		return "", err
+	}
+	if err := writeRSAKey(filepath.Join(abs, "server.key"), srvKey, 0o644); err != nil {
+		return "", err
+	}
+
+	return abs, nil
+}
+
+// writeRSAKey writes an RSA private key as a PKCS#1 PEM block (SQL Server
+// accepts this form). See writePEMKey for the ECDSA equivalent.
+func writeRSAKey(path string, key *rsa.PrivateKey, perm os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return pem.Encode(f, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
 }
 
 // RotateServerCert re-signs a fresh server leaf (new key, new serial, fresh
