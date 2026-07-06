@@ -267,11 +267,19 @@ services:
     deploy:
       resources:
         limits:
+{{- if .CPULimit }}
           cpus: "{{ .CPULimit }}"
+{{- end }}
+{{- if .MemLimit }}
           memory: "{{ .MemLimit }}"
+{{- end }}
         reservations:
+{{- if .CPULimit }}
           cpus: "{{ .CPULimit }}"
+{{- end }}
+{{- if .MemLimit }}
           memory: "{{ .MemLimit }}"
+{{- end }}
 {{- end }}
     restart: "no"
 {{- end }}
@@ -1980,9 +1988,13 @@ func writeCompose(path string, cfg RunConfig) error {
 		BenchSubnet:       benchSubnet,
 		NodesNeedNetAdmin: nodesNeedNetAdmin,
 		SubjectEnv:        env,
+		// Emit only the limits the caller actually set: back-filling the
+		// unset one (the old defaultStr(.., "1"/"1g") behavior) silently
+		// pinned --mem-limit-only runs to 1 CPU and --cpu-limit-only runs
+		// to 1 GB, which throttled the subject into bogus results.
 		HasResourceLimits: cfg.CPULimit != "" || cfg.MemLimit != "",
-		CPULimit:          defaultStr(cfg.CPULimit, "1"),
-		MemLimit:          defaultStr(cfg.MemLimit, "1g"),
+		CPULimit:          cfg.CPULimit,
+		MemLimit:          cfg.MemLimit,
 		UseSharedData:     useSharedData,
 		// DeferReceiver drops the `generator.depends_on: receiver` link
 		// so `UpServices("generator")` doesn't transitively start the
