@@ -184,7 +184,7 @@ services:
     image: "{{ .SubjectImage }}"
     container_name: "{{ .SubjectContainer }}"
     networks: [bench]
-{{- if or .KafkaEnabled .AWSEnabled .AzureEnabled .VaultEnabled .MinioEnabled .PipelineBrokerEnabled .VerifierLocalDir }}
+{{- if or .KafkaEnabled .AWSEnabled .AzureEnabled .VaultEnabled .DatabaseEnabled .MinioEnabled .PipelineBrokerEnabled .VerifierLocalDir }}
     depends_on:
 {{- if .VerifierLocalDir }}
       data-init:
@@ -199,6 +199,10 @@ services:
 {{- end }}
 {{- if .VaultEnabled }}
       vault-init:
+        condition: service_completed_successfully
+{{- end }}
+{{- if .DatabaseEnabled }}
+      database-init:
         condition: service_completed_successfully
 {{- end }}
 {{- if .AWSEnabled }}
@@ -991,6 +995,46 @@ services:
     command:
       - "{{ .VaultInitCmd }}"
 {{- end }}
+{{- if .DatabaseEnabled }}
+
+  database:
+    image: "{{ .DatabaseImage }}"
+    container_name: "bench-database"
+    hostname: "database"
+    networks: [bench]
+    environment:
+{{- range $k, $v := .DatabaseEnv }}
+      {{ $k }}: "{{ $v }}"
+{{- end }}
+    healthcheck:
+      test: ["CMD-SHELL", "{{ .DatabaseHealthCmd }}"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 30s
+    restart: "no"
+
+  # One-shot: create the database and run the seed file, then exit 0. The
+  # subject gates on this completing so the first poll never races an
+  # empty/missing table.
+  database-init:
+    image: "{{ .DatabaseImage }}"
+    container_name: "bench-database-init"
+    networks: [bench]
+    depends_on:
+      database:
+        condition: service_healthy
+    environment:
+{{- range $k, $v := .DatabaseEnv }}
+      {{ $k }}: "{{ $v }}"
+{{- end }}
+    volumes:
+      - "{{ .DatabaseSeedHost }}:/db-seed/init.sql:ro"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "{{ .DatabaseInitCmd }}"
+    restart: "no"
+{{- end }}
 {{- if .AWSEnabled }}
 
   localstack:
@@ -1120,6 +1164,10 @@ type RunConfig struct {
 	VaultTLSHost     string
 	VaultSecretsHost string
 	VaultSeeds       []VaultSeed
+	// DatabaseSeedHost is the host path holding the seed SQL provisioned by
+	// PrepareDatabase for a `database:`-enabled case. NewComposeRunner
+	// populates it when empty; tests may set it directly.
+	DatabaseSeedHost string
 	// KrbHostDir / KerberosInitCmd are provisioned by PrepareKerberos for a
 	// `kafka.auth.mechanism: gssapi` case. NewComposeRunner populates them when
 	// empty; tests may set them directly to render without touching the KDC.
@@ -1164,6 +1212,17 @@ func NewComposeRunner(cfg RunConfig) (*ComposeRunner, error) {
 			return nil, fmt.Errorf("preparing vault topology: %w", err)
 		}
 		cfg.VaultTLSHost, cfg.VaultSecretsHost, cfg.VaultSeeds = vp.TLSDir, vp.SecretsDir, vp.Seeds
+	}
+
+	// Database backend topology prep, same pattern as Vault: a `database:`
+	// case needs the seed SQL file on disk before the compose file is
+	// rendered so database-init can bind-mount it.
+	if cfg.TestCase.UsesDatabase() && cfg.DatabaseSeedHost == "" {
+		seedPath, err := PrepareDatabase(cfg.TmpDir, cfg.TestCase.Database)
+		if err != nil {
+			return nil, fmt.Errorf("preparing database topology: %w", err)
+		}
+		cfg.DatabaseSeedHost = seedPath
 	}
 
 	// Kerberos topology prep, same pattern as Vault: a gssapi case needs the
@@ -1684,6 +1743,18 @@ type composeVars struct {
 	VaultTLSHost     string
 	VaultSecretsHost string
 	VaultInitCmd     string
+
+	// Database backend topology. DatabaseEnabled gates the database +
+	// database-init services and the subject's database-init depends_on.
+	// DatabaseEnv/DatabaseHealthCmd/DatabaseInitCmd are entirely built by
+	// the selected config.DatabaseEngine — this file has no engine-specific
+	// knowledge.
+	DatabaseEnabled   bool
+	DatabaseImage     string
+	DatabaseEnv       map[string]string
+	DatabaseHealthCmd string
+	DatabaseInitCmd   string
+	DatabaseSeedHost  string
 
 	RecvMode              string
 	RecvListen            string
@@ -2228,6 +2299,30 @@ func writeCompose(path string, cfg RunConfig) error {
 		}
 		sb.WriteString("echo vault seeding complete")
 		vars.VaultInitCmd = sb.String()
+	}
+
+	// Database backend: render the database + database-init services and
+	// gate the subject on the seeding completing. All engine-specific
+	// knowledge (image, env, healthcheck, init command) comes from the
+	// selected config.DatabaseEngine — this block just wires it through.
+	if tc.UsesDatabase() {
+		if cfg.DatabaseSeedHost == "" {
+			return fmt.Errorf("case %q uses database but the seed sql was not prepared", tc.Name)
+		}
+		engine, ok := config.DatabaseEngines[tc.Database.Engine]
+		if !ok {
+			// Unreachable in practice: TestCase.Validate rejects an unknown
+			// engine before a run ever reaches compose rendering.
+			return fmt.Errorf("case %q: unknown database.engine %q", tc.Name, tc.Database.Engine)
+		}
+		vars.DatabaseEnabled = true
+		vars.DatabaseImage = tc.Database.ImageOrDefault(engine)
+		password := tc.Database.PasswordOrDefault(engine)
+		dbName := tc.Database.DatabaseOrDefault()
+		vars.DatabaseEnv = engine.BuildEnv(password)
+		vars.DatabaseHealthCmd = engine.BuildHealthCmd(password)
+		vars.DatabaseInitCmd = engine.BuildInitCmd(password, dbName)
+		vars.DatabaseSeedHost = filepath.ToSlash(cfg.DatabaseSeedHost)
 	}
 
 	if tc.MultiReceiver() {

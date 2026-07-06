@@ -7,6 +7,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -79,6 +80,15 @@ type TestCase struct {
 	// secret-store integration (e.g. vmetric's hashicorpvault credential
 	// provider) without real infrastructure.
 	Vault *VaultConfig `yaml:"vault"`
+
+	// Database, when set, adds a real database backend to the test topology,
+	// keyed by `engine:` (see DatabaseEngines): the harness renders a
+	// `database` service plus a one-shot `database-init` that creates the
+	// database and runs the declared seed SQL, and the subject gates on the
+	// seeding completing. Lets a case exercise a subject's database
+	// poller/collector (e.g. vmetric's mssql customquery collector) against
+	// a real engine instead of a mock.
+	Database *DatabaseConfig `yaml:"database"`
 
 	// AWS, when set, adds a LocalStack emulator to the test topology and
 	// creates the declared S3/SQS/SNS/Kinesis/CloudWatch resources before
@@ -523,6 +533,52 @@ func (v *VaultConfig) MountOrDefault() string {
 	return "secret"
 }
 
+// DatabaseConfig configures the in-topology database backend (see
+// TestCase.Database). Engine selects a DatabaseEngines entry, which supplies
+// the image/credential defaults, env vars, healthcheck, and init command;
+// Image/Password/Database override the engine's defaults per-case.
+type DatabaseConfig struct {
+	// Engine selects the backend (e.g. "mssql") — a key into DatabaseEngines.
+	Engine string `yaml:"engine"`
+	// Image overrides the engine's default container image.
+	Image string `yaml:"image"`
+	// Password overrides the engine's default admin/root credential. Flows
+	// only through the compose `environment:` block and shell `$VAR`
+	// expansion — never string-built into a command line. Test-only.
+	Password string `yaml:"password"`
+	// Database is the database name created by database-init (default
+	// "bench").
+	Database string `yaml:"database"`
+	// SeedSQL is DDL/DML run once, after the server is healthy, via the
+	// engine's CLI against Database. Mounted as a file — never rendered
+	// inline into a command line.
+	SeedSQL string `yaml:"seed_sql"`
+}
+
+// ImageOrDefault, PasswordOrDefault, DatabaseOrDefault centralize the
+// database-backend defaults so the orchestrator and any caller render the
+// same values.
+func (d *DatabaseConfig) ImageOrDefault(engine DatabaseEngine) string {
+	if d != nil && d.Image != "" {
+		return d.Image
+	}
+	return engine.DefaultImage
+}
+
+func (d *DatabaseConfig) PasswordOrDefault(engine DatabaseEngine) string {
+	if d != nil && d.Password != "" {
+		return d.Password
+	}
+	return engine.DefaultPassword
+}
+
+func (d *DatabaseConfig) DatabaseOrDefault() string {
+	if d != nil && d.Database != "" {
+		return d.Database
+	}
+	return "bench"
+}
+
 // AgentConfig configures an external agent container in the test topology
 // (see TestCase.Agent). Unlike endpoints (which the subject connects out to),
 // the agent connects INTO the subject over the bench network — it starts after
@@ -806,6 +862,9 @@ func (tc *TestCase) UsesKafka() bool { return tc.Kafka != nil }
 // UsesVault reports whether the case adds a Vault dev server to the topology.
 func (tc *TestCase) UsesVault() bool { return tc.Vault != nil }
 
+// UsesDatabase reports whether the case adds a database backend to the topology.
+func (tc *TestCase) UsesDatabase() bool { return tc.Database != nil }
+
 // UsesVerifier reports whether the case drives correctness through the one-shot
 // DuckDB verifier container instead of a receiver.
 func (tc *TestCase) UsesVerifier() bool { return tc.Verifier != nil }
@@ -1007,6 +1066,9 @@ func (tc *TestCase) Validate() error {
 		return fmt.Errorf("case %q: max_overdelivery_pct must be non-negative, got %.2f", tc.Name, tc.Correctness.MaxOverDeliveryPct)
 	}
 	if err := tc.validateVault(); err != nil {
+		return err
+	}
+	if err := tc.validateDatabase(); err != nil {
 		return err
 	}
 	if err := tc.validateKafkaAuth(); err != nil {
@@ -2180,6 +2242,38 @@ func (tc *TestCase) validateVault() error {
 				return fmt.Errorf("case %q: vault secret %q field key %q must match %s", tc.Name, path, key, vaultTokenRe)
 			}
 		}
+	}
+	return nil
+}
+
+// databaseNameRe constrains the database name, the only DatabaseConfig field
+// interpolated directly into a compose-embedded shell command (CREATE
+// DATABASE <name>). SeedSQL is mounted as a file and Password flows only
+// through a compose `environment:` value expanded by the shell at runtime,
+// so neither needs charset restriction (mirrors vaultPathRe/vaultTokenRe).
+var databaseNameRe = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
+
+// validateDatabase checks the optional `database:` block: engine must be a
+// known DatabaseEngines entry, seeding at least some SQL is mandatory (a
+// database nothing seeds is a case-authoring mistake), and the database name
+// is charset-restricted.
+func (tc *TestCase) validateDatabase() error {
+	if tc.Database == nil {
+		return nil
+	}
+	if _, ok := DatabaseEngines[tc.Database.Engine]; !ok {
+		known := make([]string, 0, len(DatabaseEngines))
+		for name := range DatabaseEngines {
+			known = append(known, name)
+		}
+		sort.Strings(known)
+		return fmt.Errorf("case %q: unknown database.engine %q, known engines: %s", tc.Name, tc.Database.Engine, strings.Join(known, ", "))
+	}
+	if tc.Database.SeedSQL == "" {
+		return fmt.Errorf("case %q: database block requires `seed_sql`", tc.Name)
+	}
+	if !databaseNameRe.MatchString(tc.Database.DatabaseOrDefault()) {
+		return fmt.Errorf("case %q: database.database %q must match %s", tc.Name, tc.Database.DatabaseOrDefault(), databaseNameRe)
 	}
 	return nil
 }
