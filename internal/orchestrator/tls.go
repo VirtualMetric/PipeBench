@@ -142,9 +142,12 @@ func GenerateTLSCerts(outDir string, serverHosts []string) (string, error) {
 //	server.crt  — server leaf with SAN serverHosts (PEM), signed by ca.crt
 //	server.key  — server leaf private key (RSA, PEM)
 //
-// server.key is world-readable (0644): the SQL Server container runs as a
-// non-root user and must read the mounted key. Per-run throwaway cert in a
-// temp dir, removed with it — never real key material.
+// server.key is world-readable (0644) on purpose: it is bind-mounted read-only
+// into the database container, whose SQL Server process runs as a non-root
+// user (mssql, uid 10001) that differs from the host uid writing the file.
+// Owner-only modes (0400/0600) would be unreadable across that uid boundary
+// and break the TLS endpoint; chown needs host root. Per-run throwaway cert
+// in a temp dir, removed with it — never real key material.
 func GenerateDatabaseTLSCerts(outDir string, serverHosts []string) (string, error) {
 	abs, err := filepath.Abs(outDir)
 	if err != nil {
