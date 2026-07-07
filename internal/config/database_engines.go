@@ -86,4 +86,52 @@ var DatabaseEngines = map[string]DatabaseEngine{
 				"forceencryption = 0\n"
 		},
 	},
+	"mysql": {
+		DefaultImage: "mysql:8.4",
+		// MySQL has no password-complexity policy to satisfy; any value works.
+		DefaultPassword: "PipeBench-Db1!",
+		BuildEnv: func(password string) map[string]string {
+			return map[string]string{
+				"MYSQL_ROOT_PASSWORD": password,
+				// The official image only creates root@localhost by default.
+				// database-init and the director subject both connect over
+				// the compose network (hostname "database", not localhost),
+				// so root needs a host wildcard grant or every non-local
+				// connection is refused regardless of password.
+				"MYSQL_ROOT_HOST": "%",
+			}
+		},
+		BuildHealthCmd: func(password string) string {
+			// This probe runs inside the database container itself, so
+			// "localhost" resolves to the local root@localhost account created
+			// unconditionally by the image — MYSQL_ROOT_HOST is irrelevant
+			// here. Same two-layer escaping as the mssql entry: `$$` survives
+			// compose's own `$VAR` interpolation to reach the container's
+			// shell as a literal `$`, and `\"` survives the double-quoted
+			// YAML flow scalar this string is rendered into.
+			return `mysqladmin ping -h localhost -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent || exit 1`
+		},
+		BuildInitCmd: func(password, database string) string {
+			// Connects over TCP to hostname "database" (not localhost), so
+			// this is the codepath MYSQL_ROOT_HOST=% exists for. `IF NOT
+			// EXISTS` keeps the command idempotent; same `$$`/`\"` escaping
+			// as BuildHealthCmd.
+			return fmt.Sprintf(
+				`set -e; mysql -h database -uroot -p\"$$MYSQL_ROOT_PASSWORD\" -e \"CREATE DATABASE IF NOT EXISTS %s\"; `+
+					`mysql -h database -uroot -p\"$$MYSQL_ROOT_PASSWORD\" %s < /db-seed/init.sql; `+
+					`echo database seeding complete`,
+				database, database)
+		},
+		// The official image includes /etc/mysql/conf.d/*.cnf from its base
+		// my.cnf. Dropping a conf file there overrides the image's own
+		// auto-generated (ephemeral, untrusted) SSL cert with the harness's
+		// CA-signed one.
+		TLSServerCertPath: "/etc/mysql/certs/server.crt",
+		TLSServerKeyPath:  "/etc/mysql/certs/server.key",
+		BuildTLSConf: func() (string, string) {
+			return "/etc/mysql/conf.d/tls.cnf", "[mysqld]\n" +
+				"ssl-cert = /etc/mysql/certs/server.crt\n" +
+				"ssl-key = /etc/mysql/certs/server.key\n"
+		},
+	},
 }
