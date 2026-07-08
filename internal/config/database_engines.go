@@ -25,6 +25,16 @@ type DatabaseEngine struct {
 	TLSServerCertPath string
 	TLSServerKeyPath  string
 	BuildTLSConf      func() (mountPath, content string)
+
+	// BuildTLSCommand, when non-nil and the case enables TLS, overrides the
+	// database container's entrypoint with `/bin/sh -c <returned string>`.
+	// Engines whose image auto-reads the BuildTLSConf file (mssql via mssql.conf,
+	// mysql via /etc/mysql/conf.d) leave this nil and use the image defaults.
+	// Postgres needs it because it (a) refuses to start with a group/world-
+	// readable TLS key — the harness writes server.key as 0644 — and (b) has no
+	// auto-include conf dir, so TLS must be turned on via `-c` args. certPath /
+	// keyPath are the in-container mount paths (TLSServerCertPath/KeyPath).
+	BuildTLSCommand func(certPath, keyPath string) string
 }
 
 // DatabaseEngines is the registry of engines the `database:` case block can
@@ -134,4 +144,65 @@ var DatabaseEngines = map[string]DatabaseEngine{
 				"ssl-key = /etc/mysql/certs/server.key\n"
 		},
 	},
+  "postgres": {
+		DefaultImage: "postgres:17",
+		// pg has no password-complexity policy; reuse the mssql credential for
+		// parity across engines. Test-only credential.
+		DefaultPassword: "PipeBench-Db1!",
+		BuildEnv: func(password string) map[string]string {
+			// The official image only auto-creates the `postgres` superuser;
+			// the bench db is created by BuildInitCmd. POSTGRES_PASSWORD is
+			// required for TCP auth from database-init and the subject.
+			return map[string]string{
+				"POSTGRES_PASSWORD": password,
+			}
+		},
+		BuildHealthCmd: func(password string) string {
+			// pg_isready needs no auth (no password/escaping here), but it MUST
+			// target TCP, not the Unix socket: the official postgres image runs a
+			// temporary socket-only server (listen_addresses='') while it inits the
+			// data dir, and a socket pg_isready reports "ready" during that phase — a
+			// false positive that lets database-init (which connects over TCP via
+			// `psql -h database`) race ahead of the real network listener. -h forces
+			// the TCP path; 127.0.0.1 (not "localhost") pins IPv4 to match the
+			// server's listener and avoid a localhost->::1 resolution stall.
+			return `pg_isready -h 127.0.0.1 -U postgres -d postgres || exit 1`
+		},
+		BuildInitCmd: func(password, database string) string {
+			// CREATE DATABASE cannot run inside a transaction, so it is its own
+			// psql -c invocation, then the seed file runs against it. Same
+			// `$$`/`\"` escaping requirement as the mssql init (rendered into
+			// "{{ ... }}" in the compose template): `$$` survives compose's own
+			// $VAR interpolation to reach the container shell as a literal `$`;
+			// `\"` survives the double-quoted YAML flow scalar. ON_ERROR_STOP
+			// makes psql fail the container on any SQL error.
+			return fmt.Sprintf(
+				`set -e; PGPASSWORD=\"$$POSTGRES_PASSWORD\" psql -h database -U postgres -v ON_ERROR_STOP=1 -c \"CREATE DATABASE %s\"; `+
+					`PGPASSWORD=\"$$POSTGRES_PASSWORD\" psql -h database -U postgres -d %s -v ON_ERROR_STOP=1 -f /db-seed/init.sql; `+
+					`echo database seeding complete`,
+				database, database)
+		},
+		TLSServerCertPath: "/etc/pg/certs/server.crt",
+		TLSServerKeyPath:  "/etc/pg/certs/server.key",
+		// Postgres drives TLS via -c args (BuildTLSCommand), not a config file,
+		// so this returns an inert mount that keeps the orchestrator's
+		// unconditional conf-mount valid without special-casing. Postgres never
+		// reads this path.
+		BuildTLSConf: func() (string, string) {
+			return "/etc/pg/pipebench-unused.conf",
+				"# PipeBench: postgres TLS is configured via -c args; this file is unused\n"
+		},
+		BuildTLSCommand: func(certPath, keyPath string) string {
+			// Copy the world-readable (0644) mounted key to a postgres-owned
+			// 0600 copy — postgres refuses to start with a group/world-readable
+			// key — then start postgres with TLS on (no auto-include conf dir,
+			// so ssl settings are passed via -c). Runs as the image's default
+			// root user; docker-entrypoint.sh then steps down to the postgres
+			// user, which reads the 0600 copy.
+			const keyCopy = "/var/lib/postgresql/pipebench-server.key"
+			return fmt.Sprintf(
+				"install -m 600 -o postgres -g postgres %s %s && "+
+					"exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=%s -c ssl_key_file=%s",
+				keyPath, keyCopy, certPath, keyCopy)
+  },
 }

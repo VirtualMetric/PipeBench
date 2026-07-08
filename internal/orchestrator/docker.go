@@ -1015,6 +1015,11 @@ services:
       - "{{ .DatabaseServerKeyHost }}:{{ .DatabaseServerKeyPath }}:ro"
       - "{{ .DatabaseConfHost }}:{{ .DatabaseConfPath }}:ro"
 {{- end }}
+{{- if .DatabaseCommand }}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "{{ .DatabaseCommand }}"
+{{- end }}
     healthcheck:
       test: ["CMD-SHELL", "{{ .DatabaseHealthCmd }}"]
       interval: 5s
@@ -1786,6 +1791,11 @@ type composeVars struct {
 	DatabaseInitCmd   string
 	DatabaseSeedHost  string
 
+	// DatabaseCommand, when non-empty, overrides the database container's
+	// entrypoint with `/bin/sh -c <DatabaseCommand>` (engine BuildTLSCommand).
+	// Empty for engines that use their image defaults (mssql/mysql).
+	DatabaseCommand string
+
 	// Database TLS (gated by DatabaseTLSEnabled). *Host are host paths bind-
 	// mounted into the database container at the engine's *Path targets;
 	// DatabaseCAHost is the CA mounted into the subject so a device can verify.
@@ -2382,6 +2392,12 @@ func writeCompose(path string, cfg RunConfig) error {
 			vars.DatabaseServerKeyPath = engine.TLSServerKeyPath
 			vars.DatabaseConfPath = confMount
 			vars.DatabaseCAHost = filepath.ToSlash(filepath.Join(cfg.DatabaseCertDir, "ca.crt"))
+
+			// Engines that cannot pick up TLS from a mounted conf file (postgres)
+			// override the container entrypoint to enable TLS at startup.
+			if engine.BuildTLSCommand != nil {
+				vars.DatabaseCommand = engine.BuildTLSCommand(engine.TLSServerCertPath, engine.TLSServerKeyPath)
+			}
 		}
 	}
 
