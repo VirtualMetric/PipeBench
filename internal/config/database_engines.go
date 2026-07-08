@@ -112,14 +112,20 @@ var DatabaseEngines = map[string]DatabaseEngine{
 			}
 		},
 		BuildHealthCmd: func(password string) string {
-			// This probe runs inside the database container itself, so
-			// "localhost" resolves to the local root@localhost account created
-			// unconditionally by the image — MYSQL_ROOT_HOST is irrelevant
-			// here. Same two-layer escaping as the mssql entry: `$$` survives
-			// compose's own `$VAR` interpolation to reach the container's
-			// shell as a literal `$`, and `\"` survives the double-quoted
-			// YAML flow scalar this string is rendered into.
-			return `mysqladmin ping -h localhost -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent || exit 1`
+			// MUST target TCP, not the Unix socket. The official mysql image runs
+			// a temporary --skip-networking server (socket up, no TCP listener)
+			// while it inits the data dir; a socket probe (`-h localhost`) reports
+			// healthy during that phase — a false positive that lets database-init
+			// (which connects over TCP via `mysql -h database`) race ahead and hit
+			// "Can't connect ... 3306 (111)". `-h 127.0.0.1 --protocol=TCP` fails
+			// until the real networked server binds TCP, so healthy means the port
+			// is actually accepting connections. Mirrors the postgres entry's
+			// `pg_isready -h 127.0.0.1`. (mysqladmin ping reports the server alive
+			// even on auth error, so it passes as soon as TCP is up.) Same two
+			// escaping layers: `$$` survives compose's own `$VAR` interpolation to
+			// reach the container shell as a literal `$`, and `\"` survives the
+			// double-quoted YAML flow scalar this string is rendered into.
+			return `mysqladmin ping -h 127.0.0.1 --protocol=TCP -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent || exit 1`
 		},
 		BuildInitCmd: func(password, database string) string {
 			// Connects over TCP to hostname "database" (not localhost), so
