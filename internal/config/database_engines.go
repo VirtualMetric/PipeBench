@@ -110,9 +110,15 @@ var DatabaseEngines = map[string]DatabaseEngine{
 			}
 		},
 		BuildHealthCmd: func(password string) string {
-			// pg_isready checks the server accepts connections; it needs no
-			// auth, so no password/escaping is involved here.
-			return `pg_isready -U postgres -d postgres || exit 1`
+			// pg_isready needs no auth (no password/escaping here), but it MUST
+			// target TCP, not the Unix socket: the official postgres image runs a
+			// temporary socket-only server (listen_addresses='') while it inits the
+			// data dir, and a socket pg_isready reports "ready" during that phase — a
+			// false positive that lets database-init (which connects over TCP via
+			// `psql -h database`) race ahead of the real network listener. -h forces
+			// the TCP path; 127.0.0.1 (not "localhost") pins IPv4 to match the
+			// server's listener and avoid a localhost->::1 resolution stall.
+			return `pg_isready -h 127.0.0.1 -U postgres -d postgres || exit 1`
 		},
 		BuildInitCmd: func(password, database string) string {
 			// CREATE DATABASE cannot run inside a transaction, so it is its own
