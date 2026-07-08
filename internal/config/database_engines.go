@@ -144,7 +144,7 @@ var DatabaseEngines = map[string]DatabaseEngine{
 				"ssl-key = /etc/mysql/certs/server.key\n"
 		},
 	},
-  "postgres": {
+	"postgres": {
 		DefaultImage: "postgres:17",
 		// pg has no password-complexity policy; reuse the mssql credential for
 		// parity across engines. Test-only credential.
@@ -204,5 +204,6 @@ var DatabaseEngines = map[string]DatabaseEngine{
 				"install -m 600 -o postgres -g postgres %s %s && "+
 					"exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=%s -c ssl_key_file=%s",
 				keyPath, keyCopy, certPath, keyCopy)
-  },
+		},
+	},
 }
