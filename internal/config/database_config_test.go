@@ -40,6 +40,12 @@ func TestValidateDatabase(t *testing.T) {
 			wantErr: "must match",
 		},
 		{name: "custom database name", mutate: func(tc *TestCase) { tc.Database.Database = "bench_2" }},
+		{
+			name:    "tls on a TLS-less engine is rejected",
+			mutate:  func(tc *TestCase) { tc.Database.Engine = "oracle"; tc.Database.TLS = true },
+			wantErr: `not supported by engine "oracle"`,
+		},
+		{name: "tls on a TLS-capable engine is allowed", mutate: func(tc *TestCase) { tc.Database.TLS = true }},
 	}
 
 	for _, tt := range tests {

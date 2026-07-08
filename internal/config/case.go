@@ -2271,7 +2271,8 @@ func (tc *TestCase) validateDatabase() error {
 	if tc.Database == nil {
 		return nil
 	}
-	if _, ok := DatabaseEngines[tc.Database.Engine]; !ok {
+	engine, ok := DatabaseEngines[tc.Database.Engine]
+	if !ok {
 		known := make([]string, 0, len(DatabaseEngines))
 		for name := range DatabaseEngines {
 			known = append(known, name)
@@ -2284,6 +2285,15 @@ func (tc *TestCase) validateDatabase() error {
 	}
 	if !databaseNameRe.MatchString(tc.Database.DatabaseOrDefault()) {
 		return fmt.Errorf("case %q: database.database %q must match %s", tc.Name, tc.Database.DatabaseOrDefault(), databaseNameRe)
+	}
+	// Reject database.tls for engines without TLS wiring at load time, rather
+	// than letting it fail later during compose rendering. An empty
+	// TLSServerCertPath is the registry's "no TLS support" marker (see the
+	// DatabaseEngine struct doc and the docker.go compose guard) — keying off it
+	// covers any current or future TLS-less engine (e.g. oracle) with no
+	// per-engine list.
+	if tc.Database.TLS && engine.TLSServerCertPath == "" {
+		return fmt.Errorf("case %q: database.tls is not supported by engine %q", tc.Name, tc.Database.Engine)
 	}
 	return nil
 }
