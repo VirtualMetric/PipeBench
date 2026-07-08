@@ -206,4 +206,42 @@ var DatabaseEngines = map[string]DatabaseEngine{
 				keyPath, keyCopy, certPath, keyCopy)
 		},
 	},
+	"oracle": {
+		DefaultImage: "gvenzl/oracle-free:23-slim-faststart",
+		// Oracle has no password-complexity policy for these accounts; reuse the
+		// shared credential for parity across engines. Test-only credential.
+		DefaultPassword: "PipeBench-Db1!",
+		BuildEnv: func(password string) map[string]string {
+			// The gvenzl image sets the SYS/SYSTEM password from ORACLE_PASSWORD
+			// and opens the FREEPDB1 pluggable database. The bench device
+			// connects as SYSTEM to FREEPDB1 — Oracle has no CREATE DATABASE, so
+			// a "database" is a schema and the seeded table lives in SYSTEM's.
+			return map[string]string{
+				"ORACLE_PASSWORD": password,
+			}
+		},
+		BuildHealthCmd: func(password string) string {
+			// The gvenzl image ships healthcheck.sh on PATH; it returns success
+			// once the DB is open and accepting connections. No credentials or
+			// escaping needed (contrast the mssql/mysql CLI probes).
+			return "healthcheck.sh"
+		},
+		BuildInitCmd: func(password, database string) string {
+			// Oracle has no CREATE DATABASE (the database param is unused): the
+			// seed runs as SYSTEM against the pre-created FREEPDB1 PDB. A single-
+			// line brace group pipes the mounted seed — bracketed by WHENEVER
+			// SQLERROR + EXIT so any SQL error fails the one-shot container and
+			// sqlplus always terminates — into sqlplus. `set -e` makes a failed
+			// pipeline abort before the success echo (otherwise the trailing echo
+			// would mask a seeding failure). The password comes from
+			// $ORACLE_PASSWORD, never string-built: `$$` survives compose's own
+			// $VAR interpolation to reach the container shell as a literal `$`.
+			// Two escaping layers, same as the mssql/mysql/postgres entries: `$$`
+			// for compose interpolation, and `\"` because this string is rendered
+			// into a double-quoted YAML flow scalar (`- "{{ ... }}"`) — a bare `"`
+			// would terminate the scalar. Connects over TCP to hostname "database".
+			return `set -e; { echo 'WHENEVER SQLERROR EXIT SQL.SQLCODE'; cat /db-seed/init.sql; echo; echo EXIT; } | ` +
+				`sqlplus -S -L system/\"$$ORACLE_PASSWORD\"@//database:1521/FREEPDB1; echo database seeding complete`
+		},
+	},
 }

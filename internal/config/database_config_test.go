@@ -22,11 +22,12 @@ func TestValidateDatabase(t *testing.T) {
 		wantErr string // substring of the expected error, "" = valid
 	}{
 		{name: "valid mssql database block", mutate: func(*TestCase) {}},
+		{name: "valid oracle database block", mutate: func(tc *TestCase) { tc.Database.Engine = "oracle" }},
 		{name: "nil database block is a no-op", mutate: func(tc *TestCase) { tc.Database = nil }},
 		{
 			name:    "unknown engine",
-			mutate:  func(tc *TestCase) { tc.Database.Engine = "oracle" },
-			wantErr: `unknown database.engine "oracle"`,
+			mutate:  func(tc *TestCase) { tc.Database.Engine = "nosuchdb" },
+			wantErr: `unknown database.engine "nosuchdb"`,
 		},
 		{
 			name:    "missing seed_sql",
@@ -57,6 +58,32 @@ func TestValidateDatabase(t *testing.T) {
 				t.Fatalf("validateDatabase() = %v, want error containing %q", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestOracleEngineEntry(t *testing.T) {
+	engine, ok := DatabaseEngines["oracle"]
+	if !ok {
+		t.Fatal("oracle engine not registered in DatabaseEngines")
+	}
+	if engine.DefaultImage != "gvenzl/oracle-free:23-slim-faststart" {
+		t.Errorf("DefaultImage = %q", engine.DefaultImage)
+	}
+	if env := engine.BuildEnv("pw"); env["ORACLE_PASSWORD"] != "pw" {
+		t.Errorf("BuildEnv ORACLE_PASSWORD = %q, want pw", env["ORACLE_PASSWORD"])
+	}
+	if hc := engine.BuildHealthCmd("pw"); hc != "healthcheck.sh" {
+		t.Errorf("BuildHealthCmd = %q, want healthcheck.sh", hc)
+	}
+	init := engine.BuildInitCmd("pw", "bench")
+	// Password must never be string-built into the command — only the env ref.
+	if strings.Contains(init, "pw") {
+		t.Errorf("BuildInitCmd leaks the raw password: %q", init)
+	}
+	for _, want := range []string{"$$ORACLE_PASSWORD", "/db-seed/init.sql", "sqlplus", "FREEPDB1"} {
+		if !strings.Contains(init, want) {
+			t.Errorf("BuildInitCmd missing %q: %q", want, init)
+		}
 	}
 }
 
