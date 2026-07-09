@@ -208,7 +208,7 @@ var Registry = map[string]Subject{
 	"vmetric": {
 		Name:       "vmetric",
 		Image:      "vmetric/director",
-		Version:    "2.0.6",
+		Version:    "2.0.9",
 		ConfigPath: "/config.yml",
 		// The director resolves device TLS cert_name against its WorkingDir
 		// (/opt/vmetric) and rejects paths outside it, so mount the harness
