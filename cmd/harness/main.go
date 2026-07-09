@@ -1,12 +1,16 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -52,6 +56,23 @@ var (
 )
 
 func main() {
+	// The root context is cancelled only by SIGINT/SIGTERM — never by a
+	// timeout — so context.Canceled unambiguously means "user interrupt"
+	// everywhere downstream. On the first signal the run loop winds down
+	// through its normal error path (deferred teardown still runs); the
+	// handler then unregisters itself so a second signal kills the process
+	// immediately via the default disposition.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sig
+		fmt.Fprintln(os.Stderr, "\ninterrupt — tearing down current run; press Ctrl+C again to exit immediately (then run `harness clean` to remove leftovers)")
+		cancel()
+		signal.Stop(sig)
+	}()
+
 	root := &cobra.Command{
 		Use:   "harness",
 		Short: "PipeBench — containerized data pipeline benchmarking",
@@ -73,7 +94,7 @@ No cloud account, Terraform, Ansible, or SSH required.`,
 	root.AddCommand(serveCmd())
 	root.AddCommand(versionCmd())
 
-	if err := root.Execute(); err != nil {
+	if err := root.ExecuteContext(ctx); err != nil {
 		os.Exit(1)
 	}
 }
@@ -240,7 +261,7 @@ func testCmd() *cobra.Command {
 				Drain:            drain,
 			}
 
-			r := runner.New(opts)
+			r := runner.New(cmd.Context(), opts)
 
 			// Stub out per-(hardware, subject) result files up front so a
 			// subject that fails every test still appears in the index.
@@ -284,7 +305,11 @@ func testCmd() *cobra.Command {
 				subjectOutcomes = subjectOutcomes[:0]
 			}
 
-			for _, p := range pairs {
+			for i, p := range pairs {
+				if cmd.Context().Err() != nil {
+					fmt.Fprintf(os.Stderr, "interrupted — skipping remaining %d run(s)\n", len(pairs)-i)
+					break
+				}
 				if perSubjectSummaries && p.subject.Name != currentSubject {
 					flushSubjectSummary()
 					currentSubject = p.subject.Name
@@ -307,7 +332,11 @@ func testCmd() *cobra.Command {
 
 				res, err := r.Run(p.tc, p.subject)
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "ERROR running %s/%s: %v\n", p.tc.Name, p.subject.Name, err)
+					if errors.Is(err, context.Canceled) {
+						fmt.Fprintf(os.Stderr, "interrupted %s/%s\n", p.tc.Name, p.subject.Name)
+					} else {
+						fmt.Fprintf(os.Stderr, "ERROR running %s/%s: %v\n", p.tc.Name, p.subject.Name, err)
+					}
 					failed = append(failed, p.tc.Name+"/"+p.subject.Name)
 				}
 				o := runOutcome{
@@ -328,6 +357,9 @@ func testCmd() *cobra.Command {
 			}
 			printRunSummary(outcomes)
 
+			if cmd.Context().Err() != nil {
+				return fmt.Errorf("interrupted by signal (%d of %d runs attempted); leftover containers, if any: `harness clean`", len(outcomes), len(pairs))
+			}
 			if len(failed) > 0 {
 				return fmt.Errorf("%d run(s) failed: %v", len(failed), failed)
 			}
@@ -566,6 +598,16 @@ func cleanCmd() *cobra.Command {
 		Short: "Remove all bench containers and networks",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			fmt.Println("Removing bench containers…")
+			// Prefix sweep catches every bench-* container regardless of
+			// name (localstack, azurite, redpanda, vault, verifier, plural
+			// generators/receivers, …) — the fixed list below is only a
+			// fallback for when `docker ps` itself fails.
+			if out, err := exec.Command("docker", "ps", "-aq", "--filter", "name=^bench-").Output(); err == nil {
+				if ids := strings.Fields(string(out)); len(ids) > 0 {
+					rmArgs := append([]string{"rm", "-f"}, ids...)
+					_ = exec.Command("docker", rmArgs...).Run()
+				}
+			}
 			containers := []string{
 				"bench-generator",
 				"bench-receiver",
@@ -576,6 +618,16 @@ func cleanCmd() *cobra.Command {
 			}
 			for _, c := range containers {
 				_ = exec.Command("docker", "rm", "-f", c).Run()
+			}
+			// Compose networks are named <tmpdir-project>_bench; an
+			// interrupted run that never reached `compose down` leaves them
+			// behind. Removal fails harmlessly while a container still uses
+			// the network, so containers go first above.
+			fmt.Println("Removing bench networks…")
+			if out, err := exec.Command("docker", "network", "ls", "-q", "--filter", "name=bench").Output(); err == nil {
+				for _, id := range strings.Fields(string(out)) {
+					_ = exec.Command("docker", "network", "rm", id).Run()
+				}
 			}
 			fmt.Println("Done.")
 			return nil

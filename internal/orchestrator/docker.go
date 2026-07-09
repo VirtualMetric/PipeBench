@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"context"
 	"fmt"
 	"maps"
 	"os"
@@ -1197,6 +1198,12 @@ type RunConfig struct {
 
 // ComposeRunner manages a docker compose lifecycle for one test run.
 type ComposeRunner struct {
+	// runCtx is cancelled on SIGINT/SIGTERM. Forward-path operations (up,
+	// waits) run under it so an interrupt unwinds them; teardown operations
+	// (Down/Stop/Kill) deliberately use fresh bounded contexts instead, so
+	// cleanup still runs after cancellation. Run-scoped, so storing the ctx
+	// on the struct is the accepted exception to "don't put ctx in structs".
+	runCtx      context.Context
 	cfg         RunConfig
 	composeFile string
 
@@ -1214,7 +1221,12 @@ type ComposeRunner struct {
 var _ Orchestrator = (*ComposeRunner)(nil)
 
 // NewComposeRunner creates a ComposeRunner and writes the compose file.
-func NewComposeRunner(cfg RunConfig) (*ComposeRunner, error) {
+// ctx should be the run-scoped interrupt context; nil means "never
+// interrupted".
+func NewComposeRunner(ctx context.Context, cfg RunConfig) (*ComposeRunner, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := os.MkdirAll(cfg.TmpDir, 0o755); err != nil {
 		return nil, err
 	}
@@ -1276,7 +1288,7 @@ func NewComposeRunner(cfg RunConfig) (*ComposeRunner, error) {
 		return nil, err
 	}
 
-	cr := &ComposeRunner{cfg: cfg, composeFile: composeFile}
+	cr := &ComposeRunner{runCtx: ctx, cfg: cfg, composeFile: composeFile}
 	cr.populateServiceNames()
 	return cr, nil
 }
@@ -1383,25 +1395,36 @@ func (r *ComposeRunner) resolveServiceAliases(names []string) []string {
 
 // StopServices sends SIGTERM to named services with the given grace timeout
 // before SIGKILL. Uses `docker compose stop -t <seconds> <svc>...`.
+// Runs on a fresh bounded context (grace + 30s margin) so it still works
+// after an interrupt and can't hang on a wedged daemon.
 func (r *ComposeRunner) StopServices(timeout time.Duration, services ...string) error {
 	secs := max(int(timeout.Seconds()), 0)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout+30*time.Second)
+	defer cancel()
 	resolved := r.resolveServiceAliases(services)
 	args := append([]string{"stop", "-t", strconv.Itoa(secs)}, resolved...)
-	return r.compose(args...)
+	return r.composeCtx(ctx, args...)
 }
 
 // KillServices sends SIGKILL immediately — no grace period, no chance for
 // the process to clean up. Mirrors a crash scenario for persistence tests.
 // Uses `docker compose kill -s SIGKILL <svc>...`.
 func (r *ComposeRunner) KillServices(services ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	resolved := r.resolveServiceAliases(services)
 	args := append([]string{"kill", "-s", "SIGKILL"}, resolved...)
-	return r.compose(args...)
+	return r.composeCtx(ctx, args...)
 }
 
-// Down stops and removes all containers and anonymous volumes.
+// Down stops and removes all containers and anonymous volumes. It is the
+// deferred teardown for every flow, so it runs on a fresh bounded context:
+// it must proceed after the run context is cancelled by an interrupt, and
+// it must not block forever on a wedged daemon.
 func (r *ComposeRunner) Down() error {
-	return r.compose("down", "-v", "--remove-orphans")
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	return r.composeCtx(ctx, "down", "-v", "--remove-orphans")
 }
 
 // WaitForGeneratorExit blocks until ALL generator containers exit or the
@@ -1413,6 +1436,9 @@ func (r *ComposeRunner) WaitForGeneratorExit(timeout time.Duration) error {
 	pending := append([]string(nil), r.genContainers...)
 	var firstErr error
 	for time.Now().Before(deadline) {
+		if err := r.runCtx.Err(); err != nil {
+			return fmt.Errorf("interrupted while waiting for generator(s): %w", err)
+		}
 		var still []string
 		for _, name := range pending {
 			out, err := exec.Command("docker", "inspect", "--format={{.State.Status}}", name).Output()
@@ -1433,7 +1459,11 @@ func (r *ComposeRunner) WaitForGeneratorExit(timeout time.Duration) error {
 			return firstErr
 		}
 		pending = still
-		time.Sleep(2 * time.Second)
+		select {
+		case <-r.runCtx.Done():
+			return fmt.Errorf("interrupted while waiting for generator(s): %w", r.runCtx.Err())
+		case <-time.After(2 * time.Second):
+		}
 	}
 	return fmt.Errorf("generator(s) did not exit within %s (still running: %v)", timeout, pending)
 }
@@ -1451,7 +1481,11 @@ func (r *ComposeRunner) WaitForVerifierExit(timeout time.Duration) error {
 		if err == nil && strings.TrimSpace(string(out)) == "exited" {
 			return nil
 		}
-		time.Sleep(2 * time.Second)
+		select {
+		case <-r.runCtx.Done():
+			return fmt.Errorf("interrupted while waiting for verifier: %w", r.runCtx.Err())
+		case <-time.After(2 * time.Second):
+		}
 	}
 	return fmt.Errorf("verifier did not exit within %s", timeout)
 }
@@ -1479,19 +1513,25 @@ func (r *ComposeRunner) Logs(service string, lines int) string {
 	return string(out)
 }
 
-// StopCollector sends SIGTERM to the collector container and waits for it to exit.
-// The collector writes its CSV file on SIGTERM, so this must be called before CopyMetricsCSV.
+// StopCollector sends SIGTERM to the collector container and waits for it to
+// exit. The collector fsyncs each CSV row as it samples, so callers copy the
+// CSV first (while the collector still runs) and stop it after — see the
+// teardown order in runner.Run. Bounded so it works after an interrupt and
+// can't hang on a wedged daemon.
 func (r *ComposeRunner) StopCollector() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
 	// docker stop sends SIGTERM and waits up to 10s for graceful exit.
-	out, err := exec.Command("docker", "stop", "-t", "10", "bench-collector").CombinedOutput()
+	out, err := exec.CommandContext(ctx, "docker", "stop", "-t", "10", "bench-collector").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("docker stop bench-collector: %w\n%s", err, out)
 	}
 	return nil
 }
 
-// CopyMetricsCSV copies the metrics CSV from the (stopped) collector container to dst.
-// Call StopCollector first so the CSV has been flushed.
+// CopyMetricsCSV copies the metrics CSV from the (still running) collector
+// container to dst. Safe before StopCollector because the collector fsyncs
+// every row as it writes it.
 func (r *ComposeRunner) CopyMetricsCSV(dst string) error {
 	src := "bench-collector:/results/metrics.csv"
 	out, err := exec.Command("docker", "cp", src, dst).CombinedOutput()
@@ -1558,9 +1598,16 @@ func (r *ComposeRunner) GeneratorStdout() string {
 	return b.String()
 }
 
+// compose runs a docker compose subcommand under the run context: the first
+// interrupt cancels it. Teardown paths must use composeCtx with a fresh
+// bounded context instead, so cleanup still runs after cancellation.
 func (r *ComposeRunner) compose(args ...string) error {
+	return r.composeCtx(r.runCtx, args...)
+}
+
+func (r *ComposeRunner) composeCtx(ctx context.Context, args ...string) error {
 	cmdArgs := append([]string{"compose", "-f", r.composeFile}, args...)
-	cmd := exec.Command("docker", cmdArgs...)
+	cmd := exec.CommandContext(ctx, "docker", cmdArgs...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
