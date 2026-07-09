@@ -1,0 +1,30 @@
+# TCP device → ClickHouse target, NATIVE protocol. `format: native` uses the
+# clickhouse-go batch INSERT over the native TCP port (9000) — the lowest-
+# overhead wire path. The raw message goes into the `message` column of
+# bench.logs (created by the harness receiver before data flows).
+devices:
+  - id: 1
+    name: tcp-in
+    type: tcp
+    properties:
+      address: "0.0.0.0"
+      port: 9000
+
+targets:
+  - name: ch-out
+    type: clickhouse
+    properties:
+      address: "clickhouse"
+      port: 9000
+      database: "bench"
+      table: "logs"
+      username: "bench"
+      password: "benchpass"
+      format: "native"
+
+routes:
+  - name: tcp-to-ch
+    devices:
+      - name: tcp-in
+    targets:
+      - name: ch-out

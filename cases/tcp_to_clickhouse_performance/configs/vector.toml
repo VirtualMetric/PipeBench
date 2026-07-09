@@ -1,0 +1,32 @@
+# Vector: TCP socket in, native `clickhouse` sink out. The clickhouse sink
+# POSTs JSONEachRow batches over the HTTP interface (:8123). The socket source
+# with the `bytes` codec puts each raw line into the `message` field, which maps
+# to the `message` column of bench.logs; skip_unknown_fields tolerates the
+# source's extra metadata fields (timestamp, host, source_type) server-side.
+
+[sources.in]
+type = "socket"
+mode = "tcp"
+address = "0.0.0.0:9000"
+decoding.codec = "bytes"
+framing.method = "newline_delimited"
+
+[sinks.out]
+type = "clickhouse"
+inputs = ["in"]
+endpoint = "http://clickhouse:8123"
+database = "bench"
+table = "logs"
+skip_unknown_fields = true
+
+[sinks.out.auth]
+strategy = "basic"
+user = "bench"
+password = "benchpass"
+
+[sinks.out.batch]
+max_events = 10000
+timeout_secs = 1
+
+[sinks.out.healthcheck]
+enabled = false

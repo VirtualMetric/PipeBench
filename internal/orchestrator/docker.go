@@ -184,8 +184,12 @@ services:
     image: "{{ .SubjectImage }}"
     container_name: "{{ .SubjectContainer }}"
     networks: [bench]
-{{- if or .KafkaEnabled .AWSEnabled .AzureEnabled .VaultEnabled .MinioEnabled .PipelineBrokerEnabled .VerifierLocalDir }}
+{{- if or .KafkaEnabled .AWSEnabled .AzureEnabled .VaultEnabled .MinioEnabled .PipelineBrokerEnabled .VerifierLocalDir .HasHealthcheckEndpoints }}
     depends_on:
+{{- range .HealthcheckEndpoints }}
+      {{ . }}:
+        condition: service_healthy
+{{- end }}
 {{- if .VerifierLocalDir }}
       data-init:
         condition: service_completed_successfully
@@ -433,6 +437,9 @@ services:
       GENERATOR_WARMUP: "{{ .GenWarmup }}"
       GENERATOR_SEQUENCED: "{{ .GenSequenced }}"
       GENERATOR_CONNECTIONS: "{{ .GenConnections }}"
+{{- if .GenReconnect }}
+      GENERATOR_RECONNECT: "true"
+{{- end }}
 {{- if .GenTotalLines }}
       GENERATOR_TOTAL_LINES: "{{ .GenTotalLines }}"
 {{- end }}
@@ -676,6 +683,14 @@ services:
 {{- range $k, $v := .Env }}
       {{ $k }}: "{{ $v }}"
 {{- end }}
+{{- end }}
+{{- if .HasHealthcheck }}
+    healthcheck:
+      test: ["CMD-SHELL", "{{ .HCTest }}"]
+      interval: {{ .HCInterval }}
+      timeout: {{ .HCTimeout }}
+      retries: {{ .HCRetries }}
+      start_period: {{ .HCStartPeriod }}
 {{- end }}
     restart: "no"
 {{- end }}
@@ -1524,6 +1539,14 @@ type endpointTpl struct {
 	Image   string
 	Env     map[string]string
 	Command string // pre-formatted YAML list, empty = use the image's default
+	// Healthcheck (optional): when HasHealthcheck is set, the endpoint gets a
+	// compose healthcheck and the subject gates on it (service_healthy).
+	HasHealthcheck bool
+	HCTest         string
+	HCInterval     string
+	HCTimeout      string
+	HCRetries      int
+	HCStartPeriod  string
 }
 
 // clusterNode is one director node service in a director_cluster_correctness run.
@@ -1595,6 +1618,7 @@ type composeVars struct {
 	GenWarmup        string
 	GenSequenced     string
 	GenConnections   int
+	GenReconnect     bool
 	GenTotalLines    int64
 	GenEnv           map[string]string
 	GenRotateMode    string
@@ -1752,6 +1776,12 @@ type composeVars struct {
 	// Endpoints are auxiliary containers (a case's `endpoints:` list) emitted
 	// as their own services after the collector.
 	Endpoints []endpointTpl
+
+	// HealthcheckEndpoints lists the names of endpoints that declared a
+	// healthcheck; the subject gates on each (depends_on … service_healthy) so
+	// it never starts before those auxiliary servers accept connections.
+	HealthcheckEndpoints    []string
+	HasHealthcheckEndpoints bool
 
 	// Agent is the optional external agent container (a case's `agent:` block).
 	// When AgentEnabled is true the template renders an `agent:` service with
@@ -2097,6 +2127,7 @@ func writeCompose(path string, cfg RunConfig) error {
 		vars.GenLineSize = genLineSize
 		vars.GenFormat = genFormat
 		vars.GenConnections = resolveGeneratorConnections(g.Connections)
+		vars.GenReconnect = g.Reconnect
 		vars.GenTotalLines = g.TotalLines
 		vars.GenEnv = mergeEnv(cloudEnvForMode(g.Mode, awsEnv, minioEnv, azureEnv), g.Env)
 		vars.GenRotateMode = g.FileRotation.Mode
@@ -2324,12 +2355,25 @@ func writeCompose(path string, cfg RunConfig) error {
 		for k, v := range ep.Env {
 			env[k] = strings.ReplaceAll(v, "$", "$$")
 		}
-		vars.Endpoints = append(vars.Endpoints, endpointTpl{
+		et := endpointTpl{
 			Name:    ep.Name,
 			Image:   ep.Image,
 			Env:     env,
 			Command: formatYAMLList(cmd),
-		})
+		}
+		if hc := ep.Healthcheck; hc != nil && hc.Test != "" {
+			et.HasHealthcheck = true
+			// Escape "$" so compose doesn't interpolate the shell test (same
+			// reason as command/env above).
+			et.HCTest = strings.ReplaceAll(hc.Test, "$", "$$")
+			et.HCInterval = hc.IntervalOrDefault()
+			et.HCTimeout = hc.TimeoutOrDefault()
+			et.HCRetries = hc.RetriesOrDefault()
+			et.HCStartPeriod = hc.StartPeriodOrDefault()
+			vars.HealthcheckEndpoints = append(vars.HealthcheckEndpoints, ep.Name)
+			vars.HasHealthcheckEndpoints = true
+		}
+		vars.Endpoints = append(vars.Endpoints, et)
 	}
 
 	if tc.UsesAgent() {

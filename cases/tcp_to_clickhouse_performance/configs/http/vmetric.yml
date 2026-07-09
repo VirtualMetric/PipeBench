@@ -1,0 +1,30 @@
+# vmetric variant: ClickHouse target over the HTTP interface (:8123) with
+# INSERT … FORMAT JSONEachRow + gzip (use_compression) — the same high-throughput
+# wire path Vector/Fluent Bit/Cribl use here, for an apples-to-apples comparison
+# against the native-protocol default config. Selected with `-c http`.
+devices:
+  - id: 1
+    name: tcp-in
+    type: tcp
+    properties:
+      address: "0.0.0.0"
+      port: 9000
+
+targets:
+  - name: ch-out
+    type: clickhouse
+    properties:
+      address: "clickhouse"
+      port: 8123
+      database: "bench"
+      table: "logs"
+      username: "bench"
+      password: "benchpass"
+      use_compression: true
+
+routes:
+  - name: tcp-to-ch
+    devices:
+      - name: tcp-in
+    targets:
+      - name: ch-out

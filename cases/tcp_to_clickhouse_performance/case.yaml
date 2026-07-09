@@ -1,0 +1,63 @@
+name: tcp_to_clickhouse_performance
+type: performance
+description: "Measures throughput of a TCP-in to ClickHouse-out pipeline against a real clickhouse-server (24.8). Unlimited generator rate — pushes peak. Each subject ingests into ClickHouse over its native integration: vmetric and the OpenTelemetry Collector batch-INSERT over the native TCP protocol (:9000, the lowest-overhead wire path); Vector, Fluent Bit, and Cribl Stream POST JSONEachRow over the HTTP interface (:8123). This isolates how efficiently each tool batches and pipelines log ingest into ClickHouse — not the TCP receiver, which is out of the data path here. The receiver polls ClickHouse for the committed row count every 500ms (summing active MergeTree parts across the whole database, so it counts whatever table a subject created) and the harness derives EPS from the row-count timeline."
+
+duration: 60s
+# ClickHouse-server needs a few seconds to open its ports; the receiver creates
+# the bench database + table during warmup, before any data reaches the subject.
+warmup: 30s
+# Sink batches flush on interval/size — give the tail time to land in ClickHouse.
+drain_grace: 45s
+
+endpoints:
+  - name: clickhouse
+    image: clickhouse/clickhouse-server:24.8
+    env:
+      CLICKHOUSE_USER: "bench"
+      CLICKHOUSE_PASSWORD: "benchpass"
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    # Gate the subject on ClickHouse being up. Most subjects retry their sink
+    # lazily, but the otel-collector clickhouse exporter creates its schema
+    # eagerly at startup and crashes if the server isn't accepting connections
+    # yet — so the subject waits for this healthcheck to pass.
+    healthcheck:
+      test: "clickhouse-client --query 'SELECT 1'"
+      interval: 2s
+      timeout: 3s
+      retries: 45
+      start_period: 3s
+
+generator:
+  mode: tcp
+  target: "subject:9000"
+  rate: 0           # unlimited — push as fast as possible
+  line_size: 256
+  format: raw
+  # Some subjects (Fluent Bit, Cribl) can't backpressure cleanly on TCP when
+  # ClickHouse can't keep up at peak — they reset the socket instead. Reconnect
+  # so those resets are absorbed and still yield a measured throughput, rather
+  # than aborting the whole run. Subjects that backpressure cleanly (vmetric,
+  # Vector, otel) never trigger it.
+  reconnect: true
+
+receiver:
+  mode: clickhouse
+  env:
+    RECEIVER_CH_ENDPOINT: "http://clickhouse:8123"
+    RECEIVER_CH_USER: "bench"
+    RECEIVER_CH_PASSWORD: "benchpass"
+    # Poll the row count twice a second for a tight EPS window.
+    RECEIVER_CLOUD_POLL_MS: "500"
+
+requires: [clickhouse_sink]
+
+subjects:
+  - vmetric
+  - vector
+  - fluent-bit
+  - otel-collector
+  - cribl-stream
+
+configurations:
+  default:
+    description: "Raw TCP to a ClickHouse table — no transforms, unlimited rate"

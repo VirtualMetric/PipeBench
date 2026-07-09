@@ -1,0 +1,16 @@
+id: ch_prep
+conf:
+  output: default
+  groups: {}
+  asyncFuncTimeout: 1000
+  functions:
+    - id: eval
+      filter: "true"
+      disabled: false
+      conf:
+        add:
+          - name: message
+            value: _raw
+        remove:
+          - "_raw"
+          - "_time"
