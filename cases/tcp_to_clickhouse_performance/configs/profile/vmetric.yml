@@ -1,0 +1,35 @@
+# Native ClickHouse target + pprof profiler enabled — used to capture CPU/heap
+# profiles of the native ingestion path. Selected with `-c profile`. Reach the
+# profiler at http://127.0.0.1:6061/debug/pprof/ from inside the subject
+# container (docker exec + wget).
+profiler:
+  status: true
+  remote: true
+  director_profile_port: 6061
+
+devices:
+  - id: 1
+    name: tcp-in
+    type: tcp
+    properties:
+      address: "0.0.0.0"
+      port: 9000
+
+targets:
+  - name: ch-out
+    type: clickhouse
+    properties:
+      address: "clickhouse"
+      port: 9000
+      database: "bench"
+      table: "logs"
+      username: "bench"
+      password: "benchpass"
+      format: "native"
+
+routes:
+  - name: tcp-to-ch
+    devices:
+      - name: tcp-in
+    targets:
+      - name: ch-out
