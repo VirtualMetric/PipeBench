@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"context"
 	"fmt"
 	"maps"
 	"os"
@@ -184,7 +185,7 @@ services:
     image: "{{ .SubjectImage }}"
     container_name: "{{ .SubjectContainer }}"
     networks: [bench]
-{{- if or .KafkaEnabled .AWSEnabled .AzureEnabled .VaultEnabled .MinioEnabled .PipelineBrokerEnabled .VerifierLocalDir }}
+{{- if or .KafkaEnabled .AWSEnabled .AzureEnabled .VaultEnabled .DatabaseEnabled .MinioEnabled .PipelineBrokerEnabled .VerifierLocalDir }}
     depends_on:
 {{- if .VerifierLocalDir }}
       data-init:
@@ -199,6 +200,10 @@ services:
 {{- end }}
 {{- if .VaultEnabled }}
       vault-init:
+        condition: service_completed_successfully
+{{- end }}
+{{- if .DatabaseEnabled }}
+      database-init:
         condition: service_completed_successfully
 {{- end }}
 {{- if .AWSEnabled }}
@@ -237,6 +242,9 @@ services:
 {{- end }}
 {{- if .CaseCertsHost }}
       - "{{ .CaseCertsHost }}:/opt/vmetric/certs:ro"
+{{- end }}
+{{- if .DatabaseCAHost }}
+      - "{{ .DatabaseCAHost }}:/opt/vmetric/certs/ca.pem:ro"
 {{- end }}
 {{- if .KrbHostDir }}
       - "{{ .KrbHostDir }}:/krb5:ro"
@@ -991,6 +999,57 @@ services:
     command:
       - "{{ .VaultInitCmd }}"
 {{- end }}
+{{- if .DatabaseEnabled }}
+
+  database:
+    image: "{{ .DatabaseImage }}"
+    container_name: "bench-database"
+    hostname: "database"
+    networks: [bench]
+    environment:
+{{- range $k, $v := .DatabaseEnv }}
+      {{ $k }}: "{{ $v }}"
+{{- end }}
+{{- if .DatabaseTLSEnabled }}
+    volumes:
+      - "{{ .DatabaseServerCertHost }}:{{ .DatabaseServerCertPath }}:ro"
+      - "{{ .DatabaseServerKeyHost }}:{{ .DatabaseServerKeyPath }}:ro"
+      - "{{ .DatabaseConfHost }}:{{ .DatabaseConfPath }}:ro"
+{{- end }}
+{{- if .DatabaseCommand }}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "{{ .DatabaseCommand }}"
+{{- end }}
+    healthcheck:
+      test: ["CMD-SHELL", "{{ .DatabaseHealthCmd }}"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 30s
+    restart: "no"
+
+  # One-shot: create the database and run the seed file, then exit 0. The
+  # subject gates on this completing so the first poll never races an
+  # empty/missing table.
+  database-init:
+    image: "{{ .DatabaseImage }}"
+    container_name: "bench-database-init"
+    networks: [bench]
+    depends_on:
+      database:
+        condition: service_healthy
+    environment:
+{{- range $k, $v := .DatabaseEnv }}
+      {{ $k }}: "{{ $v }}"
+{{- end }}
+    volumes:
+      - "{{ .DatabaseSeedHost }}:/db-seed/init.sql:ro"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "{{ .DatabaseInitCmd }}"
+    restart: "no"
+{{- end }}
 {{- if .AWSEnabled }}
 
   localstack:
@@ -1120,6 +1179,16 @@ type RunConfig struct {
 	VaultTLSHost     string
 	VaultSecretsHost string
 	VaultSeeds       []VaultSeed
+	// DatabaseSeedHost is the host path holding the seed SQL provisioned by
+	// PrepareDatabase for a `database:`-enabled case. NewComposeRunner
+	// populates it when empty; tests may set it directly.
+	DatabaseSeedHost string
+	// DatabaseCertDir / DatabaseConfHost are provisioned by PrepareDatabaseTLS
+	// for a `database.tls: true` case: DatabaseCertDir holds ca.crt +
+	// server.crt + server.key, DatabaseConfHost is the engine TLS config file.
+	// NewComposeRunner populates them when empty.
+	DatabaseCertDir  string
+	DatabaseConfHost string
 	// KrbHostDir / KerberosInitCmd are provisioned by PrepareKerberos for a
 	// `kafka.auth.mechanism: gssapi` case. NewComposeRunner populates them when
 	// empty; tests may set them directly to render without touching the KDC.
@@ -1129,6 +1198,12 @@ type RunConfig struct {
 
 // ComposeRunner manages a docker compose lifecycle for one test run.
 type ComposeRunner struct {
+	// runCtx is cancelled on SIGINT/SIGTERM. Forward-path operations (up,
+	// waits) run under it so an interrupt unwinds them; teardown operations
+	// (Down/Stop/Kill) deliberately use fresh bounded contexts instead, so
+	// cleanup still runs after cancellation. Run-scoped, so storing the ctx
+	// on the struct is the accepted exception to "don't put ctx in structs".
+	runCtx      context.Context
 	cfg         RunConfig
 	composeFile string
 
@@ -1146,7 +1221,12 @@ type ComposeRunner struct {
 var _ Orchestrator = (*ComposeRunner)(nil)
 
 // NewComposeRunner creates a ComposeRunner and writes the compose file.
-func NewComposeRunner(cfg RunConfig) (*ComposeRunner, error) {
+// ctx should be the run-scoped interrupt context; nil means "never
+// interrupted".
+func NewComposeRunner(ctx context.Context, cfg RunConfig) (*ComposeRunner, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := os.MkdirAll(cfg.TmpDir, 0o755); err != nil {
 		return nil, err
 	}
@@ -1166,6 +1246,32 @@ func NewComposeRunner(cfg RunConfig) (*ComposeRunner, error) {
 		cfg.VaultTLSHost, cfg.VaultSecretsHost, cfg.VaultSeeds = vp.TLSDir, vp.SecretsDir, vp.Seeds
 	}
 
+	// Database backend topology prep, same pattern as Vault: a `database:`
+	// case needs the seed SQL file on disk before the compose file is
+	// rendered so database-init can bind-mount it.
+	if cfg.TestCase.UsesDatabase() && cfg.DatabaseSeedHost == "" {
+		seedPath, err := PrepareDatabase(cfg.TmpDir, cfg.TestCase.Database)
+		if err != nil {
+			return nil, fmt.Errorf("preparing database topology: %w", err)
+		}
+		cfg.DatabaseSeedHost = seedPath
+	}
+
+	// Database TLS prep: generate a CA + RSA server cert and the engine TLS
+	// config so the database container presents a verifiable cert and the
+	// subject can trust the CA. Same populate-when-empty pattern.
+	if cfg.TestCase.UsesDatabaseTLS() && cfg.DatabaseCertDir == "" {
+		engine, ok := config.DatabaseEngines[cfg.TestCase.Database.Engine]
+		if !ok {
+			return nil, fmt.Errorf("preparing database tls: unknown engine %q", cfg.TestCase.Database.Engine)
+		}
+		tp, err := PrepareDatabaseTLS(cfg.TmpDir, engine)
+		if err != nil {
+			return nil, fmt.Errorf("preparing database tls: %w", err)
+		}
+		cfg.DatabaseCertDir, cfg.DatabaseConfHost = tp.CertDir, tp.ConfPath
+	}
+
 	// Kerberos topology prep, same pattern as Vault: a gssapi case needs the
 	// KDC bootstrap command + the shared krb5 dir before the compose file is
 	// rendered.
@@ -1182,7 +1288,7 @@ func NewComposeRunner(cfg RunConfig) (*ComposeRunner, error) {
 		return nil, err
 	}
 
-	cr := &ComposeRunner{cfg: cfg, composeFile: composeFile}
+	cr := &ComposeRunner{runCtx: ctx, cfg: cfg, composeFile: composeFile}
 	cr.populateServiceNames()
 	return cr, nil
 }
@@ -1289,25 +1395,36 @@ func (r *ComposeRunner) resolveServiceAliases(names []string) []string {
 
 // StopServices sends SIGTERM to named services with the given grace timeout
 // before SIGKILL. Uses `docker compose stop -t <seconds> <svc>...`.
+// Runs on a fresh bounded context (grace + 30s margin) so it still works
+// after an interrupt and can't hang on a wedged daemon.
 func (r *ComposeRunner) StopServices(timeout time.Duration, services ...string) error {
 	secs := max(int(timeout.Seconds()), 0)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout+30*time.Second)
+	defer cancel()
 	resolved := r.resolveServiceAliases(services)
 	args := append([]string{"stop", "-t", strconv.Itoa(secs)}, resolved...)
-	return r.compose(args...)
+	return r.composeCtx(ctx, args...)
 }
 
 // KillServices sends SIGKILL immediately — no grace period, no chance for
 // the process to clean up. Mirrors a crash scenario for persistence tests.
 // Uses `docker compose kill -s SIGKILL <svc>...`.
 func (r *ComposeRunner) KillServices(services ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	resolved := r.resolveServiceAliases(services)
 	args := append([]string{"kill", "-s", "SIGKILL"}, resolved...)
-	return r.compose(args...)
+	return r.composeCtx(ctx, args...)
 }
 
-// Down stops and removes all containers and anonymous volumes.
+// Down stops and removes all containers and anonymous volumes. It is the
+// deferred teardown for every flow, so it runs on a fresh bounded context:
+// it must proceed after the run context is cancelled by an interrupt, and
+// it must not block forever on a wedged daemon.
 func (r *ComposeRunner) Down() error {
-	return r.compose("down", "-v", "--remove-orphans")
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	return r.composeCtx(ctx, "down", "-v", "--remove-orphans")
 }
 
 // WaitForGeneratorExit blocks until ALL generator containers exit or the
@@ -1319,6 +1436,9 @@ func (r *ComposeRunner) WaitForGeneratorExit(timeout time.Duration) error {
 	pending := append([]string(nil), r.genContainers...)
 	var firstErr error
 	for time.Now().Before(deadline) {
+		if err := r.runCtx.Err(); err != nil {
+			return fmt.Errorf("interrupted while waiting for generator(s): %w", err)
+		}
 		var still []string
 		for _, name := range pending {
 			out, err := exec.Command("docker", "inspect", "--format={{.State.Status}}", name).Output()
@@ -1339,7 +1459,11 @@ func (r *ComposeRunner) WaitForGeneratorExit(timeout time.Duration) error {
 			return firstErr
 		}
 		pending = still
-		time.Sleep(2 * time.Second)
+		select {
+		case <-r.runCtx.Done():
+			return fmt.Errorf("interrupted while waiting for generator(s): %w", r.runCtx.Err())
+		case <-time.After(2 * time.Second):
+		}
 	}
 	return fmt.Errorf("generator(s) did not exit within %s (still running: %v)", timeout, pending)
 }
@@ -1357,7 +1481,11 @@ func (r *ComposeRunner) WaitForVerifierExit(timeout time.Duration) error {
 		if err == nil && strings.TrimSpace(string(out)) == "exited" {
 			return nil
 		}
-		time.Sleep(2 * time.Second)
+		select {
+		case <-r.runCtx.Done():
+			return fmt.Errorf("interrupted while waiting for verifier: %w", r.runCtx.Err())
+		case <-time.After(2 * time.Second):
+		}
 	}
 	return fmt.Errorf("verifier did not exit within %s", timeout)
 }
@@ -1385,19 +1513,25 @@ func (r *ComposeRunner) Logs(service string, lines int) string {
 	return string(out)
 }
 
-// StopCollector sends SIGTERM to the collector container and waits for it to exit.
-// The collector writes its CSV file on SIGTERM, so this must be called before CopyMetricsCSV.
+// StopCollector sends SIGTERM to the collector container and waits for it to
+// exit. The collector fsyncs each CSV row as it samples, so callers copy the
+// CSV first (while the collector still runs) and stop it after — see the
+// teardown order in runner.Run. Bounded so it works after an interrupt and
+// can't hang on a wedged daemon.
 func (r *ComposeRunner) StopCollector() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
 	// docker stop sends SIGTERM and waits up to 10s for graceful exit.
-	out, err := exec.Command("docker", "stop", "-t", "10", "bench-collector").CombinedOutput()
+	out, err := exec.CommandContext(ctx, "docker", "stop", "-t", "10", "bench-collector").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("docker stop bench-collector: %w\n%s", err, out)
 	}
 	return nil
 }
 
-// CopyMetricsCSV copies the metrics CSV from the (stopped) collector container to dst.
-// Call StopCollector first so the CSV has been flushed.
+// CopyMetricsCSV copies the metrics CSV from the (still running) collector
+// container to dst. Safe before StopCollector because the collector fsyncs
+// every row as it writes it.
 func (r *ComposeRunner) CopyMetricsCSV(dst string) error {
 	src := "bench-collector:/results/metrics.csv"
 	out, err := exec.Command("docker", "cp", src, dst).CombinedOutput()
@@ -1464,9 +1598,16 @@ func (r *ComposeRunner) GeneratorStdout() string {
 	return b.String()
 }
 
+// compose runs a docker compose subcommand under the run context: the first
+// interrupt cancels it. Teardown paths must use composeCtx with a fresh
+// bounded context instead, so cleanup still runs after cancellation.
 func (r *ComposeRunner) compose(args ...string) error {
+	return r.composeCtx(r.runCtx, args...)
+}
+
+func (r *ComposeRunner) composeCtx(ctx context.Context, args ...string) error {
 	cmdArgs := append([]string{"compose", "-f", r.composeFile}, args...)
-	cmd := exec.Command("docker", cmdArgs...)
+	cmd := exec.CommandContext(ctx, "docker", cmdArgs...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
@@ -1684,6 +1825,35 @@ type composeVars struct {
 	VaultTLSHost     string
 	VaultSecretsHost string
 	VaultInitCmd     string
+
+	// Database backend topology. DatabaseEnabled gates the database +
+	// database-init services and the subject's database-init depends_on.
+	// DatabaseEnv/DatabaseHealthCmd/DatabaseInitCmd are entirely built by
+	// the selected config.DatabaseEngine — this file has no engine-specific
+	// knowledge.
+	DatabaseEnabled   bool
+	DatabaseImage     string
+	DatabaseEnv       map[string]string
+	DatabaseHealthCmd string
+	DatabaseInitCmd   string
+	DatabaseSeedHost  string
+
+	// DatabaseCommand, when non-empty, overrides the database container's
+	// entrypoint with `/bin/sh -c <DatabaseCommand>` (engine BuildTLSCommand).
+	// Empty for engines that use their image defaults (mssql/mysql).
+	DatabaseCommand string
+
+	// Database TLS (gated by DatabaseTLSEnabled). *Host are host paths bind-
+	// mounted into the database container at the engine's *Path targets;
+	// DatabaseCAHost is the CA mounted into the subject so a device can verify.
+	DatabaseTLSEnabled     bool
+	DatabaseServerCertHost string
+	DatabaseServerKeyHost  string
+	DatabaseConfHost       string
+	DatabaseServerCertPath string
+	DatabaseServerKeyPath  string
+	DatabaseConfPath       string
+	DatabaseCAHost         string
 
 	RecvMode              string
 	RecvListen            string
@@ -2228,6 +2398,54 @@ func writeCompose(path string, cfg RunConfig) error {
 		}
 		sb.WriteString("echo vault seeding complete")
 		vars.VaultInitCmd = sb.String()
+	}
+
+	// Database backend: render the database + database-init services and
+	// gate the subject on the seeding completing. All engine-specific
+	// knowledge (image, env, healthcheck, init command) comes from the
+	// selected config.DatabaseEngine — this block just wires it through.
+	if tc.UsesDatabase() {
+		if cfg.DatabaseSeedHost == "" {
+			return fmt.Errorf("case %q uses database but the seed sql was not prepared", tc.Name)
+		}
+		engine, ok := config.DatabaseEngines[tc.Database.Engine]
+		if !ok {
+			// Unreachable in practice: TestCase.Validate rejects an unknown
+			// engine before a run ever reaches compose rendering.
+			return fmt.Errorf("case %q: unknown database.engine %q", tc.Name, tc.Database.Engine)
+		}
+		vars.DatabaseEnabled = true
+		vars.DatabaseImage = tc.Database.ImageOrDefault(engine)
+		password := tc.Database.PasswordOrDefault(engine)
+		dbName := tc.Database.DatabaseOrDefault()
+		vars.DatabaseEnv = engine.BuildEnv(password)
+		vars.DatabaseHealthCmd = engine.BuildHealthCmd(password)
+		vars.DatabaseInitCmd = engine.BuildInitCmd(password, dbName)
+		vars.DatabaseSeedHost = filepath.ToSlash(cfg.DatabaseSeedHost)
+
+		// Database TLS: mount the generated server cert/key + engine TLS conf
+		// into the database container and the CA into the subject so a device
+		// can verify the server certificate instead of skipping verification.
+		if tc.UsesDatabaseTLS() {
+			if cfg.DatabaseCertDir == "" || engine.TLSServerCertPath == "" {
+				return fmt.Errorf("case %q uses database.tls but the tls certs were not prepared (or engine %q lacks TLS support)", tc.Name, tc.Database.Engine)
+			}
+			confMount, _ := engine.BuildTLSConf()
+			vars.DatabaseTLSEnabled = true
+			vars.DatabaseServerCertHost = filepath.ToSlash(filepath.Join(cfg.DatabaseCertDir, "server.crt"))
+			vars.DatabaseServerKeyHost = filepath.ToSlash(filepath.Join(cfg.DatabaseCertDir, "server.key"))
+			vars.DatabaseConfHost = filepath.ToSlash(cfg.DatabaseConfHost)
+			vars.DatabaseServerCertPath = engine.TLSServerCertPath
+			vars.DatabaseServerKeyPath = engine.TLSServerKeyPath
+			vars.DatabaseConfPath = confMount
+			vars.DatabaseCAHost = filepath.ToSlash(filepath.Join(cfg.DatabaseCertDir, "ca.crt"))
+
+			// Engines that cannot pick up TLS from a mounted conf file (postgres)
+			// override the container entrypoint to enable TLS at startup.
+			if engine.BuildTLSCommand != nil {
+				vars.DatabaseCommand = engine.BuildTLSCommand(engine.TLSServerCertPath, engine.TLSServerKeyPath)
+			}
+		}
 	}
 
 	if tc.MultiReceiver() {
