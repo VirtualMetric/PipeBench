@@ -1,0 +1,29 @@
+# vmetric variant: ClickHouse target, columnar Parquet POSTed over the HTTP REST
+# interface (:8123). parquet-go encodes a single `message` column file; ClickHouse
+# maps it by name. Parquet self-compresses (no gzip). Selected with `-c parquet`.
+devices:
+  - id: 1
+    name: tcp-in
+    type: tcp
+    properties:
+      address: "0.0.0.0"
+      port: 9000
+
+targets:
+  - name: ch-out
+    type: clickhouse
+    properties:
+      address: "clickhouse"
+      port: 8123
+      database: "bench"
+      table: "logs"
+      username: "bench"
+      password: "benchpass"
+      format: "parquet"
+
+routes:
+  - name: tcp-to-ch
+    devices:
+      - name: tcp-in
+    targets:
+      - name: ch-out

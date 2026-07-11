@@ -626,6 +626,57 @@ type Endpoint struct {
 	// container; the harness escapes it so docker-compose interpolation leaves
 	// it alone.
 	Command []string `yaml:"command"`
+	// Healthcheck, when set, attaches a compose healthcheck to the endpoint so
+	// the subject gates on it (depends_on … condition: service_healthy) before
+	// starting. Without it the endpoint has no readiness signal and the subject
+	// starts immediately alongside it. Needed when a subject's sink connects to
+	// the endpoint eagerly at startup and crashes if it isn't up yet — e.g. the
+	// otel-collector clickhouse exporter creates its schema on start, so the
+	// clickhouse endpoint declares a healthcheck and otel waits for it.
+	Healthcheck *EndpointHealthcheck `yaml:"healthcheck"`
+}
+
+// EndpointHealthcheck is a compose healthcheck for an Endpoint. Only Test is
+// required; the timing fields default to a fast poll (see the OrDefault
+// helpers) suitable for a local container coming up in a few seconds.
+type EndpointHealthcheck struct {
+	// Test is the command run inside the container, wrapped as CMD-SHELL — a
+	// non-zero exit means unhealthy. Example (clickhouse-server):
+	// "clickhouse-client --query 'SELECT 1'".
+	Test string `yaml:"test"`
+	// Interval between checks (default "2s").
+	Interval string `yaml:"interval"`
+	// Timeout per check (default "3s").
+	Timeout string `yaml:"timeout"`
+	// Retries before the container is marked unhealthy (default 30).
+	Retries int `yaml:"retries"`
+	// StartPeriod grace before failures count (default "2s").
+	StartPeriod string `yaml:"start_period"`
+}
+
+func (h *EndpointHealthcheck) IntervalOrDefault() string {
+	if h != nil && h.Interval != "" {
+		return h.Interval
+	}
+	return "2s"
+}
+func (h *EndpointHealthcheck) TimeoutOrDefault() string {
+	if h != nil && h.Timeout != "" {
+		return h.Timeout
+	}
+	return "3s"
+}
+func (h *EndpointHealthcheck) RetriesOrDefault() int {
+	if h != nil && h.Retries > 0 {
+		return h.Retries
+	}
+	return 30
+}
+func (h *EndpointHealthcheck) StartPeriodOrDefault() string {
+	if h != nil && h.StartPeriod != "" {
+		return h.StartPeriod
+	}
+	return "2s"
 }
 
 // Rotation parameterizes the director_agent_tls_cert_rotation_correctness
@@ -2376,6 +2427,15 @@ type GeneratorConfig struct {
 	LineSize    int    `yaml:"line_size"`   // bytes per line
 	Format      string `yaml:"format"`      // "raw" | "syslog" | "json"
 	Connections int    `yaml:"connections"` // parallel connections (default 1)
+	// Reconnect, when true, has each parallel TCP connection redial and keep
+	// sending after a transient break (subject reset/OOM under load) until the
+	// run ceiling, instead of failing the whole run — the resilience the
+	// single-connection path already has. Used by sink-bound performance cases
+	// (e.g. clickhouse) where a subject that can't sustain peak rate resets the
+	// socket rather than backpressuring cleanly; without it that shows as a run
+	// ERROR instead of a measured throughput. Default off — every other case
+	// keeps treating a mid-run break as a hard failure.
+	Reconnect bool `yaml:"reconnect"`
 	// SampleFile replays a fixed input file instead of synthesizing lines.
 	// Path is relative to the case directory (e.g. "input/sample.cef"). When
 	// set, the generator sends the file's lines verbatim, cycling to reach

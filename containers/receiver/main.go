@@ -78,6 +78,24 @@ func (s *connStats) recordLine(byteCount int64) int64 {
 	return n
 }
 
+// recordN bumps the line/byte counters by a whole batch at once and refreshes
+// the receive window. Poll-based modes that learn a row COUNT (clickhouse)
+// discover many rows from a single query and can't spin recordLine per row at
+// multi-million scale; recordN folds the batch into one pair of atomic adds.
+// firstNs is stamped on the first non-empty batch, lastNs on every batch.
+func (s *connStats) recordN(lines, bytes int64) {
+	if lines <= 0 {
+		return
+	}
+	newTotal := s.lines.Add(lines)
+	s.bytes.Add(bytes)
+	now := time.Now().UnixNano()
+	if newTotal == lines { // first batch recorded on this shard
+		s.firstNs.CompareAndSwap(0, now)
+	}
+	s.lastNs.Store(now)
+}
+
 // finish records a closing timestamp regardless of where the 1024-line
 // sampling left off, so the last bucket of lines in a connection isn't
 // silently dropped from the receive window.
@@ -542,6 +560,8 @@ func main() {
 		err = receiveOTLP(cfg, onLine)
 	case "s3":
 		err = receiveS3(cfg, cnt, val)
+	case "clickhouse":
+		err = receiveClickHouse(cfg, cnt, val)
 	case "azure_blob":
 		err = receiveAzureBlob(cfg, cnt, val)
 	case "sqs":

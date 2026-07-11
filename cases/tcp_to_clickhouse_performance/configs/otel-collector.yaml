@@ -1,0 +1,40 @@
+# OpenTelemetry Collector (contrib): tcplog receiver in, native `clickhouse`
+# exporter out. The exporter INSERTs over the native protocol (:9000) and
+# manages its own schema (create_schema) — it writes to its own bench.otel_logs
+# table, not the shared bench.logs. The perf receiver counts rows database-wide,
+# so otel_logs is measured on equal footing. The body of each log record is the
+# raw TCP line.
+
+receivers:
+  tcplog:
+    listen_address: "0.0.0.0:9000"
+
+processors:
+  batch:
+    send_batch_size: 10000
+    timeout: 1s
+
+exporters:
+  clickhouse:
+    endpoint: tcp://clickhouse:9000?dial_timeout=10s
+    database: bench
+    username: bench
+    password: benchpass
+    logs_table_name: otel_logs
+    create_schema: true
+    ttl: 0
+    timeout: 10s
+    retry_on_failure:
+      enabled: true
+    sending_queue:
+      queue_size: 1000
+
+service:
+  telemetry:
+    metrics:
+      level: none
+  pipelines:
+    logs:
+      receivers: [tcplog]
+      processors: [batch]
+      exporters: [clickhouse]

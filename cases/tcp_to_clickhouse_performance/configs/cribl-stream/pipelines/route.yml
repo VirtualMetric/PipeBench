@@ -1,0 +1,12 @@
+id: default
+groups: {}
+comments: []
+routes:
+  - id: bench_route
+    name: bench_clickhouse
+    final: true
+    disabled: false
+    pipeline: ch_prep
+    filter: "true"
+    output: bench_clickhouse_out
+    description: "Map _raw to message, then insert into ClickHouse"

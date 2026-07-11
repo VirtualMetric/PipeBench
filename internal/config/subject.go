@@ -123,6 +123,8 @@ var Registry = map[string]Subject{
 		Capabilities: []string{
 			"s3_sink", "s3_source", "azure_blob_sink",
 			"sqs_sink", "sns_sink", "kinesis_sink", "cloudwatch_logs_sink",
+			// Native `clickhouse` sink — HTTP JSONEachRow into a real server.
+			"clickhouse_sink",
 		},
 	},
 	"fluent-bit": {
@@ -140,6 +142,10 @@ var Registry = map[string]Subject{
 		// history. Re-add once upstream ships an insecure-TLS option.
 		Capabilities: []string{
 			"s3_sink", "azure_blob_sink",
+			// No native ClickHouse plugin; the stock `http` output POSTs
+			// JSONEachRow to ClickHouse's HTTP interface (INSERT … FORMAT
+			// JSONEachRow), which the server ingests like any other client.
+			"clickhouse_sink",
 		},
 	},
 	"fluentd": {
@@ -208,7 +214,7 @@ var Registry = map[string]Subject{
 	"vmetric": {
 		Name:       "vmetric",
 		Image:      "vmetric/director",
-		Version:    "2.0.6",
+		Version:    "2.0.9",
 		ConfigPath: "/config.yml",
 		// The director resolves device TLS cert_name against its WorkingDir
 		// (/opt/vmetric) and rejects paths outside it, so mount the harness
@@ -244,6 +250,9 @@ var Registry = map[string]Subject{
 			"s3_sink", "s3_source", "azure_blob_sink", "azure_blob_source",
 			"sqs_sink", "sns_sink", "kinesis_sink", "cloudwatch_logs_sink",
 			"s3_avro_sink", "s3_parquet_sink",
+			// Native `clickhouse` target — batch INSERT over the native TCP
+			// protocol (:9000), the lowest-overhead wire path.
+			"clickhouse_sink",
 		},
 	},
 	"otel-collector": {
@@ -254,7 +263,12 @@ var Registry = map[string]Subject{
 		// awss3exporter + awscloudwatchlogsexporter take `endpoint`. Note
 		// the s3 exporter writes OTLP-JSON batches, not raw lines — keep
 		// otel out of exact-count correctness cases.
-		Capabilities: []string{"s3_sink", "cloudwatch_logs_sink"},
+		//
+		// clickhouse: the contrib `clickhouse` exporter INSERTs over the native
+		// protocol and manages its own schema (create_schema), writing to its
+		// own otel_logs table rather than the shared bench.logs — the perf
+		// receiver counts rows database-wide, so it's still measured fairly.
+		Capabilities: []string{"s3_sink", "cloudwatch_logs_sink", "clickhouse_sink"},
 	},
 	"grafana-alloy": {
 		Name:       "grafana-alloy",
@@ -283,6 +297,9 @@ var Registry = map[string]Subject{
 		Capabilities: []string{
 			"s3_sink", "s3_source", "azure_blob_sink", "azure_blob_source",
 			"sqs_sink", "sns_sink", "kinesis_sink", "cloudwatch_logs_sink",
+			// Native ClickHouse destination — HTTP JSONEachRow with automatic
+			// field→column mapping.
+			"clickhouse_sink",
 		},
 	},
 	// rotel — Streamfold's Rust-based OTel collector. No config file:

@@ -29,7 +29,7 @@ After the test, the result is merged into a single per-(hardware, subject) JSON 
 
 ## Available tests
 
-### Performance tests (25)
+### Performance tests (26)
 
 | Test | What it does |
 | --- | --- |
@@ -58,6 +58,7 @@ After the test, the result is merged into a single per-(hardware, subject) JSON 
 | `tcp_to_sns_performance` | TCP in, SNS topic out, observed via an SQS subscription (LocalStack emulator) |
 | `tcp_to_kinesis_performance` | TCP in, Kinesis stream out across 4 shards (LocalStack emulator) |
 | `tcp_to_cloudwatch_performance` | TCP in, CloudWatch Logs out (LocalStack emulator) |
+| `tcp_to_clickhouse_performance` | TCP in, batch-INSERT into a real ClickHouse server — native protocol (vmetric, otel) or HTTP JSONEachRow (Vector, Fluent Bit, Cribl); receiver counts committed rows |
 
 ### Correctness tests (17)
 
@@ -90,11 +91,17 @@ Two caveats when reading the numbers:
 - **Compare across subjects, not across case types.** The emulators (Python/Node single-process services) cap throughput far below the raw TCP cases. Every subject faces the same ceiling, so rankings are meaningful; absolute EPS is not comparable to `tcp_to_tcp_performance`.
 - **Out of scope:** Azure Event Hubs, Service Bus, Sentinel and Data Explorer have no usable local emulator; AWS Firehose and DynamoDB delivery are LocalStack pro-tier. Cases for those services would silently measure a mock, so they don't exist.
 
+### ClickHouse ingest case
+
+`tcp_to_clickhouse_performance` measures **sustained rows/s committed to a real `clickhouse-server` (24.8)** through each subject's native ClickHouse integration. Unlike the emulator cases the target is the real database, and unlike the TCP cases the receiver isn't in the data path — it polls ClickHouse for the committed row count and the harness derives EPS from that timeline. Coverage is the subjects with a first-party ClickHouse path: **vmetric** and the **OpenTelemetry Collector** batch-INSERT over the native TCP protocol (`:9000`); **Vector**, **Fluent Bit** (via its `http` output), and **Cribl Stream** POST JSONEachRow over the HTTP interface (`:8123`).
+
+Reading the numbers: the generator runs unbounded, so this is a **peak** test. Tools that backpressure cleanly on TCP throttle the generator and deliver nearly everything (low `loss%`); tools that can't shed load once ClickHouse can't keep up, which shows as high `loss%`. Weigh **EPS alongside CPU/memory and loss** — a high raw EPS bought with an order of magnitude more RAM and a large fraction of events dropped is a very different result than the same EPS at a fraction of the resources with almost no loss.
+
 ## Subjects
 
 | Name | Image | Version |
 | --- | --- | --- |
-| VirtualMetric DataStream | `vmetric/director` | `2.0.6` |
+| VirtualMetric DataStream | `vmetric/director` | `2.0.9` |
 | Vector | `timberio/vector` | `0.54.0-alpine` |
 | Fluent Bit | `fluent/fluent-bit` | `5.0` |
 | Fluentd | `fluent/fluentd` | `v1.17-debian-1` |
@@ -127,7 +134,7 @@ PipeBench/
     receiver/            Receives output, counts lines, validates correctness
     collector/           Polls Docker stats API, writes metrics CSV
     vmetric/             Dockerfile + pre-built binary for the VirtualMetric Director subject
-  cases/                 51 test cases (27 performance + 24 correctness), each with per-subject configs
+  cases/                 60 test cases (32 performance + 28 correctness), each with per-subject configs
   web/                   Static PipeBench UI (single HTML + per-(hardware, subject) JSON under web/results/)
 ```
 

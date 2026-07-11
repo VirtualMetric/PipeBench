@@ -1,0 +1,17 @@
+outputs:
+  default:
+    defaultId: bench_clickhouse_out
+    type: default
+  bench_clickhouse_out:
+    type: click_house
+    url: http://clickhouse:8123
+    database: bench
+    tableName: logs
+    format: json-each-row
+    mappingType: automatic
+    authType: basic
+    username: bench
+    password: benchpass
+    asyncInserts: false
+    onBackpressure: block
+    compress: false

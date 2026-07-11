@@ -1,0 +1,16 @@
+inputs:
+  bench_tcp_in:
+    type: tcp
+    host: 0.0.0.0
+    port: 9000
+    disabled: false
+    tls:
+      disabled: true
+    enableProxyHeader: false
+    staleChannelFlushMs: 10000
+    enableHeader: false
+    preprocess:
+      disabled: true
+    sendToRoutes: true
+    pqEnabled: false
+    authType: manual

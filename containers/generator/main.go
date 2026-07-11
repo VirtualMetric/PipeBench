@@ -46,6 +46,7 @@ type config struct {
 	Warmup           time.Duration
 	Sequenced        bool  // embed SEQ=<n> in each line for correctness
 	Connections      int   // parallel TCP/HTTP connections (default 1)
+	Reconnect        bool  // redial + resume each parallel connection after a transient break, instead of failing the run (opt-in; sink-bound perf cases where a saturated subject resets the socket)
 	SeqOffset        int64 // starting sequence number — set per worker by the parallel dispatcher so global sequences don't overlap across workers (otherwise each worker emits 0..perWorker, breaking the receiver-side dedup check)
 	ConnOffset       int   // global offset added to connection IDs — set by the harness in multi-generator mode so CONN= values from different generators never collide downstream
 
@@ -329,6 +330,7 @@ func loadConfig() config {
 	if cfg.Connections < 1 {
 		cfg.Connections = 1
 	}
+	cfg.Reconnect = getEnvBool("GENERATOR_RECONNECT", false)
 
 	warmupStr := getEnv("GENERATOR_WARMUP", "5s")
 	w, err := time.ParseDuration(warmupStr)
@@ -352,7 +354,15 @@ func loadConfig() config {
 
 func dialTCP(target string) (net.Conn, error) {
 	timeout := time.Duration(getEnvInt("GENERATOR_CONNECT_TIMEOUT", 120)) * time.Second
-	deadline := time.Now().Add(timeout)
+	return dialTCPDeadline(target, time.Now().Add(timeout))
+}
+
+// dialTCPDeadline retries the dial until it succeeds or `deadline` passes. The
+// reconnect path passes the run ceiling as the deadline so a worker can't sit
+// in a 120s connect-retry loop past the end of the run (which would keep the
+// generator process alive past the harness's generator-wait timeout when a
+// saturated subject stops accepting connections).
+func dialTCPDeadline(target string, deadline time.Time) (net.Conn, error) {
 	// KeepAlive lets the OS detect a dead server within ~15s so a wedged
 	// subject surfaces an error promptly instead of blocking until the
 	// run-duration write deadline fires.
@@ -370,7 +380,7 @@ func dialTCP(target string) (net.Conn, error) {
 		fmt.Fprintf(os.Stderr, "generator: tcp connect %s: %v (retrying…)\n", target, err)
 		time.Sleep(2 * time.Second)
 	}
-	return nil, fmt.Errorf("tcp connect %s after %s: %w", target, timeout, err)
+	return nil, fmt.Errorf("tcp connect %s: %w", target, err)
 }
 
 // dialMaybeTLS dials cfg.Target either as plain TCP (default) or wraps the
@@ -379,15 +389,21 @@ func dialTCP(target string) (net.Conn, error) {
 // auto-writes self-signed material for TLS-enabled runs. Returns the same
 // net.Conn type so callers don't need to branch on TLS.
 func dialMaybeTLS(cfg config) (net.Conn, error) {
+	timeout := time.Duration(getEnvInt("GENERATOR_CONNECT_TIMEOUT", 120)) * time.Second
+	return dialMaybeTLSDeadline(cfg, time.Now().Add(timeout))
+}
+
+// dialMaybeTLSDeadline is dialMaybeTLS bounded by an absolute deadline (see
+// dialTCPDeadline) — used by the reconnect path so a worker's redial respects
+// the run ceiling instead of the full connect timeout.
+func dialMaybeTLSDeadline(cfg config, deadline time.Time) (net.Conn, error) {
 	if !cfg.TLS {
-		return dialTCP(cfg.Target)
+		return dialTCPDeadline(cfg.Target, deadline)
 	}
 	tlsCfg, err := buildTLSConfig(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("tls config: %w", err)
 	}
-	timeout := time.Duration(getEnvInt("GENERATOR_CONNECT_TIMEOUT", 120)) * time.Second
-	deadline := time.Now().Add(timeout)
 	var lastErr error
 	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 15 * time.Second}
 	for time.Now().Before(deadline) {
@@ -399,7 +415,7 @@ func dialMaybeTLS(cfg config) (net.Conn, error) {
 		fmt.Fprintf(os.Stderr, "generator: tls connect %s: %v (retrying…)\n", cfg.Target, err)
 		time.Sleep(2 * time.Second)
 	}
-	return nil, fmt.Errorf("tls connect %s after %s: %w", cfg.Target, timeout, lastErr)
+	return nil, fmt.Errorf("tls connect %s: %w", cfg.Target, lastErr)
 }
 
 // buildTLSConfig assembles a *tls.Config from cfg, falling back to the
@@ -605,6 +621,20 @@ func runTCPParallel(cfg config, clock *sendClock) (int64, int64, error) {
 		wg.Add(1)
 		go func(id int, conn net.Conn) {
 			defer wg.Done()
+
+			// Reconnect mode: on a transient break, redial and resume until the
+			// run ceiling — the resilience runTCPSingle already has. The run's
+			// verdict is the receiver's delivered count, so a worker's own
+			// errors are swallowed rather than failing the whole run.
+			if cfg.Reconnect {
+				sent, bytes := sendWorkerReconnect(cfg, id+cfg.ConnOffset, clock, conn)
+				totalLines.Add(sent)
+				totalBytes.Add(bytes)
+				fmt.Fprintf(os.Stderr, "generator: connection %d done: lines=%d bytes=%d\n",
+					id, sent, bytes)
+				return
+			}
+
 			defer conn.Close()
 
 			w := bufio.NewWriterSize(conn, 256*1024)
@@ -635,6 +665,85 @@ func runTCPParallel(cfg config, clock *sendClock) (int64, int64, error) {
 
 	wg.Wait()
 	return totalLines.Load(), totalBytes.Load(), firstErr
+}
+
+// sendWorkerReconnect drives one parallel worker with reconnect-on-break, used
+// when GENERATOR_RECONNECT is set. It reuses the already-dialed initialConn for
+// the first attempt, then redials on any non-timeout break until the run
+// ceiling (cfg.Duration + 5s). This mirrors runTCPSingle but for a single
+// worker id in the parallel fan-out; errors are swallowed because the run's
+// success is judged by the receiver's delivered count, not the generator's.
+func sendWorkerReconnect(cfg config, id int, clock *sendClock, initialConn net.Conn) (int64, int64) {
+	runEnd := time.Now().Add(cfg.Duration + 5*time.Second)
+	var totalSent, totalBytes int64
+	conn := initialConn
+
+	for {
+		if time.Now().After(runEnd) {
+			if conn != nil {
+				_ = conn.Close()
+			}
+			return totalSent, totalBytes
+		}
+		if conn == nil {
+			// Bound the redial to the run ceiling so a worker never lingers in
+			// the 120s connect-retry loop after the run should have ended (a
+			// saturated subject that stops accepting connections would otherwise
+			// keep the generator process alive past the harness timeout).
+			c, err := dialMaybeTLSDeadline(cfg, runEnd)
+			if err != nil {
+				if time.Now().After(runEnd) {
+					return totalSent, totalBytes
+				}
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+			conn = c
+		}
+		_ = conn.SetWriteDeadline(runEnd)
+
+		// Per-attempt config: inner duration fires a few seconds before the
+		// absolute conn deadline, and TotalLines is decremented so reconnects
+		// don't overshoot it (matches runTCPSingle).
+		attempt := cfg
+		attempt.Duration = time.Until(runEnd) - 5*time.Second
+		if attempt.Duration <= 0 {
+			_ = conn.Close()
+			return totalSent, totalBytes
+		}
+		if attempt.TotalLines > 0 {
+			attempt.TotalLines -= totalSent
+			if attempt.TotalLines <= 0 {
+				_ = conn.Close()
+				return totalSent, totalBytes
+			}
+		}
+
+		w := bufio.NewWriterSize(conn, 256*1024)
+		sent, bytes, werr := sendLinesConn(attempt, id, clock, func(line []byte) error {
+			_, e := w.Write(line)
+			return e
+		})
+		ferr := w.Flush()
+		_ = conn.Close()
+		conn = nil
+		totalSent += sent
+		totalBytes += bytes
+
+		// Absolute/inner deadline fired, or the attempt finished cleanly
+		// (duration elapsed / TotalLines hit): clean worker exit.
+		if isDurationTimeout(werr) || isDurationTimeout(ferr) {
+			return totalSent, totalBytes
+		}
+		if werr == nil && ferr == nil {
+			return totalSent, totalBytes
+		}
+		if time.Now().After(runEnd) {
+			return totalSent, totalBytes
+		}
+		// Transient break (reset/broken pipe) before the ceiling — reconnect.
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 // isDurationTimeout reports whether err is the write deadline firing —
