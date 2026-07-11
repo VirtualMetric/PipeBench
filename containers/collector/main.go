@@ -215,15 +215,8 @@ func dockerStatsToRow(cur *dockerStats, prev *dockerStats) MetricsRow {
 		cpuPct = 100 * numCPU
 	}
 
-	cache := cur.MemoryStats.Stats["cache"]
-	memUsed := int64(cur.MemoryStats.Usage) - int64(cache)
-	if memUsed < 0 {
-		memUsed = int64(cur.MemoryStats.Usage)
-	}
-	memFree := int64(cur.MemoryStats.Limit) - int64(cur.MemoryStats.Usage)
-	if memFree < 0 {
-		memFree = 0
-	}
+	memUsed, cache := memUsage(cur.MemoryStats.Usage, cur.MemoryStats.Stats)
+	memFree := max(int64(cur.MemoryStats.Limit)-int64(cur.MemoryStats.Usage), 0)
 
 	var netRecv, netSend int64
 	for _, n := range cur.Networks {
@@ -280,13 +273,41 @@ func dockerStatsToRow(cur *dockerStats, prev *dockerStats) MetricsRow {
 		CpuUsr:  cpuPct,
 		CpuIdl:  100.0 - cpuPct,
 		MemUsed: memUsed,
-		MemCach: int64(cache),
+		MemCach: cache,
 		MemFree: memFree,
 		NetRecv: netRecv,
 		NetSend: netSend,
 		DskRead: dskRead,
 		DskWrit: dskWrit,
 	}
+}
+
+// memUsage converts Docker stats memory counters into used/cache bytes.
+//
+// All page cache is excluded, except shmem: cgroups charge shared image-layer
+// and binary pages to whichever container faults them first, and pages
+// touched twice migrate to the active list — so both raw usage and the
+// `docker stats` formula (usage - inactive_file) swing tens of MB between
+// otherwise identical runs. A benchmark needs a reproducible figure, so
+// mem_used is anon + shmem + kernel. shmem stays counted because tmpfs/shm
+// segments are swap-backed real memory that cgroups fold into the page
+// cache number.
+func memUsage(usage uint64, stats map[string]uint64) (used, cache int64) {
+	// cgroup v1 keys the page cache as "total_cache"/"cache"; v2 as "file".
+	pageCache, ok := stats["total_cache"]
+	shmem := stats["total_shmem"]
+	if !ok {
+		if pageCache, ok = stats["cache"]; !ok {
+			pageCache = stats["file"]
+		}
+		shmem = stats["shmem"]
+	}
+	cache = int64(pageCache)
+
+	if pageCache >= shmem && usage >= pageCache-shmem {
+		return int64(usage - (pageCache - shmem)), cache
+	}
+	return int64(usage), cache
 }
 
 // --- Common ---

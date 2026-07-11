@@ -111,6 +111,9 @@ type GeneratorResult struct {
 
 // Runner executes a single test case against a single subject.
 type Runner struct {
+	// ctx is cancelled only by SIGINT/SIGTERM — it never carries a
+	// deadline — so context.Canceled always means "user interrupt".
+	ctx   context.Context
 	opts  Options
 	store *results.Store
 }
@@ -125,10 +128,16 @@ func hardwareID() string {
 	return "custom"
 }
 
-// New creates a Runner.
-func New(opts Options) *Runner {
+// New creates a Runner. ctx should be cancelled on SIGINT/SIGTERM so
+// in-flight waits unwind through their error paths and deferred teardown
+// still runs; nil means "never interrupted".
+func New(ctx context.Context, opts Options) *Runner {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	opts.applyDefaults()
 	return &Runner{
+		ctx:   ctx,
 		opts:  opts,
 		store: results.NewStore(opts.ResultsDir),
 	}
@@ -350,7 +359,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		TLSCertsHost:     tlsCertsHost,
 	}
 
-	cr, err := orchestrator.NewComposeRunner(runCfg)
+	cr, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
 	if err != nil {
 		return results.RunResult{}, fmt.Errorf("compose setup: %w", err)
 	}
@@ -418,6 +427,11 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 
 		fmt.Printf("  waiting for generator (up to %s)…\n", genTimeout)
 		if err := orch.WaitForGeneratorExit(genTimeout); err != nil {
+			if errors.Is(err, context.Canceled) {
+				// A user interrupt must never be misread as an expected
+				// negative-test outcome — abort the run instead.
+				return results.RunResult{}, err
+			}
 			if tc.Correctness.ExpectFailure {
 				// A negative test EXPECTS the data path to fail — e.g. the
 				// generator gets 401s because auth correctly rejects a wrong
@@ -440,8 +454,8 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 			headStart = rem
 		}
 		fmt.Printf("  no generator — letting the subject run (head start %s)…\n", headStart)
-		if headStart > 0 {
-			time.Sleep(headStart)
+		if err := sleepCtx(r.ctx, headStart); err != nil {
+			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
 		}
 	}
 
@@ -479,7 +493,9 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 			var drainLast int64
 			drainStart := time.Now()
 			for time.Now().Before(drainDeadline) {
-				time.Sleep(drainPoll)
+				if err := sleepCtx(r.ctx, drainPoll); err != nil {
+					return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+				}
 				var totalLines int64
 				if tc.MultiReceiver() {
 					agg, _, qerr := r.aggregateReceivers(ports, 10*time.Second)
@@ -513,7 +529,9 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 			}
 			if drainGrace > 0 {
 				fmt.Printf("  waiting post-send receive grace (%s)…\n", drainGrace)
-				time.Sleep(drainGrace)
+				if err := sleepCtx(r.ctx, drainGrace); err != nil {
+					return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+				}
 			}
 		} else {
 			// Correctness tests need completeness rather than a fixed SLA window:
@@ -541,7 +559,9 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 			var drainStable int
 			var drainLast int64
 			for time.Now().Before(drainDeadline) {
-				time.Sleep(drainPoll)
+				if err := sleepCtx(r.ctx, drainPoll); err != nil {
+					return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+				}
 				var totalLines int64
 				if tc.MultiReceiver() {
 					agg, _, qerr := r.aggregateReceivers(ports, 10*time.Second)
@@ -915,7 +935,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		// canonical results file the web UI consumes.
 		fmt.Println("  done. (drain mode — result not persisted)")
 	} else {
-		dir, err := r.store.Save(result, metricsCSVSrc)
+		dir, err := r.saveResult(result, metricsCSVSrc)
 		if err != nil {
 			return result, fmt.Errorf("saving results: %w", err)
 		}
@@ -1058,7 +1078,7 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 		MemLimit:         r.opts.MemLimit,
 	}
 
-	cr, err := orchestrator.NewComposeRunner(runCfg)
+	cr, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
 	if err != nil {
 		return results.RunResult{}, fmt.Errorf("compose setup: %w", err)
 	}
@@ -1106,7 +1126,9 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 
 	// PHASE 3: Wait for subject to persist all buffered data
 	fmt.Println("  phase 3: waiting for subject to persist data…")
-	time.Sleep(10 * time.Second)
+	if err := sleepCtx(r.ctx, 10*time.Second); err != nil {
+		return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+	}
 
 	// PHASE 4: Start receiver — subject should now forward persisted logs
 	fmt.Println("  phase 4: starting receiver (subject should forward buffered logs)…")
@@ -1129,7 +1151,9 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 	stableRounds := 0
 	drainDeadline := time.Now().Add(drainTimeout)
 	for time.Now().Before(drainDeadline) {
-		time.Sleep(5 * time.Second)
+		if err := sleepCtx(r.ctx, 5*time.Second); err != nil {
+			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+		}
 		rm, err := r.queryReceiverMetrics(metricsPort, 10*time.Second)
 		if err != nil {
 			continue
@@ -1224,7 +1248,7 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 		result.FailReason = strings.Join(errors, "; ")
 	}
 
-	dir, err := r.store.Save(result, "")
+	dir, err := r.saveResult(result, "")
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
 	}
@@ -1333,7 +1357,7 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 		MemLimit:         r.opts.MemLimit,
 	}
 
-	cr, err := orchestrator.NewComposeRunner(runCfg)
+	cr, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
 	if err != nil {
 		return results.RunResult{}, fmt.Errorf("compose setup: %w", err)
 	}
@@ -1401,7 +1425,9 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 	}
 
 	// Small pause so receiver is fully ready before subject comes back online
-	time.Sleep(3 * time.Second)
+	if err := sleepCtx(r.ctx, 3*time.Second); err != nil {
+		return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+	}
 
 	// PHASE 5: Restart subject — it should read persisted logs and forward them
 	fmt.Println("  phase 5: restarting subject (should replay persisted logs)…")
@@ -1423,7 +1449,9 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 	stableRounds := 0
 	drainDeadline := time.Now().Add(drainTimeout)
 	for time.Now().Before(drainDeadline) {
-		time.Sleep(5 * time.Second)
+		if err := sleepCtx(r.ctx, 5*time.Second); err != nil {
+			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+		}
 		rm, err := r.queryReceiverMetrics(metricsPort, 10*time.Second)
 		if err != nil {
 			continue
@@ -1516,7 +1544,7 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 		result.FailReason = strings.Join(errors, "; ")
 	}
 
-	dir, err := r.store.Save(result, "")
+	dir, err := r.saveResult(result, "")
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
 	}
@@ -1649,7 +1677,7 @@ func (r *Runner) runKafkaMidDeliveryAction(tc *config.TestCase, subject config.S
 		}
 	}
 
-	orch, err := orchestrator.NewComposeRunner(runCfg)
+	orch, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
 	if err != nil {
 		return results.RunResult{}, fmt.Errorf("compose setup: %w", err)
 	}
@@ -1706,7 +1734,9 @@ func (r *Runner) runKafkaMidDeliveryAction(tc *config.TestCase, subject config.S
 				break
 			}
 		}
-		time.Sleep(500 * time.Millisecond)
+		if err := sleepCtx(r.ctx, 500*time.Millisecond); err != nil {
+			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+		}
 	}
 	if !fired {
 		return results.RunResult{}, fmt.Errorf("never reached mid-delivery (%s) before timeout", formatCount(mid))
@@ -1718,6 +1748,10 @@ func (r *Runner) runKafkaMidDeliveryAction(tc *config.TestCase, subject config.S
 	warmup := tc.WarmupOrDefault(30 * time.Second)
 	genTimeout := min(duration+warmup+2*time.Minute, r.opts.Timeout)
 	if err := orch.WaitForGeneratorExit(genTimeout); err != nil {
+		if errors.Is(err, context.Canceled) {
+			// A user interrupt is not a tolerable generator hiccup — abort.
+			return results.RunResult{}, err
+		}
 		fmt.Printf("  (generator wait: %v)\n", err)
 	}
 	genStats := r.parseGeneratorStats(orch.GeneratorStdout())
@@ -1730,7 +1764,9 @@ func (r *Runner) runKafkaMidDeliveryAction(tc *config.TestCase, subject config.S
 	stableRounds := 0
 	drainDeadline := time.Now().Add(drainTimeout)
 	for time.Now().Before(drainDeadline) {
-		time.Sleep(5 * time.Second)
+		if err := sleepCtx(r.ctx, 5*time.Second); err != nil {
+			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+		}
 		rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
 		if qerr != nil {
 			continue
@@ -1809,7 +1845,7 @@ func (r *Runner) runKafkaMidDeliveryAction(tc *config.TestCase, subject config.S
 
 	// Persist the result like every other run path — Run's contract is to
 	// return the *persisted* result.
-	dir, err := r.store.Save(result, "")
+	dir, err := r.saveResult(result, "")
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
 	}
@@ -1852,7 +1888,9 @@ func (r *Runner) runKafkaInflightCrash(tc *config.TestCase, subject config.Subje
 				return fmt.Errorf("killing subject: %w", err)
 			}
 			// Settle before the consumer rejoins and replays uncommitted offsets.
-			time.Sleep(3 * time.Second)
+			if err := sleepCtx(r.ctx, 3*time.Second); err != nil {
+				return fmt.Errorf("interrupted: %w", err)
+			}
 			if err := orch.UpServices("subject"); err != nil {
 				return fmt.Errorf("restarting subject: %w", err)
 			}
@@ -1911,7 +1949,9 @@ func (r *Runner) runKafkaCertRotation(tc *config.TestCase, subject config.Subjec
 			// Give the broker time to come back and the consumer time to
 			// bounce-detect and retry against the untrusted leaf (each attempt
 			// should fail certificate verification).
-			time.Sleep(25 * time.Second)
+			if err := sleepCtx(r.ctx, 25*time.Second); err != nil {
+				return fmt.Errorf("interrupted: %w", err)
+			}
 
 			lines, after := subjectLogStats(subj)
 			if lines == 0 {
@@ -1931,7 +1971,9 @@ func (r *Runner) runKafkaCertRotation(tc *config.TestCase, subject config.Subjec
 			}); err != nil {
 				return err
 			}
-			time.Sleep(5 * time.Second)
+			if err := sleepCtx(r.ctx, 5*time.Second); err != nil {
+				return fmt.Errorf("interrupted: %w", err)
+			}
 			fmt.Println("  broker cert restored under the trusted CA — expecting delivery to resume")
 			return nil
 		},
@@ -2100,7 +2142,7 @@ func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject confi
 		TLSCertsHost:     certsDir,
 	}
 
-	orch, err := orchestrator.NewComposeRunner(runCfg)
+	orch, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
 	if err != nil {
 		return results.RunResult{}, fmt.Errorf("compose setup: %w", err)
 	}
@@ -2127,7 +2169,9 @@ func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject confi
 		if d > rem {
 			return fmt.Errorf("run timeout (%s) exceeded during the rotation wait", r.opts.Timeout)
 		}
-		time.Sleep(d)
+		if err := sleepCtx(r.ctx, d); err != nil {
+			return fmt.Errorf("interrupted: %w", err)
+		}
 		return nil
 	}
 	defer func() {
@@ -2191,7 +2235,9 @@ func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject confi
 				break
 			}
 		}
-		time.Sleep(2 * time.Second)
+		if err := sleepCtx(r.ctx, 2*time.Second); err != nil {
+			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+		}
 	}
 	if !established {
 		return results.RunResult{}, fmt.Errorf(
@@ -2327,7 +2373,9 @@ func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject confi
 		drainDeadline = runDeadline
 	}
 	for time.Now().Before(drainDeadline) {
-		time.Sleep(5 * time.Second)
+		if err := sleepCtx(r.ctx, 5*time.Second); err != nil {
+			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+		}
 		rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
 		if qerr != nil {
 			continue
@@ -2410,7 +2458,7 @@ func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject confi
 		result.FailReason = strings.Join(errs, "; ")
 	}
 
-	dir, err := r.store.Save(result, "")
+	dir, err := r.saveResult(result, "")
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
 	}
@@ -2510,7 +2558,7 @@ func (r *Runner) runDirectorAgentACLRotation(tc *config.TestCase, subject config
 		MemLimit:         r.opts.MemLimit,
 	}
 
-	orch, err := orchestrator.NewComposeRunner(runCfg)
+	orch, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
 	if err != nil {
 		return results.RunResult{}, fmt.Errorf("compose setup: %w", err)
 	}
@@ -2531,7 +2579,9 @@ func (r *Runner) runDirectorAgentACLRotation(tc *config.TestCase, subject config
 		if d > rem {
 			return fmt.Errorf("run timeout (%s) exceeded during the rotation wait", r.opts.Timeout)
 		}
-		time.Sleep(d)
+		if err := sleepCtx(r.ctx, d); err != nil {
+			return fmt.Errorf("interrupted: %w", err)
+		}
 		return nil
 	}
 	defer func() {
@@ -2651,7 +2701,9 @@ func (r *Runner) runDirectorAgentACLRotation(tc *config.TestCase, subject config
 					break
 				}
 			}
-			time.Sleep(3 * time.Second)
+			if err := sleepCtx(r.ctx, 3*time.Second); err != nil {
+				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+			}
 		}
 		started := finalCount >= minRecv
 		if !started {
@@ -2682,7 +2734,9 @@ func (r *Runner) runDirectorAgentACLRotation(tc *config.TestCase, subject config
 					break
 				}
 			}
-			time.Sleep(2 * time.Second)
+			if err := sleepCtx(r.ctx, 2*time.Second); err != nil {
+				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+			}
 		}
 		if !established {
 			return results.RunResult{}, fmt.Errorf(
@@ -2766,7 +2820,7 @@ func (r *Runner) runDirectorAgentACLRotation(tc *config.TestCase, subject config
 		result.FailReason = strings.Join(errs, "; ")
 	}
 
-	dir, err := r.store.Save(result, "")
+	dir, err := r.saveResult(result, "")
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
 	}
@@ -2845,15 +2899,19 @@ func clusterFormed(containers []string) bool {
 }
 
 // waitClusterReady polls until every node has formed the cluster AND a leader is
-// elected, or the deadline passes. Returns the leader index and whether ready.
-func waitClusterReady(containers []string, deadline time.Time) (int, bool) {
+// elected, or the deadline passes / ctx is cancelled. Returns the leader index
+// and whether ready — callers must check ctx.Err() after a not-ready result so
+// an interrupt isn't misread as "cluster never formed".
+func waitClusterReady(ctx context.Context, containers []string, deadline time.Time) (int, bool) {
 	for time.Now().Before(deadline) {
 		if clusterFormed(containers) {
 			if l, ok := leaderExistsNow(containers); ok {
 				return l, true
 			}
 		}
-		time.Sleep(3 * time.Second)
+		if sleepCtx(ctx, 3*time.Second) != nil {
+			break
+		}
 	}
 	l, _ := leaderExistsNow(containers)
 	return l, false
@@ -2898,7 +2956,7 @@ func agentlessCollectingNow(container string) bool {
 // waitAgentlessCollecting waits until the agentless device is assigned to a node
 // AND that owner is actively collecting (forwarding to the router). Returns the
 // owner node name ("1".."N"), its container, and whether it became ready.
-func waitAgentlessCollecting(subjectName string, containers []string, deadline time.Time) (string, string, bool) {
+func waitAgentlessCollecting(ctx context.Context, subjectName string, containers []string, deadline time.Time) (string, string, bool) {
 	for time.Now().Before(deadline) {
 		if owner := agentlessDeviceOwner(containers); owner != "" {
 			ownerContainer := fmt.Sprintf("bench-subject-%s-%s", subjectName, owner)
@@ -2906,7 +2964,9 @@ func waitAgentlessCollecting(subjectName string, containers []string, deadline t
 				return owner, ownerContainer, true
 			}
 		}
-		time.Sleep(5 * time.Second)
+		if sleepCtx(ctx, 5*time.Second) != nil {
+			break
+		}
 	}
 	return agentlessDeviceOwner(containers), "", false
 }
@@ -2915,7 +2975,7 @@ func waitAgentlessCollecting(subjectName string, containers []string, deadline t
 // (the stopped owner, identified by node name "1".."N") is actively collecting
 // the agentless device — i.e. the device failed over and the new owner re-deployed
 // and resumed collection. Returns the new owner's name, container, and readiness.
-func waitAgentlessCollectingExcluding(containers []string, exclude string, deadline time.Time) (string, string, bool) {
+func waitAgentlessCollectingExcluding(ctx context.Context, containers []string, exclude string, deadline time.Time) (string, string, bool) {
 	for time.Now().Before(deadline) {
 		for i, c := range containers {
 			name := strconv.Itoa(i + 1)
@@ -2926,7 +2986,9 @@ func waitAgentlessCollectingExcluding(containers []string, exclude string, deadl
 				return name, c, true
 			}
 		}
-		time.Sleep(5 * time.Second)
+		if sleepCtx(ctx, 5*time.Second) != nil {
+			break
+		}
 	}
 	return "", "", false
 }
@@ -3032,13 +3094,16 @@ func nodeHasClusterIP(container, ip string) bool {
 	return strings.Contains(string(out), "inet "+ip+"/")
 }
 
-// waitNodeHasClusterIP polls until the node holds ip, or the deadline passes.
-func waitNodeHasClusterIP(container, ip string, deadline time.Time) bool {
+// waitNodeHasClusterIP polls until the node holds ip, or the deadline passes /
+// ctx is cancelled.
+func waitNodeHasClusterIP(ctx context.Context, container, ip string, deadline time.Time) bool {
 	for time.Now().Before(deadline) {
 		if nodeHasClusterIP(container, ip) {
 			return true
 		}
-		time.Sleep(3 * time.Second)
+		if sleepCtx(ctx, 3*time.Second) != nil {
+			break
+		}
 	}
 	return false
 }
@@ -3111,7 +3176,7 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 		MemLimit:         r.opts.MemLimit,
 	}
 
-	orch, err := orchestrator.NewComposeRunner(runCfg)
+	orch, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
 	if err != nil {
 		return results.RunResult{}, fmt.Errorf("compose setup: %w", err)
 	}
@@ -3156,7 +3221,7 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 		formDeadline = runDeadline
 	}
 	fmt.Printf("  waiting for cluster to form + elect a leader (up to %s)…\n", time.Until(formDeadline).Round(time.Second))
-	leader, ready := waitClusterReady(nodes, formDeadline)
+	leader, ready := waitClusterReady(r.ctx, nodes, formDeadline)
 
 	var passed bool
 	var errs []string
@@ -3193,7 +3258,7 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 
 		if isAgentless {
 			fmt.Printf("  baseline: waiting for the agentless device to deploy + collect (up to %s)…\n", time.Until(drainDeadline).Round(time.Second))
-			owner, ownerContainer, baselineOK = waitAgentlessCollecting(subject.Name, nodes, drainDeadline)
+			owner, ownerContainer, baselineOK = waitAgentlessCollecting(r.ctx, subject.Name, nodes, drainDeadline)
 			if baselineOK {
 				fmt.Printf("  agentless device deployed; owner = node %s (%s), collecting ✓\n", owner, ownerContainer)
 			} else {
@@ -3220,7 +3285,9 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 						break
 					}
 				}
-				time.Sleep(3 * time.Second)
+				if err := sleepCtx(r.ctx, 3*time.Second); err != nil {
+					return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+				}
 			}
 			baselineOK = finalCount >= minRecv
 			if !baselineOK {
@@ -3243,7 +3310,9 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 				actionOK = false
 				errs = append(errs, fmt.Sprintf("docker restart %s failed: %v (disruption did not happen)", nodes[follower-1], rerr))
 			}
-			time.Sleep(settle)
+			if err := sleepCtx(r.ctx, settle); err != nil {
+				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+			}
 			if _, ok := leaderExistsNow(nodes); !ok {
 				actionOK = false
 				errs = append(errs, "no leader after restarting a follower (cluster unexpectedly lost leadership)")
@@ -3258,7 +3327,9 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 				errs = append(errs, fmt.Sprintf("docker restart %s failed: %v (disruption did not happen)", nodes[leader-1], rerr))
 			}
 			restartedAt := time.Now()
-			time.Sleep(settle)
+			if err := sleepCtx(r.ctx, settle); err != nil {
+				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+			}
 			// A leader restart must trigger a re-election. Anchor the search window to
 			// the instant the restart completed so a stale pre-restart "became leader"
 			// line can't satisfy the check; fall back to a leader simply being present.
@@ -3291,7 +3362,9 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 					errs = append(errs, fmt.Sprintf("docker stop %s failed: %v (disruption did not happen)", c, serr))
 				}
 			}
-			time.Sleep(settle)
+			if err := sleepCtx(r.ctx, settle); err != nil {
+				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+			}
 			if _, ok := leaderExistsNow(nodes); ok {
 				fmt.Printf("  note: a leader still appears present with %d/%d down (unexpected — quorum should be lost)\n", len(stopped), tc.Cluster.Nodes)
 			} else {
@@ -3309,7 +3382,7 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 				recDeadline = runDeadline
 			}
 			fmt.Printf("  waiting for cluster to recover + re-elect a leader (up to %s)…\n", time.Until(recDeadline).Round(time.Second))
-			l2, ok2 := waitClusterReady(nodes, recDeadline)
+			l2, ok2 := waitClusterReady(r.ctx, nodes, recDeadline)
 			if !ok2 {
 				actionOK = false
 				errs = append(errs, fmt.Sprintf("cluster did not recover a leader after restarting the two nodes (leaderIdx=%d)", l2))
@@ -3337,7 +3410,9 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 					errs = append(errs, fmt.Sprintf("docker stop %s failed: %v (disruption did not happen)", ownerContainer, serr))
 				}
 				fmt.Printf("  waiting %s for the leader to detect the down node and reassign the device…\n", settle)
-				time.Sleep(settle)
+				if err := sleepCtx(r.ctx, settle); err != nil {
+					return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+				}
 
 				// HARD 1: the device is reassigned AWAY FROM the stopped owner — the
 				//   automatic ownership failover the case exists to prove ("the new owner is
@@ -3368,7 +3443,7 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 				if collectDeadline.After(runDeadline) {
 					collectDeadline = runDeadline
 				}
-				if newOwner, _, ok := waitAgentlessCollectingExcluding(nodes, owner, collectDeadline); ok {
+				if newOwner, _, ok := waitAgentlessCollectingExcluding(r.ctx, nodes, owner, collectDeadline); ok {
 					fmt.Printf("  (soft) a surviving node (%s) is collecting the device after failover ✓\n", newOwner)
 				} else {
 					fmt.Println("  (soft) no survivor observed collecting within the window — known cluster data-plane gap")
@@ -3385,7 +3460,7 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 				ipDeadline = runDeadline
 			}
 			fmt.Printf("  asserting leader node %d holds the cluster IP %s…\n", leader, vip)
-			if !waitNodeHasClusterIP(nodes[leader-1], vip, ipDeadline) {
+			if !waitNodeHasClusterIP(r.ctx, nodes[leader-1], vip, ipDeadline) {
 				actionOK = false
 				errs = append(errs, fmt.Sprintf("leader node %d did not bind the cluster IP %s", leader, vip))
 			} else {
@@ -3408,7 +3483,9 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 				actionOK = false
 				errs = append(errs, fmt.Sprintf("docker stop %s failed: %v (disruption did not happen)", nodes[oldLeader-1], serr))
 			}
-			time.Sleep(settle)
+			if err := sleepCtx(r.ctx, settle); err != nil {
+				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+			}
 			newLeader, haveLeader := leaderExistsNow(nodes)
 			switch {
 			case !haveLeader:
@@ -3425,7 +3502,7 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 				if migDeadline.After(runDeadline) {
 					migDeadline = runDeadline
 				}
-				if !waitNodeHasClusterIP(nodes[newLeader-1], vip, migDeadline) {
+				if !waitNodeHasClusterIP(r.ctx, nodes[newLeader-1], vip, migDeadline) {
 					actionOK = false
 					errs = append(errs, fmt.Sprintf("cluster IP %s did not migrate to the new leader (node %d)", vip, newLeader))
 				} else {
@@ -3442,7 +3519,9 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 				// and a follower never binds the VIP, so it must be absent. Check soon
 				// (before any later re-election could legitimately move leadership back).
 				if d := time.Until(runDeadline); d > 0 {
-					time.Sleep(min(10*time.Second, d))
+					if err := sleepCtx(r.ctx, min(10*time.Second, d)); err != nil {
+						return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+					}
 				}
 				if nodeHasClusterIP(nodes[oldLeader-1], vip) {
 					actionOK = false
@@ -3488,7 +3567,7 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 		result.FailReason = strings.Join(errs, "; ")
 	}
 
-	dir, err := r.store.Save(result, "")
+	dir, err := r.saveResult(result, "")
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
 	}
@@ -3526,8 +3605,8 @@ type fleetStatBucket struct {
 	DroppedCount int64 `json:"dropped_count"`
 	BytesIn      int64 `json:"bytes_in"`
 	BytesOut     int64 `json:"bytes_out"`
-	ExecCount    int64 `json:"exec_count"`    // pipeline.* only: per-processor execution count
-	ExecTimeNs   int64 `json:"exec_time_ns"`  // pipeline.* only: per-processor execution time
+	ExecCount    int64 `json:"exec_count"`   // pipeline.* only: per-processor execution count
+	ExecTimeNs   int64 `json:"exec_time_ns"` // pipeline.* only: per-processor execution time
 }
 
 type fleetStatus struct {
@@ -3672,19 +3751,21 @@ func fleetSimDLProbe(simContainer string, params map[string]any) (map[string]int
 }
 
 // fleetWaitConnected polls until the director shows connected at the simulator.
-func fleetWaitConnected(simContainer, dirID string, deadline time.Time) bool {
+func fleetWaitConnected(ctx context.Context, simContainer, dirID string, deadline time.Time) bool {
 	for time.Now().Before(deadline) {
 		if st, err := fleetSimStatus(simContainer); err == nil && st.connected(dirID) {
 			return true
 		}
-		time.Sleep(3 * time.Second)
+		if sleepCtx(ctx, 3*time.Second) != nil {
+			break
+		}
 	}
 	return false
 }
 
 // fleetWaitCount polls until inbound[key].count >= min for the director, returning
 // the final count and whether the threshold was reached.
-func fleetWaitCount(simContainer, dirID, key string, min int, deadline time.Time) (int, bool) {
+func fleetWaitCount(ctx context.Context, simContainer, dirID, key string, min int, deadline time.Time) (int, bool) {
 	last := 0
 	for time.Now().Before(deadline) {
 		if st, err := fleetSimStatus(simContainer); err == nil {
@@ -3693,7 +3774,9 @@ func fleetWaitCount(simContainer, dirID, key string, min int, deadline time.Time
 				return last, true
 			}
 		}
-		time.Sleep(3 * time.Second)
+		if sleepCtx(ctx, 3*time.Second) != nil {
+			break
+		}
 	}
 	return last, false
 }
@@ -3703,7 +3786,7 @@ func fleetWaitCount(simContainer, dirID, key string, min int, deadline time.Time
 // reached. A capture's lifecycle markers ("Capture Started/Completed", tiny)
 // arrive immediately on session start, while real captured data only flushes on
 // the session's periodic (≈5s) ticker — so this must POLL, not sample once.
-func fleetWaitMaxLen(simContainer, dirID, key string, min int, deadline time.Time) (int, bool) {
+func fleetWaitMaxLen(ctx context.Context, simContainer, dirID, key string, min int, deadline time.Time) (int, bool) {
 	last := 0
 	for time.Now().Before(deadline) {
 		if st, err := fleetSimStatus(simContainer); err == nil {
@@ -3712,7 +3795,9 @@ func fleetWaitMaxLen(simContainer, dirID, key string, min int, deadline time.Tim
 				return last, true
 			}
 		}
-		time.Sleep(3 * time.Second)
+		if sleepCtx(ctx, 3*time.Second) != nil {
+			break
+		}
 	}
 	return last, false
 }
@@ -3722,7 +3807,7 @@ func fleetWaitMaxLen(simContainer, dirID, key string, min int, deadline time.Tim
 // deterministic for a fixed, replayed input, so an over-count is as much a
 // failure as an under-count. Returns nil on success, or an error describing the
 // outstanding mismatch when the deadline passes.
-func fleetWaitStats(simContainer, dirID string, expect map[string]map[string]int64, deadline time.Time) error {
+func fleetWaitStats(ctx context.Context, simContainer, dirID string, expect map[string]map[string]int64, deadline time.Time) error {
 	var lastErr error
 	for {
 		st, err := fleetSimStatus(simContainer)
@@ -3754,7 +3839,9 @@ func fleetWaitStats(simContainer, dirID string, expect map[string]map[string]int
 			}
 			return lastErr
 		}
-		time.Sleep(3 * time.Second)
+		if err := sleepCtx(ctx, 3*time.Second); err != nil {
+			return fmt.Errorf("interrupted: %w", err)
+		}
 	}
 }
 
@@ -3856,7 +3943,7 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		MemLimit:         r.opts.MemLimit,
 	}
 
-	orch, err := orchestrator.NewComposeRunner(runCfg)
+	orch, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
 	if err != nil {
 		return results.RunResult{}, fmt.Errorf("compose setup: %w", err)
 	}
@@ -3910,7 +3997,9 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 				connected = true
 				break
 			}
-			time.Sleep(3 * time.Second)
+			if err := sleepCtx(r.ctx, 3*time.Second); err != nil {
+				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+			}
 		}
 		if connected {
 			errs = append(errs, "director connected despite a bad fleet token (auth not enforced)")
@@ -3932,7 +4021,7 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 			connDeadline = runDeadline
 		}
 		fmt.Printf("  waiting for the director to connect to the fleet simulator (up to %s)…\n", time.Until(connDeadline).Round(time.Second))
-		if !fleetWaitConnected(simContainer, dirID, connDeadline) {
+		if !fleetWaitConnected(r.ctx, simContainer, dirID, connDeadline) {
 			errs = append(errs, "director never connected to the fleet simulator")
 			passed = false
 			return r.saveFleetResult(tc, subject, configName, startTime, finalCount, passed, errs, simContainer, subjectContainer)
@@ -3980,7 +4069,7 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		if applyDeadline.After(runDeadline) {
 			applyDeadline = runDeadline
 		}
-		if _, ok := fleetWaitCount(simContainer, dirID, "rep.config", 1, applyDeadline); !ok {
+		if _, ok := fleetWaitCount(r.ctx, simContainer, dirID, "rep.config", 1, applyDeadline); !ok {
 			errs = append(errs, "director did not acknowledge the delivered config over the fleet link")
 			passed = false
 			return r.saveFleetResult(tc, subject, configName, startTime, finalCount, passed, errs, simContainer, subjectContainer)
@@ -4018,16 +4107,21 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 			return r.saveFleetResult(tc, subject, configName, startTime, finalCount, passed, errs, simContainer, subjectContainer)
 		}
 		fmt.Println("  letting the agent stream before the restart…")
-		time.Sleep(25 * time.Second)
+		if err := sleepCtx(r.ctx, 25*time.Second); err != nil {
+			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+		}
 		fmt.Println("  restarting the director (stop + start) mid-stream…")
 		if err := orch.StopServices(30*time.Second, "subject"); err != nil {
 			errs = append(errs, "failed to stop director for restart: "+err.Error())
 		}
-		time.Sleep(8 * time.Second) // director-down window — the agent should retry, not storm
+		// Director-down window — the agent should retry, not storm.
+		if err := sleepCtx(r.ctx, 8*time.Second); err != nil {
+			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+		}
 		if err := orch.UpServices("subject"); err != nil {
 			errs = append(errs, "failed to restart director: "+err.Error())
 		}
-		if !fleetWaitConnected(simContainer, dirID, time.Now().Add(90*time.Second)) {
+		if !fleetWaitConnected(r.ctx, simContainer, dirID, time.Now().Add(90*time.Second)) {
 			errs = append(errs, "director did not reconnect to the fleet simulator after restart")
 		} else {
 			fmt.Println("  director reconnected after restart ✓")
@@ -4035,7 +4129,7 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 				if vmfBytes, e := os.ReadFile(filepath.Join(caseDir, "configs", fc.DeliverConfig)); e == nil {
 					b64 := base64.StdEncoding.EncodeToString(vmfBytes)
 					_, _ = fleetSimSend(simContainer, dirID, "config", map[string]any{"data_b64": b64})
-					_, _ = fleetWaitCount(simContainer, dirID, "rep.config", 2, time.Now().Add(60*time.Second))
+					_, _ = fleetWaitCount(r.ctx, simContainer, dirID, "rep.config", 2, time.Now().Add(60*time.Second))
 					fmt.Println("  re-delivered operational config after restart ✓")
 				}
 			}
@@ -4058,14 +4152,14 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 			minHealth = 2
 		}
 		fmt.Printf("  waiting for >= %d health frames + connection_state…\n", minHealth)
-		hc, okH := fleetWaitCount(simContainer, dirID, "req.health", minHealth, scenarioDeadline())
+		hc, okH := fleetWaitCount(r.ctx, simContainer, dirID, "req.health", minHealth, scenarioDeadline())
 		finalCount = int64(hc)
 		if !okH {
 			errs = append(errs, fmt.Sprintf("director did not publish >= %d health frames (got %d)", minHealth, hc))
 		} else {
 			fmt.Printf("  health frames: %d ✓\n", hc)
 		}
-		if cs, okC := fleetWaitCount(simContainer, dirID, "req.connection_state", 1, scenarioDeadline()); !okC {
+		if cs, okC := fleetWaitCount(r.ctx, simContainer, dirID, "req.connection_state", 1, scenarioDeadline()); !okC {
 			errs = append(errs, "director did not publish connection_state")
 		} else {
 			fmt.Printf("  connection_state frames: %d ✓\n", cs)
@@ -4107,7 +4201,9 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 				ready = true
 				break
 			}
-			time.Sleep(3 * time.Second)
+			if err := sleepCtx(r.ctx, 3*time.Second); err != nil {
+				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+			}
 		}
 		if !ready {
 			errs = append(errs, "director /dl endpoint never returned an HTTP response")
@@ -4178,7 +4274,7 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		if _, e := fleetSimSend(simContainer, dirID, "remote_check_ssh", params); e != nil {
 			errs = append(errs, "failed to send remote_check: "+e.Error())
 		}
-		if _, ok := fleetWaitCount(simContainer, dirID, "rep.remote_check", 1, scenarioDeadline()); !ok {
+		if _, ok := fleetWaitCount(r.ctx, simContainer, dirID, "rep.remote_check", 1, scenarioDeadline()); !ok {
 			errs = append(errs, "no remote_check reply from director")
 		} else {
 			last := ""
@@ -4216,7 +4312,7 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 			if _, se := fleetSimSend(simContainer, dirID, "config", map[string]any{"data_b64": b64}); se != nil {
 				return fmt.Errorf("pushing %s: %w", filename, se)
 			}
-			if _, ok := fleetWaitCount(simContainer, dirID, "rep.config", wantReplies, scenarioDeadline()); !ok {
+			if _, ok := fleetWaitCount(r.ctx, simContainer, dirID, "rep.config", wantReplies, scenarioDeadline()); !ok {
 				return fmt.Errorf("no config reply from director after pushing %s", filename)
 			}
 			last := ""
@@ -4284,7 +4380,7 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 			if _, se := fleetSimSend(simContainer, dirID, "config", map[string]any{"data_b64": b64}); se != nil {
 				return fmt.Errorf("pushing %s: %w", filename, se)
 			}
-			if _, ok := fleetWaitCount(simContainer, dirID, "rep.config", before+1, scenarioDeadline()); !ok {
+			if _, ok := fleetWaitCount(r.ctx, simContainer, dirID, "rep.config", before+1, scenarioDeadline()); !ok {
 				return fmt.Errorf("no config reply from director after pushing %s", filename)
 			}
 			last := ""
@@ -4317,7 +4413,9 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		}
 		fmt.Printf("  confirming delivery is SUPPRESSED for %s (receiver must stay ~0)…\n", baseline)
 		if baseline > 0 {
-			time.Sleep(baseline)
+			if err := sleepCtx(r.ctx, baseline); err != nil {
+				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+			}
 		}
 		rmBase, qErr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
 		if qErr != nil {
@@ -4362,7 +4460,9 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 					break
 				}
 			}
-			time.Sleep(3 * time.Second)
+			if err := sleepCtx(r.ctx, 3*time.Second); err != nil {
+				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+			}
 		}
 		delivered := finalCount - baseCount
 		if delivered < minRecv {
@@ -4416,7 +4516,9 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		// Phase 0: confirm delivery is BLOCKED under config A (dead target), so
 		// post-change delivery is attributable to the pushed change.
 		if d := min(15*time.Second, time.Until(runDeadline)); d > 0 {
-			time.Sleep(d)
+			if err := sleepCtx(r.ctx, d); err != nil {
+				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+			}
 		}
 		rmB, _ := r.queryReceiverMetrics(metricsPort, 10*time.Second)
 		fmt.Printf("  before config change: received=%s (expected ~0; target A is a dead endpoint)\n", formatCount(rmB.LinesReceived))
@@ -4442,7 +4544,7 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 			errs = append(errs, "failed to push changed config: "+se.Error())
 			break
 		}
-		if _, ok := fleetWaitCount(simContainer, dirID, "rep.config", before+1, scenarioDeadline()); !ok {
+		if _, ok := fleetWaitCount(r.ctx, simContainer, dirID, "rep.config", before+1, scenarioDeadline()); !ok {
 			errs = append(errs, "no config reply from director after the change push")
 		}
 
@@ -4471,7 +4573,9 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 					break
 				}
 			}
-			time.Sleep(3 * time.Second)
+			if err := sleepCtx(r.ctx, 3*time.Second); err != nil {
+				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+			}
 		}
 		if finalCount < target {
 			errs = append(errs, fmt.Sprintf(
@@ -4503,7 +4607,7 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		// Generator traffic (if the case ships one) flows through the director so
 		// records get captured.
 		key := "req." + cmd + "_reply"
-		if c, ok := fleetWaitCount(simContainer, dirID, key, 1, scenarioDeadline()); !ok {
+		if c, ok := fleetWaitCount(r.ctx, simContainer, dirID, key, 1, scenarioDeadline()); !ok {
 			errs = append(errs, fmt.Sprintf("no %s capture data streamed back (got %d frames)", cmd, c))
 		} else {
 			finalCount = int64(c)
@@ -4516,7 +4620,7 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 			// asserts at least one frame carried real captured data. Used by the
 			// where:raw mis-frame case.
 			if fc.LiveMinFrameBytes > 0 {
-				if maxLen, ok := fleetWaitMaxLen(simContainer, dirID, key, fc.LiveMinFrameBytes, scenarioDeadline()); !ok {
+				if maxLen, ok := fleetWaitMaxLen(r.ctx, simContainer, dirID, key, fc.LiveMinFrameBytes, scenarioDeadline()); !ok {
 					errs = append(errs, fmt.Sprintf("%s returned only small frames (max %d bytes < live_min_frame_bytes %d) — capture saw lifecycle markers, no real data", cmd, maxLen, fc.LiveMinFrameBytes))
 				} else {
 					fmt.Printf("  %s largest frame %d bytes (>= %d) — real data captured ✓\n", cmd, maxLen, fc.LiveMinFrameBytes)
@@ -4528,10 +4632,10 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		// The director forwards stats/metrics partitions as traffic flows. The case
 		// ships a generator → director pipeline; assert metrics frames arrive.
 		fmt.Println("  waiting for stats/metrics frames…")
-		c1, ok1 := fleetWaitCount(simContainer, dirID, "req.metricsvmf", 1, scenarioDeadline())
+		c1, ok1 := fleetWaitCount(r.ctx, simContainer, dirID, "req.metricsvmf", 1, scenarioDeadline())
 		c2 := 0
 		if !ok1 {
-			c2, _ = fleetWaitCount(simContainer, dirID, "req.metrics", 1, scenarioDeadline())
+			c2, _ = fleetWaitCount(r.ctx, simContainer, dirID, "req.metrics", 1, scenarioDeadline())
 		}
 		finalCount = int64(c1 + c2)
 		if c1 < 1 && c2 < 1 {
@@ -4545,7 +4649,7 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		// arrived. This is what proves the director's pipeline-error / dropped
 		// counters increment correctly and surface on the stats path.
 		if len(fc.ExpectStats) > 0 {
-			if serr := fleetWaitStats(simContainer, dirID, fc.ExpectStats, scenarioDeadline()); serr != nil {
+			if serr := fleetWaitStats(r.ctx, simContainer, dirID, fc.ExpectStats, scenarioDeadline()); serr != nil {
 				errs = append(errs, "decoded stats mismatch: "+serr.Error())
 			} else {
 				fmt.Println("  decoded stats match expectations ✓")
@@ -4574,13 +4678,15 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 				reconnected = true
 				break
 			}
-			time.Sleep(3 * time.Second)
+			if err := sleepCtx(r.ctx, 3*time.Second); err != nil {
+				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+			}
 		}
 		if !reconnected {
 			errs = append(errs, "director did not reconnect after the simulator restarted")
 		} else {
 			// And resume publishing health on the fresh connection.
-			if hc, ok := fleetWaitCount(simContainer, dirID, "req.health", 1, scenarioDeadline()); ok {
+			if hc, ok := fleetWaitCount(r.ctx, simContainer, dirID, "req.health", 1, scenarioDeadline()); ok {
 				finalCount = int64(hc)
 				fmt.Printf("  director reconnected and resumed health (%d) ✓\n", hc)
 			} else {
@@ -4592,7 +4698,7 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		// A self-managed director still publishes health but must IGNORE platform
 		// commands (ListenRequests is not started). Send a remote_check and assert
 		// NO reply, while health keeps flowing.
-		if hc, ok := fleetWaitCount(simContainer, dirID, "req.health", 1, scenarioDeadline()); ok {
+		if hc, ok := fleetWaitCount(r.ctx, simContainer, dirID, "req.health", 1, scenarioDeadline()); ok {
 			fmt.Printf("  self-managed director still publishes health (%d) ✓\n", hc)
 			finalCount = int64(hc)
 		} else {
@@ -4609,7 +4715,9 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 			if d > settle {
 				d = settle
 			}
-			time.Sleep(d)
+			if err := sleepCtx(r.ctx, d); err != nil {
+				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+			}
 		}
 		if st, e := fleetSimStatus(simContainer); e != nil {
 			errs = append(errs, "could not read simulator status to confirm the command was ignored: "+e.Error())
@@ -4628,7 +4736,7 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		// the approval to the agent. Verdict: the simulator observes the forwarded
 		// enrollment (rep.check_enrollment), proving the agent→director→platform path.
 		fmt.Println("  waiting for the agent's enrollment to be forwarded to the platform…")
-		if c, ok := fleetWaitCount(simContainer, dirID, "rep.check_enrollment", 1, scenarioDeadline()); !ok {
+		if c, ok := fleetWaitCount(r.ctx, simContainer, dirID, "rep.check_enrollment", 1, scenarioDeadline()); !ok {
 			errs = append(errs, fmt.Sprintf("director did not forward agent enrollment to the platform (got %d frames)", c))
 		} else {
 			finalCount = int64(c)
@@ -4677,7 +4785,9 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 					break
 				}
 			}
-			time.Sleep(3 * time.Second)
+			if err := sleepCtx(r.ctx, 3*time.Second); err != nil {
+				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+			}
 		}
 		// One final read so the content verdict reflects the settled receiver state.
 		if cur, qe := r.queryReceiverMetrics(metricsPort, 10*time.Second); qe == nil {
@@ -4769,12 +4879,14 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 			errs = append(errs, "failed to push changed config: "+se.Error())
 			break
 		}
-		if _, ok := fleetWaitCount(simContainer, dirID, "rep.config", before+1, scenarioDeadline()); !ok {
+		if _, ok := fleetWaitCount(r.ctx, simContainer, dirID, "rep.config", before+1, scenarioDeadline()); !ok {
 			errs = append(errs, "no config reply from director after the change push")
 		}
 		// Let the director reload + the target write under config B before verifying.
 		if d := min(settle, time.Until(runDeadline)); d > 0 {
-			time.Sleep(d)
+			if err := sleepCtx(r.ctx, d); err != nil {
+				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+			}
 		}
 		fmt.Println("  running the DuckDB verifier against the post-update target objects…")
 		m, verr := r.runVerifier(orch, tc, tmpDir, runDeadline)
@@ -4834,7 +4946,7 @@ func (r *Runner) saveFleetResult(tc *config.TestCase, subject config.Subject, co
 	if !passed {
 		result.FailReason = strings.Join(errs, "; ")
 	}
-	dir, err := r.store.Save(result, "")
+	dir, err := r.saveResult(result, "")
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
 	}
@@ -4889,7 +5001,9 @@ func (r *Runner) ccfWaitLines(metricsPort int, target int64, deadline time.Time)
 				return last, true
 			}
 		}
-		time.Sleep(3 * time.Second)
+		if sleepCtx(r.ctx, 3*time.Second) != nil {
+			break
+		}
 	}
 	return last, false
 }
@@ -4913,7 +5027,9 @@ func (r *Runner) ccfWaitStable(metricsPort int, deadline time.Time) int64 {
 				last = rm.LinesReceived
 			}
 		}
-		time.Sleep(3 * time.Second)
+		if sleepCtx(r.ctx, 3*time.Second) != nil {
+			break
+		}
 	}
 	if last < 0 {
 		return 0
@@ -4991,7 +5107,7 @@ func (r *Runner) runCCFCorrectness(tc *config.TestCase, subject config.Subject) 
 		MemLimit:         r.opts.MemLimit,
 	}
 
-	orch, err := orchestrator.NewComposeRunner(runCfg)
+	orch, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
 	if err != nil {
 		return results.RunResult{}, fmt.Errorf("compose setup: %w", err)
 	}
@@ -5046,7 +5162,9 @@ func (r *Runner) runCCFCorrectness(tc *config.TestCase, subject config.Subject) 
 			apiReady = true
 			break
 		}
-		time.Sleep(2 * time.Second)
+		if err := sleepCtx(r.ctx, 2*time.Second); err != nil {
+			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+		}
 	}
 	if !apiReady {
 		errs = append(errs, "mock CCF API never became reachable")
@@ -5095,7 +5213,9 @@ func (r *Runner) runCCFCorrectness(tc *config.TestCase, subject config.Subject) 
 					break
 				}
 			}
-			time.Sleep(3 * time.Second)
+			if err := sleepCtx(r.ctx, 3*time.Second); err != nil {
+				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+			}
 		}
 		if !rejected {
 			errs = append(errs, "mock recorded no auth failures within the window — the director never polled")
@@ -5202,7 +5322,7 @@ func (r *Runner) saveCCFResult(tc *config.TestCase, subject config.Subject, conf
 	if !passed {
 		result.FailReason = strings.Join(errs, "; ")
 	}
-	dir, err := r.store.Save(result, "")
+	dir, err := r.saveResult(result, "")
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
 	}
@@ -5299,7 +5419,7 @@ func (r *Runner) runHTTPSourceCorrectness(tc *config.TestCase, subject config.Su
 		MemLimit:         r.opts.MemLimit,
 	}
 
-	orch, err := orchestrator.NewComposeRunner(runCfg)
+	orch, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
 	if err != nil {
 		return results.RunResult{}, fmt.Errorf("compose setup: %w", err)
 	}
@@ -5353,7 +5473,9 @@ func (r *Runner) runHTTPSourceCorrectness(tc *config.TestCase, subject config.Su
 			if s, _, _, e := httpSenderStats(senderContainer, ctrlPort); e == nil && s >= expected {
 				break
 			}
-			time.Sleep(3 * time.Second)
+			if err := sleepCtx(r.ctx, 3*time.Second); err != nil {
+				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+			}
 		}
 		got := r.ccfWaitStable(metricsPort, time.Now().Add(12*time.Second))
 		finalCount = got
@@ -5385,7 +5507,9 @@ func (r *Runner) runHTTPSourceCorrectness(tc *config.TestCase, subject config.Su
 			if s, _, _, e := httpSenderStats(senderContainer, ctrlPort); e == nil && s >= expected {
 				break
 			}
-			time.Sleep(3 * time.Second)
+			if err := sleepCtx(r.ctx, 3*time.Second); err != nil {
+				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+			}
 		}
 		got := r.ccfWaitStable(metricsPort, time.Now().Add(12*time.Second))
 		finalCount = got
@@ -5452,7 +5576,7 @@ func (r *Runner) saveHTTPSourceResult(tc *config.TestCase, subject config.Subjec
 	if !passed {
 		result.FailReason = strings.Join(errs, "; ")
 	}
-	dir, err := r.store.Save(result, "")
+	dir, err := r.saveResult(result, "")
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
 	}
@@ -5524,7 +5648,7 @@ func (r *Runner) runClickHouseTargetCorrectness(tc *config.TestCase, subject con
 		GeneratorImage: r.opts.GeneratorImage, ReceiverImage: r.opts.ReceiverImage, CollectorImage: r.opts.CollectorImage,
 		ReceiverHostPort: r.opts.ReceiverHostPort, ExtraSubjectEnv: extraEnv, CPULimit: r.opts.CPULimit, MemLimit: r.opts.MemLimit,
 	}
-	orch, err := orchestrator.NewComposeRunner(runCfg)
+	orch, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
 	if err != nil {
 		return results.RunResult{}, fmt.Errorf("compose setup: %w", err)
 	}
@@ -5569,7 +5693,9 @@ func (r *Runner) runClickHouseTargetCorrectness(tc *config.TestCase, subject con
 			ready = true
 			break
 		}
-		time.Sleep(2 * time.Second)
+		if err := sleepCtx(r.ctx, 2*time.Second); err != nil {
+			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+		}
 	}
 	if !ready {
 		errs = append(errs, "clickhouse-server never became reachable")
@@ -5649,10 +5775,14 @@ func (r *Runner) runClickHouseTargetCorrectness(tc *config.TestCase, subject con
 				}
 			}
 		}
-		time.Sleep(3 * time.Second)
+		if err := sleepCtx(r.ctx, 3*time.Second); err != nil {
+			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+		}
 	}
 	// Let any late/duplicate inserts settle, then re-read for an exact check.
-	time.Sleep(5 * time.Second)
+	if err := sleepCtx(r.ctx, 5*time.Second); err != nil {
+		return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+	}
 	if out, e := chExec(chContainer, "SELECT count() FROM "+fqTable); e == nil {
 		if n, perr := strconv.ParseInt(strings.TrimSpace(out), 10, 64); perr == nil {
 			finalCount = n
@@ -5691,7 +5821,7 @@ func (r *Runner) saveClickHouseTargetResult(tc *config.TestCase, subject config.
 	if !passed {
 		result.FailReason = strings.Join(errs, "; ")
 	}
-	dir, err := r.store.Save(result, "")
+	dir, err := r.saveResult(result, "")
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
 	}
@@ -5786,9 +5916,13 @@ func (r *Runner) runMQTTTargetCorrectness(tc *config.TestCase, subject config.Su
 		if finalCount >= expected {
 			break
 		}
-		time.Sleep(3 * time.Second)
+		if err := sleepCtx(r.ctx, 3*time.Second); err != nil {
+			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+		}
 	}
-	time.Sleep(5 * time.Second)
+	if err := sleepCtx(r.ctx, 5*time.Second); err != nil {
+		return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+	}
 	finalCount = mqttSubLineCount(subContainer, recvFile)
 	if finalCount < expected {
 		errs = append(errs, fmt.Sprintf("under-delivery: %d of %d messages received by the subscriber", finalCount, expected))
@@ -5870,7 +6004,9 @@ func (r *Runner) runRedisSourceCorrectness(tc *config.TestCase, subject config.S
 			settleDeadline = runDeadline
 		}
 		for time.Now().Before(settleDeadline) {
-			time.Sleep(5 * time.Second)
+			if err := sleepCtx(r.ctx, 5*time.Second); err != nil {
+				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+			}
 		}
 		got := r.ccfWaitStable(metricsPort, time.Now().Add(10*time.Second))
 		if got > int64(rc.ExpectMax) {
@@ -5974,7 +6110,9 @@ func (r *Runner) runEndpointSourceCorrectness(tc *config.TestCase, subject confi
 		}
 		fmt.Printf("  reject case: waiting %s then asserting ≤ %d records reached the receiver…\n", time.Until(settleDeadline).Round(time.Second), es.ExpectMax)
 		for time.Now().Before(settleDeadline) {
-			time.Sleep(5 * time.Second)
+			if err := sleepCtx(r.ctx, 5*time.Second); err != nil {
+				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+			}
 		}
 		got := r.ccfWaitStable(metricsPort, time.Now().Add(10*time.Second))
 		if got > int64(es.ExpectMax) {
@@ -6038,7 +6176,7 @@ func (r *Runner) setupAuxRun(tc *config.TestCase, subject config.Subject, config
 		GeneratorImage: r.opts.GeneratorImage, ReceiverImage: r.opts.ReceiverImage, CollectorImage: r.opts.CollectorImage,
 		ReceiverHostPort: r.opts.ReceiverHostPort, ExtraSubjectEnv: extraEnv, CPULimit: r.opts.CPULimit, MemLimit: r.opts.MemLimit,
 	}
-	orch, err := orchestrator.NewComposeRunner(runCfg)
+	orch, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
 	if err != nil {
 		return nil, caseDir, tmpDir, fmt.Errorf("compose setup: %w", err)
 	}
@@ -6066,7 +6204,7 @@ func (r *Runner) saveAuxResult(tc *config.TestCase, subject config.Subject, conf
 	if !passed {
 		result.FailReason = strings.Join(errs, "; ")
 	}
-	dir, err := r.store.Save(result, "")
+	dir, err := r.saveResult(result, "")
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
 	}
@@ -6171,7 +6309,7 @@ func (r *Runner) runHTTPVaultCertRotation(tc *config.TestCase, subject config.Su
 		GeneratorImage: r.opts.GeneratorImage, ReceiverImage: r.opts.ReceiverImage, CollectorImage: r.opts.CollectorImage,
 		ReceiverHostPort: r.opts.ReceiverHostPort, ExtraSubjectEnv: extraEnv, CPULimit: r.opts.CPULimit, MemLimit: r.opts.MemLimit,
 	}
-	orch, err := orchestrator.NewComposeRunner(runCfg)
+	orch, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
 	if err != nil {
 		return results.RunResult{}, fmt.Errorf("compose setup: %w", err)
 	}
@@ -6230,7 +6368,9 @@ func (r *Runner) runHTTPVaultCertRotation(tc *config.TestCase, subject config.Su
 				break
 			}
 		}
-		time.Sleep(3 * time.Second)
+		if err := sleepCtx(r.ctx, 3*time.Second); err != nil {
+			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+		}
 	}
 	if fp1 == "" {
 		errs = append(errs, "never observed initial HTTPS delivery + server cert (vault-sourced cert may have failed to load)")
@@ -6270,7 +6410,9 @@ func (r *Runner) runHTTPVaultCertRotation(tc *config.TestCase, subject config.Su
 			rotated = true
 			break
 		}
-		time.Sleep(3 * time.Second)
+		if err := sleepCtx(r.ctx, 3*time.Second); err != nil {
+			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+		}
 	}
 	if rotated {
 		fmt.Printf("  director hot-reloaded the rotated cert (fp %s… → %s…) ✓\n", fpShort(fp1), fpShort(fp2))
@@ -6368,7 +6510,7 @@ func (r *Runner) runKafkaOffsetCommitRestart(tc *config.TestCase, subject config
 		MemLimit:         r.opts.MemLimit,
 	}
 
-	orch, err := orchestrator.NewComposeRunner(runCfg)
+	orch, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
 	if err != nil {
 		return results.RunResult{}, fmt.Errorf("compose setup: %w", err)
 	}
@@ -6409,6 +6551,10 @@ func (r *Runner) runKafkaOffsetCommitRestart(tc *config.TestCase, subject config
 	warmup := tc.WarmupOrDefault(30 * time.Second)
 	genTimeout := min(duration+warmup+2*time.Minute, r.opts.Timeout)
 	if err := orch.WaitForGeneratorExit(genTimeout); err != nil {
+		if errors.Is(err, context.Canceled) {
+			// A user interrupt is not a tolerable generator hiccup — abort.
+			return results.RunResult{}, err
+		}
 		fmt.Printf("  (generator wait: %v)\n", err)
 	}
 	genStats := r.parseGeneratorStats(orch.GeneratorStdout())
@@ -6432,7 +6578,9 @@ func (r *Runner) runKafkaOffsetCommitRestart(tc *config.TestCase, subject config
 				break
 			}
 		}
-		time.Sleep(2 * time.Second)
+		if err := sleepCtx(r.ctx, 2*time.Second); err != nil {
+			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+		}
 	}
 	if !delivered {
 		return results.RunResult{}, fmt.Errorf("receiver never reached full delivery (%s) before timeout", formatCount(sent))
@@ -6441,12 +6589,16 @@ func (r *Runner) runKafkaOffsetCommitRestart(tc *config.TestCase, subject config
 	// Settle so the delivery-bound offset commits land at the broker; the
 	// graceful stop below additionally drains pending commits on shutdown.
 	fmt.Println("  full delivery reached — settling 5s, then graceful restart…")
-	time.Sleep(5 * time.Second)
+	if err := sleepCtx(r.ctx, 5*time.Second); err != nil {
+		return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+	}
 
 	if err := orch.StopServices(30*time.Second, "subject"); err != nil {
 		return results.RunResult{}, fmt.Errorf("stopping subject: %w", err)
 	}
-	time.Sleep(3 * time.Second)
+	if err := sleepCtx(r.ctx, 3*time.Second); err != nil {
+		return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+	}
 	fmt.Println("  restarting subject (must resume from committed offsets)…")
 	if err := orch.UpServices("subject"); err != nil {
 		return results.RunResult{}, fmt.Errorf("restarting subject: %w", err)
@@ -6460,7 +6612,9 @@ func (r *Runner) runKafkaOffsetCommitRestart(tc *config.TestCase, subject config
 	stableRounds := 0
 	observeDeadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(observeDeadline) {
-		time.Sleep(5 * time.Second)
+		if err := sleepCtx(r.ctx, 5*time.Second); err != nil {
+			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+		}
 		rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
 		if qerr != nil {
 			continue
@@ -6546,7 +6700,7 @@ func (r *Runner) runKafkaOffsetCommitRestart(tc *config.TestCase, subject config
 		result.FailReason = strings.Join(errors, "; ")
 	}
 
-	dir, err := r.store.Save(result, "")
+	dir, err := r.saveResult(result, "")
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
 	}
@@ -6635,7 +6789,7 @@ func (r *Runner) runPersistenceFileRestartCorrectness(tc *config.TestCase, subje
 		MemLimit:         r.opts.MemLimit,
 	}
 
-	cr, err := orchestrator.NewComposeRunner(runCfg)
+	cr, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
 	if err != nil {
 		return results.RunResult{}, fmt.Errorf("compose setup: %w", err)
 	}
@@ -6672,7 +6826,9 @@ func (r *Runner) runPersistenceFileRestartCorrectness(tc *config.TestCase, subje
 	warmup := tc.WarmupOrDefault(10 * time.Second)
 	stopAfter := warmup + rotateAt + 5*time.Second
 	fmt.Printf("  phase 2: waiting %s (rotation fires at warmup+%s)…\n", stopAfter, rotateAt)
-	time.Sleep(stopAfter)
+	if err := sleepCtx(r.ctx, stopAfter); err != nil {
+		return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+	}
 
 	// PHASE 3: SIGTERM subject. Its file-tail state must be flushed to disk
 	// (persist file, position file, sincedb, …) so the restart can resume.
@@ -6713,7 +6869,9 @@ func (r *Runner) runPersistenceFileRestartCorrectness(tc *config.TestCase, subje
 	drainDeadline := time.Now().Add(drainTimeout)
 	var recvMetrics ReceiverMetrics
 	for time.Now().Before(drainDeadline) {
-		time.Sleep(5 * time.Second)
+		if err := sleepCtx(r.ctx, 5*time.Second); err != nil {
+			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+		}
 		rm, err := r.queryReceiverMetrics(metricsPort, 10*time.Second)
 		if err != nil {
 			continue
@@ -6782,7 +6940,7 @@ func (r *Runner) runPersistenceFileRestartCorrectness(tc *config.TestCase, subje
 		result.FailReason = strings.Join(perrs, "; ")
 	}
 
-	dir, err := r.store.Save(result, "")
+	dir, err := r.saveResult(result, "")
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
 	}
@@ -6815,24 +6973,55 @@ func (r *Runner) runPersistenceFileRestartCorrectness(tc *config.TestCase, subje
 	return result, nil
 }
 
+// saveResult persists a run result unless the run was interrupted — a verdict
+// computed after cancellation reflects a half-finished run (waits bail out
+// early on cancel) and must never land in the store.
+func (r *Runner) saveResult(result results.RunResult, metricsCSVSrc string) (string, error) {
+	if err := r.ctx.Err(); err != nil {
+		return "", fmt.Errorf("interrupted: %w", err)
+	}
+	return r.store.Save(result, metricsCSVSrc)
+}
+
+// sleepCtx sleeps for d or until ctx is cancelled; returns ctx.Err() on cancel.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
 func (r *Runner) queryReceiverMetrics(port int, timeout time.Duration) (ReceiverMetrics, error) {
 	url := fmt.Sprintf("http://localhost:%d/metrics", port)
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		resp, err := http.Get(url) //nolint:noctx
 		if err != nil {
-			time.Sleep(time.Second)
+			if err := sleepCtx(r.ctx, time.Second); err != nil {
+				return ReceiverMetrics{}, fmt.Errorf("interrupted: %w", err)
+			}
 			continue
 		}
 		body, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err != nil {
-			time.Sleep(time.Second)
+			if err := sleepCtx(r.ctx, time.Second); err != nil {
+				return ReceiverMetrics{}, fmt.Errorf("interrupted: %w", err)
+			}
 			continue
 		}
 		var m ReceiverMetrics
 		if err := json.Unmarshal(body, &m); err != nil {
-			time.Sleep(time.Second)
+			if err := sleepCtx(r.ctx, time.Second); err != nil {
+				return ReceiverMetrics{}, fmt.Errorf("interrupted: %w", err)
+			}
 			continue
 		}
 		return m, nil
@@ -7062,7 +7251,9 @@ func (r *Runner) runSyslogVaultCertRotation(tc *config.TestCase, subject config.
 			stallRounds := 0
 			rejected := false
 			for time.Now().Before(phase1Deadline) {
-				time.Sleep(2 * time.Second)
+				if err := sleepCtx(r.ctx, 2*time.Second); err != nil {
+					return fmt.Errorf("interrupted: %w", err)
+				}
 				rm, qerr := r.queryReceiverMetrics(metricsPort, 5*time.Second)
 				if qerr != nil {
 					continue
@@ -7104,7 +7295,9 @@ func (r *Runner) runSyslogVaultCertRotation(tc *config.TestCase, subject config.
 			// Recovery is confirmed by the final loss verdict: if the director
 			// does not recover, lines_out < expected and loss_percent > ceiling.
 			fmt.Println("  phase 2: trusted cert restored in Vault — waiting 25s for director to detect and recover…")
-			time.Sleep(25 * time.Second)
+			if err := sleepCtx(r.ctx, 25*time.Second); err != nil {
+				return fmt.Errorf("interrupted: %w", err)
+			}
 			fmt.Println("  phase 2: director should have restarted with the restored cert — delivery resuming")
 			return nil
 		},
