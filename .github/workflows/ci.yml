@@ -81,6 +81,10 @@ jobs:
         if: github.event_name == 'pull_request'
         run: make build-collector
 
+      - name: Build kdc image
+        if: github.event_name == 'pull_request'
+        run: make build-kdc
+
       - name: Build verifier image
         if: github.event_name == 'pull_request'
         run: make build-verifier
@@ -97,6 +101,10 @@ jobs:
       - name: Build & push collector image
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: make push-collector ATTEST=1
+
+      - name: Build & push kdc image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: make push-kdc ATTEST=1
 
       - name: Build & push verifier image
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
