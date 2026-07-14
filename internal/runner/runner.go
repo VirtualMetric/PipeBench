@@ -189,6 +189,14 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	if tc.Type == "kafka_inflight_crash_correctness" {
 		return r.runKafkaInflightCrash(tc, subject)
 	}
+	// Object-storage in-flight crash: same receiver-up mid-delivery flow as the
+	// kafka in-flight crash, for a poll-mode source (S3/Azure bucket). The
+	// bucket is the durable store, decoupled from the subject, so the generator
+	// keeps uploading across the SIGKILL+restart. Verifies no loss; duplicates
+	// (crash-resistance replay + cursor re-list) are reported, not failed.
+	if tc.Type == "persistence_inflight_crash_correctness" {
+		return r.runInflightCrashCorrectness(tc, subject)
+	}
 	// Kafka offset-commit restart: receiver stays UP, ALL records are
 	// delivered cleanly, then the subject is restarted gracefully. A
 	// consumer whose offset commits actually persist resumes from the
@@ -832,15 +840,20 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		// Re-deriving pass/fail from line-count loss + a strict over-delivery
 		// cap here would wrongly flip a valid allow_overdelivery verifier pass.
 		lossOK := lossPct <= tc.Correctness.ExpectedLossPct
-		// Kafka consumption is at-least-once: the consumer may re-deliver a
-		// fetch batch on its initial group join / rebalance, so allow bounded
-		// over-delivery (Correctness.MaxOverDeliveryPct, default 0 = exact).
-		// Non-kafka correctness stays strict.
+		// Over-delivery policy, in precedence order:
+		//   - allow_overdelivery: the source is at-least-once by design (e.g. the
+		//     list-poll since-cursor re-lists the tip object every idle cycle), so
+		//     any over-delivery is accepted; only loss fails. This mirrors the
+		//     carve-out the in-flight-crash / restart handlers already apply.
+		//   - kafka: consumption is at-least-once — the consumer may re-deliver a
+		//     fetch batch on its initial group join / rebalance, so allow bounded
+		//     over-delivery (Correctness.MaxOverDeliveryPct, default 0 = exact).
+		//   - otherwise: strict exact count.
 		overCap := expectedOut
 		if tc.IsKafkaType() {
 			overCap += int64(float64(expectedOut) * tc.Correctness.MaxOverDeliveryPct / 100.0)
 		}
-		overOK := recvMetrics.LinesReceived <= overCap
+		overOK := tc.Correctness.AllowOverDelivery || recvMetrics.LinesReceived <= overCap
 		recvOK := result.Passed == nil || *result.Passed
 
 		var failReasons []string
@@ -1580,12 +1593,13 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 	return result, nil
 }
 
-// midDeliveryFlow parameterizes the shared kafka correctness driver
-// (runKafkaMidDeliveryAction): produce to the broker with the receiver live,
-// fire one disruptive action once the receiver has seen ~half of total_lines,
-// then drain and assert no loss (over-delivery from at-least-once recovery is
-// reported, not failed). The action is the only thing that varies between the
-// flows — an in-flight subject crash, a broker cert rotation, etc.
+// midDeliveryFlow parameterizes the shared mid-delivery correctness driver
+// (runMidDeliveryAction): produce to a durable source (Kafka broker, S3/Azure
+// bucket) with the receiver live, fire one disruptive action once the receiver
+// has seen ~half of total_lines, then drain and assert no loss (over-delivery
+// from at-least-once recovery is reported, not failed). The action is the only
+// thing that varies between the flows — an in-flight subject crash, a broker
+// cert rotation, etc.
 type midDeliveryFlow struct {
 	// verdictLabel names the flow in the PASS/FAIL line, e.g.
 	// "kafka cert rotation correctness".
@@ -1609,12 +1623,15 @@ type midDeliveryFlow struct {
 	action func(orch orchestrator.Orchestrator) error
 }
 
-// runKafkaMidDeliveryAction is the shared driver behind the kafka in-flight
-// crash and cert-rotation flows: both bring everything up with the receiver
-// live, wait until the receiver has seen half the records, fire one disruptive
-// action, then drain and apply the same no-loss / at-least-once verdict. Only
-// the action (and a little setup/labelling) differs — see midDeliveryFlow.
-func (r *Runner) runKafkaMidDeliveryAction(tc *config.TestCase, subject config.Subject, f midDeliveryFlow) (results.RunResult, error) {
+// runMidDeliveryAction is the shared driver behind the receiver-up mid-delivery
+// flows (kafka in-flight crash, kafka cert rotation, and object-storage
+// in-flight crash): all bring everything up with the receiver live, wait until
+// the receiver has seen half the records, fire one disruptive action, then
+// drain and apply the same no-loss / at-least-once verdict. Only the action
+// (and a little setup/labelling) differs — see midDeliveryFlow. The source is
+// decoupled from the subject (broker or bucket), so the generator keeps
+// producing across a subject restart.
+func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subject, f midDeliveryFlow) (results.RunResult, error) {
 	configName := r.opts.ConfigName
 	subject = r.applySubjectOverrides(subject)
 
@@ -1878,7 +1895,7 @@ func rotateAndReload(orch orchestrator.Orchestrator, service string, rotate func
 // offset-committed are re-consumed on restart. Verdict: no loss; duplicates are
 // reported, not failed.
 func (r *Runner) runKafkaInflightCrash(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
-	return r.runKafkaMidDeliveryAction(tc, subject, midDeliveryFlow{
+	return r.runMidDeliveryAction(tc, subject, midDeliveryFlow{
 		verdictLabel:  "kafka in-flight crash correctness",
 		actionLog:     "SIGKILL subject (no graceful shutdown), then restart",
 		overDelivNote: "expected for a mid-delivery crash",
@@ -1888,6 +1905,35 @@ func (r *Runner) runKafkaInflightCrash(tc *config.TestCase, subject config.Subje
 				return fmt.Errorf("killing subject: %w", err)
 			}
 			// Settle before the consumer rejoins and replays uncommitted offsets.
+			if err := sleepCtx(r.ctx, 3*time.Second); err != nil {
+				return fmt.Errorf("interrupted: %w", err)
+			}
+			if err := orch.UpServices("subject"); err != nil {
+				return fmt.Errorf("restarting subject: %w", err)
+			}
+			return nil
+		},
+	})
+}
+
+// runInflightCrashCorrectness SIGKILLs the subject WHILE it is actively
+// delivering to a live receiver, then restarts it — the receiver-up
+// mid-delivery worst case for any source whose store is decoupled from the
+// subject (e.g. the S3/Azure bucket a poll-mode device lists). The since-cursor
+// advances at cycle end with no per-object delivery commit, so recovery must
+// still lose nothing; duplicates from the crash-resistance replay + re-list are
+// reported, not failed.
+func (r *Runner) runInflightCrashCorrectness(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
+	return r.runMidDeliveryAction(tc, subject, midDeliveryFlow{
+		verdictLabel:  "in-flight crash correctness",
+		actionLog:     "SIGKILL subject (no graceful shutdown), then restart",
+		overDelivNote: "expected for a mid-delivery crash",
+		totalLinesErr: "persistence_inflight_crash_correctness requires generator.total_lines > 0",
+		action: func(orch orchestrator.Orchestrator) error {
+			if err := orch.KillServices("subject"); err != nil {
+				return fmt.Errorf("killing subject: %w", err)
+			}
+			// Settle before the subject restarts and re-lists from its cursor.
 			if err := sleepCtx(r.ctx, 3*time.Second); err != nil {
 				return fmt.Errorf("interrupted: %w", err)
 			}
@@ -1919,7 +1965,7 @@ func (r *Runner) runKafkaCertRotation(tc *config.TestCase, subject config.Subjec
 	// and prepare runs before action, so the capture is well-ordered.
 	var certsDir string
 	hosts := []string{"subject", "localhost", "redpanda"}
-	return r.runKafkaMidDeliveryAction(tc, subject, midDeliveryFlow{
+	return r.runMidDeliveryAction(tc, subject, midDeliveryFlow{
 		verdictLabel:  "kafka cert rotation correctness",
 		actionLog:     "rotating broker cert to an UNTRUSTED CA (must be rejected), then back to a trusted cert",
 		overDelivNote: "expected across the broker reconnects",
@@ -7178,7 +7224,7 @@ func (r *Runner) runSyslogVaultCertRotation(tc *config.TestCase, subject config.
 	hosts := []string{"subject", "localhost"}
 	var certsDir string
 
-	return r.runKafkaMidDeliveryAction(tc, subject, midDeliveryFlow{
+	return r.runMidDeliveryAction(tc, subject, midDeliveryFlow{
 		verdictLabel:  "syslog TLS vault cert rotation correctness",
 		actionLog:     "rotating syslog server cert to UNTRUSTED CA (generator TLS must fail), then restoring trusted cert",
 		overDelivNote: "expected after the trusted cert is restored and the generator reconnects",
@@ -7222,7 +7268,7 @@ func (r *Runner) runSyslogVaultCertRotation(tc *config.TestCase, subject config.
 
 			mount := tc.Vault.MountOrDefault()
 			token := tc.Vault.TokenOrDefault()
-			// Receiver metrics port is already forwarded by runKafkaMidDeliveryAction.
+			// Receiver metrics port is already forwarded by runMidDeliveryAction.
 			metricsPort := orch.ReceiverMetricsPorts()["default"]
 
 			// ---- Phase 1: UNTRUSTED cert — generator TLS must fail ----
