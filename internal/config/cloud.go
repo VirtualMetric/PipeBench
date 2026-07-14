@@ -77,6 +77,30 @@ type AWSConfig struct {
 	// Subscriptions wires SNS → SQS (RawMessageDelivery=true) so an
 	// SNS-target case is observable by the `sqs` receiver mode.
 	Subscriptions []AWSSubscription `yaml:"subscriptions"`
+
+	// SeedObjects pre-uploads synthetic objects into a declared bucket at
+	// init, before the subject starts — for list-mode / first-run backlog
+	// source cases where the subject must find objects already present rather
+	// than a generator streaming them in during the run.
+	SeedObjects []AWSSeedObjects `yaml:"seed_objects"`
+}
+
+// AWSSeedObjects pre-uploads Objects synthetic objects (Lines lines each,
+// each line prefixed with Marker) under Prefix in Bucket during LocalStack
+// init.
+type AWSSeedObjects struct {
+	// Bucket must be one of the declared Buckets.
+	Bucket string `yaml:"bucket"`
+	// Prefix is the key prefix for seeded objects (default "seed/").
+	Prefix string `yaml:"prefix"`
+	// Objects is the number of objects to create (> 0).
+	Objects int `yaml:"objects"`
+	// Lines is the number of lines per object (> 0).
+	Lines int `yaml:"lines"`
+	// Marker is the per-line content prefix (default "SEED"); validated
+	// against the cloud-name charset so it cannot inject into the init shell
+	// script.
+	Marker string `yaml:"marker"`
 }
 
 // AWSStream declares a Kinesis stream created at init.
@@ -418,6 +442,27 @@ func (tc *TestCase) validateAWS() error {
 	for _, svc := range tc.AWS.Services {
 		if err := validateCloudName(tc.Name, "aws service", svc); err != nil {
 			return err
+		}
+	}
+	for _, so := range tc.AWS.SeedObjects {
+		if _, ok := buckets[so.Bucket]; !ok {
+			return fmt.Errorf("case %q: seed_objects references undeclared bucket %q", tc.Name, so.Bucket)
+		}
+		if so.Prefix != "" {
+			if err := validateCloudName(tc.Name, "aws seed prefix", so.Prefix); err != nil {
+				return err
+			}
+		}
+		if so.Marker != "" {
+			if err := validateCloudName(tc.Name, "aws seed marker", so.Marker); err != nil {
+				return err
+			}
+		}
+		if so.Objects <= 0 {
+			return fmt.Errorf("case %q: seed_objects for bucket %q requires objects > 0, got %d", tc.Name, so.Bucket, so.Objects)
+		}
+		if so.Lines <= 0 {
+			return fmt.Errorf("case %q: seed_objects for bucket %q requires lines > 0, got %d", tc.Name, so.Bucket, so.Lines)
 		}
 	}
 	return nil
