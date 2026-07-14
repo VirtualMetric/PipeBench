@@ -804,7 +804,8 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 			result.FailReason = fmt.Sprintf(
 				"expect_failure: data path was NOT blocked — receiver observed %s line(s) (> %s); "+
 					"the control under test (e.g. auth) appears bypassed",
-				formatCount(recvMetrics.LinesReceived), formatCount(cap))
+				formatCount(recvMetrics.LinesReceived), formatCount(cap),
+			)
 		}
 	} else if tc.IsCorrectnessType() && !tc.HasGenerator() {
 		// No generator: there's no expected line count to derive loss or
@@ -824,7 +825,8 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		if !gotEnough {
 			failReasons = append(failReasons, fmt.Sprintf(
 				"expected >= %s received records, got %s",
-				formatCount(minRecv), formatCount(recvMetrics.LinesReceived)))
+				formatCount(minRecv), formatCount(recvMetrics.LinesReceived),
+			))
 		}
 		passed := gotEnough && recvOK
 		result.Passed = &passed
@@ -863,13 +865,15 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		if !lossOK {
 			failReasons = append(failReasons, fmt.Sprintf(
 				"expected loss <= %.2f%%, got %.2f%%",
-				tc.Correctness.ExpectedLossPct, lossPct))
+				tc.Correctness.ExpectedLossPct, lossPct,
+			))
 		}
 		if !overOK {
 			extra := recvMetrics.LinesReceived - expectedOut
 			failReasons = append(failReasons, fmt.Sprintf(
 				"over-delivery: received %s lines but only %s were expected (%s extra/duplicate lines)",
-				formatCount(recvMetrics.LinesReceived), formatCount(expectedOut), formatCount(extra)))
+				formatCount(recvMetrics.LinesReceived), formatCount(expectedOut), formatCount(extra),
+			))
 		}
 
 		passed := lossOK && overOK && recvOK
@@ -1759,8 +1763,8 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 		return results.RunResult{}, fmt.Errorf("never reached mid-delivery (%s) before timeout", formatCount(mid))
 	}
 
-	// The generator produces to Kafka independently of the subject; collect
-	// its final count.
+	// The generator produces to the durable source (broker or bucket)
+	// independently of the subject; collect its final count.
 	duration := tc.DurationOrDefault(60 * time.Second)
 	warmup := tc.WarmupOrDefault(30 * time.Second)
 	genTimeout := min(duration+warmup+2*time.Minute, r.opts.Timeout)
@@ -1929,6 +1933,7 @@ func (r *Runner) runInflightCrashCorrectness(tc *config.TestCase, subject config
 		actionLog:     "SIGKILL subject (no graceful shutdown), then restart",
 		overDelivNote: "expected for a mid-delivery crash",
 		totalLinesErr: "persistence_inflight_crash_correctness requires generator.total_lines > 0",
+		extraCleanup:  []string{"bench-localstack", "bench-azurite", "bench-azure-init"},
 		action: func(orch orchestrator.Orchestrator) error {
 			if err := orch.KillServices("subject"); err != nil {
 				return fmt.Errorf("killing subject: %w", err)
@@ -2715,7 +2720,8 @@ func (r *Runner) runDirectorAgentACLRotation(tc *config.TestCase, subject config
 		if !blockedOK {
 			errs = append(errs, fmt.Sprintf(
 				"agent was NOT blocked before rotation (%s records during the %s baseline) — the initial allowlist already admits it; the recover transition is untested",
-				formatCount(rmBlocked.LinesReceived), baseline))
+				formatCount(rmBlocked.LinesReceived), baseline,
+			))
 		}
 
 		// Phase 1: rotate to the allow config; the director's refreshACL must pick
@@ -2755,7 +2761,8 @@ func (r *Runner) runDirectorAgentACLRotation(tc *config.TestCase, subject config
 		if !started {
 			errs = append(errs, fmt.Sprintf(
 				"delivery did not start after admitting the agent — %s records (expected >= %s); the ACL hot-reload did not take effect",
-				formatCount(finalCount), formatCount(minRecv)))
+				formatCount(finalCount), formatCount(minRecv),
+			))
 		}
 		passed = blockedOK && started
 
@@ -2788,7 +2795,8 @@ func (r *Runner) runDirectorAgentACLRotation(tc *config.TestCase, subject config
 			return results.RunResult{}, fmt.Errorf(
 				"agent never delivered the initial %s records — cannot test revocation (subject image %s:%s); "+
 					"if this is not the agent-capable image, re-run with VMETRIC_IMAGE=vmetric/director-enterprise",
-				formatCount(minRecv), subject.Image, subject.Version)
+				formatCount(minRecv), subject.Image, subject.Version,
+			)
 		}
 		fmt.Printf("  delivery established — %s records before revocation ✓\n", formatCount(beforeCount))
 
@@ -2828,11 +2836,13 @@ func (r *Runner) runDirectorAgentACLRotation(tc *config.TestCase, subject config
 		if advanced < 0 {
 			errs = append(errs, fmt.Sprintf(
 				"inconclusive: receiver count decreased after blocking the agent (after1=%s after2=%s) — the counter regressed, cannot confirm delivery stopped",
-				formatCount(rmAfter1.LinesReceived), formatCount(rmAfter2.LinesReceived)))
+				formatCount(rmAfter1.LinesReceived), formatCount(rmAfter2.LinesReceived),
+			))
 		} else if !stopped {
 			errs = append(errs, fmt.Sprintf(
 				"delivery did NOT stop after blocking the agent (%s new records across the block window) — the ACL was not enforced on the live data path",
-				formatCount(advanced)))
+				formatCount(advanced),
+			))
 		}
 		passed = stopped
 
@@ -3718,6 +3728,7 @@ func (st *fleetStatus) count(id, key string) int {
 	}
 	return d.Inbound[key].Count
 }
+
 func (st *fleetStatus) lastData(id, key string) string {
 	d, ok := st.Directors[id]
 	if !ok {
@@ -4474,7 +4485,8 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		if leakedDuringBaseline > cfgUpdateLeak {
 			errs = append(errs, fmt.Sprintf(
 				"delivery was NOT suppressed by the BEFORE config (%s records during the %s baseline) — the update verdict would be vacuous",
-				formatCount(leakedDuringBaseline), baseline))
+				formatCount(leakedDuringBaseline), baseline,
+			))
 		}
 
 		// Phase 2: AFTER pipeline (configs/update.vmf) — enables delivery.
@@ -4514,7 +4526,8 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		if delivered < minRecv {
 			errs = append(errs, fmt.Sprintf(
 				"delivery did not start after the config update — %s new records (expected >= %s); the update did not take effect on the data plane",
-				formatCount(delivered), formatCount(minRecv)))
+				formatCount(delivered), formatCount(minRecv),
+			))
 		} else {
 			fmt.Printf("  delivery started after the update — %s new records ✓\n", formatCount(delivered))
 		}
@@ -4571,7 +4584,8 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		if rmB.LinesReceived > leak {
 			errs = append(errs, fmt.Sprintf(
 				"delivery was not blocked before the change (%s received) — config A is not pointing at a dead target; the change is untested",
-				formatCount(rmB.LinesReceived)))
+				formatCount(rmB.LinesReceived),
+			))
 		}
 
 		// Phase 1: push the changed VMF (config B → working target) over the fleet link.
@@ -4626,7 +4640,8 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		if finalCount < target {
 			errs = append(errs, fmt.Sprintf(
 				"delivery did not start after the pushed config change — %s received (expected >= %s = baseline %s + %s); the fleet-delivered VMF change did not reconcile onto the live data path",
-				formatCount(finalCount), formatCount(target), formatCount(rmB.LinesReceived), formatCount(minRecv)))
+				formatCount(finalCount), formatCount(target), formatCount(rmB.LinesReceived), formatCount(minRecv),
+			))
 		} else {
 			fmt.Printf("  delivery started after the VMF config change (%s received, baseline %s) ✓\n", formatCount(finalCount), formatCount(rmB.LinesReceived))
 		}
@@ -4844,7 +4859,8 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		if finalCount < minRecv {
 			errs = append(errs, fmt.Sprintf(
 				"delivered pipeline produced too few records at the receiver — %s received (expected >= %s); the VMF-delivered pipeline/library did not apply on the data path",
-				formatCount(finalCount), formatCount(minRecv)))
+				formatCount(finalCount), formatCount(minRecv),
+			))
 		} else {
 			fmt.Printf("  delivered pipeline produced %s record(s) at the receiver ✓\n", formatCount(finalCount))
 		}
@@ -4964,8 +4980,8 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 // saveFleetResult records the verdict and, on failure, dumps short log tails of
 // the simulator and director to aid diagnosis.
 func (r *Runner) saveFleetResult(tc *config.TestCase, subject config.Subject, configName string,
-	startTime time.Time, finalCount int64, passed bool, errs []string, simContainer, subjectContainer string) (results.RunResult, error) {
-
+	startTime time.Time, finalCount int64, passed bool, errs []string, simContainer, subjectContainer string,
+) (results.RunResult, error) {
 	elapsed := time.Since(startTime).Seconds()
 	label := tc.Fleet.Scenario
 	if passed {
@@ -5340,8 +5356,8 @@ func (r *Runner) runCCFCorrectness(tc *config.TestCase, subject config.Subject) 
 // saveCCFResult records the CCF verdict and, on failure, dumps short log tails of
 // the mock API and director to aid diagnosis.
 func (r *Runner) saveCCFResult(tc *config.TestCase, subject config.Subject, configName string,
-	startTime time.Time, finalCount int64, passed bool, errs []string, apiContainer, subjectContainer string) (results.RunResult, error) {
-
+	startTime time.Time, finalCount int64, passed bool, errs []string, apiContainer, subjectContainer string,
+) (results.RunResult, error) {
 	elapsed := time.Since(startTime).Seconds()
 	label := tc.CCF.Scenario
 	if passed {
@@ -5603,8 +5619,8 @@ func (r *Runner) runHTTPSourceCorrectness(tc *config.TestCase, subject config.Su
 }
 
 func (r *Runner) saveHTTPSourceResult(tc *config.TestCase, subject config.Subject, configName string,
-	startTime time.Time, finalCount int64, passed bool, errs []string, senderContainer, subjectContainer string) (results.RunResult, error) {
-
+	startTime time.Time, finalCount int64, passed bool, errs []string, senderContainer, subjectContainer string,
+) (results.RunResult, error) {
 	elapsed := time.Since(startTime).Seconds()
 	if passed {
 		fmt.Printf("  http source (%s): PASSED ✓\n", tc.HTTPSource.Scenario)
@@ -5759,7 +5775,8 @@ func (r *Runner) runClickHouseTargetCorrectness(tc *config.TestCase, subject con
 	// (tabseparatedraw/parquet/native write only `message`; the rest DEFAULT).
 	createTable := fmt.Sprintf(
 		"CREATE TABLE IF NOT EXISTS %s (message String, `@timestamp` String DEFAULT '', ts DateTime DEFAULT now()) ENGINE = MergeTree ORDER BY ts",
-		fqTable)
+		fqTable,
+	)
 	if ch.CreateTableSQL != "" {
 		createTable = strings.ReplaceAll(ch.CreateTableSQL, "{{TABLE}}", fqTable)
 	}
@@ -5848,8 +5865,8 @@ func (r *Runner) runClickHouseTargetCorrectness(tc *config.TestCase, subject con
 }
 
 func (r *Runner) saveClickHouseTargetResult(tc *config.TestCase, subject config.Subject, configName string,
-	startTime time.Time, finalCount int64, passed bool, errs []string, chContainer, subjectContainer string) (results.RunResult, error) {
-
+	startTime time.Time, finalCount int64, passed bool, errs []string, chContainer, subjectContainer string,
+) (results.RunResult, error) {
 	elapsed := time.Since(startTime).Seconds()
 	if passed {
 		fmt.Println("  clickhouse target: PASSED ✓")
@@ -6231,8 +6248,8 @@ func (r *Runner) setupAuxRun(tc *config.TestCase, subject config.Subject, config
 
 // saveAuxResult records the verdict for the small aux-container drivers.
 func (r *Runner) saveAuxResult(tc *config.TestCase, subject config.Subject, configName, label string,
-	startTime time.Time, finalCount int64, passed bool, errs []string, auxContainer, subjectContainer string) (results.RunResult, error) {
-
+	startTime time.Time, finalCount int64, passed bool, errs []string, auxContainer, subjectContainer string,
+) (results.RunResult, error) {
 	elapsed := time.Since(startTime).Seconds()
 	if passed {
 		fmt.Printf("  %s: PASSED ✓\n", label)
@@ -6707,7 +6724,8 @@ func (r *Runner) runKafkaOffsetCommitRestart(tc *config.TestCase, subject config
 	if overPct > tc.Correctness.MaxOverDeliveryPct {
 		errors = append(errors, fmt.Sprintf(
 			"expected over-delivery <= %.2f%%, got %.2f%% (%s duplicate lines) — restart re-consumed records whose offsets should have been committed",
-			tc.Correctness.MaxOverDeliveryPct, overPct, formatCount(extra)))
+			tc.Correctness.MaxOverDeliveryPct, overPct, formatCount(extra),
+		))
 	}
 	passed := len(errors) == 0
 
@@ -7322,7 +7340,8 @@ func (r *Runner) runSyslogVaultCertRotation(tc *config.TestCase, subject config.
 					"SECURITY: receiver count never stalled after wrong-CA rotation "+
 						"(last count: %d) — director did not serve the untrusted cert, "+
 						"or generator ignored cert validation; check debug.console.status: true logs",
-					lastCount)
+					lastCount,
+				)
 			}
 
 			// ---- Phase 2: TRUSTED cert restored — recovery ----
