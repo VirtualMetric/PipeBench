@@ -1248,7 +1248,7 @@ func (tc *TestCase) validateCluster() error {
 		return fmt.Errorf("case %q: cluster.nodes must be >= 3, got %d", tc.Name, tc.Cluster.Nodes)
 	}
 	switch tc.Cluster.Action {
-	case "", "restart_follower", "restart_leader", "stop_two_recover", "agentless_failover", "cluster_ip_failover":
+	case "", "restart_follower", "restart_leader", "stop_two_recover", "agentless_failover", "device_failover", "cluster_ip_failover":
 	default:
 		return fmt.Errorf("case %q: unknown cluster.action %q", tc.Name, tc.Cluster.Action)
 	}
