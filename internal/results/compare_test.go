@@ -62,6 +62,26 @@ func TestAggregateAllMetricsFromCSV(t *testing.T) {
 		}
 	})
 
+	// An unparseable cpu/mem field is not evidence of a stopped container:
+	// the row is kept and its valid net/disk columns still count.
+	t.Run("malformed cpu field kept", func(t *testing.T) {
+		t.Parallel()
+		csv := writeMetricsCSV(t,
+			"100,x,0,100,200,300,400,0,0,0\n"+
+				"101,0,0,0,0,0,0,0,0,0\n")
+		m, err := AggregateAllMetricsFromCSV(csv)
+		if err != nil {
+			t.Fatalf("aggregate: %v", err)
+		}
+		if m.Samples != 1 {
+			t.Fatalf("Samples = %d, want 1 (malformed row kept, all-zero row dropped)", m.Samples)
+		}
+		if m.NetRecv != 100 || m.NetSend != 200 || m.DiskRead != 300 || m.DiskWrite != 400 {
+			t.Fatalf("io = net %d/%d disk %d/%d, want 100/200 300/400",
+				m.NetRecv, m.NetSend, m.DiskRead, m.DiskWrite)
+		}
+	})
+
 	// Net/disk totals accumulate only over surviving rows.
 	t.Run("io totals over kept rows", func(t *testing.T) {
 		t.Parallel()

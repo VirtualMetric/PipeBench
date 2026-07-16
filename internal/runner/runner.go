@@ -1651,9 +1651,12 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 // aggregates resource usage over the whole run. Used by the crash/restart
 // drivers, whose subject stops and restarts mid-run: the collector samples by
 // container name each tick, so it rides across the restart; samples taken
-// while the subject is down are all-zero rows the aggregator drops. Returns
-// the aggregated metrics and the local CSV path ("" if unavailable) for
-// saveResult.
+// while the subject is down are all-zero rows the aggregator drops. The
+// copy-then-stop order is deliberate and matches the standard driver: the
+// collector fsyncs every row as it writes it (see CopyMetricsCSV) and has no
+// shutdown flush, so copying first loses nothing and excludes post-cutoff
+// idle samples from the stop grace. Returns the aggregated metrics and the
+// local CSV path ("" if unavailable) for saveResult.
 func (r *Runner) harvestResourceMetrics(orch orchestrator.Orchestrator, tmpDir string) (results.AggregatedMetrics, string) {
 	csvPath := filepath.Join(tmpDir, "metrics.csv")
 	fmt.Println("  collecting metrics…")
