@@ -120,3 +120,24 @@ func TestAddRow(t *testing.T) {
 		t.Errorf("Epoch/CpuIdl = %d/%v, want 0/0", dst.Epoch, dst.CpuIdl)
 	}
 }
+
+func TestDockerStatsToRowLeavesPerTickFieldsZero(t *testing.T) {
+	// Epoch and CpuIdl are derived once per tick by runDockerMode after the
+	// per-target rows are summed (CpuIdl floored at 0 there, since summed
+	// usage can exceed 100). A per-container row must leave them zero, or a
+	// stale per-container idle would leak into the combined row's contract.
+	var s dockerStats
+	s.CPUStats.CPUUsage.TotalUsage = 2_000_000
+	s.CPUStats.SystemUsage = 10_000_000
+	s.CPUStats.OnlineCPUs = 4
+	s.PreCPUStats.CPUUsage.TotalUsage = 1_000_000
+	s.PreCPUStats.SystemUsage = 9_000_000
+
+	row := dockerStatsToRow(&s, nil)
+	if row.CpuUsr <= 0 {
+		t.Fatalf("CpuUsr = %v, want > 0 (sanity: stats deltas present)", row.CpuUsr)
+	}
+	if row.Epoch != 0 || row.CpuIdl != 0 {
+		t.Fatalf("Epoch/CpuIdl = %d/%v, want 0/0 (caller-derived per tick)", row.Epoch, row.CpuIdl)
+	}
+}

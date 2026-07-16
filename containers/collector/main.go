@@ -148,7 +148,9 @@ func runDockerMode(ctx context.Context, ticker *time.Ticker, emit func(MetricsRo
 				continue
 			}
 			row.Epoch = time.Now().Unix()
-			row.CpuIdl = 100.0 - row.CpuUsr
+			// Summed usage regularly exceeds 100 (multi-core containers,
+			// multi-node clusters); idle is a percentage, so floor it at 0.
+			row.CpuIdl = max(100.0-row.CpuUsr, 0)
 			emit(row)
 		}
 	}
@@ -235,9 +237,10 @@ func fetchDockerStats(client *http.Client, dockerHost, container string) (*docke
 	return &s, nil
 }
 
+// dockerStatsToRow converts one container's stats snapshot into a partial
+// row: per-tick fields (Epoch, CpuIdl) are derived by the caller after the
+// per-target rows are summed, so they stay zero here.
 func dockerStatsToRow(cur *dockerStats, prev *dockerStats) MetricsRow {
-	now := time.Now().Unix()
-
 	var cpuPct float64
 	cpuDelta := float64(cur.CPUStats.CPUUsage.TotalUsage) - float64(cur.PreCPUStats.CPUUsage.TotalUsage)
 	sysDelta := float64(cur.CPUStats.SystemUsage) - float64(cur.PreCPUStats.SystemUsage)
@@ -306,9 +309,7 @@ func dockerStatsToRow(cur *dockerStats, prev *dockerStats) MetricsRow {
 	}
 
 	return MetricsRow{
-		Epoch:   now,
 		CpuUsr:  cpuPct,
-		CpuIdl:  100.0 - cpuPct,
 		MemUsed: memUsed,
 		MemCach: cache,
 		MemFree: memFree,
