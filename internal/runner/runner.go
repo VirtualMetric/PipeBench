@@ -1194,6 +1194,9 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 		return results.RunResult{}, fmt.Errorf("querying receiver metrics: %w", err)
 	}
 
+	metrics, metricsCSVSrc := r.harvestResourceMetrics(orch, tmpDir)
+	sysCPUs, sysMemMB := getSystemInfo()
+
 	elapsed := time.Since(startTime).Seconds()
 
 	// Compute results
@@ -1258,14 +1261,31 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 		LinesOut:        recvMetrics.LinesReceived,
 		BytesIn:         genStats.BytesSent,
 		BytesOut:        recvMetrics.BytesReceived,
+		LinesPerSec:     receiveWindowRate(recvMetrics),
 		LossPercent:     lossPct,
+		AvgCPUPercent:   metrics.CPUAvg,
+		MaxCPUPercent:   metrics.CPUMax,
+		AvgMemMB:        metrics.MemAvgMB,
+		MaxMemMB:        metrics.MemMaxMB,
+		DiskReadBytes:   metrics.DiskRead,
+		DiskWriteBytes:  metrics.DiskWrite,
+		NetRecvBytes:    metrics.NetRecv,
+		NetSendBytes:    metrics.NetSend,
+		IOThroughputAvg: metrics.IOThroughputAvg,
+		LoadAvg1:        metrics.LoadAvg1,
+		LoadAvg5:        metrics.LoadAvg5,
+		LoadAvg15:       metrics.LoadAvg15,
+		SystemCPUs:      sysCPUs,
+		SystemMemMB:     sysMemMB,
+		SubjectCPULimit: r.opts.CPULimit,
+		SubjectMemLimit: r.opts.MemLimit,
 		Passed:          &passed,
 	}
 	if !passed {
 		result.FailReason = strings.Join(errors, "; ")
 	}
 
-	dir, err := r.saveResult(result, "")
+	dir, err := r.saveResult(result, metricsCSVSrc)
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
 	}
@@ -1273,6 +1293,11 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 	fmt.Printf("  done. results → %s\n", dir)
 	fmt.Printf("  lines sent: %s  lines received: %s  loss: %.2f%%\n",
 		formatCount(genStats.LinesSent), formatCount(recvMetrics.LinesReceived), lossPct)
+	fmt.Printf("  cpu: avg %.1f%% max %.1f%%  mem: avg %.0f MB max %.0f MB\n",
+		metrics.CPUAvg, metrics.CPUMax, metrics.MemAvgMB, metrics.MemMaxMB)
+	if metrics.IOThroughputAvg > 0 {
+		fmt.Printf("  io throughput: avg %.1f MB/s\n", metrics.IOThroughputAvg/(1024*1024))
+	}
 	if tc.Correctness.ValidateDedup {
 		fmt.Printf("  unique lines: %s  duplicates: %s\n",
 			formatCount(recvMetrics.UniqueLines), formatCount(recvMetrics.Duplicates))
@@ -1491,6 +1516,9 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 		return results.RunResult{}, fmt.Errorf("querying receiver metrics: %w", err)
 	}
 
+	metrics, metricsCSVSrc := r.harvestResourceMetrics(orch, tmpDir)
+	sysCPUs, sysMemMB := getSystemInfo()
+
 	elapsed := time.Since(startTime).Seconds()
 
 	lossPct := 0.0
@@ -1554,14 +1582,31 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 		LinesOut:        recvMetrics.LinesReceived,
 		BytesIn:         genStats.BytesSent,
 		BytesOut:        recvMetrics.BytesReceived,
+		LinesPerSec:     receiveWindowRate(recvMetrics),
 		LossPercent:     lossPct,
+		AvgCPUPercent:   metrics.CPUAvg,
+		MaxCPUPercent:   metrics.CPUMax,
+		AvgMemMB:        metrics.MemAvgMB,
+		MaxMemMB:        metrics.MemMaxMB,
+		DiskReadBytes:   metrics.DiskRead,
+		DiskWriteBytes:  metrics.DiskWrite,
+		NetRecvBytes:    metrics.NetRecv,
+		NetSendBytes:    metrics.NetSend,
+		IOThroughputAvg: metrics.IOThroughputAvg,
+		LoadAvg1:        metrics.LoadAvg1,
+		LoadAvg5:        metrics.LoadAvg5,
+		LoadAvg15:       metrics.LoadAvg15,
+		SystemCPUs:      sysCPUs,
+		SystemMemMB:     sysMemMB,
+		SubjectCPULimit: r.opts.CPULimit,
+		SubjectMemLimit: r.opts.MemLimit,
 		Passed:          &passed,
 	}
 	if !passed {
 		result.FailReason = strings.Join(errors, "; ")
 	}
 
-	dir, err := r.saveResult(result, "")
+	dir, err := r.saveResult(result, metricsCSVSrc)
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
 	}
@@ -1569,6 +1614,11 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 	fmt.Printf("  done. results → %s\n", dir)
 	fmt.Printf("  lines sent: %s  lines received: %s  loss: %.2f%%\n",
 		formatCount(genStats.LinesSent), formatCount(recvMetrics.LinesReceived), lossPct)
+	fmt.Printf("  cpu: avg %.1f%% max %.1f%%  mem: avg %.0f MB max %.0f MB\n",
+		metrics.CPUAvg, metrics.CPUMax, metrics.MemAvgMB, metrics.MemMaxMB)
+	if metrics.IOThroughputAvg > 0 {
+		fmt.Printf("  io throughput: avg %.1f MB/s\n", metrics.IOThroughputAvg/(1024*1024))
+	}
 	if tc.Correctness.ValidateDedup {
 		fmt.Printf("  unique lines: %s  duplicates: %s\n",
 			formatCount(recvMetrics.UniqueLines), formatCount(recvMetrics.Duplicates))
@@ -1595,6 +1645,41 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 	}
 
 	return result, nil
+}
+
+// harvestResourceMetrics copies the collector's CSV, stops the collector, and
+// aggregates resource usage over the whole run. Used by the crash/restart
+// drivers, whose subject stops and restarts mid-run: the collector samples by
+// container name each tick, so it rides across the restart; samples taken
+// while the subject is down are all-zero rows the aggregator drops. Returns
+// the aggregated metrics and the local CSV path ("" if unavailable) for
+// saveResult.
+func (r *Runner) harvestResourceMetrics(orch orchestrator.Orchestrator, tmpDir string) (results.AggregatedMetrics, string) {
+	csvPath := filepath.Join(tmpDir, "metrics.csv")
+	fmt.Println("  collecting metrics…")
+	if err := orch.CopyMetricsCSV(csvPath); err != nil {
+		fmt.Fprintf(os.Stderr, "  warning: metrics CSV not available: %v\n", err)
+		csvPath = ""
+	}
+	fmt.Println("  stopping collector…")
+	if err := orch.StopCollector(); err != nil {
+		fmt.Fprintf(os.Stderr, "  warning: stopping collector: %v\n", err)
+	}
+	var metrics results.AggregatedMetrics
+	if csvPath != "" {
+		metrics, _ = results.AggregateAllMetricsFromCSV(csvPath)
+	}
+	return metrics, csvPath
+}
+
+// receiveWindowRate returns lines/sec over the receiver's active window
+// (first→last received). Crash/restart delivery is a burst after the
+// disruption, so lines/total-run-time would understate to near zero.
+func receiveWindowRate(rm ReceiverMetrics) float64 {
+	if rm.LastReceivedNs > rm.FirstReceivedNs {
+		return float64(rm.LinesReceived) / (float64(rm.LastReceivedNs-rm.FirstReceivedNs) / 1e9)
+	}
+	return 0
 }
 
 // midDeliveryFlow parameterizes the shared mid-delivery correctness driver
@@ -1810,6 +1895,9 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 		return results.RunResult{}, fmt.Errorf("querying receiver metrics: %w", err)
 	}
 
+	metrics, metricsCSVSrc := r.harvestResourceMetrics(orch, tmpDir)
+	sysCPUs, sysMemMB := getSystemInfo()
+
 	elapsed := time.Since(startTime).Seconds()
 	lossPct := 0.0
 	if genStats.LinesSent > 0 {
@@ -1835,6 +1923,11 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 
 	fmt.Printf("  lines sent: %s  lines received: %s  loss: %.2f%%\n",
 		formatCount(genStats.LinesSent), formatCount(recvMetrics.LinesReceived), lossPct)
+	fmt.Printf("  cpu: avg %.1f%% max %.1f%%  mem: avg %.0f MB max %.0f MB\n",
+		metrics.CPUAvg, metrics.CPUMax, metrics.MemAvgMB, metrics.MemMaxMB)
+	if metrics.IOThroughputAvg > 0 {
+		fmt.Printf("  io throughput: avg %.1f MB/s\n", metrics.IOThroughputAvg/(1024*1024))
+	}
 	if passed {
 		fmt.Printf("  %s: PASSED ✓\n", f.verdictLabel)
 	} else {
@@ -1857,7 +1950,24 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 		LinesOut:        recvMetrics.LinesReceived,
 		BytesIn:         genStats.BytesSent,
 		BytesOut:        recvMetrics.BytesReceived,
+		LinesPerSec:     receiveWindowRate(recvMetrics),
 		LossPercent:     lossPct,
+		AvgCPUPercent:   metrics.CPUAvg,
+		MaxCPUPercent:   metrics.CPUMax,
+		AvgMemMB:        metrics.MemAvgMB,
+		MaxMemMB:        metrics.MemMaxMB,
+		DiskReadBytes:   metrics.DiskRead,
+		DiskWriteBytes:  metrics.DiskWrite,
+		NetRecvBytes:    metrics.NetRecv,
+		NetSendBytes:    metrics.NetSend,
+		IOThroughputAvg: metrics.IOThroughputAvg,
+		LoadAvg1:        metrics.LoadAvg1,
+		LoadAvg5:        metrics.LoadAvg5,
+		LoadAvg15:       metrics.LoadAvg15,
+		SystemCPUs:      sysCPUs,
+		SystemMemMB:     sysMemMB,
+		SubjectCPULimit: r.opts.CPULimit,
+		SubjectMemLimit: r.opts.MemLimit,
 		Passed:          &passed,
 	}
 	if !passed {
@@ -1866,7 +1976,7 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 
 	// Persist the result like every other run path — Run's contract is to
 	// return the *persisted* result.
-	dir, err := r.saveResult(result, "")
+	dir, err := r.saveResult(result, metricsCSVSrc)
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
 	}
@@ -6954,6 +7064,9 @@ func (r *Runner) runPersistenceFileRestartCorrectness(tc *config.TestCase, subje
 		lastCount = rm.LinesReceived
 	}
 
+	metrics, metricsCSVSrc := r.harvestResourceMetrics(orch, tmpDir)
+	sysCPUs, sysMemMB := getSystemInfo()
+
 	// Evaluate.
 	elapsed := time.Since(startTime).Seconds()
 	lossPct := 0.0
@@ -6997,14 +7110,31 @@ func (r *Runner) runPersistenceFileRestartCorrectness(tc *config.TestCase, subje
 		LinesOut:        recvMetrics.LinesReceived,
 		BytesIn:         genStats.BytesSent,
 		BytesOut:        recvMetrics.BytesReceived,
+		LinesPerSec:     receiveWindowRate(recvMetrics),
 		LossPercent:     lossPct,
+		AvgCPUPercent:   metrics.CPUAvg,
+		MaxCPUPercent:   metrics.CPUMax,
+		AvgMemMB:        metrics.MemAvgMB,
+		MaxMemMB:        metrics.MemMaxMB,
+		DiskReadBytes:   metrics.DiskRead,
+		DiskWriteBytes:  metrics.DiskWrite,
+		NetRecvBytes:    metrics.NetRecv,
+		NetSendBytes:    metrics.NetSend,
+		IOThroughputAvg: metrics.IOThroughputAvg,
+		LoadAvg1:        metrics.LoadAvg1,
+		LoadAvg5:        metrics.LoadAvg5,
+		LoadAvg15:       metrics.LoadAvg15,
+		SystemCPUs:      sysCPUs,
+		SystemMemMB:     sysMemMB,
+		SubjectCPULimit: r.opts.CPULimit,
+		SubjectMemLimit: r.opts.MemLimit,
 		Passed:          &passed,
 	}
 	if !passed {
 		result.FailReason = strings.Join(perrs, "; ")
 	}
 
-	dir, err := r.saveResult(result, "")
+	dir, err := r.saveResult(result, metricsCSVSrc)
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
 	}
@@ -7012,6 +7142,11 @@ func (r *Runner) runPersistenceFileRestartCorrectness(tc *config.TestCase, subje
 	fmt.Printf("  done. results → %s\n", dir)
 	fmt.Printf("  lines sent: %s  lines received: %s  loss: %.2f%%\n",
 		formatCount(genStats.LinesSent), formatCount(recvMetrics.LinesReceived), lossPct)
+	fmt.Printf("  cpu: avg %.1f%% max %.1f%%  mem: avg %.0f MB max %.0f MB\n",
+		metrics.CPUAvg, metrics.CPUMax, metrics.MemAvgMB, metrics.MemMaxMB)
+	if metrics.IOThroughputAvg > 0 {
+		fmt.Printf("  io throughput: avg %.1f MB/s\n", metrics.IOThroughputAvg/(1024*1024))
+	}
 	if tc.Correctness.ValidateDedup {
 		fmt.Printf("  unique lines: %s  duplicates: %s\n",
 			formatCount(recvMetrics.UniqueLines), formatCount(recvMetrics.Duplicates))
