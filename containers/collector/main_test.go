@@ -100,3 +100,23 @@ func TestMemUsage(t *testing.T) {
 		})
 	}
 }
+
+func TestAddRow(t *testing.T) {
+	var dst MetricsRow
+	addRow(&dst, MetricsRow{CpuUsr: 40, MemUsed: 100, MemCach: 10, MemFree: 50, NetRecv: 1, NetSend: 2, DskRead: 3, DskWrit: 4})
+	addRow(&dst, MetricsRow{CpuUsr: 15, MemUsed: 200, MemCach: 20, MemFree: 70, NetRecv: 10, NetSend: 20, DskRead: 30, DskWrit: 40})
+
+	if dst.CpuUsr != 55 {
+		t.Errorf("CpuUsr = %v, want 55", dst.CpuUsr)
+	}
+	if dst.MemUsed != 300 || dst.MemCach != 30 || dst.MemFree != 120 {
+		t.Errorf("mem = %d/%d/%d, want 300/30/120", dst.MemUsed, dst.MemCach, dst.MemFree)
+	}
+	if dst.NetRecv != 11 || dst.NetSend != 22 || dst.DskRead != 33 || dst.DskWrit != 44 {
+		t.Errorf("io = %d/%d/%d/%d, want 11/22/33/44", dst.NetRecv, dst.NetSend, dst.DskRead, dst.DskWrit)
+	}
+	// Epoch and CpuIdl are derived per tick by the caller, never summed.
+	if dst.Epoch != 0 || dst.CpuIdl != 0 {
+		t.Errorf("Epoch/CpuIdl = %d/%v, want 0/0", dst.Epoch, dst.CpuIdl)
+	}
+}

@@ -3709,6 +3709,11 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 		finalCount = rm.LinesReceived
 	}
 
+	// Cluster resource usage: the collector samples every node container and
+	// sums them per tick, so these figures are the whole cluster's footprint.
+	metrics, metricsCSVSrc := r.harvestResourceMetrics(orch, tmpDir)
+	sysCPUs, sysMemMB := getSystemInfo()
+
 	elapsed := time.Since(startTime).Seconds()
 	if passed {
 		fmt.Printf("  director cluster (%s): PASSED ✓\n", clusterActionLabel(tc.Cluster.Action))
@@ -3720,23 +3725,41 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 			fmt.Printf("  --- %s (tail) ---\n%s\n", c, string(out))
 		}
 	}
+	fmt.Printf("  cpu: avg %.1f%% max %.1f%%  mem: avg %.0f MB max %.0f MB (cluster total)\n",
+		metrics.CPUAvg, metrics.CPUMax, metrics.MemAvgMB, metrics.MemMaxMB)
 
 	result := results.RunResult{
-		TestName:    tc.Name,
-		Config:      configName,
-		Subject:     subject.Name,
-		Version:     subject.Version,
-		Hardware:    hardwareID(),
-		Timestamp:   startTime,
-		DurationSec: elapsed,
-		LinesOut:    finalCount,
-		Passed:      &passed,
+		TestName:        tc.Name,
+		Config:          configName,
+		Subject:         subject.Name,
+		Version:         subject.Version,
+		Hardware:        hardwareID(),
+		Timestamp:       startTime,
+		DurationSec:     elapsed,
+		LinesOut:        finalCount,
+		AvgCPUPercent:   metrics.CPUAvg,
+		MaxCPUPercent:   metrics.CPUMax,
+		AvgMemMB:        metrics.MemAvgMB,
+		MaxMemMB:        metrics.MemMaxMB,
+		DiskReadBytes:   metrics.DiskRead,
+		DiskWriteBytes:  metrics.DiskWrite,
+		NetRecvBytes:    metrics.NetRecv,
+		NetSendBytes:    metrics.NetSend,
+		IOThroughputAvg: metrics.IOThroughputAvg,
+		LoadAvg1:        metrics.LoadAvg1,
+		LoadAvg5:        metrics.LoadAvg5,
+		LoadAvg15:       metrics.LoadAvg15,
+		SystemCPUs:      sysCPUs,
+		SystemMemMB:     sysMemMB,
+		SubjectCPULimit: r.opts.CPULimit,
+		SubjectMemLimit: r.opts.MemLimit,
+		Passed:          &passed,
 	}
 	if !passed {
 		result.FailReason = strings.Join(errs, "; ")
 	}
 
-	dir, err := r.saveResult(result, "")
+	dir, err := r.saveResult(result, metricsCSVSrc)
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
 	}
@@ -4177,7 +4200,7 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 			fmt.Println("  director did not connect with a bad token, as expected ✓")
 		}
 		passed = len(errs) == 0
-		return r.saveFleetResult(tc, subject, configName, startTime, finalCount, passed, errs, simContainer, subjectContainer)
+		return r.saveFleetResult(tc, subject, configName, orch, tmpDir, startTime, finalCount, passed, errs, simContainer, subjectContainer)
 	}
 
 	// All other scenarios: wait for the director to connect first.
@@ -4194,7 +4217,7 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		if !fleetWaitConnected(r.ctx, simContainer, dirID, connDeadline) {
 			errs = append(errs, "director never connected to the fleet simulator")
 			passed = false
-			return r.saveFleetResult(tc, subject, configName, startTime, finalCount, passed, errs, simContainer, subjectContainer)
+			return r.saveFleetResult(tc, subject, configName, orch, tmpDir, startTime, finalCount, passed, errs, simContainer, subjectContainer)
 		}
 		fmt.Println("  director connected to the fleet simulator ✓")
 	}
@@ -4212,14 +4235,14 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		if e != nil {
 			errs = append(errs, "cannot read deliver_config "+fc.DeliverConfig+": "+e.Error())
 			passed = false
-			return r.saveFleetResult(tc, subject, configName, startTime, finalCount, passed, errs, simContainer, subjectContainer)
+			return r.saveFleetResult(tc, subject, configName, orch, tmpDir, startTime, finalCount, passed, errs, simContainer, subjectContainer)
 		}
 		fmt.Printf("  delivering operational config (%s, %d bytes vmf)…\n", fc.DeliverConfig, len(vmfBytes))
 		b64 := base64.StdEncoding.EncodeToString(vmfBytes)
 		if _, se := fleetSimSend(simContainer, dirID, "config", map[string]any{"data_b64": b64}); se != nil {
 			errs = append(errs, "failed to deliver operational config: "+se.Error())
 			passed = false
-			return r.saveFleetResult(tc, subject, configName, startTime, finalCount, passed, errs, simContainer, subjectContainer)
+			return r.saveFleetResult(tc, subject, configName, orch, tmpDir, startTime, finalCount, passed, errs, simContainer, subjectContainer)
 		}
 		// Confirm the director APPLIED the config via its fleet-link
 		// acknowledgment (a rep.config reply with executed=true), not by grepping
@@ -4242,7 +4265,7 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		if _, ok := fleetWaitCount(r.ctx, simContainer, dirID, "rep.config", 1, applyDeadline); !ok {
 			errs = append(errs, "director did not acknowledge the delivered config over the fleet link")
 			passed = false
-			return r.saveFleetResult(tc, subject, configName, startTime, finalCount, passed, errs, simContainer, subjectContainer)
+			return r.saveFleetResult(tc, subject, configName, orch, tmpDir, startTime, finalCount, passed, errs, simContainer, subjectContainer)
 		}
 		last := ""
 		if st, e := fleetSimStatus(simContainer); e == nil {
@@ -4251,7 +4274,7 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		if !strings.Contains(last, "\"executed\":true") {
 			errs = append(errs, fmt.Sprintf("director replied to the delivered config but did not report it executed: %.200s", last))
 			passed = false
-			return r.saveFleetResult(tc, subject, configName, startTime, finalCount, passed, errs, simContainer, subjectContainer)
+			return r.saveFleetResult(tc, subject, configName, orch, tmpDir, startTime, finalCount, passed, errs, simContainer, subjectContainer)
 		}
 		fmt.Println("  director applied the delivered config (executed) ✓")
 	}
@@ -4274,7 +4297,7 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		if fc.Scenario != "stats" {
 			errs = append(errs, fmt.Sprintf("restart_mid_run is only supported for the stats scenario, not %q", fc.Scenario))
 			passed = false
-			return r.saveFleetResult(tc, subject, configName, startTime, finalCount, passed, errs, simContainer, subjectContainer)
+			return r.saveFleetResult(tc, subject, configName, orch, tmpDir, startTime, finalCount, passed, errs, simContainer, subjectContainer)
 		}
 		fmt.Println("  letting the agent stream before the restart…")
 		if err := sleepCtx(r.ctx, 25*time.Second); err != nil {
@@ -5087,14 +5110,17 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 	}
 
 	passed = len(errs) == 0
-	return r.saveFleetResult(tc, subject, configName, startTime, finalCount, passed, errs, simContainer, subjectContainer)
+	return r.saveFleetResult(tc, subject, configName, orch, tmpDir, startTime, finalCount, passed, errs, simContainer, subjectContainer)
 }
 
 // saveFleetResult records the verdict and, on failure, dumps short log tails of
 // the simulator and director to aid diagnosis.
 func (r *Runner) saveFleetResult(tc *config.TestCase, subject config.Subject, configName string,
+	orch orchestrator.Orchestrator, tmpDir string,
 	startTime time.Time, finalCount int64, passed bool, errs []string, simContainer, subjectContainer string,
 ) (results.RunResult, error) {
+	metrics, metricsCSVSrc := r.harvestResourceMetrics(orch, tmpDir)
+	sysCPUs, sysMemMB := getSystemInfo()
 	elapsed := time.Since(startTime).Seconds()
 	label := tc.Fleet.Scenario
 	if passed {
@@ -5106,22 +5132,40 @@ func (r *Runner) saveFleetResult(tc *config.TestCase, subject config.Subject, co
 			fmt.Printf("  --- %s (tail) ---\n%s\n", c, string(out))
 		}
 	}
+	fmt.Printf("  cpu: avg %.1f%% max %.1f%%  mem: avg %.0f MB max %.0f MB\n",
+		metrics.CPUAvg, metrics.CPUMax, metrics.MemAvgMB, metrics.MemMaxMB)
 
 	result := results.RunResult{
-		TestName:    tc.Name,
-		Config:      configName,
-		Subject:     subject.Name,
-		Version:     subject.Version,
-		Hardware:    hardwareID(),
-		Timestamp:   startTime,
-		DurationSec: elapsed,
-		LinesOut:    finalCount,
-		Passed:      &passed,
+		TestName:        tc.Name,
+		Config:          configName,
+		Subject:         subject.Name,
+		Version:         subject.Version,
+		Hardware:        hardwareID(),
+		Timestamp:       startTime,
+		DurationSec:     elapsed,
+		LinesOut:        finalCount,
+		AvgCPUPercent:   metrics.CPUAvg,
+		MaxCPUPercent:   metrics.CPUMax,
+		AvgMemMB:        metrics.MemAvgMB,
+		MaxMemMB:        metrics.MemMaxMB,
+		DiskReadBytes:   metrics.DiskRead,
+		DiskWriteBytes:  metrics.DiskWrite,
+		NetRecvBytes:    metrics.NetRecv,
+		NetSendBytes:    metrics.NetSend,
+		IOThroughputAvg: metrics.IOThroughputAvg,
+		LoadAvg1:        metrics.LoadAvg1,
+		LoadAvg5:        metrics.LoadAvg5,
+		LoadAvg15:       metrics.LoadAvg15,
+		SystemCPUs:      sysCPUs,
+		SystemMemMB:     sysMemMB,
+		SubjectCPULimit: r.opts.CPULimit,
+		SubjectMemLimit: r.opts.MemLimit,
+		Passed:          &passed,
 	}
 	if !passed {
 		result.FailReason = strings.Join(errs, "; ")
 	}
-	dir, err := r.saveResult(result, "")
+	dir, err := r.saveResult(result, metricsCSVSrc)
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
 	}
@@ -5874,11 +5918,11 @@ func (r *Runner) runClickHouseTargetCorrectness(tc *config.TestCase, subject con
 	}
 	if !ready {
 		errs = append(errs, "clickhouse-server never became reachable")
-		return r.saveClickHouseTargetResult(tc, subject, configName, startTime, 0, false, errs, chContainer, subjectContainer)
+		return r.saveClickHouseTargetResult(tc, subject, configName, orch, tmpDir, startTime, 0, false, errs, chContainer, subjectContainer)
 	}
 	if _, e := chExec(chContainer, "CREATE DATABASE IF NOT EXISTS "+db); e != nil {
 		errs = append(errs, "create database: "+e.Error())
-		return r.saveClickHouseTargetResult(tc, subject, configName, startTime, 0, false, errs, chContainer, subjectContainer)
+		return r.saveClickHouseTargetResult(tc, subject, configName, orch, tmpDir, startTime, 0, false, errs, chContainer, subjectContainer)
 	}
 	// Flexible log table: the director sends {"message": "...", "@timestamp": "..."}
 	// (raw) or normalized JSON; skip_unknown_fields tolerates extra keys, so a
@@ -5895,7 +5939,7 @@ func (r *Runner) runClickHouseTargetCorrectness(tc *config.TestCase, subject con
 	}
 	if _, e := chExec(chContainer, createTable); e != nil {
 		errs = append(errs, "create table: "+e.Error())
-		return r.saveClickHouseTargetResult(tc, subject, configName, startTime, 0, false, errs, chContainer, subjectContainer)
+		return r.saveClickHouseTargetResult(tc, subject, configName, orch, tmpDir, startTime, 0, false, errs, chContainer, subjectContainer)
 	}
 	fmt.Printf("  clickhouse ready; table %s created ✓\n", fqTable)
 
@@ -5974,12 +6018,15 @@ func (r *Runner) runClickHouseTargetCorrectness(tc *config.TestCase, subject con
 	}
 
 	passed = len(errs) == 0
-	return r.saveClickHouseTargetResult(tc, subject, configName, startTime, finalCount, passed, errs, chContainer, subjectContainer)
+	return r.saveClickHouseTargetResult(tc, subject, configName, orch, tmpDir, startTime, finalCount, passed, errs, chContainer, subjectContainer)
 }
 
 func (r *Runner) saveClickHouseTargetResult(tc *config.TestCase, subject config.Subject, configName string,
+	orch orchestrator.Orchestrator, tmpDir string,
 	startTime time.Time, finalCount int64, passed bool, errs []string, chContainer, subjectContainer string,
 ) (results.RunResult, error) {
+	metrics, metricsCSVSrc := r.harvestResourceMetrics(orch, tmpDir)
+	sysCPUs, sysMemMB := getSystemInfo()
 	elapsed := time.Since(startTime).Seconds()
 	if passed {
 		fmt.Println("  clickhouse target: PASSED ✓")
@@ -5990,14 +6037,24 @@ func (r *Runner) saveClickHouseTargetResult(tc *config.TestCase, subject config.
 			fmt.Printf("  --- %s (tail) ---\n%s\n", c, string(out))
 		}
 	}
+	fmt.Printf("  cpu: avg %.1f%% max %.1f%%  mem: avg %.0f MB max %.0f MB\n",
+		metrics.CPUAvg, metrics.CPUMax, metrics.MemAvgMB, metrics.MemMaxMB)
 	result := results.RunResult{
 		TestName: tc.Name, Config: configName, Subject: subject.Name, Version: subject.Version,
 		Hardware: hardwareID(), Timestamp: startTime, DurationSec: elapsed, LinesOut: finalCount, Passed: &passed,
+		AvgCPUPercent: metrics.CPUAvg, MaxCPUPercent: metrics.CPUMax,
+		AvgMemMB: metrics.MemAvgMB, MaxMemMB: metrics.MemMaxMB,
+		DiskReadBytes: metrics.DiskRead, DiskWriteBytes: metrics.DiskWrite,
+		NetRecvBytes: metrics.NetRecv, NetSendBytes: metrics.NetSend,
+		IOThroughputAvg: metrics.IOThroughputAvg,
+		LoadAvg1:        metrics.LoadAvg1, LoadAvg5: metrics.LoadAvg5, LoadAvg15: metrics.LoadAvg15,
+		SystemCPUs: sysCPUs, SystemMemMB: sysMemMB,
+		SubjectCPULimit: r.opts.CPULimit, SubjectMemLimit: r.opts.MemLimit,
 	}
 	if !passed {
 		result.FailReason = strings.Join(errs, "; ")
 	}
-	dir, err := r.saveResult(result, "")
+	dir, err := r.saveResult(result, metricsCSVSrc)
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
 	}

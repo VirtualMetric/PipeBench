@@ -607,7 +607,7 @@ services:
     user: "0:0"
 {{- end }}
     environment:
-      COLLECTOR_TARGET_CONTAINER: "{{ .SubjectContainer }}"
+      COLLECTOR_TARGET_CONTAINER: "{{ .CollectorTargets }}"
       COLLECTOR_INTERVAL_SECS: "1"
       COLLECTOR_OUTPUT: "/results/metrics.csv"
     restart: "no"
@@ -1726,7 +1726,11 @@ type composeVars struct {
 	// template ranges over them instead of emitting the singular subject block.
 	// Shared fields (.SubjectImage, .SubjectEntrypoint, .SubjectCmd, .ConfigDst,
 	// .CaseCertsHost, .TmpDir) are referenced via $ inside the range.
-	Subjects          []clusterNode
+	Subjects []clusterNode
+	// CollectorTargets is the comma-separated container list the collector
+	// samples: the singular subject container normally, every cluster node
+	// container for cluster cases.
+	CollectorTargets  string
 	SubjectEnv        map[string]string
 	HasResourceLimits bool
 	CPULimit          string
@@ -2033,6 +2037,19 @@ func writeCompose(path string, cfg RunConfig) error {
 		}
 	}
 
+	// The collector samples targets by container name. Cluster cases have no
+	// singular subject container — point the collector at every node so each
+	// CSV row carries the whole cluster's footprint (the collector sums the
+	// comma-separated targets per tick).
+	collectorTargets := subjectContainer
+	if len(clusterNodes) > 0 {
+		names := make([]string, len(clusterNodes))
+		for i, n := range clusterNodes {
+			names[i] = n.Container
+		}
+		collectorTargets = strings.Join(names, ",")
+	}
+
 	// cluster_ip_failover: pin the bench subnet (so the configured virtual IP is in
 	// range and won't collide with an auto-assigned container address) and grant the
 	// node containers NET_ADMIN (so the elected leader can add the IP to its iface).
@@ -2174,6 +2191,7 @@ func writeCompose(path string, cfg RunConfig) error {
 	vars := composeVars{
 		SubjectImage:      s.ImageRef(),
 		SubjectContainer:  subjectContainer,
+		CollectorTargets:  collectorTargets,
 		ConfigSrc:         configSrc,
 		ConfigDst:         configDst,
 		ConfigMountOpts:   configMountOpts(s),
