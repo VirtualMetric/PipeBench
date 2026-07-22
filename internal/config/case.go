@@ -1208,6 +1208,18 @@ type ClusterConfig struct {
 	//                        a node loss is a known director gap). Requires
 	//                        persistent_storage in the subject config (collector payloads
 	//                        must be cluster-shared via the NATS object store).
+	//   device_failover    — the placement analogue of agentless_failover for a DB/file
+	//                        collector device: stop the node that OWNS the device so the
+	//                        leader reassigns it to ANOTHER node, then start it again.
+	//                        The hard verdict is that a survivor re-homes the device and
+	//                        runs a collect cycle resuming from the persisted checkpoint
+	//                        (a clean DB/file resume forwards 0 new rows, so it keys on
+	//                        the collect-start line, not rows-forwarded), plus a leader
+	//                        still exists. Receiver delivery is soft-logged — the same
+	//                        cross-node data-plane gap agentless_failover has. Requires
+	//                        the subject to define a DB/file placement collector device
+	//                        and, like agentless_failover, cluster-shared collector state
+	//                        (persistent_storage) so the survivor can resume.
 	//   cluster_ip_failover — the leader binds cluster.ip as a virtual IP on its
 	//                        interface; restart the leader and assert the IP migrates
 	//                        to the newly elected leader (and the old leader releases
@@ -1248,7 +1260,7 @@ func (tc *TestCase) validateCluster() error {
 		return fmt.Errorf("case %q: cluster.nodes must be >= 3, got %d", tc.Name, tc.Cluster.Nodes)
 	}
 	switch tc.Cluster.Action {
-	case "", "restart_follower", "restart_leader", "stop_two_recover", "agentless_failover", "cluster_ip_failover":
+	case "", "restart_follower", "restart_leader", "stop_two_recover", "agentless_failover", "device_failover", "cluster_ip_failover":
 	default:
 		return fmt.Errorf("case %q: unknown cluster.action %q", tc.Name, tc.Cluster.Action)
 	}
