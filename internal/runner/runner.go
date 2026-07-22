@@ -3517,12 +3517,13 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 				r.sampleDelivery(metricsPort, preFailover)
 			}
 		case "device_failover":
-			// Generalized placement-device failover (DB / file). Unlike agentless,
-			// the owner is resolved here (the hard-delivery baseline branch above
-			// did not set it), and downstream delivery is asserted HARD (below,
-			// via the receiver's own correctness verdict): a DB/file device
-			// forwards on the reliable direct path, not the cross-node payload
-			// store that makes agentless delivery a soft signal.
+			// Generalized placement-device failover (DB / file). The baseline branch
+			// above already set owner/ownerContainer; re-confirm the current owner
+			// here before the disruption. Receiver delivery is a SOFT signal — a
+			// DB/file device's route/sender may not be co-located with the collecting
+			// owner, the same cross-node data-plane gap agentless_failover soft-logs —
+			// so the verdict is passed = baselineOK && actionOK (below), not gated on
+			// delivery.
 			owner = agentlessDeviceOwner(nodes)
 			if owner == "" {
 				actionOK = false
