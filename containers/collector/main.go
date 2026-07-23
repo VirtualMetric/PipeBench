@@ -100,11 +100,25 @@ func main() {
 }
 
 func runDockerMode(ctx context.Context, ticker *time.Ticker, emit func(MetricsRow)) {
-	container := mustEnv("COLLECTOR_TARGET_CONTAINER")
+	// COLLECTOR_TARGET_CONTAINER is a comma-separated container list. Single-
+	// subject cases pass one name; director-cluster cases pass every node so
+	// each row captures the whole cluster's footprint (per-tick sum across
+	// nodes). Deltas (net/blkio) are computed per container against its own
+	// previous sample, then summed.
+	var targets []string
+	for _, t := range strings.Split(mustEnv("COLLECTOR_TARGET_CONTAINER"), ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			targets = append(targets, t)
+		}
+	}
+	if len(targets) == 0 {
+		fmt.Fprintln(os.Stderr, "collector: COLLECTOR_TARGET_CONTAINER has no container names")
+		os.Exit(1)
+	}
 	dockerHost := getEnv("DOCKER_HOST", "unix:///var/run/docker.sock")
 
 	httpClient := buildClient(dockerHost)
-	var prev *dockerStats
+	prev := make([]*dockerStats, len(targets))
 	var errCount int
 
 	for {
@@ -112,22 +126,47 @@ func runDockerMode(ctx context.Context, ticker *time.Ticker, emit func(MetricsRo
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			stats, err := fetchDockerStats(httpClient, dockerHost, container)
-			if err != nil {
-				errCount++
-				// Log the first error immediately, then every 30 ticks,
-				// so a silent permission/DNS/container-missing failure is
-				// diagnosable but we don't spam the run.
-				if errCount == 1 || errCount%30 == 0 {
-					fmt.Fprintf(os.Stderr, "collector: fetch stats (err #%d): %v\n", errCount, err)
+			var row MetricsRow
+			sampled := false
+			for i, container := range targets {
+				stats, err := fetchDockerStats(httpClient, dockerHost, container)
+				if err != nil {
+					errCount++
+					// Log the first error immediately, then every 30 ticks,
+					// so a silent permission/DNS/container-missing failure is
+					// diagnosable but we don't spam the run.
+					if errCount == 1 || errCount%30 == 0 {
+						fmt.Fprintf(os.Stderr, "collector: fetch stats %s (err #%d): %v\n", container, errCount, err)
+					}
+					continue
 				}
+				addRow(&row, dockerStatsToRow(stats, prev[i]))
+				prev[i] = stats
+				sampled = true
+			}
+			if !sampled {
 				continue
 			}
-			row := dockerStatsToRow(stats, prev)
+			row.Epoch = time.Now().Unix()
+			// Summed usage regularly exceeds 100 (multi-core containers,
+			// multi-node clusters); idle is a percentage, so floor it at 0.
+			row.CpuIdl = max(100.0-row.CpuUsr, 0)
 			emit(row)
-			prev = stats
 		}
 	}
+}
+
+// addRow accumulates one container's sample into the tick's combined row.
+// Epoch and CpuIdl are derived once per tick by the caller, not summed.
+func addRow(dst *MetricsRow, s MetricsRow) {
+	dst.CpuUsr += s.CpuUsr
+	dst.MemUsed += s.MemUsed
+	dst.MemCach += s.MemCach
+	dst.MemFree += s.MemFree
+	dst.NetRecv += s.NetRecv
+	dst.NetSend += s.NetSend
+	dst.DskRead += s.DskRead
+	dst.DskWrit += s.DskWrit
 }
 
 // --- Docker Stats API ---
@@ -198,9 +237,10 @@ func fetchDockerStats(client *http.Client, dockerHost, container string) (*docke
 	return &s, nil
 }
 
+// dockerStatsToRow converts one container's stats snapshot into a partial
+// row: per-tick fields (Epoch, CpuIdl) are derived by the caller after the
+// per-target rows are summed, so they stay zero here.
 func dockerStatsToRow(cur *dockerStats, prev *dockerStats) MetricsRow {
-	now := time.Now().Unix()
-
 	var cpuPct float64
 	cpuDelta := float64(cur.CPUStats.CPUUsage.TotalUsage) - float64(cur.PreCPUStats.CPUUsage.TotalUsage)
 	sysDelta := float64(cur.CPUStats.SystemUsage) - float64(cur.PreCPUStats.SystemUsage)
@@ -269,9 +309,7 @@ func dockerStatsToRow(cur *dockerStats, prev *dockerStats) MetricsRow {
 	}
 
 	return MetricsRow{
-		Epoch:   now,
 		CpuUsr:  cpuPct,
-		CpuIdl:  100.0 - cpuPct,
 		MemUsed: memUsed,
 		MemCach: cache,
 		MemFree: memFree,
