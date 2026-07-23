@@ -105,6 +105,15 @@ type TestCase struct {
 	// buckets. Mutually exclusive with AWS. See MinioConfig in cloud.go.
 	Minio *MinioConfig `yaml:"minio"`
 
+	// SubjectDisk, when set, mounts a size-limited tmpfs at Path inside the
+	// subject container, giving the subject a small dedicated "disk" for its
+	// storage/buffer directory without a specially built image. Lets a case
+	// exercise disk-full and disk-backpressure behavior: fill the volume with
+	// more data than it can hold and observe whether the subject crashes,
+	// drops, or backpressures. Used by the disk_pressure_correctness type but
+	// honored on the singular subject service for any type.
+	SubjectDisk *SubjectDiskConfig `yaml:"subject_disk"`
+
 	// Requires lists subject capabilities every subject in this case must
 	// declare (Subject.Capabilities); the runner fails fast on subjects
 	// lacking one instead of starting a run that silently produces zero
@@ -1032,12 +1041,30 @@ func (tc *TestCase) IsKafkaType() bool {
 	return strings.HasPrefix(tc.Type, "kafka_")
 }
 
+// subjectDiskSizeRe accepts the size strings the orchestrator's
+// parseByteSize understands: plain bytes ("1048576"), plain bytes with a
+// "b" suffix ("64b"), or a k/m/g unit with an optional trailing "b"
+// ("64m", "64mb"), case-insensitive. Kept in lockstep with parseByteSize
+// so a case that passes Validate can never fail at compose-render time.
+var subjectDiskSizeRe = regexp.MustCompile(`(?i)^[0-9]+([kmg]b?|b)?$`)
+
 // Validate runs structural checks that don't depend on runtime state.
 // Returns an error for cases where the singular and plural forms are both
 // set (ambiguous) or where required IDs on plural entries are missing.
 func (tc *TestCase) Validate() error {
 	if len(tc.Generators) > 0 && (tc.Generator.Mode != "" || tc.Generator.Target != "") {
 		return fmt.Errorf("case %q: both `generator:` and `generators:` are set — pick one", tc.Name)
+	}
+	if tc.SubjectDisk != nil {
+		if tc.SubjectDisk.Path == "" || tc.SubjectDisk.Size == "" {
+			return fmt.Errorf("case %q: subject_disk requires both `path` and `size`", tc.Name)
+		}
+		if !strings.HasPrefix(tc.SubjectDisk.Path, "/") {
+			return fmt.Errorf("case %q: subject_disk.path must be absolute, got %q", tc.Name, tc.SubjectDisk.Path)
+		}
+		if !subjectDiskSizeRe.MatchString(tc.SubjectDisk.Size) {
+			return fmt.Errorf("case %q: subject_disk.size %q is not a valid tmpfs size (e.g. 64m, 1g, 1048576)", tc.Name, tc.SubjectDisk.Size)
+		}
 	}
 	if len(tc.Receivers) > 0 && (tc.Receiver.Mode != "" || tc.Receiver.Listen != "") {
 		return fmt.Errorf("case %q: both `receiver:` and `receivers:` are set — pick one", tc.Name)
@@ -2422,6 +2449,17 @@ func validateSampleFile(caseName, sampleFile string) error {
 		return fmt.Errorf("case %q: sample_file %q must not escape the case directory", caseName, sampleFile)
 	}
 	return nil
+}
+
+// SubjectDiskConfig mounts a size-limited tmpfs inside the subject container
+// (see TestCase.SubjectDisk). Path is the in-container mount point — for
+// vmetric that's /opt/vmetric/storage, the root of its NATS JetStream
+// StoreDir and queue/WAL files. Size is a docker-compose tmpfs size string
+// ("64m", "1g", or plain bytes). The mount is created mode 01777 so
+// non-root subject images can write to it.
+type SubjectDiskConfig struct {
+	Path string `yaml:"path"`
+	Size string `yaml:"size"`
 }
 
 type GeneratorConfig struct {

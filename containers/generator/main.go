@@ -1085,17 +1085,29 @@ func sendLinesConn(cfg config, connID int, clock *sendClock, write func([]byte) 
 		templateLine = generateLine(cfg.LineSize, cfg.Format)
 	}
 
-	// Pre-allocate a reusable line buffer for sequenced mode so we don't
-	// regenerate random padding on every line (the old path ran rand.Intn
-	// LineSize times per line — cratered perf when validate_content was on).
-	// Padding is generated once and the prefix is rewritten in place.
-	// Last byte is reserved for '\n' so the hot-loop write callback can
-	// skip a per-line append-newline allocation.
-	var seqBuf []byte
+	// Pre-allocate a small POOL of line buffers for sequenced mode and
+	// rotate through them per line, rewriting only the CONN=/SEQ= prefix in
+	// place. Pre-generation keeps the hot loop free of rand calls (the old
+	// per-line rand.Intn path cratered perf when validate_content was on) —
+	// but a single shared buffer made every line's padding IDENTICAL, which
+	// let block compressors downstream (subjects that snappy/gzip their
+	// batches) shrink the stream ~100:1: a disk-pressure case that flooded
+	// 1.2 GB landed only ~11 MB on the subject's storage volume. Rotating
+	// 64 distinct random paddings makes lines inside a compressor block
+	// mutually incompressible — wire bytes ≈ stored bytes — while costing
+	// only 64×LineSize of setup memory per connection worker.
+	// Each buffer's last byte is reserved for '\n' so the hot-loop write
+	// callback can skip a per-line append-newline allocation.
+	const seqPadPool = 64
+	var seqBufs [][]byte
 	if cfg.Sequenced && len(sampleLines) == 0 {
-		seqBuf = make([]byte, cfg.LineSize+1)
-		copy(seqBuf, randString(cfg.LineSize))
-		seqBuf[cfg.LineSize] = '\n'
+		seqBufs = make([][]byte, seqPadPool)
+		for i := range seqBufs {
+			buf := make([]byte, cfg.LineSize+1)
+			copy(buf, randString(cfg.LineSize))
+			buf[cfg.LineSize] = '\n'
+			seqBufs[i] = buf
+		}
 	}
 
 	var linesSent, bytesSent int64
@@ -1175,7 +1187,7 @@ func sendLinesConn(cfg config, connID int, clock *sendClock, write func([]byte) 
 			if cfg.Format == "json" {
 				line = generateSequencedJSONLine(connID, linesSent, cfg.LineSize)
 			} else {
-				line = writeSequencedPrefix(seqBuf, connID, linesSent)
+				line = writeSequencedPrefix(seqBufs[linesSent%seqPadPool], connID, linesSent)
 			}
 		case linesSent%1000 == 0:
 			// Sample every 1000th line with a timestamp for latency measurement
