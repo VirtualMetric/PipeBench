@@ -642,10 +642,34 @@ func receiveTCP(cfg config, cnt *counters, val *validator) error {
 	}
 }
 
+// stampingReader refreshes the shard's receive-window timestamps on every
+// successful read from the connection. recordLine samples time.Now() only
+// every 1024 lines (and finish() only runs at connection close), so a burst
+// smaller than 1024 lines on a connection the sender keeps open would leave
+// lastNs == firstNs and the runner's receive-window rate at 0. Stamping per
+// read costs one time.Now() per socket read — already syscall-scale — and
+// bounds the window by actual socket activity.
+type stampingReader struct {
+	r     io.Reader
+	shard *connStats
+}
+
+func (sr *stampingReader) Read(p []byte) (int, error) {
+	n, err := sr.r.Read(p)
+	if n > 0 {
+		now := time.Now().UnixNano()
+		sr.shard.firstNs.CompareAndSwap(0, now)
+		sr.shard.lastNs.Store(now)
+	}
+	return n, err
+}
+
 func handleConn(conn net.Conn, shard *connStats, val *validator, cfg config) {
 	defer conn.Close()
-	defer shard.finish()
-	scanner := bufio.NewScanner(conn)
+	// No shard.finish() here: the stampingReader already recorded the exact
+	// time of the last data read. finish() would overwrite it with the close
+	// time, inflating the receive window when the sender idles before closing.
+	scanner := bufio.NewScanner(&stampingReader{r: conn, shard: shard})
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	needsValidation := cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.RequiredSubstring != ""
 	// Pass the scanner's internal slice directly. shard.recordLine + validator
@@ -659,6 +683,12 @@ func handleConn(conn net.Conn, shard *connStats, val *validator, cfg config) {
 		if needsValidation {
 			val.recordLine(b, cfg)
 		}
+	}
+	// A scan error (oversized line, connection reset) silently truncates the
+	// count for this connection — surface it so a lossy-looking run is
+	// diagnosable from the receiver log. EOF is not reported by Err().
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "receiver: conn %s: %v\n", conn.RemoteAddr(), err)
 	}
 }
 

@@ -219,6 +219,43 @@ func TestAWSConfigDefaults(t *testing.T) {
 	}
 }
 
+func TestValidateAWSSeedObjects(t *testing.T) {
+	base := func(so AWSSeedObjects) *TestCase {
+		return &TestCase{
+			Name:     "seed-case",
+			Type:     "correctness",
+			Duration: "10s",
+			AWS: &AWSConfig{
+				Buckets:     []string{"bench-in"},
+				SeedObjects: []AWSSeedObjects{so},
+			},
+			Receiver:    ReceiverConfig{Mode: "tcp", Listen: ":9001"},
+			Correctness: CorrectnessConfig{},
+		}
+	}
+
+	tests := []struct {
+		name    string
+		so      AWSSeedObjects
+		wantErr bool
+	}{
+		{name: "valid", so: AWSSeedObjects{Bucket: "bench-in", Objects: 10, Lines: 100}},
+		{name: "valid with prefix and marker", so: AWSSeedObjects{Bucket: "bench-in", Prefix: "seed/", Objects: 1, Lines: 1, Marker: "SEED"}},
+		{name: "undeclared bucket", so: AWSSeedObjects{Bucket: "nope", Objects: 1, Lines: 1}, wantErr: true},
+		{name: "zero objects", so: AWSSeedObjects{Bucket: "bench-in", Objects: 0, Lines: 1}, wantErr: true},
+		{name: "zero lines", so: AWSSeedObjects{Bucket: "bench-in", Objects: 1, Lines: 0}, wantErr: true},
+		{name: "injecting marker", so: AWSSeedObjects{Bucket: "bench-in", Objects: 1, Lines: 1, Marker: "a'; rm -rf /"}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := base(tt.so).validateAWS()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateAWS() err = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestMinioConfigDefaults(t *testing.T) {
 	m := &MinioConfig{Buckets: []string{"bench-out"}}
 	if got, want := m.ImageOrDefault(), "minio/minio:RELEASE.2025-04-22T22-12-26Z"; got != want {

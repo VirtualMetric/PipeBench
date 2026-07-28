@@ -632,6 +632,53 @@ func TestComposeRendersAWS(t *testing.T) {
 	mustContain(t, string(script), `"QueueArn":"arn:aws:sqs:us-east-1:000000000000:bench-events"`)
 }
 
+// TestComposeRendersAWSSeedObjects verifies a `seed_objects:` entry renders a
+// pre-upload loop into the LocalStack init script (objects exist before the
+// subject starts, for list-mode backlog cases).
+func TestComposeRendersAWSSeedObjects(t *testing.T) {
+	tc := &config.TestCase{
+		Name:     "aws-seed",
+		Type:     "correctness",
+		Duration: "10s",
+		AWS: &config.AWSConfig{
+			Buckets: []string{"bench-in"},
+			SeedObjects: []config.AWSSeedObjects{
+				{Bucket: "bench-in", Prefix: "seed/", Objects: 10, Lines: 100, Marker: "SEED"},
+			},
+		},
+		Receiver:    config.ReceiverConfig{Mode: "tcp", Listen: ":9001"},
+		Correctness: config.CorrectnessConfig{MinReceived: 1000},
+	}
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.3", ConfigPath: "/config.yml"}
+	tmp, err := os.MkdirTemp("", "compose-seed-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmp)
+	composePath := filepath.Join(tmp, "compose.yaml")
+	cfg := RunConfig{
+		TestCase: tc, Subject: subj, ConfigName: "default",
+		ConfigSrcPath: composePath, TmpDir: tmp,
+		GeneratorImage: "img-gen", ReceiverImage: "img-recv", CollectorImage: "img-coll",
+		ReceiverHostPort: 19001,
+	}
+	if err := writeCompose(composePath, cfg); err != nil {
+		t.Fatalf("writeCompose: %v", err)
+	}
+	script, err := os.ReadFile(filepath.Join(tmp, "aws-init.sh"))
+	if err != nil {
+		t.Fatalf("aws-init.sh not written: %v", err)
+	}
+	mustContain(t, string(script), "awslocal s3 mb 's3://bench-in'")
+	mustContain(t, string(script), `while [ "$i" -lt 10 ]`)
+	mustContain(t, string(script), "for(l=0;l<100;l++)")
+	mustContain(t, string(script), "SEED-OBJ%d-LINE%d")
+	mustContain(t, string(script), "'s3://bench-in/seed/obj-'\"$i\"'.log'")
+}
+
 // TestComposeRendersAzure verifies an `azure:` case renders the Azurite
 // service plus the one-shot azure-init (receiver image), gates the subject on
 // init completion, and injects the connection string where needed.

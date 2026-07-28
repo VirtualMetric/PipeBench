@@ -279,6 +279,23 @@ func AggregateAllMetricsFromCSVWindow(csvPath string, startNs, endNs int64) (Agg
 			}
 		}
 
+		// A sample with zero CPU AND zero memory is a Docker stats snapshot
+		// of a stopped container (the crash/restart drivers stop and restart
+		// the subject mid-run, and Docker returns zeroed stats for an exited
+		// container). A running process never has 0 RSS, so real idle samples
+		// (cpu 0, mem > 0) are kept; counting stopped-window rows would
+		// dilute the averages with time the subject wasn't running. An
+		// unparseable field is not evidence of a stopped container, so rows
+		// with malformed cpu/mem values are kept (they contribute 0 to the
+		// cpu/mem sums below, as they always have).
+		if cpuIdx >= 0 && cpuIdx < len(record) && memIdx >= 0 && memIdx < len(record) {
+			cpuV, cpuErr := strconv.ParseFloat(record[cpuIdx], 64)
+			memV, memErr := strconv.ParseFloat(record[memIdx], 64)
+			if cpuErr == nil && memErr == nil && cpuV == 0 && memV == 0 {
+				continue
+			}
+		}
+
 		if cpuIdx >= 0 && cpuIdx < len(record) {
 			v, _ := strconv.ParseFloat(record[cpuIdx], 64)
 			cpuSum += v

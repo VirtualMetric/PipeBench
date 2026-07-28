@@ -189,6 +189,14 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	if tc.Type == "kafka_inflight_crash_correctness" {
 		return r.runKafkaInflightCrash(tc, subject)
 	}
+	// Object-storage in-flight crash: same receiver-up mid-delivery flow as the
+	// kafka in-flight crash, for a poll-mode source (S3/Azure bucket). The
+	// bucket is the durable store, decoupled from the subject, so the generator
+	// keeps uploading across the SIGKILL+restart. Verifies no loss; duplicates
+	// (crash-resistance replay + cursor re-list) are reported, not failed.
+	if tc.Type == "persistence_inflight_crash_correctness" {
+		return r.runInflightCrashCorrectness(tc, subject)
+	}
 	// Kafka offset-commit restart: receiver stays UP, ALL records are
 	// delivered cleanly, then the subject is restarted gracefully. A
 	// consumer whose offset commits actually persist resumes from the
@@ -796,7 +804,8 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 			result.FailReason = fmt.Sprintf(
 				"expect_failure: data path was NOT blocked — receiver observed %s line(s) (> %s); "+
 					"the control under test (e.g. auth) appears bypassed",
-				formatCount(recvMetrics.LinesReceived), formatCount(cap))
+				formatCount(recvMetrics.LinesReceived), formatCount(cap),
+			)
 		}
 	} else if tc.IsCorrectnessType() && !tc.HasGenerator() {
 		// No generator: there's no expected line count to derive loss or
@@ -816,7 +825,8 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		if !gotEnough {
 			failReasons = append(failReasons, fmt.Sprintf(
 				"expected >= %s received records, got %s",
-				formatCount(minRecv), formatCount(recvMetrics.LinesReceived)))
+				formatCount(minRecv), formatCount(recvMetrics.LinesReceived),
+			))
 		}
 		passed := gotEnough && recvOK
 		result.Passed = &passed
@@ -832,15 +842,20 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		// Re-deriving pass/fail from line-count loss + a strict over-delivery
 		// cap here would wrongly flip a valid allow_overdelivery verifier pass.
 		lossOK := lossPct <= tc.Correctness.ExpectedLossPct
-		// Kafka consumption is at-least-once: the consumer may re-deliver a
-		// fetch batch on its initial group join / rebalance, so allow bounded
-		// over-delivery (Correctness.MaxOverDeliveryPct, default 0 = exact).
-		// Non-kafka correctness stays strict.
+		// Over-delivery policy, in precedence order:
+		//   - allow_overdelivery: the source is at-least-once by design (e.g. the
+		//     list-poll since-cursor re-lists the tip object every idle cycle), so
+		//     any over-delivery is accepted; only loss fails. This mirrors the
+		//     carve-out the in-flight-crash / restart handlers already apply.
+		//   - kafka: consumption is at-least-once — the consumer may re-deliver a
+		//     fetch batch on its initial group join / rebalance, so allow bounded
+		//     over-delivery (Correctness.MaxOverDeliveryPct, default 0 = exact).
+		//   - otherwise: strict exact count.
 		overCap := expectedOut
 		if tc.IsKafkaType() {
 			overCap += int64(float64(expectedOut) * tc.Correctness.MaxOverDeliveryPct / 100.0)
 		}
-		overOK := recvMetrics.LinesReceived <= overCap
+		overOK := tc.Correctness.AllowOverDelivery || recvMetrics.LinesReceived <= overCap
 		recvOK := result.Passed == nil || *result.Passed
 
 		var failReasons []string
@@ -850,13 +865,15 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		if !lossOK {
 			failReasons = append(failReasons, fmt.Sprintf(
 				"expected loss <= %.2f%%, got %.2f%%",
-				tc.Correctness.ExpectedLossPct, lossPct))
+				tc.Correctness.ExpectedLossPct, lossPct,
+			))
 		}
 		if !overOK {
 			extra := recvMetrics.LinesReceived - expectedOut
 			failReasons = append(failReasons, fmt.Sprintf(
 				"over-delivery: received %s lines but only %s were expected (%s extra/duplicate lines)",
-				formatCount(recvMetrics.LinesReceived), formatCount(expectedOut), formatCount(extra)))
+				formatCount(recvMetrics.LinesReceived), formatCount(expectedOut), formatCount(extra),
+			))
 		}
 
 		passed := lossOK && overOK && recvOK
@@ -1177,6 +1194,9 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 		return results.RunResult{}, fmt.Errorf("querying receiver metrics: %w", err)
 	}
 
+	metrics, metricsCSVSrc := r.harvestResourceMetrics(orch, tmpDir)
+	sysCPUs, sysMemMB := getSystemInfo()
+
 	elapsed := time.Since(startTime).Seconds()
 
 	// Compute results
@@ -1241,14 +1261,31 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 		LinesOut:        recvMetrics.LinesReceived,
 		BytesIn:         genStats.BytesSent,
 		BytesOut:        recvMetrics.BytesReceived,
+		LinesPerSec:     receiveWindowRate(recvMetrics),
 		LossPercent:     lossPct,
+		AvgCPUPercent:   metrics.CPUAvg,
+		MaxCPUPercent:   metrics.CPUMax,
+		AvgMemMB:        metrics.MemAvgMB,
+		MaxMemMB:        metrics.MemMaxMB,
+		DiskReadBytes:   metrics.DiskRead,
+		DiskWriteBytes:  metrics.DiskWrite,
+		NetRecvBytes:    metrics.NetRecv,
+		NetSendBytes:    metrics.NetSend,
+		IOThroughputAvg: metrics.IOThroughputAvg,
+		LoadAvg1:        metrics.LoadAvg1,
+		LoadAvg5:        metrics.LoadAvg5,
+		LoadAvg15:       metrics.LoadAvg15,
+		SystemCPUs:      sysCPUs,
+		SystemMemMB:     sysMemMB,
+		SubjectCPULimit: r.opts.CPULimit,
+		SubjectMemLimit: r.opts.MemLimit,
 		Passed:          &passed,
 	}
 	if !passed {
 		result.FailReason = strings.Join(errors, "; ")
 	}
 
-	dir, err := r.saveResult(result, "")
+	dir, err := r.saveResult(result, metricsCSVSrc)
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
 	}
@@ -1256,6 +1293,11 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 	fmt.Printf("  done. results → %s\n", dir)
 	fmt.Printf("  lines sent: %s  lines received: %s  loss: %.2f%%\n",
 		formatCount(genStats.LinesSent), formatCount(recvMetrics.LinesReceived), lossPct)
+	fmt.Printf("  cpu: avg %.1f%% max %.1f%%  mem: avg %.0f MB max %.0f MB\n",
+		metrics.CPUAvg, metrics.CPUMax, metrics.MemAvgMB, metrics.MemMaxMB)
+	if metrics.IOThroughputAvg > 0 {
+		fmt.Printf("  io throughput: avg %.1f MB/s\n", metrics.IOThroughputAvg/(1024*1024))
+	}
 	if tc.Correctness.ValidateDedup {
 		fmt.Printf("  unique lines: %s  duplicates: %s\n",
 			formatCount(recvMetrics.UniqueLines), formatCount(recvMetrics.Duplicates))
@@ -1474,6 +1516,9 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 		return results.RunResult{}, fmt.Errorf("querying receiver metrics: %w", err)
 	}
 
+	metrics, metricsCSVSrc := r.harvestResourceMetrics(orch, tmpDir)
+	sysCPUs, sysMemMB := getSystemInfo()
+
 	elapsed := time.Since(startTime).Seconds()
 
 	lossPct := 0.0
@@ -1537,14 +1582,31 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 		LinesOut:        recvMetrics.LinesReceived,
 		BytesIn:         genStats.BytesSent,
 		BytesOut:        recvMetrics.BytesReceived,
+		LinesPerSec:     receiveWindowRate(recvMetrics),
 		LossPercent:     lossPct,
+		AvgCPUPercent:   metrics.CPUAvg,
+		MaxCPUPercent:   metrics.CPUMax,
+		AvgMemMB:        metrics.MemAvgMB,
+		MaxMemMB:        metrics.MemMaxMB,
+		DiskReadBytes:   metrics.DiskRead,
+		DiskWriteBytes:  metrics.DiskWrite,
+		NetRecvBytes:    metrics.NetRecv,
+		NetSendBytes:    metrics.NetSend,
+		IOThroughputAvg: metrics.IOThroughputAvg,
+		LoadAvg1:        metrics.LoadAvg1,
+		LoadAvg5:        metrics.LoadAvg5,
+		LoadAvg15:       metrics.LoadAvg15,
+		SystemCPUs:      sysCPUs,
+		SystemMemMB:     sysMemMB,
+		SubjectCPULimit: r.opts.CPULimit,
+		SubjectMemLimit: r.opts.MemLimit,
 		Passed:          &passed,
 	}
 	if !passed {
 		result.FailReason = strings.Join(errors, "; ")
 	}
 
-	dir, err := r.saveResult(result, "")
+	dir, err := r.saveResult(result, metricsCSVSrc)
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
 	}
@@ -1552,6 +1614,11 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 	fmt.Printf("  done. results → %s\n", dir)
 	fmt.Printf("  lines sent: %s  lines received: %s  loss: %.2f%%\n",
 		formatCount(genStats.LinesSent), formatCount(recvMetrics.LinesReceived), lossPct)
+	fmt.Printf("  cpu: avg %.1f%% max %.1f%%  mem: avg %.0f MB max %.0f MB\n",
+		metrics.CPUAvg, metrics.CPUMax, metrics.MemAvgMB, metrics.MemMaxMB)
+	if metrics.IOThroughputAvg > 0 {
+		fmt.Printf("  io throughput: avg %.1f MB/s\n", metrics.IOThroughputAvg/(1024*1024))
+	}
 	if tc.Correctness.ValidateDedup {
 		fmt.Printf("  unique lines: %s  duplicates: %s\n",
 			formatCount(recvMetrics.UniqueLines), formatCount(recvMetrics.Duplicates))
@@ -1580,12 +1647,51 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 	return result, nil
 }
 
-// midDeliveryFlow parameterizes the shared kafka correctness driver
-// (runKafkaMidDeliveryAction): produce to the broker with the receiver live,
-// fire one disruptive action once the receiver has seen ~half of total_lines,
-// then drain and assert no loss (over-delivery from at-least-once recovery is
-// reported, not failed). The action is the only thing that varies between the
-// flows — an in-flight subject crash, a broker cert rotation, etc.
+// harvestResourceMetrics copies the collector's CSV, stops the collector, and
+// aggregates resource usage over the whole run. Used by the crash/restart
+// drivers, whose subject stops and restarts mid-run: the collector samples by
+// container name each tick, so it rides across the restart; samples taken
+// while the subject is down are all-zero rows the aggregator drops. The
+// copy-then-stop order is deliberate and matches the standard driver: the
+// collector fsyncs every row as it writes it (see CopyMetricsCSV) and has no
+// shutdown flush, so copying first loses nothing and excludes post-cutoff
+// idle samples from the stop grace. Returns the aggregated metrics and the
+// local CSV path ("" if unavailable) for saveResult.
+func (r *Runner) harvestResourceMetrics(orch orchestrator.Orchestrator, tmpDir string) (results.AggregatedMetrics, string) {
+	csvPath := filepath.Join(tmpDir, "metrics.csv")
+	fmt.Println("  collecting metrics…")
+	if err := orch.CopyMetricsCSV(csvPath); err != nil {
+		fmt.Fprintf(os.Stderr, "  warning: metrics CSV not available: %v\n", err)
+		csvPath = ""
+	}
+	fmt.Println("  stopping collector…")
+	if err := orch.StopCollector(); err != nil {
+		fmt.Fprintf(os.Stderr, "  warning: stopping collector: %v\n", err)
+	}
+	var metrics results.AggregatedMetrics
+	if csvPath != "" {
+		metrics, _ = results.AggregateAllMetricsFromCSV(csvPath)
+	}
+	return metrics, csvPath
+}
+
+// receiveWindowRate returns lines/sec over the receiver's active window
+// (first→last received). Crash/restart delivery is a burst after the
+// disruption, so lines/total-run-time would understate to near zero.
+func receiveWindowRate(rm ReceiverMetrics) float64 {
+	if rm.LastReceivedNs > rm.FirstReceivedNs {
+		return float64(rm.LinesReceived) / (float64(rm.LastReceivedNs-rm.FirstReceivedNs) / 1e9)
+	}
+	return 0
+}
+
+// midDeliveryFlow parameterizes the shared mid-delivery correctness driver
+// (runMidDeliveryAction): produce to a durable source (Kafka broker, S3/Azure
+// bucket) with the receiver live, fire one disruptive action once the receiver
+// has seen ~half of total_lines, then drain and assert no loss (over-delivery
+// from at-least-once recovery is reported, not failed). The action is the only
+// thing that varies between the flows — an in-flight subject crash, a broker
+// cert rotation, etc.
 type midDeliveryFlow struct {
 	// verdictLabel names the flow in the PASS/FAIL line, e.g.
 	// "kafka cert rotation correctness".
@@ -1609,12 +1715,15 @@ type midDeliveryFlow struct {
 	action func(orch orchestrator.Orchestrator) error
 }
 
-// runKafkaMidDeliveryAction is the shared driver behind the kafka in-flight
-// crash and cert-rotation flows: both bring everything up with the receiver
-// live, wait until the receiver has seen half the records, fire one disruptive
-// action, then drain and apply the same no-loss / at-least-once verdict. Only
-// the action (and a little setup/labelling) differs — see midDeliveryFlow.
-func (r *Runner) runKafkaMidDeliveryAction(tc *config.TestCase, subject config.Subject, f midDeliveryFlow) (results.RunResult, error) {
+// runMidDeliveryAction is the shared driver behind the receiver-up mid-delivery
+// flows (kafka in-flight crash, kafka cert rotation, and object-storage
+// in-flight crash): all bring everything up with the receiver live, wait until
+// the receiver has seen half the records, fire one disruptive action, then
+// drain and apply the same no-loss / at-least-once verdict. Only the action
+// (and a little setup/labelling) differs — see midDeliveryFlow. The source is
+// decoupled from the subject (broker or bucket), so the generator keeps
+// producing across a subject restart.
+func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subject, f midDeliveryFlow) (results.RunResult, error) {
 	configName := r.opts.ConfigName
 	subject = r.applySubjectOverrides(subject)
 
@@ -1742,8 +1851,8 @@ func (r *Runner) runKafkaMidDeliveryAction(tc *config.TestCase, subject config.S
 		return results.RunResult{}, fmt.Errorf("never reached mid-delivery (%s) before timeout", formatCount(mid))
 	}
 
-	// The generator produces to Kafka independently of the subject; collect
-	// its final count.
+	// The generator produces to the durable source (broker or bucket)
+	// independently of the subject; collect its final count.
 	duration := tc.DurationOrDefault(60 * time.Second)
 	warmup := tc.WarmupOrDefault(30 * time.Second)
 	genTimeout := min(duration+warmup+2*time.Minute, r.opts.Timeout)
@@ -1789,6 +1898,9 @@ func (r *Runner) runKafkaMidDeliveryAction(tc *config.TestCase, subject config.S
 		return results.RunResult{}, fmt.Errorf("querying receiver metrics: %w", err)
 	}
 
+	metrics, metricsCSVSrc := r.harvestResourceMetrics(orch, tmpDir)
+	sysCPUs, sysMemMB := getSystemInfo()
+
 	elapsed := time.Since(startTime).Seconds()
 	lossPct := 0.0
 	if genStats.LinesSent > 0 {
@@ -1814,6 +1926,11 @@ func (r *Runner) runKafkaMidDeliveryAction(tc *config.TestCase, subject config.S
 
 	fmt.Printf("  lines sent: %s  lines received: %s  loss: %.2f%%\n",
 		formatCount(genStats.LinesSent), formatCount(recvMetrics.LinesReceived), lossPct)
+	fmt.Printf("  cpu: avg %.1f%% max %.1f%%  mem: avg %.0f MB max %.0f MB\n",
+		metrics.CPUAvg, metrics.CPUMax, metrics.MemAvgMB, metrics.MemMaxMB)
+	if metrics.IOThroughputAvg > 0 {
+		fmt.Printf("  io throughput: avg %.1f MB/s\n", metrics.IOThroughputAvg/(1024*1024))
+	}
 	if passed {
 		fmt.Printf("  %s: PASSED ✓\n", f.verdictLabel)
 	} else {
@@ -1836,7 +1953,24 @@ func (r *Runner) runKafkaMidDeliveryAction(tc *config.TestCase, subject config.S
 		LinesOut:        recvMetrics.LinesReceived,
 		BytesIn:         genStats.BytesSent,
 		BytesOut:        recvMetrics.BytesReceived,
+		LinesPerSec:     receiveWindowRate(recvMetrics),
 		LossPercent:     lossPct,
+		AvgCPUPercent:   metrics.CPUAvg,
+		MaxCPUPercent:   metrics.CPUMax,
+		AvgMemMB:        metrics.MemAvgMB,
+		MaxMemMB:        metrics.MemMaxMB,
+		DiskReadBytes:   metrics.DiskRead,
+		DiskWriteBytes:  metrics.DiskWrite,
+		NetRecvBytes:    metrics.NetRecv,
+		NetSendBytes:    metrics.NetSend,
+		IOThroughputAvg: metrics.IOThroughputAvg,
+		LoadAvg1:        metrics.LoadAvg1,
+		LoadAvg5:        metrics.LoadAvg5,
+		LoadAvg15:       metrics.LoadAvg15,
+		SystemCPUs:      sysCPUs,
+		SystemMemMB:     sysMemMB,
+		SubjectCPULimit: r.opts.CPULimit,
+		SubjectMemLimit: r.opts.MemLimit,
 		Passed:          &passed,
 	}
 	if !passed {
@@ -1845,7 +1979,7 @@ func (r *Runner) runKafkaMidDeliveryAction(tc *config.TestCase, subject config.S
 
 	// Persist the result like every other run path — Run's contract is to
 	// return the *persisted* result.
-	dir, err := r.saveResult(result, "")
+	dir, err := r.saveResult(result, metricsCSVSrc)
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
 	}
@@ -1878,7 +2012,7 @@ func rotateAndReload(orch orchestrator.Orchestrator, service string, rotate func
 // offset-committed are re-consumed on restart. Verdict: no loss; duplicates are
 // reported, not failed.
 func (r *Runner) runKafkaInflightCrash(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
-	return r.runKafkaMidDeliveryAction(tc, subject, midDeliveryFlow{
+	return r.runMidDeliveryAction(tc, subject, midDeliveryFlow{
 		verdictLabel:  "kafka in-flight crash correctness",
 		actionLog:     "SIGKILL subject (no graceful shutdown), then restart",
 		overDelivNote: "expected for a mid-delivery crash",
@@ -1888,6 +2022,36 @@ func (r *Runner) runKafkaInflightCrash(tc *config.TestCase, subject config.Subje
 				return fmt.Errorf("killing subject: %w", err)
 			}
 			// Settle before the consumer rejoins and replays uncommitted offsets.
+			if err := sleepCtx(r.ctx, 3*time.Second); err != nil {
+				return fmt.Errorf("interrupted: %w", err)
+			}
+			if err := orch.UpServices("subject"); err != nil {
+				return fmt.Errorf("restarting subject: %w", err)
+			}
+			return nil
+		},
+	})
+}
+
+// runInflightCrashCorrectness SIGKILLs the subject WHILE it is actively
+// delivering to a live receiver, then restarts it — the receiver-up
+// mid-delivery worst case for any source whose store is decoupled from the
+// subject (e.g. the S3/Azure bucket a poll-mode device lists). The since-cursor
+// advances at cycle end with no per-object delivery commit, so recovery must
+// still lose nothing; duplicates from the crash-resistance replay + re-list are
+// reported, not failed.
+func (r *Runner) runInflightCrashCorrectness(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
+	return r.runMidDeliveryAction(tc, subject, midDeliveryFlow{
+		verdictLabel:  "in-flight crash correctness",
+		actionLog:     "SIGKILL subject (no graceful shutdown), then restart",
+		overDelivNote: "expected for a mid-delivery crash",
+		totalLinesErr: "persistence_inflight_crash_correctness requires generator.total_lines > 0",
+		extraCleanup:  []string{"bench-localstack", "bench-azurite", "bench-azure-init"},
+		action: func(orch orchestrator.Orchestrator) error {
+			if err := orch.KillServices("subject"); err != nil {
+				return fmt.Errorf("killing subject: %w", err)
+			}
+			// Settle before the subject restarts and re-lists from its cursor.
 			if err := sleepCtx(r.ctx, 3*time.Second); err != nil {
 				return fmt.Errorf("interrupted: %w", err)
 			}
@@ -1919,7 +2083,7 @@ func (r *Runner) runKafkaCertRotation(tc *config.TestCase, subject config.Subjec
 	// and prepare runs before action, so the capture is well-ordered.
 	var certsDir string
 	hosts := []string{"subject", "localhost", "redpanda"}
-	return r.runKafkaMidDeliveryAction(tc, subject, midDeliveryFlow{
+	return r.runMidDeliveryAction(tc, subject, midDeliveryFlow{
 		verdictLabel:  "kafka cert rotation correctness",
 		actionLog:     "rotating broker cert to an UNTRUSTED CA (must be rejected), then back to a trusted cert",
 		overDelivNote: "expected across the broker reconnects",
@@ -2669,7 +2833,8 @@ func (r *Runner) runDirectorAgentACLRotation(tc *config.TestCase, subject config
 		if !blockedOK {
 			errs = append(errs, fmt.Sprintf(
 				"agent was NOT blocked before rotation (%s records during the %s baseline) — the initial allowlist already admits it; the recover transition is untested",
-				formatCount(rmBlocked.LinesReceived), baseline))
+				formatCount(rmBlocked.LinesReceived), baseline,
+			))
 		}
 
 		// Phase 1: rotate to the allow config; the director's refreshACL must pick
@@ -2709,7 +2874,8 @@ func (r *Runner) runDirectorAgentACLRotation(tc *config.TestCase, subject config
 		if !started {
 			errs = append(errs, fmt.Sprintf(
 				"delivery did not start after admitting the agent — %s records (expected >= %s); the ACL hot-reload did not take effect",
-				formatCount(finalCount), formatCount(minRecv)))
+				formatCount(finalCount), formatCount(minRecv),
+			))
 		}
 		passed = blockedOK && started
 
@@ -2742,7 +2908,8 @@ func (r *Runner) runDirectorAgentACLRotation(tc *config.TestCase, subject config
 			return results.RunResult{}, fmt.Errorf(
 				"agent never delivered the initial %s records — cannot test revocation (subject image %s:%s); "+
 					"if this is not the agent-capable image, re-run with VMETRIC_IMAGE=vmetric/director-enterprise",
-				formatCount(minRecv), subject.Image, subject.Version)
+				formatCount(minRecv), subject.Image, subject.Version,
+			)
 		}
 		fmt.Printf("  delivery established — %s records before revocation ✓\n", formatCount(beforeCount))
 
@@ -2782,11 +2949,13 @@ func (r *Runner) runDirectorAgentACLRotation(tc *config.TestCase, subject config
 		if advanced < 0 {
 			errs = append(errs, fmt.Sprintf(
 				"inconclusive: receiver count decreased after blocking the agent (after1=%s after2=%s) — the counter regressed, cannot confirm delivery stopped",
-				formatCount(rmAfter1.LinesReceived), formatCount(rmAfter2.LinesReceived)))
+				formatCount(rmAfter1.LinesReceived), formatCount(rmAfter2.LinesReceived),
+			))
 		} else if !stopped {
 			errs = append(errs, fmt.Sprintf(
 				"delivery did NOT stop after blocking the agent (%s new records across the block window) — the ACL was not enforced on the live data path",
-				formatCount(advanced)))
+				formatCount(advanced),
+			))
 		}
 		passed = stopped
 
@@ -3694,6 +3863,11 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 		}
 	}
 
+	// Cluster resource usage: the collector samples every node container and
+	// sums them per tick, so these figures are the whole cluster's footprint.
+	metrics, metricsCSVSrc := r.harvestResourceMetrics(orch, tmpDir)
+	sysCPUs, sysMemMB := getSystemInfo()
+
 	elapsed := time.Since(startTime).Seconds()
 	if passed {
 		fmt.Printf("  director cluster (%s): PASSED ✓\n", clusterActionLabel(tc.Cluster.Action))
@@ -3705,23 +3879,41 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 			fmt.Printf("  --- %s (tail) ---\n%s\n", c, string(out))
 		}
 	}
+	fmt.Printf("  cpu: avg %.1f%% max %.1f%%  mem: avg %.0f MB max %.0f MB (cluster total)\n",
+		metrics.CPUAvg, metrics.CPUMax, metrics.MemAvgMB, metrics.MemMaxMB)
 
 	result := results.RunResult{
-		TestName:    tc.Name,
-		Config:      configName,
-		Subject:     subject.Name,
-		Version:     subject.Version,
-		Hardware:    hardwareID(),
-		Timestamp:   startTime,
-		DurationSec: elapsed,
-		LinesOut:    finalCount,
-		Passed:      &passed,
+		TestName:        tc.Name,
+		Config:          configName,
+		Subject:         subject.Name,
+		Version:         subject.Version,
+		Hardware:        hardwareID(),
+		Timestamp:       startTime,
+		DurationSec:     elapsed,
+		LinesOut:        finalCount,
+		AvgCPUPercent:   metrics.CPUAvg,
+		MaxCPUPercent:   metrics.CPUMax,
+		AvgMemMB:        metrics.MemAvgMB,
+		MaxMemMB:        metrics.MemMaxMB,
+		DiskReadBytes:   metrics.DiskRead,
+		DiskWriteBytes:  metrics.DiskWrite,
+		NetRecvBytes:    metrics.NetRecv,
+		NetSendBytes:    metrics.NetSend,
+		IOThroughputAvg: metrics.IOThroughputAvg,
+		LoadAvg1:        metrics.LoadAvg1,
+		LoadAvg5:        metrics.LoadAvg5,
+		LoadAvg15:       metrics.LoadAvg15,
+		SystemCPUs:      sysCPUs,
+		SystemMemMB:     sysMemMB,
+		SubjectCPULimit: r.opts.CPULimit,
+		SubjectMemLimit: r.opts.MemLimit,
+		Passed:          &passed,
 	}
 	if !passed {
 		result.FailReason = strings.Join(errs, "; ")
 	}
 
-	dir, err := r.saveResult(result, "")
+	dir, err := r.saveResult(result, metricsCSVSrc)
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
 	}
@@ -3826,6 +4018,7 @@ func (st *fleetStatus) count(id, key string) int {
 	}
 	return d.Inbound[key].Count
 }
+
 func (st *fleetStatus) lastData(id, key string) string {
 	d, ok := st.Directors[id]
 	if !ok {
@@ -4161,7 +4354,7 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 			fmt.Println("  director did not connect with a bad token, as expected ✓")
 		}
 		passed = len(errs) == 0
-		return r.saveFleetResult(tc, subject, configName, startTime, finalCount, passed, errs, simContainer, subjectContainer)
+		return r.saveFleetResult(tc, subject, configName, orch, tmpDir, startTime, finalCount, passed, errs, simContainer, subjectContainer)
 	}
 
 	// All other scenarios: wait for the director to connect first.
@@ -4178,7 +4371,7 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		if !fleetWaitConnected(r.ctx, simContainer, dirID, connDeadline) {
 			errs = append(errs, "director never connected to the fleet simulator")
 			passed = false
-			return r.saveFleetResult(tc, subject, configName, startTime, finalCount, passed, errs, simContainer, subjectContainer)
+			return r.saveFleetResult(tc, subject, configName, orch, tmpDir, startTime, finalCount, passed, errs, simContainer, subjectContainer)
 		}
 		fmt.Println("  director connected to the fleet simulator ✓")
 	}
@@ -4196,14 +4389,14 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		if e != nil {
 			errs = append(errs, "cannot read deliver_config "+fc.DeliverConfig+": "+e.Error())
 			passed = false
-			return r.saveFleetResult(tc, subject, configName, startTime, finalCount, passed, errs, simContainer, subjectContainer)
+			return r.saveFleetResult(tc, subject, configName, orch, tmpDir, startTime, finalCount, passed, errs, simContainer, subjectContainer)
 		}
 		fmt.Printf("  delivering operational config (%s, %d bytes vmf)…\n", fc.DeliverConfig, len(vmfBytes))
 		b64 := base64.StdEncoding.EncodeToString(vmfBytes)
 		if _, se := fleetSimSend(simContainer, dirID, "config", map[string]any{"data_b64": b64}); se != nil {
 			errs = append(errs, "failed to deliver operational config: "+se.Error())
 			passed = false
-			return r.saveFleetResult(tc, subject, configName, startTime, finalCount, passed, errs, simContainer, subjectContainer)
+			return r.saveFleetResult(tc, subject, configName, orch, tmpDir, startTime, finalCount, passed, errs, simContainer, subjectContainer)
 		}
 		// Confirm the director APPLIED the config via its fleet-link
 		// acknowledgment (a rep.config reply with executed=true), not by grepping
@@ -4226,7 +4419,7 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		if _, ok := fleetWaitCount(r.ctx, simContainer, dirID, "rep.config", 1, applyDeadline); !ok {
 			errs = append(errs, "director did not acknowledge the delivered config over the fleet link")
 			passed = false
-			return r.saveFleetResult(tc, subject, configName, startTime, finalCount, passed, errs, simContainer, subjectContainer)
+			return r.saveFleetResult(tc, subject, configName, orch, tmpDir, startTime, finalCount, passed, errs, simContainer, subjectContainer)
 		}
 		last := ""
 		if st, e := fleetSimStatus(simContainer); e == nil {
@@ -4235,7 +4428,7 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		if !strings.Contains(last, "\"executed\":true") {
 			errs = append(errs, fmt.Sprintf("director replied to the delivered config but did not report it executed: %.200s", last))
 			passed = false
-			return r.saveFleetResult(tc, subject, configName, startTime, finalCount, passed, errs, simContainer, subjectContainer)
+			return r.saveFleetResult(tc, subject, configName, orch, tmpDir, startTime, finalCount, passed, errs, simContainer, subjectContainer)
 		}
 		fmt.Println("  director applied the delivered config (executed) ✓")
 	}
@@ -4258,7 +4451,7 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		if fc.Scenario != "stats" {
 			errs = append(errs, fmt.Sprintf("restart_mid_run is only supported for the stats scenario, not %q", fc.Scenario))
 			passed = false
-			return r.saveFleetResult(tc, subject, configName, startTime, finalCount, passed, errs, simContainer, subjectContainer)
+			return r.saveFleetResult(tc, subject, configName, orch, tmpDir, startTime, finalCount, passed, errs, simContainer, subjectContainer)
 		}
 		fmt.Println("  letting the agent stream before the restart…")
 		if err := sleepCtx(r.ctx, 25*time.Second); err != nil {
@@ -4582,7 +4775,8 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		if leakedDuringBaseline > cfgUpdateLeak {
 			errs = append(errs, fmt.Sprintf(
 				"delivery was NOT suppressed by the BEFORE config (%s records during the %s baseline) — the update verdict would be vacuous",
-				formatCount(leakedDuringBaseline), baseline))
+				formatCount(leakedDuringBaseline), baseline,
+			))
 		}
 
 		// Phase 2: AFTER pipeline (configs/update.vmf) — enables delivery.
@@ -4622,7 +4816,8 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		if delivered < minRecv {
 			errs = append(errs, fmt.Sprintf(
 				"delivery did not start after the config update — %s new records (expected >= %s); the update did not take effect on the data plane",
-				formatCount(delivered), formatCount(minRecv)))
+				formatCount(delivered), formatCount(minRecv),
+			))
 		} else {
 			fmt.Printf("  delivery started after the update — %s new records ✓\n", formatCount(delivered))
 		}
@@ -4679,7 +4874,8 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		if rmB.LinesReceived > leak {
 			errs = append(errs, fmt.Sprintf(
 				"delivery was not blocked before the change (%s received) — config A is not pointing at a dead target; the change is untested",
-				formatCount(rmB.LinesReceived)))
+				formatCount(rmB.LinesReceived),
+			))
 		}
 
 		// Phase 1: push the changed VMF (config B → working target) over the fleet link.
@@ -4734,7 +4930,8 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		if finalCount < target {
 			errs = append(errs, fmt.Sprintf(
 				"delivery did not start after the pushed config change — %s received (expected >= %s = baseline %s + %s); the fleet-delivered VMF change did not reconcile onto the live data path",
-				formatCount(finalCount), formatCount(target), formatCount(rmB.LinesReceived), formatCount(minRecv)))
+				formatCount(finalCount), formatCount(target), formatCount(rmB.LinesReceived), formatCount(minRecv),
+			))
 		} else {
 			fmt.Printf("  delivery started after the VMF config change (%s received, baseline %s) ✓\n", formatCount(finalCount), formatCount(rmB.LinesReceived))
 		}
@@ -4952,7 +5149,8 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		if finalCount < minRecv {
 			errs = append(errs, fmt.Sprintf(
 				"delivered pipeline produced too few records at the receiver — %s received (expected >= %s); the VMF-delivered pipeline/library did not apply on the data path",
-				formatCount(finalCount), formatCount(minRecv)))
+				formatCount(finalCount), formatCount(minRecv),
+			))
 		} else {
 			fmt.Printf("  delivered pipeline produced %s record(s) at the receiver ✓\n", formatCount(finalCount))
 		}
@@ -5066,14 +5264,17 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 	}
 
 	passed = len(errs) == 0
-	return r.saveFleetResult(tc, subject, configName, startTime, finalCount, passed, errs, simContainer, subjectContainer)
+	return r.saveFleetResult(tc, subject, configName, orch, tmpDir, startTime, finalCount, passed, errs, simContainer, subjectContainer)
 }
 
 // saveFleetResult records the verdict and, on failure, dumps short log tails of
 // the simulator and director to aid diagnosis.
 func (r *Runner) saveFleetResult(tc *config.TestCase, subject config.Subject, configName string,
-	startTime time.Time, finalCount int64, passed bool, errs []string, simContainer, subjectContainer string) (results.RunResult, error) {
-
+	orch orchestrator.Orchestrator, tmpDir string,
+	startTime time.Time, finalCount int64, passed bool, errs []string, simContainer, subjectContainer string,
+) (results.RunResult, error) {
+	metrics, metricsCSVSrc := r.harvestResourceMetrics(orch, tmpDir)
+	sysCPUs, sysMemMB := getSystemInfo()
 	elapsed := time.Since(startTime).Seconds()
 	label := tc.Fleet.Scenario
 	if passed {
@@ -5085,22 +5286,40 @@ func (r *Runner) saveFleetResult(tc *config.TestCase, subject config.Subject, co
 			fmt.Printf("  --- %s (tail) ---\n%s\n", c, string(out))
 		}
 	}
+	fmt.Printf("  cpu: avg %.1f%% max %.1f%%  mem: avg %.0f MB max %.0f MB\n",
+		metrics.CPUAvg, metrics.CPUMax, metrics.MemAvgMB, metrics.MemMaxMB)
 
 	result := results.RunResult{
-		TestName:    tc.Name,
-		Config:      configName,
-		Subject:     subject.Name,
-		Version:     subject.Version,
-		Hardware:    hardwareID(),
-		Timestamp:   startTime,
-		DurationSec: elapsed,
-		LinesOut:    finalCount,
-		Passed:      &passed,
+		TestName:        tc.Name,
+		Config:          configName,
+		Subject:         subject.Name,
+		Version:         subject.Version,
+		Hardware:        hardwareID(),
+		Timestamp:       startTime,
+		DurationSec:     elapsed,
+		LinesOut:        finalCount,
+		AvgCPUPercent:   metrics.CPUAvg,
+		MaxCPUPercent:   metrics.CPUMax,
+		AvgMemMB:        metrics.MemAvgMB,
+		MaxMemMB:        metrics.MemMaxMB,
+		DiskReadBytes:   metrics.DiskRead,
+		DiskWriteBytes:  metrics.DiskWrite,
+		NetRecvBytes:    metrics.NetRecv,
+		NetSendBytes:    metrics.NetSend,
+		IOThroughputAvg: metrics.IOThroughputAvg,
+		LoadAvg1:        metrics.LoadAvg1,
+		LoadAvg5:        metrics.LoadAvg5,
+		LoadAvg15:       metrics.LoadAvg15,
+		SystemCPUs:      sysCPUs,
+		SystemMemMB:     sysMemMB,
+		SubjectCPULimit: r.opts.CPULimit,
+		SubjectMemLimit: r.opts.MemLimit,
+		Passed:          &passed,
 	}
 	if !passed {
 		result.FailReason = strings.Join(errs, "; ")
 	}
-	dir, err := r.saveResult(result, "")
+	dir, err := r.saveResult(result, metricsCSVSrc)
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
 	}
@@ -5448,8 +5667,8 @@ func (r *Runner) runCCFCorrectness(tc *config.TestCase, subject config.Subject) 
 // saveCCFResult records the CCF verdict and, on failure, dumps short log tails of
 // the mock API and director to aid diagnosis.
 func (r *Runner) saveCCFResult(tc *config.TestCase, subject config.Subject, configName string,
-	startTime time.Time, finalCount int64, passed bool, errs []string, apiContainer, subjectContainer string) (results.RunResult, error) {
-
+	startTime time.Time, finalCount int64, passed bool, errs []string, apiContainer, subjectContainer string,
+) (results.RunResult, error) {
 	elapsed := time.Since(startTime).Seconds()
 	label := tc.CCF.Scenario
 	if passed {
@@ -5711,8 +5930,8 @@ func (r *Runner) runHTTPSourceCorrectness(tc *config.TestCase, subject config.Su
 }
 
 func (r *Runner) saveHTTPSourceResult(tc *config.TestCase, subject config.Subject, configName string,
-	startTime time.Time, finalCount int64, passed bool, errs []string, senderContainer, subjectContainer string) (results.RunResult, error) {
-
+	startTime time.Time, finalCount int64, passed bool, errs []string, senderContainer, subjectContainer string,
+) (results.RunResult, error) {
 	elapsed := time.Since(startTime).Seconds()
 	if passed {
 		fmt.Printf("  http source (%s): PASSED ✓\n", tc.HTTPSource.Scenario)
@@ -5853,11 +6072,11 @@ func (r *Runner) runClickHouseTargetCorrectness(tc *config.TestCase, subject con
 	}
 	if !ready {
 		errs = append(errs, "clickhouse-server never became reachable")
-		return r.saveClickHouseTargetResult(tc, subject, configName, startTime, 0, false, errs, chContainer, subjectContainer)
+		return r.saveClickHouseTargetResult(tc, subject, configName, orch, tmpDir, startTime, 0, false, errs, chContainer, subjectContainer)
 	}
 	if _, e := chExec(chContainer, "CREATE DATABASE IF NOT EXISTS "+db); e != nil {
 		errs = append(errs, "create database: "+e.Error())
-		return r.saveClickHouseTargetResult(tc, subject, configName, startTime, 0, false, errs, chContainer, subjectContainer)
+		return r.saveClickHouseTargetResult(tc, subject, configName, orch, tmpDir, startTime, 0, false, errs, chContainer, subjectContainer)
 	}
 	// Flexible log table: the director sends {"message": "...", "@timestamp": "..."}
 	// (raw) or normalized JSON; skip_unknown_fields tolerates extra keys, so a
@@ -5867,13 +6086,14 @@ func (r *Runner) runClickHouseTargetCorrectness(tc *config.TestCase, subject con
 	// (tabseparatedraw/parquet/native write only `message`; the rest DEFAULT).
 	createTable := fmt.Sprintf(
 		"CREATE TABLE IF NOT EXISTS %s (message String, `@timestamp` String DEFAULT '', ts DateTime DEFAULT now()) ENGINE = MergeTree ORDER BY ts",
-		fqTable)
+		fqTable,
+	)
 	if ch.CreateTableSQL != "" {
 		createTable = strings.ReplaceAll(ch.CreateTableSQL, "{{TABLE}}", fqTable)
 	}
 	if _, e := chExec(chContainer, createTable); e != nil {
 		errs = append(errs, "create table: "+e.Error())
-		return r.saveClickHouseTargetResult(tc, subject, configName, startTime, 0, false, errs, chContainer, subjectContainer)
+		return r.saveClickHouseTargetResult(tc, subject, configName, orch, tmpDir, startTime, 0, false, errs, chContainer, subjectContainer)
 	}
 	fmt.Printf("  clickhouse ready; table %s created ✓\n", fqTable)
 
@@ -5952,12 +6172,15 @@ func (r *Runner) runClickHouseTargetCorrectness(tc *config.TestCase, subject con
 	}
 
 	passed = len(errs) == 0
-	return r.saveClickHouseTargetResult(tc, subject, configName, startTime, finalCount, passed, errs, chContainer, subjectContainer)
+	return r.saveClickHouseTargetResult(tc, subject, configName, orch, tmpDir, startTime, finalCount, passed, errs, chContainer, subjectContainer)
 }
 
 func (r *Runner) saveClickHouseTargetResult(tc *config.TestCase, subject config.Subject, configName string,
-	startTime time.Time, finalCount int64, passed bool, errs []string, chContainer, subjectContainer string) (results.RunResult, error) {
-
+	orch orchestrator.Orchestrator, tmpDir string,
+	startTime time.Time, finalCount int64, passed bool, errs []string, chContainer, subjectContainer string,
+) (results.RunResult, error) {
+	metrics, metricsCSVSrc := r.harvestResourceMetrics(orch, tmpDir)
+	sysCPUs, sysMemMB := getSystemInfo()
 	elapsed := time.Since(startTime).Seconds()
 	if passed {
 		fmt.Println("  clickhouse target: PASSED ✓")
@@ -5968,14 +6191,24 @@ func (r *Runner) saveClickHouseTargetResult(tc *config.TestCase, subject config.
 			fmt.Printf("  --- %s (tail) ---\n%s\n", c, string(out))
 		}
 	}
+	fmt.Printf("  cpu: avg %.1f%% max %.1f%%  mem: avg %.0f MB max %.0f MB\n",
+		metrics.CPUAvg, metrics.CPUMax, metrics.MemAvgMB, metrics.MemMaxMB)
 	result := results.RunResult{
 		TestName: tc.Name, Config: configName, Subject: subject.Name, Version: subject.Version,
 		Hardware: hardwareID(), Timestamp: startTime, DurationSec: elapsed, LinesOut: finalCount, Passed: &passed,
+		AvgCPUPercent: metrics.CPUAvg, MaxCPUPercent: metrics.CPUMax,
+		AvgMemMB: metrics.MemAvgMB, MaxMemMB: metrics.MemMaxMB,
+		DiskReadBytes: metrics.DiskRead, DiskWriteBytes: metrics.DiskWrite,
+		NetRecvBytes: metrics.NetRecv, NetSendBytes: metrics.NetSend,
+		IOThroughputAvg: metrics.IOThroughputAvg,
+		LoadAvg1:        metrics.LoadAvg1, LoadAvg5: metrics.LoadAvg5, LoadAvg15: metrics.LoadAvg15,
+		SystemCPUs: sysCPUs, SystemMemMB: sysMemMB,
+		SubjectCPULimit: r.opts.CPULimit, SubjectMemLimit: r.opts.MemLimit,
 	}
 	if !passed {
 		result.FailReason = strings.Join(errs, "; ")
 	}
-	dir, err := r.saveResult(result, "")
+	dir, err := r.saveResult(result, metricsCSVSrc)
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
 	}
@@ -6339,8 +6572,8 @@ func (r *Runner) setupAuxRun(tc *config.TestCase, subject config.Subject, config
 
 // saveAuxResult records the verdict for the small aux-container drivers.
 func (r *Runner) saveAuxResult(tc *config.TestCase, subject config.Subject, configName, label string,
-	startTime time.Time, finalCount int64, passed bool, errs []string, auxContainer, subjectContainer string) (results.RunResult, error) {
-
+	startTime time.Time, finalCount int64, passed bool, errs []string, auxContainer, subjectContainer string,
+) (results.RunResult, error) {
 	elapsed := time.Since(startTime).Seconds()
 	if passed {
 		fmt.Printf("  %s: PASSED ✓\n", label)
@@ -6815,7 +7048,8 @@ func (r *Runner) runKafkaOffsetCommitRestart(tc *config.TestCase, subject config
 	if overPct > tc.Correctness.MaxOverDeliveryPct {
 		errors = append(errors, fmt.Sprintf(
 			"expected over-delivery <= %.2f%%, got %.2f%% (%s duplicate lines) — restart re-consumed records whose offsets should have been committed",
-			tc.Correctness.MaxOverDeliveryPct, overPct, formatCount(extra)))
+			tc.Correctness.MaxOverDeliveryPct, overPct, formatCount(extra),
+		))
 	}
 	passed := len(errors) == 0
 
@@ -7044,6 +7278,9 @@ func (r *Runner) runPersistenceFileRestartCorrectness(tc *config.TestCase, subje
 		lastCount = rm.LinesReceived
 	}
 
+	metrics, metricsCSVSrc := r.harvestResourceMetrics(orch, tmpDir)
+	sysCPUs, sysMemMB := getSystemInfo()
+
 	// Evaluate.
 	elapsed := time.Since(startTime).Seconds()
 	lossPct := 0.0
@@ -7087,14 +7324,31 @@ func (r *Runner) runPersistenceFileRestartCorrectness(tc *config.TestCase, subje
 		LinesOut:        recvMetrics.LinesReceived,
 		BytesIn:         genStats.BytesSent,
 		BytesOut:        recvMetrics.BytesReceived,
+		LinesPerSec:     receiveWindowRate(recvMetrics),
 		LossPercent:     lossPct,
+		AvgCPUPercent:   metrics.CPUAvg,
+		MaxCPUPercent:   metrics.CPUMax,
+		AvgMemMB:        metrics.MemAvgMB,
+		MaxMemMB:        metrics.MemMaxMB,
+		DiskReadBytes:   metrics.DiskRead,
+		DiskWriteBytes:  metrics.DiskWrite,
+		NetRecvBytes:    metrics.NetRecv,
+		NetSendBytes:    metrics.NetSend,
+		IOThroughputAvg: metrics.IOThroughputAvg,
+		LoadAvg1:        metrics.LoadAvg1,
+		LoadAvg5:        metrics.LoadAvg5,
+		LoadAvg15:       metrics.LoadAvg15,
+		SystemCPUs:      sysCPUs,
+		SystemMemMB:     sysMemMB,
+		SubjectCPULimit: r.opts.CPULimit,
+		SubjectMemLimit: r.opts.MemLimit,
 		Passed:          &passed,
 	}
 	if !passed {
 		result.FailReason = strings.Join(perrs, "; ")
 	}
 
-	dir, err := r.saveResult(result, "")
+	dir, err := r.saveResult(result, metricsCSVSrc)
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
 	}
@@ -7102,6 +7356,11 @@ func (r *Runner) runPersistenceFileRestartCorrectness(tc *config.TestCase, subje
 	fmt.Printf("  done. results → %s\n", dir)
 	fmt.Printf("  lines sent: %s  lines received: %s  loss: %.2f%%\n",
 		formatCount(genStats.LinesSent), formatCount(recvMetrics.LinesReceived), lossPct)
+	fmt.Printf("  cpu: avg %.1f%% max %.1f%%  mem: avg %.0f MB max %.0f MB\n",
+		metrics.CPUAvg, metrics.CPUMax, metrics.MemAvgMB, metrics.MemMaxMB)
+	if metrics.IOThroughputAvg > 0 {
+		fmt.Printf("  io throughput: avg %.1f MB/s\n", metrics.IOThroughputAvg/(1024*1024))
+	}
 	if tc.Correctness.ValidateDedup {
 		fmt.Printf("  unique lines: %s  duplicates: %s\n",
 			formatCount(recvMetrics.UniqueLines), formatCount(recvMetrics.Duplicates))
@@ -7332,7 +7591,7 @@ func (r *Runner) runSyslogVaultCertRotation(tc *config.TestCase, subject config.
 	hosts := []string{"subject", "localhost"}
 	var certsDir string
 
-	return r.runKafkaMidDeliveryAction(tc, subject, midDeliveryFlow{
+	return r.runMidDeliveryAction(tc, subject, midDeliveryFlow{
 		verdictLabel:  "syslog TLS vault cert rotation correctness",
 		actionLog:     "rotating syslog server cert to UNTRUSTED CA (generator TLS must fail), then restoring trusted cert",
 		overDelivNote: "expected after the trusted cert is restored and the generator reconnects",
@@ -7376,7 +7635,7 @@ func (r *Runner) runSyslogVaultCertRotation(tc *config.TestCase, subject config.
 
 			mount := tc.Vault.MountOrDefault()
 			token := tc.Vault.TokenOrDefault()
-			// Receiver metrics port is already forwarded by runKafkaMidDeliveryAction.
+			// Receiver metrics port is already forwarded by runMidDeliveryAction.
 			metricsPort := orch.ReceiverMetricsPorts()["default"]
 
 			// ---- Phase 1: UNTRUSTED cert — generator TLS must fail ----
@@ -7430,7 +7689,8 @@ func (r *Runner) runSyslogVaultCertRotation(tc *config.TestCase, subject config.
 					"SECURITY: receiver count never stalled after wrong-CA rotation "+
 						"(last count: %d) — director did not serve the untrusted cert, "+
 						"or generator ignored cert validation; check debug.console.status: true logs",
-					lastCount)
+					lastCount,
+				)
 			}
 
 			// ---- Phase 2: TRUSTED cert restored — recovery ----

@@ -56,6 +56,25 @@ func writeAWSInit(path string, aws *config.AWSConfig) error {
 			"awslocal sns subscribe --topic-arn '%s' --protocol sqs --notification-endpoint '%s' --attributes RawMessageDelivery=true\n",
 			aws.TopicARN(s.Topic), aws.QueueARN(s.Queue))
 	}
+	for _, so := range aws.SeedObjects {
+		prefix := so.Prefix
+		if prefix == "" {
+			prefix = "seed/"
+		}
+		marker := so.Marker
+		if marker == "" {
+			marker = "SEED"
+		}
+		// Build each object body with awk (busybox ships it), then upload —
+		// so the objects exist before LocalStack reports init "completed" and
+		// the subject's depends_on gate releases. All values are int-formatted
+		// or charset-validated, so single-quoting is defense in depth.
+		fmt.Fprintf(&b, "i=0; while [ \"$i\" -lt %d ]; do\n", so.Objects)
+		fmt.Fprintf(&b, "  awk -v o=\"$i\" 'BEGIN{for(l=0;l<%d;l++) printf \"%s-OBJ%%d-LINE%%d\\n\", o, l}' > /tmp/pb-seed-obj\n", so.Lines, marker)
+		fmt.Fprintf(&b, "  awslocal s3 cp /tmp/pb-seed-obj 's3://%s/%sobj-'\"$i\"'.log'\n", so.Bucket, prefix)
+		b.WriteString("  i=$((i+1))\n")
+		b.WriteString("done\n")
+	}
 
 	b.WriteString("echo 'pipebench aws init complete'\n")
 	return os.WriteFile(path, []byte(b.String()), 0o755)
