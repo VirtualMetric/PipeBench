@@ -2624,7 +2624,20 @@ func writeCompose(path string, cfg RunConfig) error {
 			agentEnv[k] = strings.ReplaceAll(v, "$", "$$")
 		}
 		vars.AgentEnabled = true
-		vars.AgentImage = a.Image
+
+		// Apply the run's --version to an UNTAGGED agent image, the same way
+		// the subject gets one.
+		//
+		// Without this an agent case written as `image: "vmetric/agent"` runs
+		// :latest while the subject runs the build under test, so the case
+		// silently exercises whatever agent was published last — usually an
+		// OLD one. It still passes, and reads as agent-mode coverage while
+		// proving nothing about the agent being tested.
+		//
+		// A case that pins its own tag is left alone: that is how
+		// director_old_agent_compat_deploy holds an agent DELIBERATELY older
+		// than the subject, which is the point of an upgrade-compatibility case.
+		vars.AgentImage = applyVersionIfUntagged(a.Image, s.Version)
 		vars.AgentCommand = formatYAMLList(agentCmd)
 		vars.AgentEnv = agentEnv
 		vars.AgentMountsSharedData = a.MountsSharedData
@@ -2675,4 +2688,28 @@ func boolStr(b bool) string {
 		return "true"
 	}
 	return "false"
+}
+
+// applyVersionIfUntagged appends ":<version>" to an image reference that has no
+// tag, leaving an explicitly tagged reference untouched.
+//
+// Tag detection has to cope with a registry host carrying a port
+// ("registry:5000/vmetric/agent"), where the only colon is NOT a tag separator.
+// A tag can only appear after the last "/", so that is where to look.
+func applyVersionIfUntagged(image, version string) string {
+	if image == "" || version == "" {
+		return image
+	}
+
+	name := image
+	if slash := strings.LastIndex(image, "/"); slash >= 0 {
+		name = image[slash+1:]
+	}
+
+	// Already tagged (or digest-pinned) — the case chose it on purpose.
+	if strings.Contains(name, ":") || strings.Contains(name, "@") {
+		return image
+	}
+
+	return image + ":" + version
 }
