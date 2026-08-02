@@ -2,11 +2,13 @@ package config
 
 import (
 	"fmt"
+	"maps"
 	"net"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -2752,6 +2754,44 @@ func LoadCase(casesDir, name string) (*TestCase, error) {
 		return nil, err
 	}
 	return &tc, nil
+}
+
+// CloneForRun returns a copy of tc that one run may mutate in place without
+// affecting any other. One loaded case is shared by every (case, subject) pair
+// the CLI queues, and the runner rewrites parts of it per run: resolveValues
+// expands `${NAME}` into endpoint commands and env, and the Vault cert-rotation
+// flow seeds freshly generated certs into vault.secrets. Sharing one pointer
+// bakes the first subject's values in for every subject after it — the
+// placeholder is already gone, so the later runs silently execute the earlier
+// subject's command and still report a verdict on it.
+//
+// Only the fields the runner writes are deep-copied; the rest stays shared
+// because it is read-only for the duration of a run. Extend this when a new
+// mutation site appears.
+func (tc *TestCase) CloneForRun() *TestCase {
+	if tc == nil {
+		return nil
+	}
+	cp := *tc
+	if tc.Endpoints != nil {
+		cp.Endpoints = make([]Endpoint, len(tc.Endpoints))
+		for i, ep := range tc.Endpoints {
+			cp.Endpoints[i] = ep
+			cp.Endpoints[i].Command = slices.Clone(ep.Command)
+			cp.Endpoints[i].Env = maps.Clone(ep.Env)
+		}
+	}
+	if tc.Vault != nil {
+		v := *tc.Vault
+		if tc.Vault.Secrets != nil {
+			v.Secrets = make(map[string]map[string]string, len(tc.Vault.Secrets))
+			for secretPath, fields := range tc.Vault.Secrets {
+				v.Secrets[secretPath] = maps.Clone(fields)
+			}
+		}
+		cp.Vault = &v
+	}
+	return &cp
 }
 
 // ListCases returns all case names found in casesDir.

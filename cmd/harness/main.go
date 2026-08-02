@@ -170,7 +170,10 @@ func testCmd() *cobra.Command {
 							continue
 						}
 						for _, s := range subs {
-							pairs = append(pairs, runPair{tc: tc, subject: applyCasePin(s, tc)})
+							// Own copy per pair — the runner mutates the case
+							// in place (see TestCase.CloneForRun), and -s a,b
+							// puts several subjects on one loaded case here.
+							pairs = append(pairs, runPair{tc: tc.CloneForRun(), subject: applyCasePin(s, tc)})
 						}
 					}
 					if len(subjectsToLoop) > 1 {
@@ -215,7 +218,11 @@ func testCmd() *cobra.Command {
 						}
 					}
 					for _, s := range subjects {
-						pairs = append(pairs, runPair{tc: tc, subject: applyCasePin(s, tc)})
+						// Every subject gets its own copy of the case: the
+						// runner rewrites endpoint commands/env in place while
+						// resolving `${NAME}`, so a shared pointer would leave
+						// the second subject running the first one's command.
+						pairs = append(pairs, runPair{tc: tc.CloneForRun(), subject: applyCasePin(s, tc)})
 					}
 				}
 				if len(pairs) == 0 {

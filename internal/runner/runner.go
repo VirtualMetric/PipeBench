@@ -171,6 +171,16 @@ func (r *Runner) resolveValues(tc *config.TestCase, subject config.Subject) erro
 
 	subject = r.applySubjectOverrides(subject)
 
+	// A resolve step is a `docker run` on an image that may not be on the host
+	// yet, so the wall has to cover a cold pull, not just the command — a fixed
+	// minute fails the whole case on a first-run pull that was going to
+	// succeed. Reuse the run timeout: it is the budget the operator already
+	// sized for this run, and r.ctx still cancels immediately on SIGINT.
+	resolveTimeout := r.opts.Timeout
+	if resolveTimeout <= 0 {
+		resolveTimeout = 10 * time.Minute
+	}
+
 	for _, rv := range tc.Resolve {
 		image := rv.Image
 		if image == "subject" {
@@ -180,7 +190,7 @@ func (r *Runner) resolveValues(tc *config.TestCase, subject config.Subject) erro
 			}
 		}
 
-		ctx, cancel := context.WithTimeout(r.ctx, 60*time.Second)
+		ctx, cancel := context.WithTimeout(r.ctx, resolveTimeout)
 		args := append([]string{"run", "--rm", "--entrypoint", rv.Command[0], image}, rv.Command[1:]...)
 		out, err := exec.CommandContext(ctx, "docker", args...).Output()
 		cancel()
