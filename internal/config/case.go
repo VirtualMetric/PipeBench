@@ -2,11 +2,13 @@ package config
 
 import (
 	"fmt"
+	"maps"
 	"net"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -47,6 +49,19 @@ type TestCase struct {
 	// can reach the endpoint by Name. A case may run with no generator when it
 	// drives data purely through endpoints.
 	Endpoints []Endpoint `yaml:"endpoints"`
+
+	// Resolve computes values from the subject BEFORE the topology starts, so a
+	// case can drive the subject with a string the subject itself produces
+	// rather than one the case author transcribed. Each entry runs a one-shot
+	// container and captures its stdout; `${NAME}` then expands in every
+	// endpoint command and endpoint env value.
+	//
+	// The point is contract coverage. When a case hard-codes a value that some
+	// component generates at runtime, it stops testing the generator: the case
+	// keeps passing against a copy of what the author believed the format to be,
+	// and drifts silently when the real one changes. Resolving it from the
+	// subject makes the producer part of the test.
+	Resolve []ResolveValue `yaml:"resolve"`
 
 	// Agent, when set, adds an external agent container to the test topology.
 	// The agent connects INTO the subject (director) rather than being connected
@@ -608,6 +623,30 @@ type AgentConfig struct {
 	MountsSharedData bool `yaml:"mounts_shared_data"`
 }
 
+// ResolveValue asks the subject to produce a value the case then uses (see
+// TestCase.Resolve). The harness runs a one-shot container, trims the trailing
+// newline from its stdout, and substitutes the result for `${Name}` in every
+// endpoint command and endpoint env value.
+//
+// The container runs to completion before the topology starts, so the command
+// must be self-contained — it cannot reach a running subject, a generator, or
+// the bench network, and it must not need any of them. Anything that only makes
+// sense against a live topology belongs in an endpoint command instead.
+type ResolveValue struct {
+	// Name is the placeholder this value fills, referenced as ${Name}. Use
+	// uppercase with underscores. Must be unique within the case.
+	Name string `yaml:"name"`
+	// Image is the container image to run. The literal "subject" means the
+	// image under test, including any --image/--version override, which is what
+	// makes the value come from the build being tested rather than a fixed one.
+	Image string `yaml:"image"`
+	// Command is the command to run. Its stdout (trailing newline trimmed) is
+	// the value. A non-zero exit fails the run: a value that could not be
+	// produced must stop the case, never silently expand to an empty string and
+	// let a downstream assertion pass for the wrong reason.
+	Command []string `yaml:"command"`
+}
+
 // Endpoint is an auxiliary container in the test topology (see
 // TestCase.Endpoints). It's a host the subject reaches on the bench network —
 // not a generator or receiver.
@@ -1104,6 +1143,45 @@ func (tc *TestCase) Validate() error {
 			return fmt.Errorf("case %q: duplicate endpoint name %q", tc.Name, e.Name)
 		}
 		epNames[e.Name] = struct{}{}
+	}
+	// Resolved values must be well formed and actually referenced. An unused or
+	// misspelled entry is the failure mode worth catching here: the ${NAME} it
+	// was meant to fill would stay literal in the command, the container would
+	// run something meaningless, and the case would report on that instead.
+	resolveNames := map[string]struct{}{}
+	for i, rv := range tc.Resolve {
+		if rv.Name == "" {
+			return fmt.Errorf("case %q: resolve[%d] missing required `name`", tc.Name, i)
+		}
+		if rv.Image == "" {
+			return fmt.Errorf("case %q: resolve %q missing required `image` (use \"subject\" for the image under test)", tc.Name, rv.Name)
+		}
+		if len(rv.Command) == 0 {
+			return fmt.Errorf("case %q: resolve %q missing required `command`", tc.Name, rv.Name)
+		}
+		if _, dup := resolveNames[rv.Name]; dup {
+			return fmt.Errorf("case %q: duplicate resolve name %q", tc.Name, rv.Name)
+		}
+		resolveNames[rv.Name] = struct{}{}
+
+		placeholder := "${" + rv.Name + "}"
+		used := false
+		for _, e := range tc.Endpoints {
+			for _, part := range e.Command {
+				if strings.Contains(part, placeholder) {
+					used = true
+				}
+			}
+			for _, val := range e.Env {
+				if strings.Contains(val, placeholder) {
+					used = true
+				}
+			}
+		}
+		if !used {
+			return fmt.Errorf("case %q: resolve %q is never referenced as %s in any endpoint command or env",
+				tc.Name, rv.Name, placeholder)
+		}
 	}
 	// Kafka types require the broker block + a generator producing in kafka mode.
 	if tc.IsKafkaType() {
@@ -2676,6 +2754,44 @@ func LoadCase(casesDir, name string) (*TestCase, error) {
 		return nil, err
 	}
 	return &tc, nil
+}
+
+// CloneForRun returns a copy of tc that one run may mutate in place without
+// affecting any other. One loaded case is shared by every (case, subject) pair
+// the CLI queues, and the runner rewrites parts of it per run: resolveValues
+// expands `${NAME}` into endpoint commands and env, and the Vault cert-rotation
+// flow seeds freshly generated certs into vault.secrets. Sharing one pointer
+// bakes the first subject's values in for every subject after it — the
+// placeholder is already gone, so the later runs silently execute the earlier
+// subject's command and still report a verdict on it.
+//
+// Only the fields the runner writes are deep-copied; the rest stays shared
+// because it is read-only for the duration of a run. Extend this when a new
+// mutation site appears.
+func (tc *TestCase) CloneForRun() *TestCase {
+	if tc == nil {
+		return nil
+	}
+	cp := *tc
+	if tc.Endpoints != nil {
+		cp.Endpoints = make([]Endpoint, len(tc.Endpoints))
+		for i, ep := range tc.Endpoints {
+			cp.Endpoints[i] = ep
+			cp.Endpoints[i].Command = slices.Clone(ep.Command)
+			cp.Endpoints[i].Env = maps.Clone(ep.Env)
+		}
+	}
+	if tc.Vault != nil {
+		v := *tc.Vault
+		if tc.Vault.Secrets != nil {
+			v.Secrets = make(map[string]map[string]string, len(tc.Vault.Secrets))
+			for secretPath, fields := range tc.Vault.Secrets {
+				v.Secrets[secretPath] = maps.Clone(fields)
+			}
+		}
+		cp.Vault = &v
+	}
+	return &cp
 }
 
 // ListCases returns all case names found in casesDir.

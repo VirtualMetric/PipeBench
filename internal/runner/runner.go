@@ -157,8 +157,78 @@ func (r *Runner) applySubjectOverrides(subject config.Subject) config.Subject {
 	return subject
 }
 
+// resolveValues runs each tc.Resolve entry and expands `${NAME}` in every
+// endpoint command and env value. It mutates tc, so it must run before any
+// driver reads the endpoints — i.e. before Run dispatches on tc.Type.
+//
+// A failure here aborts the run. The alternative — leaving the placeholder
+// literal or expanding it to "" — would let the case proceed and report a
+// verdict on a command that is not the one it meant to run.
+func (r *Runner) resolveValues(tc *config.TestCase, subject config.Subject) error {
+	if len(tc.Resolve) == 0 {
+		return nil
+	}
+
+	subject = r.applySubjectOverrides(subject)
+
+	// A resolve step is a `docker run` on an image that may not be on the host
+	// yet, so the wall has to cover a cold pull, not just the command — a fixed
+	// minute fails the whole case on a first-run pull that was going to
+	// succeed. Reuse the run timeout: it is the budget the operator already
+	// sized for this run, and r.ctx still cancels immediately on SIGINT.
+	resolveTimeout := r.opts.Timeout
+	if resolveTimeout <= 0 {
+		resolveTimeout = 10 * time.Minute
+	}
+
+	for _, rv := range tc.Resolve {
+		image := rv.Image
+		if image == "subject" {
+			image = subject.Image
+			if subject.Version != "" {
+				image += ":" + subject.Version
+			}
+		}
+
+		ctx, cancel := context.WithTimeout(r.ctx, resolveTimeout)
+		args := append([]string{"run", "--rm", "--entrypoint", rv.Command[0], image}, rv.Command[1:]...)
+		out, err := exec.CommandContext(ctx, "docker", args...).Output()
+		cancel()
+		if err != nil {
+			stderr := ""
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				stderr = strings.TrimSpace(string(exitErr.Stderr))
+			}
+			return fmt.Errorf("resolve %q via %s: %w (stderr: %s)", rv.Name, image, err, stderr)
+		}
+
+		value := strings.TrimRight(string(out), "\r\n")
+		if value == "" {
+			return fmt.Errorf("resolve %q via %s produced no output; a case must not run on an empty value", rv.Name, image)
+		}
+
+		fmt.Printf("  resolved ${%s} from %s\n", rv.Name, image)
+
+		placeholder := "${" + rv.Name + "}"
+		for i := range tc.Endpoints {
+			for j, part := range tc.Endpoints[i].Command {
+				tc.Endpoints[i].Command[j] = strings.ReplaceAll(part, placeholder, value)
+			}
+			for k, val := range tc.Endpoints[i].Env {
+				tc.Endpoints[i].Env[k] = strings.ReplaceAll(val, placeholder, value)
+			}
+		}
+	}
+
+	return nil
+}
+
 // Run executes the test and returns the persisted result.
 func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
+	if err := r.resolveValues(tc, subject); err != nil {
+		return results.RunResult{}, err
+	}
 	if tc.Type == "persistence_correctness" {
 		return r.runPersistenceCorrectness(tc, subject)
 	}
