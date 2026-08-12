@@ -744,17 +744,24 @@ func versionCmd() *cobra.Command {
 	}
 }
 
-// applyCasePin overlays a case's subject_image/subject_version pin onto a
-// registry-resolved Subject. The global --image/--version CLI flags are applied
-// later in runner.applySubjectOverrides, so an explicit CLI flag still wins:
+// applyCasePin overlays a case's subject_image/subject_version/subject_entrypoint
+// pin onto a registry-resolved Subject. The global --image/--version CLI flags are
+// applied later in runner.applySubjectOverrides, so an explicit CLI flag still
+// wins:
 //
 //	CLI --image/--version  >  case subject_image/subject_version  >  registry default
+//
+// subject_entrypoint has no CLI counterpart: it is a property of what the case
+// tests (see TestCase.SubjectEntrypoint), not of which build is under test.
 func applyCasePin(s config.Subject, tc *config.TestCase) config.Subject {
 	if tc.SubjectImage != "" {
 		s = s.WithImage(tc.SubjectImage)
 	}
 	if tc.SubjectVersion != "" {
 		s = s.WithVersion(tc.SubjectVersion)
+	}
+	if len(tc.SubjectEntrypoint) > 0 {
+		s = s.WithEntrypoint(tc.SubjectEntrypoint)
 	}
 	return s
 }

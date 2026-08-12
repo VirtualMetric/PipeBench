@@ -135,6 +135,17 @@ type TestCase struct {
 	SubjectImage   string `yaml:"subject_image"`
 	SubjectVersion string `yaml:"subject_version"`
 
+	// SubjectEntrypoint replaces the registry's entrypoint for this case, with
+	// the registry Command still appended as arguments. Same precedence and the
+	// same non-strict-decode tolerance as SubjectImage.
+	//
+	// Needed where the case is about the subject's own process lifecycle: the
+	// director self-update cases stop and restart the service they are updating,
+	// which ends the container when the service is PID 1. Pointing the entrypoint
+	// at a wrapper that runs the service as a CHILD keeps the container alive
+	// across that restart, so "the service came back" is observable at all.
+	SubjectEntrypoint []string `yaml:"subject_entrypoint"`
+
 	Subjects       []string                 `yaml:"subjects"`
 	Configurations map[string]Configuration `yaml:"configurations"`
 	Correctness    CorrectnessConfig        `yaml:"correctness"`
