@@ -6498,11 +6498,18 @@ func (r *Runner) runRedisSourceCorrectness(tc *config.TestCase, subject config.S
 	return r.saveAuxResult(tc, subject, configName, "redis source", startTime, finalCount, passed, errs, pubContainer, subjectContainer)
 }
 
+// endpointSourceCeilingQuietPeriod is how long a case that states an
+// endpoint_source.expect_max keeps watching after its floor is met, before the
+// ceiling is judged. Short on purpose: excess records arrive in a burst, so this
+// only has to outlast one, and a longer wait would tax every ceiling case.
+const endpointSourceCeilingQuietPeriod = 30 * time.Second
+
 // runEndpointSourceCorrectness drives a director source the bench generator can't
 // feed (snmptrap, tftp, smtp, …) via a generic CLI-sender endpoint and counts at
 // the receiver. The sender is an `endpoints:` container in the case; the driver
 // just waits for the receiver to reach endpoint_source.expect_min. Tolerant of the
-// best-effort loss of UDP senders (expect_min, not exact).
+// best-effort loss of UDP senders (expect_min, not exact) unless the case also
+// states an expect_max, which makes the count a window — see the ceiling below.
 func (r *Runner) runEndpointSourceCorrectness(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
 	configName := r.opts.ConfigName
 	subject = r.applySubjectOverrides(subject)
@@ -6596,6 +6603,29 @@ func (r *Runner) runEndpointSourceCorrectness(tc *config.TestCase, subject confi
 		errs = append(errs, fmt.Sprintf("under-delivery: %d of ≥%d records from the source", got, expectMin))
 	} else {
 		fmt.Printf("  source delivered %d records (≥ %d) ✓\n", got, expectMin)
+	}
+
+	// Ceiling, when the case states one. A floor alone cannot fail a case whose
+	// records ARE its assertion: a subject that forwards more than it was asked to
+	// (a filter that silently stopped matching, a duplicated route, an evidence line
+	// the case did not intend) clears any expect_min. Cases that encode content in
+	// the count set expect_max == expect_min and become exact.
+	//
+	// The extra wait is deliberately short rather than the full settle window: a
+	// runaway forwarder delivers its excess within a second or two, and charging
+	// every ceiling case the whole window would add minutes per case for nothing.
+	if reached && es.ExpectMax > 0 {
+		if err := sleepCtx(r.ctx, endpointSourceCeilingQuietPeriod); err != nil {
+			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+		}
+		if stable := r.ccfWaitStable(metricsPort, time.Now().Add(10*time.Second)); stable > finalCount {
+			finalCount = stable
+		}
+		if finalCount > int64(es.ExpectMax) {
+			errs = append(errs, fmt.Sprintf("over-delivery: %d records from the source (expected ≤ %d) — more arrived than the case asserts", finalCount, es.ExpectMax))
+		} else {
+			fmt.Printf("  source stayed within the ceiling: %d ≤ %d ✓\n", finalCount, es.ExpectMax)
+		}
 	}
 
 	passed := len(errs) == 0

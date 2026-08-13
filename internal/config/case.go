@@ -2074,7 +2074,13 @@ type EndpointSourceConfig struct {
 	// source must NOT deliver. The driver waits the settle window then asserts the
 	// receiver count stays <= ExpectMax. Proves auth/validation is load-bearing.
 	Reject bool `yaml:"reject"`
-	// ExpectMax is the ceiling for a reject case (default 0 — nothing delivered).
+	// ExpectMax is the ceiling. For a reject case it is the whole assertion
+	// (default 0 — nothing delivered). On a POSITIVE case it turns the count into a
+	// window: the driver waits past the floor and then fails on over-delivery,
+	// which is what a case needs when its records ARE its assertion (e.g. the
+	// director_update_* family, where one record stands for one proven outcome) —
+	// a floor alone cannot notice a subject that forwarded more than the case
+	// meant.
 	ExpectMax int `yaml:"expect_max"`
 }
 
@@ -2107,6 +2113,13 @@ func (tc *TestCase) validateEndpointSource() error {
 	}
 	if tc.EndpointSource.Reject && tc.EndpointSource.ExpectMax < 0 {
 		return fmt.Errorf("case %q: endpoint_source.expect_max must be >= 0", tc.Name)
+	}
+	// A ceiling below the floor can never be satisfied, so refuse it at load time
+	// rather than at the end of a ten-minute run.
+	if !tc.EndpointSource.Reject && tc.EndpointSource.ExpectMax > 0 &&
+		tc.EndpointSource.ExpectMax < tc.EndpointSource.ExpectMin {
+		return fmt.Errorf("case %q: endpoint_source.expect_max (%d) must be >= expect_min (%d)",
+			tc.Name, tc.EndpointSource.ExpectMax, tc.EndpointSource.ExpectMin)
 	}
 	want := tc.EndpointSource.SenderContainerOrDefault()[len("bench-"):]
 	found := false
