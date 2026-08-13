@@ -2115,10 +2115,13 @@ func (tc *TestCase) validateEndpointSource() error {
 		return fmt.Errorf("case %q: endpoint_source.expect_max must be >= 0", tc.Name)
 	}
 	// A ceiling below the floor can never be satisfied, so refuse it at load time
-	// rather than at the end of a ten-minute run.
-	if !tc.EndpointSource.Reject && tc.EndpointSource.ExpectMax > 0 &&
+	// rather than at the end of a ten-minute run. Every NONZERO value is checked, not
+	// just positive ones: zero is the documented "unset", and the runner enables the
+	// ceiling on the same `> 0` test, so `expect_max: -1` would otherwise pass
+	// validation AND silently disable the assertion it looks like it is making.
+	if !tc.EndpointSource.Reject && tc.EndpointSource.ExpectMax != 0 &&
 		tc.EndpointSource.ExpectMax < tc.EndpointSource.ExpectMin {
-		return fmt.Errorf("case %q: endpoint_source.expect_max (%d) must be >= expect_min (%d)",
+		return fmt.Errorf("case %q: endpoint_source.expect_max (%d) must be >= expect_min (%d), or 0 for no ceiling",
 			tc.Name, tc.EndpointSource.ExpectMax, tc.EndpointSource.ExpectMin)
 	}
 	want := tc.EndpointSource.SenderContainerOrDefault()[len("bench-"):]

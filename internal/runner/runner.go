@@ -6615,15 +6615,38 @@ func (r *Runner) runEndpointSourceCorrectness(tc *config.TestCase, subject confi
 	// runaway forwarder delivers its excess within a second or two, and charging
 	// every ceiling case the whole window would add minutes per case for nothing.
 	if reached && es.ExpectMax > 0 {
-		if err := sleepCtx(r.ctx, endpointSourceCeilingQuietPeriod); err != nil {
-			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+		// Bounded by the run budget: the floor above is capped at runDeadline, and a
+		// case that reached it late must not push the run past --timeout on the way
+		// out. No budget left is a timeout, not a pass.
+		quietUntil := time.Now().Add(endpointSourceCeilingQuietPeriod)
+		if quietUntil.After(runDeadline) {
+			quietUntil = runDeadline
 		}
-		if stable := r.ccfWaitStable(metricsPort, time.Now().Add(10*time.Second)); stable > finalCount {
+		if remaining := time.Until(quietUntil); remaining > 0 {
+			if err := sleepCtx(r.ctx, remaining); err != nil {
+				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+			}
+		}
+
+		// The ceiling needs a FRESH count, and it must fail when it cannot get one:
+		// ccfWaitStable reports 0 or the last value it saw when the metrics endpoint
+		// stops answering, and treating that as "within the ceiling" would pass a case
+		// whose delivery nobody measured.
+		if stable := r.ccfWaitStable(metricsPort, quietUntil.Add(10*time.Second)); stable > finalCount {
 			finalCount = stable
 		}
-		if finalCount > int64(es.ExpectMax) {
+
+		rm, err := r.queryReceiverMetrics(metricsPort, 5*time.Second)
+		switch {
+		case err != nil:
+			errs = append(errs, fmt.Sprintf("ceiling not verified: the receiver metrics endpoint stopped answering (%v) — a ≤ %d assertion cannot be made on an unmeasured window", err, es.ExpectMax))
+		case rm.LinesReceived > int64(es.ExpectMax):
+			finalCount = rm.LinesReceived
 			errs = append(errs, fmt.Sprintf("over-delivery: %d records from the source (expected ≤ %d) — more arrived than the case asserts", finalCount, es.ExpectMax))
-		} else {
+		default:
+			if rm.LinesReceived > finalCount {
+				finalCount = rm.LinesReceived
+			}
 			fmt.Printf("  source stayed within the ceiling: %d ≤ %d ✓\n", finalCount, es.ExpectMax)
 		}
 	}
