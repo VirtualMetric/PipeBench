@@ -6504,6 +6504,31 @@ func (r *Runner) runRedisSourceCorrectness(tc *config.TestCase, subject config.S
 // only has to outlast one, and a longer wait would tax every ceiling case.
 const endpointSourceCeilingQuietPeriod = 30 * time.Second
 
+// earliest returns whichever instant comes first — used to keep a step's own
+// deadline inside the run budget.
+func earliest(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+
+	return b
+}
+
+// budgetedTimeout clamps a step's timeout to the budget left before deadline, never
+// returning a non-positive value: a zero timeout would read as "no deadline" to the
+// callers here, which is the opposite of what a spent budget means.
+func budgetedTimeout(deadline time.Time, want time.Duration) time.Duration {
+	if remaining := time.Until(deadline); remaining < want {
+		if remaining < time.Second {
+			return time.Second
+		}
+
+		return remaining
+	}
+
+	return want
+}
+
 // runEndpointSourceCorrectness drives a director source the bench generator can't
 // feed (snmptrap, tftp, smtp, …) via a generic CLI-sender endpoint and counts at
 // the receiver. The sender is an `endpoints:` container in the case; the driver
@@ -6622,21 +6647,36 @@ func (r *Runner) runEndpointSourceCorrectness(tc *config.TestCase, subject confi
 		if quietUntil.After(runDeadline) {
 			quietUntil = runDeadline
 		}
-		if remaining := time.Until(quietUntil); remaining > 0 {
-			if err := sleepCtx(r.ctx, remaining); err != nil {
-				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
-			}
+
+		remaining := time.Until(quietUntil)
+		if remaining <= 0 {
+			// No budget means the window was never watched, and an unwatched window is
+			// not a pass — the same rule the metrics-outage branch below applies. A case
+			// that reaches its floor in the last seconds of --timeout fails as
+			// unverified, which is the honest outcome for a case that asked for a ceiling.
+			errs = append(errs, fmt.Sprintf("ceiling not verified: the run budget (%s) ran out before the ≤ %d window could be observed", r.opts.Timeout, es.ExpectMax))
+			passed := len(errs) == 0
+
+			return r.saveAuxResult(tc, subject, configName, "endpoint source", startTime, finalCount, passed, errs, senderContainer, subjectContainer)
+		}
+
+		if err := sleepCtx(r.ctx, remaining); err != nil {
+			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
 		}
 
 		// The ceiling needs a FRESH count, and it must fail when it cannot get one:
 		// ccfWaitStable reports 0 or the last value it saw when the metrics endpoint
 		// stops answering, and treating that as "within the ceiling" would pass a case
 		// whose delivery nobody measured.
-		if stable := r.ccfWaitStable(metricsPort, quietUntil.Add(10*time.Second)); stable > finalCount {
+		//
+		// Both this settle and the authoritative sample below stay inside runDeadline:
+		// the whole point of capping the quiet period is lost if the two steps after it
+		// can push the run past --timeout on their own.
+		if stable := r.ccfWaitStable(metricsPort, earliest(time.Now().Add(10*time.Second), runDeadline)); stable > finalCount {
 			finalCount = stable
 		}
 
-		rm, err := r.queryReceiverMetrics(metricsPort, 5*time.Second)
+		rm, err := r.queryReceiverMetrics(metricsPort, budgetedTimeout(runDeadline, 5*time.Second))
 		switch {
 		case err != nil:
 			errs = append(errs, fmt.Sprintf("ceiling not verified: the receiver metrics endpoint stopped answering (%v) — a ≤ %d assertion cannot be made on an unmeasured window", err, es.ExpectMax))
