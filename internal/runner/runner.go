@@ -432,8 +432,8 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		VerifierImage:    r.opts.VerifierImage,
 		ReceiverHostPort: r.opts.ReceiverHostPort,
 		ExtraSubjectEnv:  extraEnv,
-		CPULimit:         r.opts.CPULimit,
-		MemLimit:         r.opts.MemLimit,
+		CPULimit:         subjectCPULimit(tc, r.opts.CPULimit),
+		MemLimit:         subjectMemLimit(tc, r.opts.MemLimit),
 		TLSCertsHost:     tlsCertsHost,
 	}
 
@@ -1051,9 +1051,9 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	if tc.Correctness.ValidateContent {
 		fmt.Printf("  malformed lines: %s\n", formatCount(recvMetrics.MalformedLines))
 	}
-	if r.opts.CPULimit != "" || r.opts.MemLimit != "" {
+	if cpuLim, memLim := subjectCPULimit(tc, r.opts.CPULimit), subjectMemLimit(tc, r.opts.MemLimit); cpuLim != "" || memLim != "" {
 		fmt.Printf("  subject limits: cpu=%s mem=%s\n",
-			defaultVal(r.opts.CPULimit, "unlimited"), defaultVal(r.opts.MemLimit, "unlimited"))
+			defaultVal(cpuLim, "unlimited"), defaultVal(memLim, "unlimited"))
 	}
 	recvWindow := 0.0
 	if recvMetrics.FirstReceivedNs > 0 && recvMetrics.LastReceivedNs > recvMetrics.FirstReceivedNs {
@@ -1161,8 +1161,8 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 		CollectorImage:   r.opts.CollectorImage,
 		ReceiverHostPort: r.opts.ReceiverHostPort,
 		ExtraSubjectEnv:  extraEnv,
-		CPULimit:         r.opts.CPULimit,
-		MemLimit:         r.opts.MemLimit,
+		CPULimit:         subjectCPULimit(tc, r.opts.CPULimit),
+		MemLimit:         subjectMemLimit(tc, r.opts.MemLimit),
 	}
 
 	cr, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
@@ -1465,8 +1465,8 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 		CollectorImage:   r.opts.CollectorImage,
 		ReceiverHostPort: r.opts.ReceiverHostPort,
 		ExtraSubjectEnv:  extraEnv,
-		CPULimit:         r.opts.CPULimit,
-		MemLimit:         r.opts.MemLimit,
+		CPULimit:         subjectCPULimit(tc, r.opts.CPULimit),
+		MemLimit:         subjectMemLimit(tc, r.opts.MemLimit),
 	}
 
 	cr, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
@@ -1844,8 +1844,8 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 		CollectorImage:   r.opts.CollectorImage,
 		ReceiverHostPort: r.opts.ReceiverHostPort,
 		ExtraSubjectEnv:  extraEnv,
-		CPULimit:         r.opts.CPULimit,
-		MemLimit:         r.opts.MemLimit,
+		CPULimit:         subjectCPULimit(tc, r.opts.CPULimit),
+		MemLimit:         subjectMemLimit(tc, r.opts.MemLimit),
 	}
 
 	// Per-flow setup (e.g. generate TLS certs and set rc.TLSCertsHost) before
@@ -2371,8 +2371,8 @@ func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject confi
 		CollectorImage:   r.opts.CollectorImage,
 		ReceiverHostPort: r.opts.ReceiverHostPort,
 		ExtraSubjectEnv:  extraEnv,
-		CPULimit:         r.opts.CPULimit,
-		MemLimit:         r.opts.MemLimit,
+		CPULimit:         subjectCPULimit(tc, r.opts.CPULimit),
+		MemLimit:         subjectMemLimit(tc, r.opts.MemLimit),
 		TLSCertsHost:     certsDir,
 	}
 
@@ -2788,8 +2788,8 @@ func (r *Runner) runDirectorAgentACLRotation(tc *config.TestCase, subject config
 		CollectorImage:   r.opts.CollectorImage,
 		ReceiverHostPort: r.opts.ReceiverHostPort,
 		ExtraSubjectEnv:  extraEnv,
-		CPULimit:         r.opts.CPULimit,
-		MemLimit:         r.opts.MemLimit,
+		CPULimit:         subjectCPULimit(tc, r.opts.CPULimit),
+		MemLimit:         subjectMemLimit(tc, r.opts.MemLimit),
 	}
 
 	orch, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
@@ -3457,8 +3457,8 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 		CollectorImage:   r.opts.CollectorImage,
 		ReceiverHostPort: r.opts.ReceiverHostPort,
 		ExtraSubjectEnv:  extraEnv,
-		CPULimit:         r.opts.CPULimit,
-		MemLimit:         r.opts.MemLimit,
+		CPULimit:         subjectCPULimit(tc, r.opts.CPULimit),
+		MemLimit:         subjectMemLimit(tc, r.opts.MemLimit),
 	}
 
 	orch, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
@@ -4025,6 +4025,36 @@ type fleetStatBucket struct {
 	ExecTimeNs   int64 `json:"exec_time_ns"` // pipeline.* only: per-processor execution time
 }
 
+// subjectCPULimit and subjectMemLimit resolve the subject container's cgroup
+// ceilings: the case's own pin when it sets one, otherwise the --cpu-limit /
+// --mem-limit flags. The case wins because a case that pins a limit is
+// asserting on it — see Case.SubjectCPULimit.
+func subjectCPULimit(tc *config.TestCase, flag string) string {
+	if tc != nil && tc.SubjectCPULimit != "" {
+		return tc.SubjectCPULimit
+	}
+	return flag
+}
+
+func subjectMemLimit(tc *config.TestCase, flag string) string {
+	if tc != nil && tc.SubjectMemLimit != "" {
+		return tc.SubjectMemLimit
+	}
+	return flag
+}
+
+// fleetResourceSample mirrors the simulator's per-item DeviceResource gauge.
+type fleetResourceSample struct {
+	Samples  int64 `json:"samples"`
+	Count    int64 `json:"count"`
+	Total    int64 `json:"total"`
+	Used     int64 `json:"used"`
+	Cores    int64 `json:"cores"`
+	Threads  int64 `json:"threads"`
+	Sockets  int64 `json:"sockets"`
+	DeviceID int64 `json:"device_id"`
+}
+
 type fleetStatus struct {
 	Directors map[string]struct {
 		Connected bool `json:"connected"`
@@ -4037,9 +4067,14 @@ type fleetStatus struct {
 		// Stats are decoded from the director's forwarded VMF metric frames by
 		// the simulator (see fleetsim/vmfstats.go), keyed by "<inputtype>.<type>"
 		// e.g. "route.in", "target.out".
-		Stats        map[string]fleetStatBucket `json:"stats"`
-		StatsFrames  int                        `json:"stats_frames"`
-		StatsRecords int                        `json:"stats_records"`
+		Stats map[string]fleetStatBucket `json:"stats"`
+		// Resources are the DeviceResource (inputtype=4) gauge rows, keyed
+		// "<resource type>.<identifier>" e.g. "cpu.container",
+		// "runtime.container". LAST value seen, not summed — see
+		// fleetsim/vmfstats.go resourceSample.
+		Resources    map[string]fleetResourceSample `json:"resources"`
+		StatsFrames  int                            `json:"stats_frames"`
+		StatsRecords int                            `json:"stats_records"`
 	} `json:"directors"`
 }
 
@@ -4074,6 +4109,85 @@ func (st *fleetStatus) statField(id, bucket, field string) (int64, bool) {
 		return b.ExecTimeNs, true
 	}
 	return 0, false
+}
+
+// resourceField returns the named field of a decoded DeviceResource item.
+func (st *fleetStatus) resourceField(id, key, field string) (int64, bool) {
+	d, ok := st.Directors[id]
+	if !ok {
+		return 0, false
+	}
+	r, ok := d.Resources[key]
+	if !ok {
+		return 0, false
+	}
+	switch field {
+	case "samples":
+		return r.Samples, true
+	case "count":
+		return r.Count, true
+	case "total":
+		return r.Total, true
+	case "used":
+		return r.Used, true
+	case "cores":
+		return r.Cores, true
+	case "threads":
+		return r.Threads, true
+	case "sockets":
+		return r.Sockets, true
+	case "device_id":
+		return r.DeviceID, true
+	}
+	return 0, false
+}
+
+// fleetWaitResources polls until every expected DeviceResource item exists and
+// satisfies its bounds.
+//
+// Unlike fleetWaitStats it never fails early on a high reading: these are
+// gauges, and the value the subject reports depends on what it was doing during
+// that 250 ms sample. A bound violation is only fatal once the deadline passes,
+// so a case can wait for a container to warm up without a flaky first tick
+// deciding the verdict.
+func fleetWaitResources(ctx context.Context, simContainer, dirID string, expect map[string]map[string]config.ResourceBound, deadline time.Time) error {
+	var lastErr error
+	for {
+		st, err := fleetSimStatus(simContainer)
+		if err != nil {
+			lastErr = err
+		} else {
+			lastErr = nil
+			for key, fields := range expect {
+				for field, bound := range fields {
+					got, ok := st.resourceField(dirID, key, field)
+					if !ok {
+						lastErr = fmt.Errorf("resource %s.%s not reported", key, field)
+						break
+					}
+					if why := bound.Check(got); why != "" {
+						lastErr = fmt.Errorf("resource %s.%s %s", key, field, why)
+						break
+					}
+				}
+				if lastErr != nil {
+					break
+				}
+			}
+			if lastErr == nil {
+				return nil
+			}
+		}
+		if !time.Now().Before(deadline) {
+			if lastErr == nil {
+				lastErr = fmt.Errorf("resource expectations not reached by deadline")
+			}
+			return lastErr
+		}
+		if err := sleepCtx(ctx, 3*time.Second); err != nil {
+			return fmt.Errorf("interrupted: %w", err)
+		}
+	}
 }
 
 func (st *fleetStatus) connected(id string) bool {
@@ -4356,8 +4470,8 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		VerifierImage:    r.opts.VerifierImage, // pipeline_verify reuses the DuckDB verifier
 		ReceiverHostPort: r.opts.ReceiverHostPort,
 		ExtraSubjectEnv:  extraEnv,
-		CPULimit:         r.opts.CPULimit,
-		MemLimit:         r.opts.MemLimit,
+		CPULimit:         subjectCPULimit(tc, r.opts.CPULimit),
+		MemLimit:         subjectMemLimit(tc, r.opts.MemLimit),
 	}
 
 	orch, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
@@ -5082,6 +5196,18 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 			}
 		}
 
+		// Same idea for the DeviceResource rows: assert the subject reported its
+		// OWN ceilings, not the host's. Without this a containerized director
+		// reporting the host's 32 cores and 32 GB looks identical to one
+		// reporting its 2-core / 512 MB share.
+		if len(fc.ExpectResources) > 0 {
+			if rerr := fleetWaitResources(r.ctx, simContainer, dirID, fc.ExpectResources, scenarioDeadline()); rerr != nil {
+				errs = append(errs, "resource rows mismatch: "+rerr.Error())
+			} else {
+				fmt.Println("  decoded resource rows match expectations ✓")
+			}
+		}
+
 	case "reconnect":
 		st0, _ := fleetSimStatus(simContainer)
 		before := 0
@@ -5546,8 +5672,8 @@ func (r *Runner) runCCFCorrectness(tc *config.TestCase, subject config.Subject) 
 		CollectorImage:   r.opts.CollectorImage,
 		ReceiverHostPort: r.opts.ReceiverHostPort,
 		ExtraSubjectEnv:  extraEnv,
-		CPULimit:         r.opts.CPULimit,
-		MemLimit:         r.opts.MemLimit,
+		CPULimit:         subjectCPULimit(tc, r.opts.CPULimit),
+		MemLimit:         subjectMemLimit(tc, r.opts.MemLimit),
 	}
 
 	orch, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
@@ -5858,8 +5984,8 @@ func (r *Runner) runHTTPSourceCorrectness(tc *config.TestCase, subject config.Su
 		CollectorImage:   r.opts.CollectorImage,
 		ReceiverHostPort: r.opts.ReceiverHostPort,
 		ExtraSubjectEnv:  extraEnv,
-		CPULimit:         r.opts.CPULimit,
-		MemLimit:         r.opts.MemLimit,
+		CPULimit:         subjectCPULimit(tc, r.opts.CPULimit),
+		MemLimit:         subjectMemLimit(tc, r.opts.MemLimit),
 	}
 
 	orch, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
@@ -6963,8 +7089,8 @@ func (r *Runner) runKafkaOffsetCommitRestart(tc *config.TestCase, subject config
 		CollectorImage:   r.opts.CollectorImage,
 		ReceiverHostPort: r.opts.ReceiverHostPort,
 		ExtraSubjectEnv:  extraEnv,
-		CPULimit:         r.opts.CPULimit,
-		MemLimit:         r.opts.MemLimit,
+		CPULimit:         subjectCPULimit(tc, r.opts.CPULimit),
+		MemLimit:         subjectMemLimit(tc, r.opts.MemLimit),
 	}
 
 	orch, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
@@ -7243,8 +7369,8 @@ func (r *Runner) runPersistenceFileRestartCorrectness(tc *config.TestCase, subje
 		CollectorImage:   r.opts.CollectorImage,
 		ReceiverHostPort: r.opts.ReceiverHostPort,
 		ExtraSubjectEnv:  extraEnv,
-		CPULimit:         r.opts.CPULimit,
-		MemLimit:         r.opts.MemLimit,
+		CPULimit:         subjectCPULimit(tc, r.opts.CPULimit),
+		MemLimit:         subjectMemLimit(tc, r.opts.MemLimit),
 	}
 
 	cr, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
