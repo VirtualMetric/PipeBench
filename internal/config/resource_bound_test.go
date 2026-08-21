@@ -33,11 +33,11 @@ expect_resources:
 	if total.Eq == nil || *total.Eq != 524288 {
 		t.Fatalf("total.eq did not decode: %+v", total)
 	}
-	if why := total.Check(524288); why != "" {
-		t.Errorf("Check(524288) = %q, want pass", why)
+	if err := total.Check(524288); err != nil {
+		t.Errorf("Check(524288) = %v, want pass", err)
 	}
 	// The exact value a pre-cgroup director reported: host RAM in KB.
-	if why := total.Check(32528416); why == "" {
+	if err := total.Check(32528416); err == nil {
 		t.Error("Check(host-sized value) passed — the bound is vacuous")
 	}
 
@@ -45,13 +45,13 @@ expect_resources:
 	if used.Min == nil || used.Max == nil {
 		t.Fatalf("min/max did not decode: %+v", used)
 	}
-	if why := used.Check(2000); why != "" {
-		t.Errorf("Check(2000) = %q, want pass at the ceiling", why)
+	if err := used.Check(2000); err != nil {
+		t.Errorf("Check(2000) = %v, want pass at the ceiling", err)
 	}
-	if why := used.Check(2001); why == "" {
+	if err := used.Check(2001); err == nil {
 		t.Error("Check(over max) passed — max is vacuous")
 	}
-	if why := used.Check(-1); why == "" {
+	if err := used.Check(-1); err == nil {
 		t.Error("Check(under min) passed — min is vacuous")
 	}
 }
@@ -61,8 +61,8 @@ expect_resources:
 func TestResourceBoundEmptyMatchesAnything(t *testing.T) {
 	var b ResourceBound
 	for _, v := range []int64{-1, 0, 1 << 40} {
-		if why := b.Check(v); why != "" {
-			t.Errorf("empty bound rejected %d: %s", v, why)
+		if err := b.Check(v); err != nil {
+			t.Errorf("empty bound rejected %d: %v", v, err)
 		}
 	}
 }

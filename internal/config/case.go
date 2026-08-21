@@ -2847,16 +2847,16 @@ type ResourceBound struct {
 	Max *int64 `yaml:"max"`
 }
 
-// Check reports why v fails the bound, or "" when it passes.
-func (b ResourceBound) Check(v int64) string {
+// Check reports why v fails the bound, or nil when it passes.
+func (b ResourceBound) Check(v int64) error {
 	if b.Eq != nil && v != *b.Eq {
-		return fmt.Sprintf("= %d, want exactly %d", v, *b.Eq)
+		return fmt.Errorf("= %d, want exactly %d", v, *b.Eq)
 	}
 	if b.Min != nil && v < *b.Min {
-		return fmt.Sprintf("= %d, want >= %d", v, *b.Min)
+		return fmt.Errorf("= %d, want >= %d", v, *b.Min)
 	}
 	if b.Max != nil && v > *b.Max {
-		return fmt.Sprintf("= %d, want <= %d", v, *b.Max)
+		return fmt.Errorf("= %d, want <= %d", v, *b.Max)
 	}
-	return ""
+	return nil
 }

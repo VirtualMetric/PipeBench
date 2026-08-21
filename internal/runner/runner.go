@@ -116,6 +116,22 @@ type Runner struct {
 	ctx   context.Context
 	opts  Options
 	store *results.Store
+
+	// runCPULimit and runMemLimit are the subject's cgroup ceilings for the
+	// CURRENT run: the case's own pin when it sets one, otherwise the CLI flag.
+	// Resolved once at the top of Run and read everywhere — compose config,
+	// console output, and the persisted result — so those three cannot
+	// disagree. They did: the compose file honoured a case pin while the saved
+	// result recorded the empty CLI flag, so a run under a 2-core/512MB ceiling
+	// was filed as unrestricted, which is worse than unrecorded because it
+	// looks recorded.
+	//
+	// A Runner is reused across (case, subject) pairs, so Run assigns BOTH
+	// unconditionally on entry — never conditionally, or one case's pin leaks
+	// into the next. Safe without a lock: Run is the only exported method and
+	// cmd/harness calls it sequentially.
+	runCPULimit string
+	runMemLimit string
 }
 
 // hardwareID returns the BENCH_HARDWARE env var or "custom" when unset.
@@ -226,6 +242,11 @@ func (r *Runner) resolveValues(tc *config.TestCase, subject config.Subject) erro
 
 // Run executes the test and returns the persisted result.
 func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
+	// Resolve the subject's ceilings once for this run. Unconditional: a
+	// Runner is reused across cases and a stale pin must not survive.
+	r.runCPULimit = subjectCPULimit(tc, r.opts.CPULimit)
+	r.runMemLimit = subjectMemLimit(tc, r.opts.MemLimit)
+
 	if err := r.resolveValues(tc, subject); err != nil {
 		return results.RunResult{}, err
 	}
@@ -432,8 +453,8 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		VerifierImage:    r.opts.VerifierImage,
 		ReceiverHostPort: r.opts.ReceiverHostPort,
 		ExtraSubjectEnv:  extraEnv,
-		CPULimit:         subjectCPULimit(tc, r.opts.CPULimit),
-		MemLimit:         subjectMemLimit(tc, r.opts.MemLimit),
+		CPULimit:         r.runCPULimit,
+		MemLimit:         r.runMemLimit,
 		TLSCertsHost:     tlsCertsHost,
 	}
 
@@ -814,8 +835,8 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		LoadAvg15:       metrics.LoadAvg15,
 		SystemCPUs:      sysCPUs,
 		SystemMemMB:     sysMemMB,
-		SubjectCPULimit: r.opts.CPULimit,
-		SubjectMemLimit: r.opts.MemLimit,
+		SubjectCPULimit: r.runCPULimit,
+		SubjectMemLimit: r.runMemLimit,
 		LatencyP50Ms:    recvMetrics.LatencyP50Ms,
 		LatencyP95Ms:    recvMetrics.LatencyP95Ms,
 		LatencyP99Ms:    recvMetrics.LatencyP99Ms,
@@ -1051,7 +1072,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	if tc.Correctness.ValidateContent {
 		fmt.Printf("  malformed lines: %s\n", formatCount(recvMetrics.MalformedLines))
 	}
-	if cpuLim, memLim := subjectCPULimit(tc, r.opts.CPULimit), subjectMemLimit(tc, r.opts.MemLimit); cpuLim != "" || memLim != "" {
+	if cpuLim, memLim := r.runCPULimit, r.runMemLimit; cpuLim != "" || memLim != "" {
 		fmt.Printf("  subject limits: cpu=%s mem=%s\n",
 			defaultVal(cpuLim, "unlimited"), defaultVal(memLim, "unlimited"))
 	}
@@ -1161,8 +1182,8 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 		CollectorImage:   r.opts.CollectorImage,
 		ReceiverHostPort: r.opts.ReceiverHostPort,
 		ExtraSubjectEnv:  extraEnv,
-		CPULimit:         subjectCPULimit(tc, r.opts.CPULimit),
-		MemLimit:         subjectMemLimit(tc, r.opts.MemLimit),
+		CPULimit:         r.runCPULimit,
+		MemLimit:         r.runMemLimit,
 	}
 
 	cr, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
@@ -1347,8 +1368,8 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 		LoadAvg15:       metrics.LoadAvg15,
 		SystemCPUs:      sysCPUs,
 		SystemMemMB:     sysMemMB,
-		SubjectCPULimit: r.opts.CPULimit,
-		SubjectMemLimit: r.opts.MemLimit,
+		SubjectCPULimit: r.runCPULimit,
+		SubjectMemLimit: r.runMemLimit,
 		Passed:          &passed,
 	}
 	if !passed {
@@ -1465,8 +1486,8 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 		CollectorImage:   r.opts.CollectorImage,
 		ReceiverHostPort: r.opts.ReceiverHostPort,
 		ExtraSubjectEnv:  extraEnv,
-		CPULimit:         subjectCPULimit(tc, r.opts.CPULimit),
-		MemLimit:         subjectMemLimit(tc, r.opts.MemLimit),
+		CPULimit:         r.runCPULimit,
+		MemLimit:         r.runMemLimit,
 	}
 
 	cr, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
@@ -1668,8 +1689,8 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 		LoadAvg15:       metrics.LoadAvg15,
 		SystemCPUs:      sysCPUs,
 		SystemMemMB:     sysMemMB,
-		SubjectCPULimit: r.opts.CPULimit,
-		SubjectMemLimit: r.opts.MemLimit,
+		SubjectCPULimit: r.runCPULimit,
+		SubjectMemLimit: r.runMemLimit,
 		Passed:          &passed,
 	}
 	if !passed {
@@ -1844,8 +1865,8 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 		CollectorImage:   r.opts.CollectorImage,
 		ReceiverHostPort: r.opts.ReceiverHostPort,
 		ExtraSubjectEnv:  extraEnv,
-		CPULimit:         subjectCPULimit(tc, r.opts.CPULimit),
-		MemLimit:         subjectMemLimit(tc, r.opts.MemLimit),
+		CPULimit:         r.runCPULimit,
+		MemLimit:         r.runMemLimit,
 	}
 
 	// Per-flow setup (e.g. generate TLS certs and set rc.TLSCertsHost) before
@@ -2039,8 +2060,8 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 		LoadAvg15:       metrics.LoadAvg15,
 		SystemCPUs:      sysCPUs,
 		SystemMemMB:     sysMemMB,
-		SubjectCPULimit: r.opts.CPULimit,
-		SubjectMemLimit: r.opts.MemLimit,
+		SubjectCPULimit: r.runCPULimit,
+		SubjectMemLimit: r.runMemLimit,
 		Passed:          &passed,
 	}
 	if !passed {
@@ -2371,8 +2392,8 @@ func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject confi
 		CollectorImage:   r.opts.CollectorImage,
 		ReceiverHostPort: r.opts.ReceiverHostPort,
 		ExtraSubjectEnv:  extraEnv,
-		CPULimit:         subjectCPULimit(tc, r.opts.CPULimit),
-		MemLimit:         subjectMemLimit(tc, r.opts.MemLimit),
+		CPULimit:         r.runCPULimit,
+		MemLimit:         r.runMemLimit,
 		TLSCertsHost:     certsDir,
 	}
 
@@ -2788,8 +2809,8 @@ func (r *Runner) runDirectorAgentACLRotation(tc *config.TestCase, subject config
 		CollectorImage:   r.opts.CollectorImage,
 		ReceiverHostPort: r.opts.ReceiverHostPort,
 		ExtraSubjectEnv:  extraEnv,
-		CPULimit:         subjectCPULimit(tc, r.opts.CPULimit),
-		MemLimit:         subjectMemLimit(tc, r.opts.MemLimit),
+		CPULimit:         r.runCPULimit,
+		MemLimit:         r.runMemLimit,
 	}
 
 	orch, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
@@ -3457,8 +3478,8 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 		CollectorImage:   r.opts.CollectorImage,
 		ReceiverHostPort: r.opts.ReceiverHostPort,
 		ExtraSubjectEnv:  extraEnv,
-		CPULimit:         subjectCPULimit(tc, r.opts.CPULimit),
-		MemLimit:         subjectMemLimit(tc, r.opts.MemLimit),
+		CPULimit:         r.runCPULimit,
+		MemLimit:         r.runMemLimit,
 	}
 
 	orch, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
@@ -3975,8 +3996,8 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 		LoadAvg15:       metrics.LoadAvg15,
 		SystemCPUs:      sysCPUs,
 		SystemMemMB:     sysMemMB,
-		SubjectCPULimit: r.opts.CPULimit,
-		SubjectMemLimit: r.opts.MemLimit,
+		SubjectCPULimit: r.runCPULimit,
+		SubjectMemLimit: r.runMemLimit,
 		Passed:          &passed,
 	}
 	if !passed {
@@ -4165,8 +4186,8 @@ func fleetWaitResources(ctx context.Context, simContainer, dirID string, expect 
 						lastErr = fmt.Errorf("resource %s.%s not reported", key, field)
 						break
 					}
-					if why := bound.Check(got); why != "" {
-						lastErr = fmt.Errorf("resource %s.%s %s", key, field, why)
+					if err := bound.Check(got); err != nil {
+						lastErr = fmt.Errorf("resource %s.%s %w", key, field, err)
 						break
 					}
 				}
@@ -4470,8 +4491,8 @@ func (r *Runner) runFleetAutomationCorrectness(tc *config.TestCase, subject conf
 		VerifierImage:    r.opts.VerifierImage, // pipeline_verify reuses the DuckDB verifier
 		ReceiverHostPort: r.opts.ReceiverHostPort,
 		ExtraSubjectEnv:  extraEnv,
-		CPULimit:         subjectCPULimit(tc, r.opts.CPULimit),
-		MemLimit:         subjectMemLimit(tc, r.opts.MemLimit),
+		CPULimit:         r.runCPULimit,
+		MemLimit:         r.runMemLimit,
 	}
 
 	orch, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
@@ -5508,8 +5529,8 @@ func (r *Runner) saveFleetResult(tc *config.TestCase, subject config.Subject, co
 		LoadAvg15:       metrics.LoadAvg15,
 		SystemCPUs:      sysCPUs,
 		SystemMemMB:     sysMemMB,
-		SubjectCPULimit: r.opts.CPULimit,
-		SubjectMemLimit: r.opts.MemLimit,
+		SubjectCPULimit: r.runCPULimit,
+		SubjectMemLimit: r.runMemLimit,
 		Passed:          &passed,
 	}
 	if !passed {
@@ -5672,8 +5693,8 @@ func (r *Runner) runCCFCorrectness(tc *config.TestCase, subject config.Subject) 
 		CollectorImage:   r.opts.CollectorImage,
 		ReceiverHostPort: r.opts.ReceiverHostPort,
 		ExtraSubjectEnv:  extraEnv,
-		CPULimit:         subjectCPULimit(tc, r.opts.CPULimit),
-		MemLimit:         subjectMemLimit(tc, r.opts.MemLimit),
+		CPULimit:         r.runCPULimit,
+		MemLimit:         r.runMemLimit,
 	}
 
 	orch, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
@@ -5984,8 +6005,8 @@ func (r *Runner) runHTTPSourceCorrectness(tc *config.TestCase, subject config.Su
 		CollectorImage:   r.opts.CollectorImage,
 		ReceiverHostPort: r.opts.ReceiverHostPort,
 		ExtraSubjectEnv:  extraEnv,
-		CPULimit:         subjectCPULimit(tc, r.opts.CPULimit),
-		MemLimit:         subjectMemLimit(tc, r.opts.MemLimit),
+		CPULimit:         r.runCPULimit,
+		MemLimit:         r.runMemLimit,
 	}
 
 	orch, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
@@ -6215,7 +6236,7 @@ func (r *Runner) runClickHouseTargetCorrectness(tc *config.TestCase, subject con
 	runCfg := orchestrator.RunConfig{
 		TestCase: tc, Subject: subject, ConfigName: configName, ConfigSrcPath: srcCfg, CaseDir: caseDir, TmpDir: tmpDir,
 		GeneratorImage: r.opts.GeneratorImage, ReceiverImage: r.opts.ReceiverImage, CollectorImage: r.opts.CollectorImage,
-		ReceiverHostPort: r.opts.ReceiverHostPort, ExtraSubjectEnv: extraEnv, CPULimit: r.opts.CPULimit, MemLimit: r.opts.MemLimit,
+		ReceiverHostPort: r.opts.ReceiverHostPort, ExtraSubjectEnv: extraEnv, CPULimit: r.runCPULimit, MemLimit: r.runMemLimit,
 	}
 	orch, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
 	if err != nil {
@@ -6399,7 +6420,7 @@ func (r *Runner) saveClickHouseTargetResult(tc *config.TestCase, subject config.
 		IOThroughputAvg: metrics.IOThroughputAvg,
 		LoadAvg1:        metrics.LoadAvg1, LoadAvg5: metrics.LoadAvg5, LoadAvg15: metrics.LoadAvg15,
 		SystemCPUs: sysCPUs, SystemMemMB: sysMemMB,
-		SubjectCPULimit: r.opts.CPULimit, SubjectMemLimit: r.opts.MemLimit,
+		SubjectCPULimit: r.runCPULimit, SubjectMemLimit: r.runMemLimit,
 	}
 	if !passed {
 		result.FailReason = strings.Join(errs, "; ")
@@ -6757,7 +6778,7 @@ func (r *Runner) setupAuxRun(tc *config.TestCase, subject config.Subject, config
 	runCfg := orchestrator.RunConfig{
 		TestCase: tc, Subject: subject, ConfigName: configName, ConfigSrcPath: srcCfg, CaseDir: caseDir, TmpDir: tmpDir,
 		GeneratorImage: r.opts.GeneratorImage, ReceiverImage: r.opts.ReceiverImage, CollectorImage: r.opts.CollectorImage,
-		ReceiverHostPort: r.opts.ReceiverHostPort, ExtraSubjectEnv: extraEnv, CPULimit: r.opts.CPULimit, MemLimit: r.opts.MemLimit,
+		ReceiverHostPort: r.opts.ReceiverHostPort, ExtraSubjectEnv: extraEnv, CPULimit: r.runCPULimit, MemLimit: r.runMemLimit,
 	}
 	orch, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
 	if err != nil {
@@ -6890,7 +6911,7 @@ func (r *Runner) runHTTPVaultCertRotation(tc *config.TestCase, subject config.Su
 	runCfg := orchestrator.RunConfig{
 		TestCase: tc, Subject: subject, ConfigName: configName, ConfigSrcPath: srcCfg, CaseDir: caseDir, TmpDir: tmpDir,
 		GeneratorImage: r.opts.GeneratorImage, ReceiverImage: r.opts.ReceiverImage, CollectorImage: r.opts.CollectorImage,
-		ReceiverHostPort: r.opts.ReceiverHostPort, ExtraSubjectEnv: extraEnv, CPULimit: r.opts.CPULimit, MemLimit: r.opts.MemLimit,
+		ReceiverHostPort: r.opts.ReceiverHostPort, ExtraSubjectEnv: extraEnv, CPULimit: r.runCPULimit, MemLimit: r.runMemLimit,
 	}
 	orch, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
 	if err != nil {
@@ -7089,8 +7110,8 @@ func (r *Runner) runKafkaOffsetCommitRestart(tc *config.TestCase, subject config
 		CollectorImage:   r.opts.CollectorImage,
 		ReceiverHostPort: r.opts.ReceiverHostPort,
 		ExtraSubjectEnv:  extraEnv,
-		CPULimit:         subjectCPULimit(tc, r.opts.CPULimit),
-		MemLimit:         subjectMemLimit(tc, r.opts.MemLimit),
+		CPULimit:         r.runCPULimit,
+		MemLimit:         r.runMemLimit,
 	}
 
 	orch, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
@@ -7369,8 +7390,8 @@ func (r *Runner) runPersistenceFileRestartCorrectness(tc *config.TestCase, subje
 		CollectorImage:   r.opts.CollectorImage,
 		ReceiverHostPort: r.opts.ReceiverHostPort,
 		ExtraSubjectEnv:  extraEnv,
-		CPULimit:         subjectCPULimit(tc, r.opts.CPULimit),
-		MemLimit:         subjectMemLimit(tc, r.opts.MemLimit),
+		CPULimit:         r.runCPULimit,
+		MemLimit:         r.runMemLimit,
 	}
 
 	cr, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
@@ -7536,8 +7557,8 @@ func (r *Runner) runPersistenceFileRestartCorrectness(tc *config.TestCase, subje
 		LoadAvg15:       metrics.LoadAvg15,
 		SystemCPUs:      sysCPUs,
 		SystemMemMB:     sysMemMB,
-		SubjectCPULimit: r.opts.CPULimit,
-		SubjectMemLimit: r.opts.MemLimit,
+		SubjectCPULimit: r.runCPULimit,
+		SubjectMemLimit: r.runMemLimit,
 		Passed:          &passed,
 	}
 	if !passed {
