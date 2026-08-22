@@ -835,8 +835,6 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		LoadAvg15:       metrics.LoadAvg15,
 		SystemCPUs:      sysCPUs,
 		SystemMemMB:     sysMemMB,
-		SubjectCPULimit: r.runCPULimit,
-		SubjectMemLimit: r.runMemLimit,
 		LatencyP50Ms:    recvMetrics.LatencyP50Ms,
 		LatencyP95Ms:    recvMetrics.LatencyP95Ms,
 		LatencyP99Ms:    recvMetrics.LatencyP99Ms,
@@ -1368,8 +1366,6 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 		LoadAvg15:       metrics.LoadAvg15,
 		SystemCPUs:      sysCPUs,
 		SystemMemMB:     sysMemMB,
-		SubjectCPULimit: r.runCPULimit,
-		SubjectMemLimit: r.runMemLimit,
 		Passed:          &passed,
 	}
 	if !passed {
@@ -1689,8 +1685,6 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 		LoadAvg15:       metrics.LoadAvg15,
 		SystemCPUs:      sysCPUs,
 		SystemMemMB:     sysMemMB,
-		SubjectCPULimit: r.runCPULimit,
-		SubjectMemLimit: r.runMemLimit,
 		Passed:          &passed,
 	}
 	if !passed {
@@ -2060,8 +2054,6 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 		LoadAvg15:       metrics.LoadAvg15,
 		SystemCPUs:      sysCPUs,
 		SystemMemMB:     sysMemMB,
-		SubjectCPULimit: r.runCPULimit,
-		SubjectMemLimit: r.runMemLimit,
 		Passed:          &passed,
 	}
 	if !passed {
@@ -3996,8 +3988,6 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 		LoadAvg15:       metrics.LoadAvg15,
 		SystemCPUs:      sysCPUs,
 		SystemMemMB:     sysMemMB,
-		SubjectCPULimit: r.runCPULimit,
-		SubjectMemLimit: r.runMemLimit,
 		Passed:          &passed,
 	}
 	if !passed {
@@ -5529,8 +5519,6 @@ func (r *Runner) saveFleetResult(tc *config.TestCase, subject config.Subject, co
 		LoadAvg15:       metrics.LoadAvg15,
 		SystemCPUs:      sysCPUs,
 		SystemMemMB:     sysMemMB,
-		SubjectCPULimit: r.runCPULimit,
-		SubjectMemLimit: r.runMemLimit,
 		Passed:          &passed,
 	}
 	if !passed {
@@ -6420,7 +6408,6 @@ func (r *Runner) saveClickHouseTargetResult(tc *config.TestCase, subject config.
 		IOThroughputAvg: metrics.IOThroughputAvg,
 		LoadAvg1:        metrics.LoadAvg1, LoadAvg5: metrics.LoadAvg5, LoadAvg15: metrics.LoadAvg15,
 		SystemCPUs: sysCPUs, SystemMemMB: sysMemMB,
-		SubjectCPULimit: r.runCPULimit, SubjectMemLimit: r.runMemLimit,
 	}
 	if !passed {
 		result.FailReason = strings.Join(errs, "; ")
@@ -7557,8 +7544,6 @@ func (r *Runner) runPersistenceFileRestartCorrectness(tc *config.TestCase, subje
 		LoadAvg15:       metrics.LoadAvg15,
 		SystemCPUs:      sysCPUs,
 		SystemMemMB:     sysMemMB,
-		SubjectCPULimit: r.runCPULimit,
-		SubjectMemLimit: r.runMemLimit,
 		Passed:          &passed,
 	}
 	if !passed {
@@ -7606,10 +7591,34 @@ func (r *Runner) runPersistenceFileRestartCorrectness(tc *config.TestCase, subje
 // saveResult persists a run result unless the run was interrupted — a verdict
 // computed after cancellation reflects a half-finished run (waits bail out
 // early on cancel) and must never land in the store.
+//
+// It is also where the subject's effective cgroup ceilings are stamped onto the
+// record. RunResult is hand-built in fourteen places, and six of them never set
+// these two fields, so those runs were filed as unrestricted while the container
+// really ran under a ceiling — worse than unrecorded, because it looks recorded.
+// Setting them at each constructor is how they drifted apart in the first place:
+// every field common to all runs eventually gets retrofitted into fourteen
+// literals and misses some. This function is the single choke point — it wraps
+// the only store.Save call in the package — so stamping here cannot be forgotten
+// by a new run path, and a future common field belongs here too.
+//
+// Safe to do centrally because no flow runs unconstrained: every
+// orchestrator.RunConfig in this file carries CPULimit. When nothing is pinned
+// the values are empty and `omitempty` keeps them out of the JSON, so an
+// unconstrained run is still never recorded as constrained.
+//
+// The stamp lands on the local copy, so it reaches the STORE but not the
+// RunResult returned up to cmd/harness. Nothing reads these fields off the
+// returned value — the console summary ignores them, and the only consumer is
+// results.Store.Save copying them into the persisted entry.
 func (r *Runner) saveResult(result results.RunResult, metricsCSVSrc string) (string, error) {
 	if err := r.ctx.Err(); err != nil {
 		return "", fmt.Errorf("interrupted: %w", err)
 	}
+
+	result.SubjectCPULimit = r.runCPULimit
+	result.SubjectMemLimit = r.runMemLimit
+
 	return r.store.Save(result, metricsCSVSrc)
 }
 

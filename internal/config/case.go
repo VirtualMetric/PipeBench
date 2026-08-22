@@ -135,14 +135,24 @@ type TestCase struct {
 	SubjectImage string `yaml:"subject_image"`
 
 	// SubjectCPULimit and SubjectMemLimit pin the subject container's cgroup
-	// ceilings for this case, overriding the --cpu-limit / --mem-limit flags.
-	// Same syntax as those flags ("2", "0.5"; "512m", "4g").
+	// ceilings for this case. Same syntax as the flags ("2", "0.5"; "512m",
+	// "4g").
 	//
-	// A case needs these when the limits are part of what it asserts rather
-	// than part of how it is being benchmarked — container-awareness cases
-	// have to run constrained or they assert nothing, and relying on the
-	// operator to remember the flags would make a plain run report a product
-	// failure that is really a missing argument.
+	// PRECEDENCE IS THE INVERSE of SubjectImage above — case pin > CLI flag,
+	// not CLI flag > case pin — and the inversion is deliberate. An image pin
+	// says "this case was written against this build", which an operator
+	// testing a different build should be able to override. A limits pin says
+	// "these ceilings are part of what this case ASSERTS", which an operator
+	// flag must not silently change.
+	//
+	// Concretely: director_container_resource_stats_correctness asserts the
+	// director reports exactly 2000 millicores. If --cpu-limit 8 won, a routine
+	// suite run would fail that case and report a product bug that is really a
+	// harness argument — the exact failure the pin exists to prevent.
+	//
+	// The rule for a new pinnable field: if a case sets it to make an assertion
+	// true, the case wins; if it only describes the environment the case was
+	// developed in, the flag wins.
 	SubjectCPULimit string `yaml:"subject_cpu_limit"`
 	SubjectMemLimit string `yaml:"subject_mem_limit"`
 	SubjectVersion  string `yaml:"subject_version"`
