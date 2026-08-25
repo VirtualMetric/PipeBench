@@ -1,0 +1,8 @@
+{"marker":"k8s-degraded-bench","message":"container started","container_id":"containerd://a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1","pod_name":"web-7d4f9c6b8f-abcde","namespace":"default"}
+{"marker":"k8s-degraded-bench","message":"healthcheck ok","container_id":"containerd://b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2","pod_name":"web-7d4f9c6b8f-fghij","namespace":"default"}
+{"marker":"k8s-degraded-bench","message":"request handled","container_id":"containerd://c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3","pod_name":"checkout-5b9d8f7c6-klmno","namespace":"prod"}
+{"marker":"k8s-degraded-bench","message":"cache miss","container_id":"containerd://d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4","pod_name":"checkout-5b9d8f7c6-pqrst","namespace":"prod"}
+{"marker":"k8s-degraded-bench","message":"worker tick","container_id":"containerd://e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5","pod_name":"worker-6c8b7d5f4-uvwxy","namespace":"batch"}
+{"marker":"k8s-degraded-bench","message":"job completed","container_id":"containerd://f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6","pod_name":"worker-6c8b7d5f4-zabcd","namespace":"batch"}
+{"marker":"k8s-degraded-bench","message":"connection accepted","container_id":"containerd://070707070707070707070707070707070707070707070707070707070707","pod_name":"api-gw-8e9c6d5a3-efghi","namespace":"gateway"}
+{"marker":"k8s-degraded-bench","message":"rate limited","container_id":"containerd://080808080808080808080808080808080808080808080808080808080808","pod_name":"api-gw-8e9c6d5a3-jklmn","namespace":"gateway"}

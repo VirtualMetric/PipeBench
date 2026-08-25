@@ -1,0 +1,6 @@
+{"message":"container running","container_id":"containerd://a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1","ns":"prod","pod_hint":"checkout-6c9f9c8b7f-nqx4z"}
+{"message":"healthcheck ok","container_id":"containerd://a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1","ns":"prod","pod_hint":"checkout-6c9f9c8b7f-nqx4z"}
+{"message":"request handled","container_id":"containerd://a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1","ns":"prod","pod_hint":"checkout-6c9f9c8b7f-nqx4z"}
+{"message":"cache refresh","container_id":"containerd://a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1","ns":"prod","pod_hint":"checkout-6c9f9c8b7f-nqx4z"}
+{"message":"order placed","container_id":"containerd://a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1","ns":"prod","pod_hint":"checkout-6c9f9c8b7f-nqx4z"}
+{"message":"order confirmed","container_id":"containerd://a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1","ns":"prod","pod_hint":"checkout-6c9f9c8b7f-nqx4z"}

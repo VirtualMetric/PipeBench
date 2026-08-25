@@ -1,0 +1,49 @@
+devices:
+  - id: 1
+    name: tcp-bench
+    type: tcp
+    properties:
+      address: "0.0.0.0"
+      port: 9000
+
+targets:
+  - name: tcp-target-bench
+    type: tcp
+    properties:
+      address: "receiver"
+      port: 9001
+
+routes:
+  - name: tcp-to-tcp-bench
+    devices:
+      - name: tcp-bench
+    pipelines:
+      - name: k8s-enrich-degraded
+    targets:
+      - name: tcp-target-bench
+
+pipelines:
+  - name: k8s-enrich-degraded
+    processors:
+      # tcp device delivers the raw line in `message`; promote it to root
+      # fields so container_id/pod_name/namespace/marker are addressable.
+      - json:
+          field: message
+          add_to_root: true
+          ignore_missing: true
+          ignore_failure: true
+      - kubernetes:
+          container_id_field: container_id
+          pod_name_field: pod_name
+          namespace_field: namespace
+          target_prefix: k8s
+          # No listener on the bench network at this hostname:port — DNS
+          # resolves nowhere, so the watcher's background LIST never
+          # completes and Synced() never returns true. The URL itself must
+          # still be a well-formed absolute https:// address: NewWatcher's
+          # normalizeOptions rejects anything else (non-https, no host) at
+          # CONSTRUCTION time, before any network use, which would fail the
+          # pipeline outright instead of exercising the degraded path.
+          api_server: "https://k8s-mock-unreachable.invalid:6443"
+          ignore_missing: true
+          ignore_failure: true

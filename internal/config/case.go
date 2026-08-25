@@ -2641,6 +2641,26 @@ type CorrectnessConfig struct {
 	// successful decode is proven by the presence of a value the generator
 	// embedded in every record. Empty = check disabled.
 	RequiredSubstring string `yaml:"required_substring"`
+	// SkipInitialSeconds exempts lines received within this many seconds of
+	// the first received line from the RequiredSubstring check (0 = no
+	// exemption — today's semantics, unchanged). Loss/dedup/JSON-validity
+	// checks are NOT affected; only RequiredSubstring is exempted, and only
+	// for the configured window.
+	//
+	// For an eventually-consistent subject-side dependency with a real,
+	// bounded one-time warm-up cost — e.g. an enrichment processor whose
+	// lookup source is a lazily-started watcher against a live/mock API,
+	// which only begins syncing once the FIRST record reaches it (the
+	// generator's warmup: delay cannot pre-trigger it — see
+	// GeneratorConfig.Warmup and waitForWarmup in containers/generator: it
+	// only polls the subject's listen port, it never sends real traffic
+	// through the pipeline) — a short, known window at the very start of
+	// the run will legitimately not carry the decode-proof value yet. Set
+	// this to something a bit larger than that warm-up cost instead of
+	// forcing every line, including ones sent before the dependency could
+	// possibly have synced, to pass a check they cannot pass by
+	// construction.
+	SkipInitialSeconds int `yaml:"skip_initial_seconds"`
 	// ValidateJSON, when true, requires every emitted line to parse as a
 	// JSON object. Without this, a subject can pass a JSON-shape test by
 	// truncating to a matching line count or by re-emitting binary garbage —

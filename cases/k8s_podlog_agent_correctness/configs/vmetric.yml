@@ -1,0 +1,57 @@
+# Director (subject) config for k8s_podlog_agent_correctness. Mounted at
+# /config.yml, loaded via `-config-path /config.yml` (single-file mode —
+# see cases/AGENT-PROVISIONING.md §4-5 for why devices/targets/routes are
+# fully supported this way, same as a folder-scanned config).
+#
+# proxy_tls is REQUIRED here, not optional decoration: per
+# AGENT-PROVISIONING.md §7b, a standalone director (no `environments:`
+# block, which this config deliberately has none of) disables its raw
+# NATS client port and assigns the WebSocket port dynamically
+# (helper/vmmq/server/server.go resolveVMMQServer) — the only externally
+# dialable, fixed endpoint for an agent to connect to is this proxy_tls
+# listener. Port 8443 is a bench-arbitrary choice that MUST match the
+# `wss://subject:8443` embedded in the agent's VMETRIC_CONFIG_HASH
+# (../case.yaml). NOT CONFIRMED to be sufficient by a passing run — see
+# the case README's "Known gaps" section.
+proxy_tls:
+  status: true
+  mode: self-signed
+  port: 8443
+
+devices:
+  - id: 42
+    name: k8s-agent-device
+    type: linux
+    status: true
+    definitions:
+      # name must match the controller constant: linux_kubernetes_pod_log_collector
+      # (docs/collectors/kubernetes-pod-logs-dataset.md, §1)
+      - name: linux_kubernetes_pod_log_collector
+        status: true
+        inputs:
+          - name: pod-logs
+            status: true
+            properties:
+              # /data is the shared-data volume the agent container mounts
+              # (mounts_shared_data: true in case.yaml) and seeds before
+              # starting. Real kubelet layout is /var/log/pods/*/*/*.log;
+              # this case roots it under /data/pods instead since /data is
+              # the only writable, agent-visible location the harness gives
+              # this container — same directory-naming CONVENTION
+              # (<ns>_<pod>_<uid>/<container>/N.log), different root.
+              path: "/data/pods/*/*/*.log"
+              start_date: -1 # don't filter by file mtime; the seeded file is written at container start
+
+targets:
+  - name: tcp-target-bench
+    type: tcp
+    properties:
+      address: "receiver"
+      port: 9001
+
+routes:
+  - name: k8s-agent-to-tcp-bench
+    devices:
+      - name: k8s-agent-device
+    targets:
+      - name: tcp-target-bench

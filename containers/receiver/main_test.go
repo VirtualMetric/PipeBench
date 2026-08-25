@@ -83,3 +83,56 @@ func TestStampingReaderFirstNsStable(t *testing.T) {
 		t.Fatal("lastNs not refreshed on second read")
 	}
 }
+
+// TestRequiredSubstringSkipInitialSeconds covers config.SkipInitialSeconds:
+// a line missing the required substring is exempt from the check while it
+// lands within the configured window of the first-ever line, and is caught
+// exactly as before once that window has elapsed. SkipInitialSeconds: 0
+// (unset) must reproduce today's strict, no-exemption behavior unchanged.
+func TestRequiredSubstringSkipInitialSeconds(t *testing.T) {
+	t.Run("zero value is fully backward compatible", func(t *testing.T) {
+		v := newValidator()
+		cfg := config{RequiredSubstring: "TOKEN"}
+		v.recordLine([]byte("missing the marker"), cfg)
+		passed, errs := v.validate(cfg, 1)
+		if passed {
+			t.Fatalf("expected failure with SkipInitialSeconds unset, got passed=true errs=%v", errs)
+		}
+	})
+
+	t.Run("line within the skip window is exempt", func(t *testing.T) {
+		v := newValidator()
+		cfg := config{RequiredSubstring: "TOKEN", SkipInitialSeconds: 5}
+		// First line stamps firstLineNs to "now" — this line is itself
+		// within the window (elapsed ~0s < 5s), so it is exempt even
+		// though it is missing the substring.
+		v.recordLine([]byte("missing the marker"), cfg)
+		passed, errs := v.validate(cfg, 1)
+		if !passed {
+			t.Fatalf("expected pass for a line inside the skip window, got errs=%v", errs)
+		}
+	})
+
+	t.Run("line after the skip window is still caught", func(t *testing.T) {
+		v := newValidator()
+		cfg := config{RequiredSubstring: "TOKEN", SkipInitialSeconds: 5}
+		// Backdate firstLineNs (no real sleep — keeps the test fast) so the
+		// very next line lands well past the 5s window.
+		v.firstLineNs.Store(time.Now().Add(-10 * time.Second).UnixNano())
+		v.recordLine([]byte("missing the marker"), cfg)
+		passed, errs := v.validate(cfg, 1)
+		if passed {
+			t.Fatalf("expected failure for a line past the skip window, got passed=true errs=%v", errs)
+		}
+	})
+
+	t.Run("matching lines pass regardless of the window", func(t *testing.T) {
+		v := newValidator()
+		cfg := config{RequiredSubstring: "TOKEN", SkipInitialSeconds: 5}
+		v.recordLine([]byte("has the TOKEN right here"), cfg)
+		passed, errs := v.validate(cfg, 1)
+		if !passed {
+			t.Fatalf("expected pass for a matching line, got errs=%v", errs)
+		}
+	})
+}

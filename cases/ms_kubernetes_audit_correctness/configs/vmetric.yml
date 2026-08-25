@@ -1,0 +1,558 @@
+# Routes raw Kubernetes audit.k8s.io/v1 Event JSON through an inlined copy
+# of the ms_kubernetes_audit content pack (helper/pipeline/content/microsoft/
+# ms_kubernetes_audit/{ms_kubernetes_audit.yml,ms_kubernetes_audit_audit_event.yml}).
+#
+# Inlined, not referenced by name: PipeBench's vmetric/director image
+# (cmd/director/Dockerfile) ships only the compiled director binary — it
+# does not embed or mount helper/pipeline/content/**, and there is no
+# content-dir loader in file-config ("flat config.yml") director mode. A
+# route can only resolve a `pipeline:` processor step's `name:` against
+# pipelines defined in this same file's top-level `pipelines:` list, so both
+# pack pipelines are copied here verbatim.
+#
+# IMPORTANT — a `pipeline:` processor step's `name:` MUST keep the packaged
+# `'{{ IngestPipeline "target_name" }}'` wrapper syntax, even in this
+# flat-file config with no platform/DB behind it. This is NOT a templating
+# feature that needs separate registration: PipelineProcessor.ProcessBase
+# (helper/pipeline/pipeline.go) parses `name:` via ParseIngestPipelineName,
+# which regex-matches `{\s*IngestPipeline\s*"([^"]+)"\s*\}`
+# (helper/pipeline/regex.go) — a BARE pipeline name with no wrapper fails
+# that regex ("invalid pipeline reference format"), and because the
+# `pipeline:` step has no `on_failure:` block, PipelineProcessor.Process
+# swallows that error as a normal return (writeError + an empty
+# RunProcessors call), so the case fails completely silently: no crash, no
+# stdout (this director build logs nothing to stdout by default), the
+# receiver just sees 0 lines forever. Confirmed by bisection: the outer
+# wrapper alone (this step replaced with a plain `set:`) passes cleanly;
+# restoring the `pipeline:` step with a bare name reproduces 100% loss;
+# restoring the exact `{{ IngestPipeline "..." }}` wrapper fixes it. Only
+# the STEP-level reference needs this — a pipeline's own top-level `name:`
+# in the `pipelines:` list below is looked up directly by FindPipeline and
+# stays a bare string.
+#
+# The conditional `ms_kubernetes_audit_drop` optimization pipeline call is
+# dropped entirely — its guard (`_vmetric.conf.optimization.status == true`)
+# is never true here since this config never sets that field, so omitting
+# it changes no observed behavior.
+devices:
+  - id: 1
+    name: tcp-bench
+    type: tcp
+    properties:
+      address: "0.0.0.0"
+      port: 9000
+
+targets:
+  - name: tcp-target-bench
+    type: tcp
+    properties:
+      address: "receiver"
+      port: 9001
+
+routes:
+  - name: tcp-to-tcp-bench
+    devices:
+      - name: tcp-bench
+    pipelines:
+      - name: ms_kubernetes_audit
+    targets:
+      - name: tcp-target-bench
+
+pipelines:
+  # --- ms_kubernetes_audit.yml (entry pipeline) -----------------------
+  - name: ms_kubernetes_audit
+    processors:
+      - syslog:
+          if: 'log == nil && message != nil && message startsWith "<"'
+          field: message
+          ignore_failure: true
+          on_success:
+            - set:
+                if: log?.syslog?.message != nil
+                field: message
+                value: "{{{log.syslog.message}}}"
+      - json:
+          if: message != nil
+          field: message
+          add_to_root: true
+          ignore_failure: true
+      - json:
+          if: 'properties?.log != nil && type(properties.log) == "string"'
+          field: properties.log
+          add_to_root: true
+          ignore_failure: true
+      - move:
+          if: 'properties?.log != nil && type(properties.log) != "string" && verb == nil'
+          fields: ["properties.log.*"]
+          move_to_root: true
+          override: true
+      - set:
+          if: 'category != nil'
+          field: _k8s_aks_category
+          copy_from: category
+          ignore_missing: true
+      - set:
+          if: 'resourceId != nil'
+          field: _k8s_aks_resource_id
+          copy_from: resourceId
+          ignore_missing: true
+      - set:
+          if: 'properties?.pod != nil'
+          field: _k8s_aks_pod
+          copy_from: properties.pod
+          ignore_missing: true
+      - set:
+          if: 'properties?.containerID != nil'
+          field: _k8s_aks_container_id
+          copy_from: properties.containerID
+          ignore_missing: true
+      - rename:
+          field: level
+          target_field: _k8s_level
+          ignore_missing: true
+      - date:
+          if: 'requestReceivedTimestamp != nil && requestReceivedTimestamp != ""'
+          field: requestReceivedTimestamp
+          target_field: TimeGenerated
+          formats:
+            - ISO8601_MS
+            - ISO8601
+            - AUTO
+          ignore_failure: true
+      - date:
+          if: 'TimeGenerated == nil && stageTimestamp != nil && stageTimestamp != ""'
+          field: stageTimestamp
+          target_field: TimeGenerated
+          formats:
+            - ISO8601_MS
+            - ISO8601
+            - AUTO
+          ignore_failure: true
+      - date:
+          if: 'TimeGenerated == nil && time != nil && time != ""'
+          field: time
+          target_field: TimeGenerated
+          formats:
+            - ISO8601_MS
+            - ISO8601
+            - AUTO
+          ignore_failure: true
+      - date:
+          if: TimeGenerated == nil && @timestamp == nil
+          field: _vmetric.event.timestamp
+          target_field: "@timestamp"
+          ignore_missing: true
+          ignore_failure: true
+      - set:
+          if: TimeGenerated == nil
+          field: TimeGenerated
+          copy_from: "@timestamp"
+          ignore_missing: true
+      - set:
+          field: EventStartTime
+          copy_from: TimeGenerated
+          ignore_missing: true
+      - set:
+          field: EventEndTime
+          copy_from: TimeGenerated
+          ignore_missing: true
+      - pipeline:
+          description: Kubernetes audit log (audit.k8s.io/v1) - ASIM Audit Event
+          if: '_vmetric?.event_processed != true && verb != nil'
+          name: '{{ IngestPipeline "ms_kubernetes_audit_audit_event" }}'
+          on_success:
+            - set:
+                field: _vmetric.event_processed
+                value: true
+      - drop:
+          if: '_vmetric?.event_processed != true'
+
+  # --- ms_kubernetes_audit_audit_event.yml (ASIM normalizer) ---------
+  - name: ms_kubernetes_audit_audit_event
+    processors:
+      - create_table:
+          name: "ASimAuditEventLogs"
+      - set:
+          field: $ASimAuditEventLogs.TimeGenerated
+          copy_from: TimeGenerated
+          ignore_missing: true
+      - set:
+          field: $ASimAuditEventLogs.EventCount
+          value: 1
+      - set:
+          field: $ASimAuditEventLogs.EventProduct
+          value: "Kubernetes"
+      - set:
+          field: $ASimAuditEventLogs.EventVendor
+          value: "Kubernetes"
+      - set:
+          field: $ASimAuditEventLogs.EventSchema
+          value: "AuditEvent"
+      - set:
+          field: $ASimAuditEventLogs.EventSchemaVersion
+          value: "0.1.0"
+      - set:
+          field: $ASimAuditEventLogs.EventStartTime
+          copy_from: TimeGenerated
+          if: "TimeGenerated != nil"
+      - set:
+          field: $ASimAuditEventLogs.EventEndTime
+          copy_from: $ASimAuditEventLogs.EventStartTime
+          if: "$ASimAuditEventLogs.EventStartTime != nil"
+      - date:
+          if: 'stageTimestamp != nil && stageTimestamp != ""'
+          field: stageTimestamp
+          target_field: $ASimAuditEventLogs.EventEndTime
+          formats:
+            - ISO8601_MS
+            - ISO8601
+            - AUTO
+          ignore_failure: true
+      - set:
+          field: $ASimAuditEventLogs.EventOriginalUid
+          copy_from: auditID
+          if: 'auditID != nil && auditID != ""'
+          ignore_missing: true
+      - set:
+          field: $ASimAuditEventLogs.EventOriginalType
+          copy_from: stage
+          if: 'stage != nil && stage != ""'
+          ignore_missing: true
+      - set:
+          field: $ASimAuditEventLogs.EventType
+          value: "Other"
+      - set:
+          field: $ASimAuditEventLogs.EventType
+          value: "Create"
+          if: 'verb != nil && verb == "create"'
+      - set:
+          field: $ASimAuditEventLogs.EventType
+          value: "Read"
+          if: 'verb != nil && (verb == "get" || verb == "list" || verb == "watch")'
+      - set:
+          field: $ASimAuditEventLogs.EventType
+          value: "Update"
+          if: 'verb != nil && (verb == "update" || verb == "patch")'
+      - set:
+          field: $ASimAuditEventLogs.EventType
+          value: "Delete"
+          if: 'verb != nil && (verb == "delete" || verb == "deletecollection")'
+      - set:
+          field: $ASimAuditEventLogs.EventResult
+          value: "Success"
+      - set:
+          field: $ASimAuditEventLogs.EventResult
+          value: "Failure"
+          if: 'responseStatus?.code != nil && responseStatus.code >= 400'
+      - set:
+          field: $ASimAuditEventLogs.EventResult
+          value: "Failure"
+          if: 'annotations != nil && annotations["authorization.k8s.io/decision"] != nil && (annotations["authorization.k8s.io/decision"] == "forbid" || annotations["authorization.k8s.io/decision"] == "deny")'
+      - set:
+          field: $ASimAuditEventLogs.EventResultDetails
+          copy_from: responseStatus.code
+          if: 'responseStatus?.code != nil'
+          ignore_missing: true
+      - convert:
+          field: $ASimAuditEventLogs.EventResultDetails
+          type: string
+          if: '$ASimAuditEventLogs.EventResultDetails != nil'
+          ignore_missing: true
+          ignore_failure: true
+      - set:
+          field: $ASimAuditEventLogs.EventOriginalResultDetails
+          copy_from: responseStatus.reason
+          if: 'responseStatus?.reason != nil && responseStatus.reason != ""'
+          ignore_missing: true
+      - set:
+          field: $ASimAuditEventLogs.EventOriginalResultDetails
+          copy_from: stage
+          if: '$ASimAuditEventLogs.EventOriginalResultDetails == nil && stage != nil && stage != ""'
+          ignore_missing: true
+      - set:
+          field: $ASimAuditEventLogs.Operation
+          value: "{{{verb}}} {{{objectRef.resource}}}"
+          if: 'verb != nil && objectRef?.resource != nil && objectRef.resource != ""'
+      - set:
+          field: $ASimAuditEventLogs.Operation
+          copy_from: verb
+          if: '$ASimAuditEventLogs.Operation == nil && verb != nil && verb != ""'
+          ignore_missing: true
+      - set:
+          field: $ASimAuditEventLogs.EventMessage
+          value: "{{{verb}}} {{{requestURI}}}"
+          if: 'verb != nil && requestURI != nil && requestURI != ""'
+      - set:
+          field: $ASimAuditEventLogs.Object
+          value: "{{{objectRef.namespace}}}/{{{objectRef.name}}}"
+          if: 'objectRef?.namespace != nil && objectRef.namespace != "" && objectRef?.name != nil && objectRef.name != ""'
+      - set:
+          field: $ASimAuditEventLogs.Object
+          copy_from: objectRef.name
+          if: '$ASimAuditEventLogs.Object == nil && objectRef?.name != nil && objectRef.name != ""'
+          ignore_missing: true
+      - set:
+          field: $ASimAuditEventLogs.Object
+          copy_from: requestURI
+          if: '$ASimAuditEventLogs.Object == nil && requestURI != nil && requestURI != ""'
+          ignore_missing: true
+      - set:
+          field: $ASimAuditEventLogs.Object
+          value: "{{{Object}}}/{{{objectRef.subresource}}}"
+          if: '$ASimAuditEventLogs.Object != nil && $ASimAuditEventLogs.Object != "Unknown" && objectRef?.subresource != nil && objectRef.subresource != ""'
+      - set:
+          field: $ASimAuditEventLogs.OriginalObjectType
+          copy_from: objectRef.resource
+          if: 'objectRef?.resource != nil && objectRef.resource != ""'
+          ignore_missing: true
+      - set:
+          field: $ASimAuditEventLogs.OriginalObjectType
+          value: "{{{objectRef.resource}}}/{{{objectRef.subresource}}}"
+          if: 'objectRef?.resource != nil && objectRef.resource != "" && objectRef?.subresource != nil && objectRef.subresource != ""'
+      - set:
+          field: $ASimAuditEventLogs.ObjectType
+          value: "User"
+          if: 'objectRef?.resource != nil && (objectRef.resource == "users" || objectRef.resource == "serviceaccounts")'
+      - set:
+          field: $ASimAuditEventLogs.ObjectType
+          value: "Other"
+          if: "$ASimAuditEventLogs.ObjectType == nil && $ASimAuditEventLogs.Object != nil"
+      - set:
+          field: $ASimAuditEventLogs.Object
+          value: "Unknown"
+          if: "$ASimAuditEventLogs.Object == nil"
+      - set:
+          field: $ASimAuditEventLogs.ObjectType
+          value: "Other"
+          if: "$ASimAuditEventLogs.ObjectType == nil"
+      - set:
+          field: $ASimAuditEventLogs.ActorUsername
+          copy_from: user.username
+          if: 'user?.username != nil && user.username != ""'
+          ignore_missing: true
+      - set:
+          field: $ASimAuditEventLogs.ActorUsernameType
+          value: "Simple"
+          if: "$ASimAuditEventLogs.ActorUsername != nil"
+      - set:
+          field: $ASimAuditEventLogs.ActorUserId
+          copy_from: user.uid
+          if: 'user?.uid != nil && user.uid != ""'
+          ignore_missing: true
+      - set:
+          field: $ASimAuditEventLogs.ActorUserType
+          value: "Regular"
+          if: "$ASimAuditEventLogs.ActorUsername != nil"
+      - foreach:
+          field: user.groups
+          ignore_missing: true
+          ignore_failure: true
+          processor:
+            set:
+              field: _k8s_is_admin
+              value: true
+              if: '_ingest._value == "system:masters"'
+              ignore_missing: true
+              ignore_failure: true
+      - set:
+          field: $ASimAuditEventLogs.ActorUserType
+          value: "Admin"
+          if: '_k8s_is_admin == true'
+      - set:
+          field: $ASimAuditEventLogs.ActorUserType
+          value: "System"
+          if: '_k8s_is_admin != true && $ASimAuditEventLogs.ActorUsername != nil && $ASimAuditEventLogs.ActorUsername startsWith "system:" && !($ASimAuditEventLogs.ActorUsername startsWith "system:serviceaccount")'
+      - set:
+          field: $ASimAuditEventLogs.ActorUserType
+          value: "Service"
+          if: '_k8s_is_admin != true && $ASimAuditEventLogs.ActorUsername != nil && $ASimAuditEventLogs.ActorUsername startsWith "system:serviceaccount"'
+      - set:
+          field: TargetUsername
+          copy_from: impersonatedUser.username
+          if: 'impersonatedUser?.username != nil && impersonatedUser.username != ""'
+          ignore_missing: true
+      - set:
+          field: TargetUsernameType
+          value: "Simple"
+          if: "TargetUsername != nil"
+      - foreach:
+          field: sourceIPs
+          ignore_missing: true
+          ignore_failure: true
+          processor:
+            set:
+              field: _k8s_src_ip0
+              copy_from: _ingest._value
+              if: "_k8s_src_ip0 == nil"
+              ignore_missing: true
+              ignore_failure: true
+      - set:
+          field: $ASimAuditEventLogs.SrcIpAddr
+          copy_from: _k8s_src_ip0
+          if: '_k8s_src_ip0 != nil && _k8s_src_ip0 != ""'
+          ignore_missing: true
+      - set:
+          field: $ASimAuditEventLogs.HttpUserAgent
+          copy_from: userAgent
+          if: 'userAgent != nil && userAgent != ""'
+          ignore_missing: true
+      - set:
+          field: $ASimAuditEventLogs.EventSeverity
+          value: "Informational"
+      - set:
+          field: $ASimAuditEventLogs.EventSeverity
+          value: "Low"
+          if: '$ASimAuditEventLogs.EventResult == "Failure"'
+      - set:
+          field: $ASimAuditEventLogs.EventSeverity
+          value: "Medium"
+          if: 'verb != nil && verb == "delete" && objectRef?.resource != nil && (objectRef.resource == "secrets" || objectRef.resource == "clusterrolebindings" || objectRef.resource == "namespaces")'
+      - set:
+          field: $ASimAuditEventLogs.EventSeverity
+          value: "Medium"
+          if: 'verb != nil && verb == "create" && objectRef?.resource != nil && objectRef.resource == "tokenreviews"'
+      - set:
+          field: $ASimAuditEventLogs.EventSeverity
+          value: "Medium"
+          if: 'verb != nil && verb == "get" && objectRef?.resource != nil && objectRef.resource == "secrets"'
+      - set:
+          field: $ASimAuditEventLogs.EventSeverity
+          value: "High"
+          if: '$ASimAuditEventLogs.ActorUsername != nil && $ASimAuditEventLogs.ActorUsername == "system:anonymous"'
+      - set:
+          field: AdditionalFields.K8sAuditId
+          copy_from: auditID
+          if: 'auditID != nil && auditID != ""'
+          ignore_missing: true
+      - set:
+          field: AdditionalFields.K8sStage
+          copy_from: stage
+          if: 'stage != nil && stage != ""'
+          ignore_missing: true
+      - set:
+          field: AdditionalFields.K8sVerb
+          copy_from: verb
+          if: 'verb != nil && verb != ""'
+          ignore_missing: true
+      - set:
+          field: AdditionalFields.K8sRequestUri
+          copy_from: requestURI
+          if: 'requestURI != nil && requestURI != ""'
+          ignore_missing: true
+      - set:
+          field: AdditionalFields.K8sLevel
+          copy_from: _k8s_level
+          if: '_k8s_level != nil && _k8s_level != ""'
+          ignore_missing: true
+      - set:
+          field: AdditionalFields.K8sResource
+          copy_from: objectRef.resource
+          if: 'objectRef?.resource != nil && objectRef.resource != ""'
+          ignore_missing: true
+      - set:
+          field: AdditionalFields.K8sNamespace
+          copy_from: objectRef.namespace
+          if: 'objectRef?.namespace != nil && objectRef.namespace != ""'
+          ignore_missing: true
+      - set:
+          field: AdditionalFields.K8sName
+          copy_from: objectRef.name
+          if: 'objectRef?.name != nil && objectRef.name != ""'
+          ignore_missing: true
+      - set:
+          field: AdditionalFields.K8sApiGroup
+          copy_from: objectRef.apiGroup
+          if: 'objectRef?.apiGroup != nil && objectRef.apiGroup != ""'
+          ignore_missing: true
+      - set:
+          field: AdditionalFields.K8sApiVersion
+          copy_from: objectRef.apiVersion
+          if: 'objectRef?.apiVersion != nil && objectRef.apiVersion != ""'
+          ignore_missing: true
+      - set:
+          field: AdditionalFields.K8sSubresource
+          copy_from: objectRef.subresource
+          if: 'objectRef?.subresource != nil && objectRef.subresource != ""'
+          ignore_missing: true
+      - set:
+          field: AdditionalFields.K8sUid
+          copy_from: objectRef.uid
+          if: 'objectRef?.uid != nil && objectRef.uid != ""'
+          ignore_missing: true
+      - set:
+          field: AdditionalFields.K8sUser
+          copy_from: user.username
+          if: 'user?.username != nil && user.username != ""'
+          ignore_missing: true
+      - set:
+          field: AdditionalFields.K8sImpersonatedUser
+          copy_from: impersonatedUser.username
+          if: 'impersonatedUser?.username != nil && impersonatedUser.username != ""'
+          ignore_missing: true
+      - set:
+          field: AdditionalFields.K8sUserGroups
+          copy_from: user.groups
+          if: 'user?.groups != nil'
+          ignore_missing: true
+      - join:
+          field: AdditionalFields.K8sUserGroups
+          separator: ","
+          if: "AdditionalFields?.K8sUserGroups != nil"
+          ignore_failure: true
+      - set:
+          field: AdditionalFields.K8sResponseCode
+          copy_from: responseStatus.code
+          if: 'responseStatus?.code != nil'
+          ignore_missing: true
+      - set:
+          field: AdditionalFields.K8sResponseReason
+          copy_from: responseStatus.reason
+          if: 'responseStatus?.reason != nil && responseStatus.reason != ""'
+          ignore_missing: true
+      - set:
+          field: AdditionalFields.K8sDecision
+          copy_from: annotations["authorization.k8s.io/decision"]
+          if: 'annotations != nil && annotations["authorization.k8s.io/decision"] != nil && annotations["authorization.k8s.io/decision"] != ""'
+          ignore_missing: true
+      - set:
+          field: AdditionalFields.K8sReason
+          copy_from: annotations["authorization.k8s.io/reason"]
+          if: 'annotations != nil && annotations["authorization.k8s.io/reason"] != nil && annotations["authorization.k8s.io/reason"] != ""'
+          ignore_missing: true
+      - set:
+          field: AdditionalFields.K8sAzureResourceId
+          copy_from: _k8s_aks_resource_id
+          if: '_k8s_aks_resource_id != nil && _k8s_aks_resource_id != ""'
+          ignore_missing: true
+      - set:
+          field: AdditionalFields.K8sAzureCategory
+          copy_from: _k8s_aks_category
+          if: '_k8s_aks_category != nil && _k8s_aks_category != ""'
+          ignore_missing: true
+      - set:
+          field: AdditionalFields.K8sAzurePod
+          copy_from: _k8s_aks_pod
+          if: '_k8s_aks_pod != nil && _k8s_aks_pod != ""'
+          ignore_missing: true
+      - set:
+          field: AdditionalFields.K8sAzureContainerID
+          copy_from: _k8s_aks_container_id
+          if: '_k8s_aks_container_id != nil && _k8s_aks_container_id != ""'
+          ignore_missing: true
+      - join_kv:
+          if: "AdditionalFields != nil"
+          field: AdditionalFields
+          target_field: $ASimAuditEventLogs.AdditionalFields
+          separator: " "
+          kv_separator: "="
+      - remove:
+          field:
+            - _k8s_src_ip0
+            - _k8s_is_admin
+            - _k8s_aks_category
+            - _k8s_aks_resource_id
+            - _k8s_aks_pod
+            - _k8s_aks_container_id
+          ignore_missing: true
+      - use_table:
+          name: "ASimAuditEventLogs"

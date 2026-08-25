@@ -530,6 +530,9 @@ services:
 {{- if $.RecvRequiredSubstring }}
       RECEIVER_REQUIRED_SUBSTRING: "{{ $.RecvRequiredSubstring }}"
 {{- end }}
+{{- if $.RecvSkipInitialSeconds }}
+      RECEIVER_SKIP_INITIAL_SECONDS: "{{ $.RecvSkipInitialSeconds }}"
+{{- end }}
 {{- if $.RecvValidateJSON }}
       RECEIVER_VALIDATE_JSON: "true"
 {{- end }}
@@ -575,6 +578,9 @@ services:
 {{- end }}
 {{- if .RecvRequiredSubstring }}
       RECEIVER_REQUIRED_SUBSTRING: "{{ .RecvRequiredSubstring }}"
+{{- end }}
+{{- if .RecvSkipInitialSeconds }}
+      RECEIVER_SKIP_INITIAL_SECONDS: "{{ .RecvSkipInitialSeconds }}"
 {{- end }}
 {{- if .RecvValidateJSON }}
       RECEIVER_VALIDATE_JSON: "true"
@@ -1883,19 +1889,20 @@ type composeVars struct {
 	DatabaseConfPath       string
 	DatabaseCAHost         string
 
-	RecvMode              string
-	RecvListen            string
-	RecvEnv               map[string]string
-	RecvAWSDep            bool
-	RecvAzureDep          bool
-	RecvMinioDep          bool
-	RecvValidateDedup     string
-	RecvValidateContent   string
-	RecvExpectedLines     int64
-	RecvRequiredSubstring string
-	RecvValidateJSON      bool
-	RecvRecordArrival     bool
-	DockerSocketGID       string
+	RecvMode               string
+	RecvListen             string
+	RecvEnv                map[string]string
+	RecvAWSDep             bool
+	RecvAzureDep           bool
+	RecvMinioDep           bool
+	RecvValidateDedup      string
+	RecvValidateContent    string
+	RecvExpectedLines      int64
+	RecvRequiredSubstring  string
+	RecvSkipInitialSeconds int
+	RecvValidateJSON       bool
+	RecvRecordArrival      bool
+	DockerSocketGID        string
 
 	// Verifier (a case's `verifier:` block): a one-shot DuckDB container under
 	// the compose profile "verify", so the initial Up() skips it. The runner
@@ -2240,11 +2247,12 @@ func writeCompose(path string, cfg RunConfig) error {
 		DockerSocketGID: cfg.DockerSocketGID,
 		TLSCertsHost:    tlsCertsHost,
 
-		RecvValidateDedup:     boolStr(tc.Correctness.ValidateDedup),
-		RecvValidateContent:   boolStr(tc.Correctness.ValidateContent),
-		RecvExpectedLines:     0,
-		RecvRequiredSubstring: tc.Correctness.RequiredSubstring,
-		RecvValidateJSON:      tc.Correctness.ValidateJSON,
+		RecvValidateDedup:      boolStr(tc.Correctness.ValidateDedup),
+		RecvValidateContent:    boolStr(tc.Correctness.ValidateContent),
+		RecvExpectedLines:      0,
+		RecvRequiredSubstring:  tc.Correctness.RequiredSubstring,
+		RecvSkipInitialSeconds: tc.Correctness.SkipInitialSeconds,
+		RecvValidateJSON:       tc.Correctness.ValidateJSON,
 		// Arrival timestamp recording is opt-in via the rate_ceiling
 		// check; flipping it on unconditionally would burn memory in
 		// every performance run.

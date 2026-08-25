@@ -1,0 +1,82 @@
+name: k8s_podlog_agent_correctness
+type: correctness
+description: >-
+  Spike case exercising PipeBench's previously-unused `agent:` mechanism for
+  real: a linux vmetric-agent (baked into vmetric/director-enterprise:dev)
+  runs the linux_kubernetes_pod_log_collector dataset against a
+  kubelet-shaped pod-log path (<ns>_<pod>_<uid>/<container>/0.log) seeded
+  with CRI-formatted JSON lines, and forwards the decoded records through a
+  director route to a plain TCP receiver. There is no `generator:` — the
+  agent container seeds its own input before starting the real agent
+  process (see README.md in this directory for why, and
+  cases/AGENT-PROVISIONING.md for the full provisioning contract this case
+  is built from).
+
+duration: 45s
+warmup: 15s
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+subjects:
+  - vmetric
+
+# No `generator:` block: this case has no data source that sends TO the
+# subject. The agent (below) is the sole data producer, matching the
+# documented "agentless deploy" shape CorrectnessConfig.MinReceived exists
+# for (internal/config/case.go: "e.g. an agentless deploy that collects
+# from an endpoint and forwards to the receiver" — a genuine agent-hosted
+# collector is the same shape from the harness's point of view).
+
+agent:
+  image: "vmetric/director-enterprise:dev"
+  mounts_shared_data: true
+  # The enterprise image's default ENTRYPOINT runs the director (see
+  # AGENT-PROVISIONING.md §4), so this overrides command+entrypoint to run
+  # the baked agent binary instead. Before that, it seeds the pod-log file
+  # itself: neither Endpoint (no shared-data mount) nor the file generator
+  # (no MkdirAll on its target) can create the nested kubelet-shaped
+  # directory PipeBench's harness would otherwise need pre-created — see
+  # AGENT-PROVISIONING.md §7a for the full gap writeup. Doing the seeding
+  # here, before `exec`-ing the agent, avoids the ordering race that an
+  # endpoint- or generator-based seed would have had against this same
+  # container.
+  command:
+    - "sh"
+    - "-c"
+    - >-
+      set -e;
+      dir=/data/pods/bench-ns_bench-pod_11111111-2222-3333-4444-555555555555/app;
+      mkdir -p "$dir";
+      i=0;
+      while [ "$i" -lt 200 ]; do
+        printf '{"time":"2024-01-01T00:00:00.000000000Z","stream":"stdout","log":"benchline %s\n"}\n' "$i" >> "$dir/0.log";
+        i=$((i+1));
+      done;
+      exec /opt/vmetric/package/agent/linux/amd64/vmetric-agent
+  env:
+    # base64("wss://subject:8443;;42;0") — see AGENT-PROVISIONING.md §2a for
+    # the field layout (director-address;director-token;deviceID;0) and §7b
+    # for why the address/port (wss://subject:8443) and empty token are
+    # BEST-GUESS values, not confirmed by a passing run: the standalone
+    # director's raw NATS/WS port is documented as dynamically-assigned and
+    # not externally reachable, so proxy_tls (configs/vmetric.yml, port
+    # 8443) is believed to be the actual dial target, but this composition
+    # was not proven end-to-end in the time available.
+    VMETRIC_CONFIG_HASH: "d3NzOi8vc3ViamVjdDo4NDQzOzs0Mjsw"
+
+correctness:
+  # No generator in this case, so MinReceived (not expected_loss_pct) is the
+  # verdict floor — see CorrectnessConfig.MinReceived's doc comment.
+  min_received: 150
+  # Proves the 200 seeded lines' payload text survived CRI-decode + pipeline
+  # + TCP transport intact (not proof of the {"time","stream","log"}
+  # envelope being *parsed* specifically — see README.md "Known gaps" for
+  # why a more rigorous shape-specific assertion needs a real run to derive
+  # from the agent's actual CRI-decoded output format).
+  required_substring: "benchline"
+
+configurations:
+  default:
+    description: "Single linux agent, single pod-log input, TCP passthrough to receiver"

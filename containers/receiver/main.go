@@ -33,6 +33,21 @@ type config struct {
 	RequiredSubstring string // empty = don't check; protocol-agnostic decode check
 	ValidateJSON      bool   // every emitted line must parse as JSON
 
+	// SkipInitialSeconds exempts lines received within this many seconds of
+	// the FIRST line from the RequiredSubstring check (0 = no exemption,
+	// today's all-lines semantics — fully backward compatible). Exists for
+	// eventually-consistent subject-side dependencies with a real, bounded
+	// one-time warm-up cost that a synthetic decode-proof value can't reach
+	// until they converge — e.g. a processor whose enrichment source is a
+	// lazily-started watcher against a live/mock API: the watcher only
+	// begins syncing once the first record reaches it (warmup: cannot
+	// pre-trigger it — see GeneratorConfig's Warmup doc), so a short,
+	// known window at the very start of the run will legitimately not
+	// carry the enrichment value yet. Loss/dedup/JSON-validity checks are
+	// NOT affected — this only exempts the RequiredSubstring check, and
+	// only for the configured window.
+	SkipInitialSeconds int
+
 	// RecordArrivalTimes, when true, has the receiver capture the
 	// wall-clock arrival nanosecond of every record into an in-memory
 	// slice exposed at /arrival_times. Used by the harness's
@@ -207,6 +222,13 @@ type validator struct {
 	missingSubstr     atomic.Int64
 	missingSubstrSamp []string
 
+	// firstLineNs is the wall-clock nanosecond of the first line recordLine
+	// ever saw, CAS-set once. Anchors SkipInitialSeconds: lines within that
+	// many seconds of THIS (not process start — the receiver listens
+	// before the generator's warmup delay even elapses) are exempt from
+	// the required-substring check.
+	firstLineNs atomic.Int64
+
 	// JSON-validity check: every emitted line must parse as a JSON value.
 	// Enabled by ValidateJSON. Without this, a JSON test could be passed
 	// by a subject that emits the right line count of garbage. Counts +
@@ -223,6 +245,12 @@ func newValidator() *validator {
 }
 
 func (v *validator) recordLine(line []byte, cfg config) {
+	// Stamp firstLineNs exactly once (CAS on the zero value) — anchors
+	// SkipInitialSeconds below, and costs nothing on every subsequent line
+	// since the CAS fails immediately once set.
+	now := time.Now().UnixNano()
+	v.firstLineNs.CompareAndSwap(0, now)
+
 	// Latency: extract TS=<nanos> and compute delta (always, no config needed)
 	if ts := extractTimestamp(line); ts > 0 {
 		delta := time.Now().UnixNano() - ts
@@ -273,7 +301,14 @@ func (v *validator) recordLine(line []byte, cfg config) {
 	// into NetFlow records, or "OTEL-<seq>" embedded into LogRecord
 	// bodies). Catches subjects that emit garbage instead of decoded
 	// records.
-	if cfg.RequiredSubstring != "" {
+	//
+	// SkipInitialSeconds > 0 exempts lines within that many seconds of
+	// firstLineNs — see config.SkipInitialSeconds's doc comment. 0 (the
+	// default) exempts nothing, so this is a strict no-op unless a case
+	// opts in.
+	skippedInitial := cfg.SkipInitialSeconds > 0 &&
+		now-v.firstLineNs.Load() < int64(cfg.SkipInitialSeconds)*int64(time.Second)
+	if cfg.RequiredSubstring != "" && !skippedInitial {
 		if !bytes.Contains(line, []byte(cfg.RequiredSubstring)) {
 			v.missingSubstr.Add(1)
 			v.mu.Lock()
@@ -1020,6 +1055,7 @@ func loadConfig() config {
 		ValidateContent:    getEnvBool("RECEIVER_VALIDATE_CONTENT", false),
 		ExpectedLines:      int64(getEnvInt("RECEIVER_EXPECTED_LINES", 0)),
 		RequiredSubstring:  getEnv("RECEIVER_REQUIRED_SUBSTRING", ""),
+		SkipInitialSeconds: getEnvInt("RECEIVER_SKIP_INITIAL_SECONDS", 0),
 		ValidateJSON:       getEnvBool("RECEIVER_VALIDATE_JSON", false),
 		RecordArrivalTimes: getEnvBool("RECEIVER_RECORD_ARRIVAL_TIMES", false),
 	}

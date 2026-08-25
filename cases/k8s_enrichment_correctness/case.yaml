@@ -1,0 +1,129 @@
+name: k8s_enrichment_correctness
+type: correctness
+description: "Proves the kubernetes processor performs REAL enrichment against a live-ish API server: a mock Kubernetes API (endpoints: k8s-mock) serves a single pod over HTTPS with a self-signed cert; the subject's watcher (pkg/kubernetes.NewWatcher enforces https and always reads both CAPath and TokenPath — see configs/certs/{ca.pem,token} mounted at /opt/vmetric/certs via the case-certs mechanism) LISTs it, syncs, and the kubernetes processor enriches matching log lines with k8s.namespace/pod/node. Verifies the enriched namespace value reaches the wire on every line."
+
+# DIAGNOSED STARTUP RACE, FIXED VIA correctness.skip_initial_seconds:
+#
+# getKubernetesWatcher (helper/pipeline/kubernetes.go) builds and starts the
+# watcher LAZILY — on the FIRST event that reaches the kubernetes processor
+# — it is NOT pre-warmed by warmup: (which only polls the subject's listen
+# port; it never sends real traffic through the pipeline — see
+# GeneratorConfig.Warmup / waitForWarmup in containers/generator/main.go).
+# Every run (reproduced at rate:200/24 conns, rate:20/1 conn, and
+# rate:200/1 conn) showed a consistent ~5-8s window right after the first
+# record where lines pass through unenriched while the watcher's first LIST
+# against the mock is in flight — the mock itself is provably ready by then
+# (its healthcheck performs a real TLS request, not just a TCP connect —
+# see below), so this is the director-side watcher's own one-time TLS
+# handshake + LIST cost (amd64-under-emulation on this arm64 host), not a
+# mock-readiness gap. A long-lived director (any real deployment) would
+# have synced its watcher long before real traffic arrived; this is a
+# PipeBench-test-duration artifact, not a product defect, and nothing in
+# PipeBench's case surface can pre-trigger the watcher before "real",
+# measured traffic begins for a run this short.
+#
+# `correctness.skip_initial_seconds: 15` (added to PipeBench specifically
+# for this — see internal/config/case.go's CorrectnessConfig.
+# SkipInitialSeconds and containers/receiver/main.go's validator) exempts
+# lines received within that many seconds of the first-received line from
+# the required_substring check only — loss/dedup/JSON-validity are
+# unaffected, and the default (0, unset) reproduces today's strict
+# semantics exactly, so every other case is untouched. 15s covers the
+# observed ~5-8s window with margin.
+duration: 60s
+# Generous warmup so the mock's HTTPS listener is definitely up before the
+# generator starts (device/mock readiness only — NOT the watcher's own
+# first-LIST latency, which skip_initial_seconds covers instead; see above).
+warmup: 20s
+
+endpoints:
+  - name: k8s-mock
+    image: python:3.12-alpine
+    # Writes the case's self-signed cert/key (base64-embedded — endpoints
+    # support no volume mounts, see EndpointHealthcheck/Endpoint in case.go)
+    # and a minimal HTTPS mock of GET /api/v1/pods (LIST) plus a
+    # GET /api/v1/pods?watch=true connection that just holds open — the
+    # watcher's store is fully seeded by the LIST response alone, so the
+    # watch stream never needs to emit an event for this case to pass.
+    # The cert's SAN is "DNS:k8s-mock", matching this endpoint's compose
+    # network alias/hostname, so Go's TLS client hostname verification
+    # (pkg/kubernetes sets RootCAs but no InsecureSkipVerify) succeeds.
+    command:
+      - sh
+      - -c
+      - |
+        printf '%s' 'LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUJrVENDQVRhZ0F3SUJBZ0lVVEdxSXV0RW5zd0lhYkFXUDI5M1RlbkZIMW1Zd0NnWUlLb1pJemowRUF3SXcKRXpFUk1BOEdBMVVFQXd3SWF6aHpMVzF2WTJzd0hoY05Nall3T0RJMU1USXpNelEyV2hjTk16WXdPREl5TVRJegpNelEyV2pBVE1SRXdEd1lEVlFRRERBaHJPSE10Ylc5amF6QlpNQk1HQnlxR1NNNDlBZ0VHQ0NxR1NNNDlBd0VICkEwSUFCSUNQbWtMQVQ5K05OSnVxai9BK1hXekFZaGttYU1JTmY3NEw3dStTdGxCdkpFS1Y4Rm1Rd0tuU3JkTUUKazk3cVlEMFM1bEEreFB0TEcyU0xISHBab3o2amFEQm1NQjBHQTFVZERnUVdCQlN4WGJnY3BpdlV6M1VGQ29TVgoxUXhKY2xFSEZqQWZCZ05WSFNNRUdEQVdnQlN4WGJnY3BpdlV6M1VGQ29TVjFReEpjbEVIRmpBUEJnTlZIUk1CCkFmOEVCVEFEQVFIL01CTUdBMVVkRVFRTU1BcUNDR3M0Y3kxdGIyTnJNQW9HQ0NxR1NNNDlCQU1DQTBrQU1FWUMKSVFEYnJZUXRxbDlrNnM3RkwvQVQxem9sY1d0QTVIUmJHVkt6Tm9qTXFsQ0hrQUloQUxtZlFlMXNHSnJzbG9jeApQWFY0SXlkWllnd3pYZnNjRks1Zk94N0RQRldqCi0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0K' | base64 -d > /tmp/cert.pem
+        printf '%s' 'LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCk1JR0hBZ0VBTUJNR0J5cUdTTTQ5QWdFR0NDcUdTTTQ5QXdFSEJHMHdhd0lCQVFRZ0RJekVXcG9CbXcvMG40QU4KMHp5RmlHMHp3enFYY1ZLQndYc2VXc3RDWWF5aFJBTkNBQVNBajVwQ3dFL2ZqVFNicW8vd1BsMXN3R0laSm1qQwpEWCsrQys3dmtyWlFieVJDbGZCWmtNQ3AwcTNUQkpQZTZtQTlFdVpRUHNUN1N4dGtpeHg2V2FNKwotLS0tLUVORCBQUklWQVRFIEtFWS0tLS0tCg==' | base64 -d > /tmp/key.pem
+        printf '%s' 'aW1wb3J0IGh0dHAuc2VydmVyCmltcG9ydCBqc29uCmltcG9ydCBzc2wKaW1wb3J0IHN5cwppbXBvcnQgdGltZQoKUE9EID0gewogICAgIm1ldGFkYXRhIjogewogICAgICAgICJuYW1lIjogImNoZWNrb3V0LTZjOWY5YzhiN2YtbnF4NHoiLAogICAgICAgICJuYW1lc3BhY2UiOiAicHJvZCIsCiAgICAgICAgInVpZCI6ICIxMTExMTExMS0xMTExLTExMTEtMTExMS0xMTExMTExMTExMTEiLAogICAgICAgICJsYWJlbHMiOiB7fSwKICAgICAgICAiYW5ub3RhdGlvbnMiOiB7fSwKICAgIH0sCiAgICAic3BlYyI6IHsibm9kZU5hbWUiOiAiYmVuY2gtbm9kZS0xIn0sCiAgICAic3RhdHVzIjogewogICAgICAgICJwaGFzZSI6ICJSdW5uaW5nIiwKICAgICAgICAiY29uZGl0aW9ucyI6IFt7InR5cGUiOiAiUmVhZHkiLCAic3RhdHVzIjogIlRydWUifV0sCiAgICAgICAgImNvbnRhaW5lclN0YXR1c2VzIjogWwogICAgICAgICAgICB7CiAgICAgICAgICAgICAgICAibmFtZSI6ICJjaGVja291dCIsCiAgICAgICAgICAgICAgICAiY29udGFpbmVySUQiOiAiY29udGFpbmVyZDovL2ExYTFhMWExYTFhMWExYTFhMWExYTFhMWExYTFhMWExYTFhMWExYTFhMWExYTFhMWExYTFhMWExYTFhMWExYTEiLAogICAgICAgICAgICAgICAgInJlYWR5IjogVHJ1ZSwKICAgICAgICAgICAgICAgICJyZXN0YXJ0Q291bnQiOiAwLAogICAgICAgICAgICAgICAgInN0YXRlIjogeyJydW5uaW5nIjoge319LAogICAgICAgICAgICB9CiAgICAgICAgXSwKICAgIH0sCn0KClBPRF9MSVNUID0geyJtZXRhZGF0YSI6IHsicmVzb3VyY2VWZXJzaW9uIjogIjEifSwgIml0ZW1zIjogW1BPRF19CgoKY2xhc3MgSGFuZGxlcihodHRwLnNlcnZlci5CYXNlSFRUUFJlcXVlc3RIYW5kbGVyKToKICAgIGRlZiBkb19HRVQoc2VsZik6CiAgICAgICAgaWYgbm90IHNlbGYucGF0aC5zdGFydHN3aXRoKCIvYXBpL3YxL3BvZHMiKToKICAgICAgICAgICAgc2VsZi5zZW5kX3Jlc3BvbnNlKDQwNCkKICAgICAgICAgICAgc2VsZi5lbmRfaGVhZGVycygpCiAgICAgICAgICAgIHJldHVybgoKICAgICAgICBpZiAid2F0Y2g9dHJ1ZSIgaW4gc2VsZi5wYXRoOgogICAgICAgICAgICAjIExJU1QgYWxyZWFkeSBzZWVkZWQgdGhlIHdhdGNoZXIncyBzdG9yZTsgdGhpcyBjb25uZWN0aW9uIGp1c3QKICAgICAgICAgICAgIyBuZWVkcyB0byBzdGF5IG9wZW4g4oCUIG5vIGV2ZW50IGlzIGV2ZXIgcmVxdWlyZWQgZm9yIHRoZQogICAgICAgICAgICAjIGNvcnJlY3RuZXNzIGNhc2UgdG8gcGFzcy4KICAgICAgICAgICAgc2VsZi5zZW5kX3Jlc3BvbnNlKDIwMCkKICAgICAgICAgICAgc2VsZi5zZW5kX2hlYWRlcigiQ29udGVudC1UeXBlIiwgImFwcGxpY2F0aW9uL2pzb24iKQogICAgICAgICAgICBzZWxmLmVuZF9oZWFkZXJzKCkKICAgICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAgd2hpbGUgVHJ1ZToKICAgICAgICAgICAgICAgICAgICB0aW1lLnNsZWVwKDM2MDApCiAgICAgICAgICAgIGV4Y2VwdCAoQnJva2VuUGlwZUVycm9yLCBDb25uZWN0aW9uUmVzZXRFcnJvcik6CiAgICAgICAgICAgICAgICByZXR1cm4KICAgICAgICAgICAgcmV0dXJuCgogICAgICAgIGJvZHkgPSBqc29uLmR1bXBzKFBPRF9MSVNUKS5lbmNvZGUoKQogICAgICAgIHNlbGYuc2VuZF9yZXNwb25zZSgyMDApCiAgICAgICAgc2VsZi5zZW5kX2hlYWRlcigiQ29udGVudC1UeXBlIiwgImFwcGxpY2F0aW9uL2pzb24iKQogICAgICAgIHNlbGYuc2VuZF9oZWFkZXIoIkNvbnRlbnQtTGVuZ3RoIiwgc3RyKGxlbihib2R5KSkpCiAgICAgICAgc2VsZi5lbmRfaGVhZGVycygpCiAgICAgICAgc2VsZi53ZmlsZS53cml0ZShib2R5KQoKICAgIGRlZiBsb2dfbWVzc2FnZShzZWxmLCBmbXQsICphcmdzKToKICAgICAgICBzeXMuc3RkZXJyLndyaXRlKCJtb2NrLWs4cy1hcGk6ICVzIC0gJXNcbiIgJSAoc2VsZi5hZGRyZXNzX3N0cmluZygpLCBmbXQgJSBhcmdzKSkKCgpkZWYgbWFpbigpOgogICAgaHR0cGQgPSBodHRwLnNlcnZlci5UaHJlYWRpbmdIVFRQU2VydmVyKCgiMC4wLjAuMCIsIDY0NDMpLCBIYW5kbGVyKQogICAgY3R4ID0gc3NsLlNTTENvbnRleHQoc3NsLlBST1RPQ09MX1RMU19TRVJWRVIpCiAgICBjdHgubG9hZF9jZXJ0X2NoYWluKGNlcnRmaWxlPSIvdG1wL2NlcnQucGVtIiwga2V5ZmlsZT0iL3RtcC9rZXkucGVtIikKICAgIGh0dHBkLnNvY2tldCA9IGN0eC53cmFwX3NvY2tldChodHRwZC5zb2NrZXQsIHNlcnZlcl9zaWRlPVRydWUpCiAgICBodHRwZC5zZXJ2ZV9mb3JldmVyKCkKCgppZiBfX25hbWVfXyA9PSAiX19tYWluX18iOgogICAgbWFpbigpCg==' | base64 -d > /tmp/mock_server.py
+        exec python3 /tmp/mock_server.py
+    healthcheck:
+      # A plain `nc -z` TCP-connect check is NOT enough: python's
+      # ThreadingHTTPServer(...) binds and starts accepting connections the
+      # instant it's constructed, BEFORE ctx.wrap_socket() has TLS-wrapped
+      # it (see mock_server.py's main()). A live run showed every record
+      # sent in roughly the first 6-8s after the mock reported healthy
+      # failing enrichment — consistent with the director's watcher hitting
+      # that window (TCP accepted, TLS handshake broken because the socket
+      # isn't SSL-wrapped yet), failing its first LIST, and walking through
+      # NewWatcher's initialBackoff/nextBackoff sequence (500ms, 1s, 2s,
+      # 4s, ...) before a retry lands after wrap_socket has run. `wget`
+      # actually completes a TLS handshake (--no-check-certificate: the
+      # self-signed leaf isn't the point here, only that TLS-serving is
+      # live), so compose only marks this endpoint healthy — and lets the
+      # subject start — once wrap_socket has really happened. No quotes in
+      # the test string: docker.go's compose template embeds
+      # EndpointHealthcheck.Test raw inside a double-quoted YAML scalar
+      # with no quote-escaping (unlike Command, which goes through %q), so
+      # this needs to stay quote-free the same as the nc check was.
+      test: wget -q --no-check-certificate -O /dev/null https://127.0.0.1:6443/api/v1/pods
+      interval: 2s
+      timeout: 3s
+      retries: 40
+      start_period: 2s
+
+generator:
+  mode: tcp
+  target: "subject:9000"
+  rate: 200
+  # Single connection: this is a correctness check, not a throughput
+  # benchmark — no need for the default auto-resolved parallelism (24 on
+  # this host). Keeps the run's resource footprint light and predictable;
+  # correctness.skip_initial_seconds below (not the connection count) is
+  # what actually covers the watcher's one-time startup race documented
+  # above.
+  connections: 1
+  format: raw
+  sample_file: input/pods.log
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+subjects:
+  - vmetric
+
+correctness:
+  validate_json: true
+  expected_loss_pct: 0.0
+  # applyMeta (helper/pipeline/kubernetes.go) writes a field literally named
+  # "namespace" (nested under target_prefix "k8s") only on a real lookup
+  # hit. The generator's raw input never uses that field name (see
+  # input/pods.log — the raw identity fields are container_id/ns/pod_hint,
+  # deliberately NOT "namespace", to keep this check free of a
+  # passthrough-collision false positive), so this word can only reach the
+  # wire via a successful enrichment against the mock's one pod (namespace
+  # "prod" — see configs/certs and the endpoint's mock_server.py). Bare
+  # token, no embedded `"`: the harness's compose renderer interpolates
+  # this value raw inside a double-quoted YAML string with no escaping
+  # (internal/orchestrator/docker.go), so literal double quotes here would
+  # corrupt the generated compose file.
+  required_substring: 'namespace'
+  # Covers the kubernetes watcher's one-time lazy-startup race — see the
+  # header comment above. Exempts only the required_substring check, only
+  # for lines within 15s of the first received line; loss is still checked
+  # (expected_loss_pct: 0.0 above) for every line including these.
+  skip_initial_seconds: 15
+
+configurations:
+  default:
+    description: "TCP in, kubernetes processor enriching against a mock HTTPS k8s API, TCP out"

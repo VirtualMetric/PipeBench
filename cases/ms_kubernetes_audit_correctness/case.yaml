@@ -1,0 +1,57 @@
+name: ms_kubernetes_audit_correctness
+type: correctness
+description: "Verifies the ms_kubernetes_audit content pack: raw Kubernetes audit.k8s.io/v1 Event JSON in, ASIM ASimAuditEventLogs normalized JSON out. Replays the pack's own fixture (helper/pipeline/content/microsoft/ms_kubernetes_audit/kubernetes_audit.log) over TCP and checks every emitted record decoded, normalized (EventVendor/EventSchema set unconditionally by the pack), and forwarded with zero loss."
+
+duration: 45s
+warmup: 15s
+
+generator:
+  mode: tcp
+  target: "subject:9000"
+  rate: 50
+  # Single connection: this is a correctness check (decode + ASIM normalize
+  # correctly, zero loss), not a throughput benchmark. The inlined
+  # ms_kubernetes_audit + ms_kubernetes_audit_audit_event pipeline is a
+  # ~90-processor chain per record — auto-resolved parallel connections
+  # (24 on this host) at rate:500 each floods it and the last straggler
+  # connection gets reset near the end of every run (23/24 always finish
+  # cleanly first). A light, single-connection load proves the same
+  # correctness property without the self-inflicted overload.
+  connections: 1
+  format: raw
+  # Replay the pack's real fixture verbatim instead of synthesizing lines —
+  # keeps the content-pack pipeline itself under test, not a hand-rolled
+  # substitute. Records are audit.k8s.io/v1 Event JSON with their own
+  # requestReceivedTimestamp/stageTimestamp fields, so no RFC3164 leading
+  # date to rewrite — rewrite_timestamp only rewrites a leading syslog
+  # header and has no effect on JSON records (see generator's sampleLine).
+  sample_file: input/kubernetes_audit.log
+
+receiver:
+  mode: tcp
+  listen: ":9001"
+
+subjects:
+  - vmetric
+
+correctness:
+  validate_json: true
+  expected_loss_pct: 0.0
+  # ms_kubernetes_audit_audit_event unconditionally sets
+  # $ASimAuditEventLogs.EventSchema = "AuditEvent" on every normalized
+  # record (see ms_kubernetes_audit_audit_event.yml) — a successful
+  # decode+normalize is proven by this literal value surviving to the wire
+  # in every emitted line. No raw audit record contains this word, so it
+  # cannot pass on unenriched passthrough. NOTE: no embedded `"` — the
+  # harness's compose renderer interpolates this value raw inside a
+  # double-quoted YAML string (internal/orchestrator/docker.go's
+  # RECEIVER_REQUIRED_SUBSTRING template, no escaping applied), so a
+  # substring containing literal double quotes corrupts the generated
+  # compose file. Every existing case's required_substring (e.g.
+  # otlp_traces_to_otlp_correctness's "TRACE-") is a bare value token for
+  # the same reason.
+  required_substring: 'AuditEvent'
+
+configurations:
+  default:
+    description: "TCP in, ms_kubernetes_audit content pack pipeline, TCP out"

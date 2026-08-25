@@ -18,3 +18,7 @@ containers/vmetric/
 # they contain credentials (cribl.secret, users.json) and must never be
 # committed. The path matches every cribl-stream case directory.
 cases/*/configs/cribl-stream/auth/
+
+# Case input fixtures are part of the case definition — exempt them from
+# the global *.log ignore above (sample_file replay needs them in git).
+!cases/*/input/*.log
