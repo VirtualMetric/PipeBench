@@ -1,34 +1,24 @@
 # Routes raw Kubernetes audit.k8s.io/v1 Event JSON through an inlined copy
-# of the ms_kubernetes_audit content pack (helper/pipeline/content/microsoft/
-# ms_kubernetes_audit/{ms_kubernetes_audit.yml,ms_kubernetes_audit_audit_event.yml}).
+# of the ms_kubernetes_audit content pack's two pipelines.
 #
-# Inlined, not referenced by name: PipeBench's vmetric/director image
-# (cmd/director/Dockerfile) ships only the compiled director binary — it
-# does not embed or mount helper/pipeline/content/**, and there is no
-# content-dir loader in file-config ("flat config.yml") director mode. A
-# route can only resolve a `pipeline:` processor step's `name:` against
-# pipelines defined in this same file's top-level `pipelines:` list, so both
-# pack pipelines are copied here verbatim.
+# Inlined, not referenced by name: this director build ships only the
+# compiled director binary, with no content-pack directory available for
+# it to load named pipelines from at runtime. A route can only resolve a
+# `pipeline:` processor step's `name:` against pipelines defined in this
+# same file's top-level `pipelines:` list, so both pack pipelines are
+# copied here verbatim.
 #
-# IMPORTANT — a `pipeline:` processor step's `name:` MUST keep the packaged
+# IMPORTANT — a `pipeline:` processor step's `name:` MUST keep the exact
 # `'{{ IngestPipeline "target_name" }}'` wrapper syntax, even in this
-# flat-file config with no platform/DB behind it. This is NOT a templating
-# feature that needs separate registration: PipelineProcessor.ProcessBase
-# (helper/pipeline/pipeline.go) parses `name:` via ParseIngestPipelineName,
-# which regex-matches `{\s*IngestPipeline\s*"([^"]+)"\s*\}`
-# (helper/pipeline/regex.go) — a BARE pipeline name with no wrapper fails
-# that regex ("invalid pipeline reference format"), and because the
-# `pipeline:` step has no `on_failure:` block, PipelineProcessor.Process
-# swallows that error as a normal return (writeError + an empty
-# RunProcessors call), so the case fails completely silently: no crash, no
-# stdout (this director build logs nothing to stdout by default), the
-# receiver just sees 0 lines forever. Confirmed by bisection: the outer
-# wrapper alone (this step replaced with a plain `set:`) passes cleanly;
-# restoring the `pipeline:` step with a bare name reproduces 100% loss;
-# restoring the exact `{{ IngestPipeline "..." }}` wrapper fixes it. Only
-# the STEP-level reference needs this — a pipeline's own top-level `name:`
-# in the `pipelines:` list below is looked up directly by FindPipeline and
-# stays a bare string.
+# flat-file config with no platform/DB behind it: this exact wrapper
+# syntax is required in every mode; a bare pipeline name silently fails.
+# Confirmed by bisection: the outer wrapper alone (this step replaced
+# with a plain `set:`) passes cleanly; restoring the `pipeline:` step
+# with a bare name reproduces 100% loss, with no crash and no log output
+# — the receiver just sees 0 lines forever; restoring the exact
+# `{{ IngestPipeline "..." }}` wrapper fixes it. Only the step-level
+# reference needs this — a pipeline's own top-level `name:` in the
+# `pipelines:` list below is looked up directly and stays a bare string.
 #
 # The conditional `ms_kubernetes_audit_drop` optimization pipeline call is
 # dropped entirely — its guard (`_vmetric.conf.optimization.status == true`)

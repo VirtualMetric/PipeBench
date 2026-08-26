@@ -1,324 +1,241 @@
-# Agent Provisioning Contract (derived from virtualmetric-backend, read-only spike)
+# Authoring Agent-Hosted Cases
 
-> **Update — confirmed by a real run.** Every assumption in §7b below (an
-> explicit `proxy_tls: {status: true, mode: self-signed, port: 8443}` block
-> in the director's single-file config, `wss://subject:8443` as the agent's
-> `Director.Address`, and an EMPTY `Director.Token`) was validated end-to-end
-> by `cases/k8s_podlog_agent_correctness`: `./bin/harness test -t
-> k8s_podlog_agent_correctness -s vmetric --version dev` → **PASSED**
-> (`correctness: PASSED`, `loss: 0.00%`, `lines_out: 111000`,
-> `min_received: 150` and `required_substring: "benchline"` both satisfied).
-> The average received line size (~209.6 bytes) was ~2.5x the raw seeded CRI
-> JSON line (~81 bytes), consistent with the agent actually CRI-decoding and
-> re-shaping each record (not passing the raw `{"time","stream","log"}` JSON
-> through byte-for-byte). See `cases/k8s_podlog_agent_correctness/README.md`
-> for the one caveat this run surfaced (line-count over-delivery, not a
-> correctness failure — the case's thresholds don't penalize it, but it's an
-> open question about the reader's resume-offset cache in this container
-> shape) and for the one non-backend-code environment blocker that had to
-> clear first (`docker compose` CLI plugin missing on the harness host,
-> unrelated to the case or backend code — resolved outside this agent's
-> action, see README "Environment note").
+This is the contract for writing a PipeBench case that runs a real
+`vmetric-agent` process via the `agent:` block in `case.yaml`, rather than
+feeding a director-fronted listener directly. It covers: the provisioning
+env var, the director-side config shapes an agent needs to connect and
+receive its device definition, the TLS/trust bootstrap workaround this
+setup requires, the container-arch requirement, and the known observable
+gaps to plan around. See `cases/k8s_podlog_agent_correctness/` for a
+working, passing example of everything below.
 
-PipeBench's `internal/config/case.go` `AgentConfig` comments admit the harness
-has never exercised this path for real. This doc is the contract that was
-missing: how a `vmetric-agent` actually registers with a director and starts
-collecting, traced end-to-end from the backend source
-(the `virtualmetric-backend` source, read-only). Every
-claim below is a file:line citation, not inference from docs.
+## 1. `VMETRIC_CONFIG_HASH`
 
-## 1. The install one-liner and `VMETRIC_CONFIG_HASH`
+The agent (and, with a different field shape, a serverless/fleet
+director) is provisioned via a single environment variable,
+`VMETRIC_CONFIG_HASH`, set at container start. The agent decodes it once
+on first start and never reads it again — it's consumed, then persisted
+to the agent's own local `vmetric.yml`.
 
-Both the **agent** one-liner and the **serverless-director** deploy
-templates work the same way: a shell script downloads the binary and sets
-`VMETRIC_CONFIG_HASH` in the environment; the binary decodes it on first
-start and never sees it again (it's consumed once, then persisted to disk).
+**Agent-mode shape**: base64 of a `;`-delimited string with at least 4
+fields:
 
-- `web/api/director/installscripts.go` builds the **director** (not agent)
-  bootstrap one-liner via `toolkit.GetInstallerURL` (`toolkit/product.go:147`)
-  — `https://<host>/dl`, environment-selected (prod vs dev host).
-- `migrations/seed_serverless_install_templates.sql` shows the **serverless
-  director** deploy templates (docker-compose, k8s Deployment, ACI, ACA) all
-  inject the SAME env var, `VMETRIC_CONFIG_HASH`, sourced from
-  `{{.EncodedAPIKey}}` — e.g. the k8s template stores it in a Secret and
-  wires it in via `secretKeyRef`.
-- The **agent** install path uses the identical env var name — confirmed by
-  the constant `_configHash = "VMETRIC_CONFIG_HASH"` duplicated in both
-  `service/agent/main.go:25` and `service/director/main.go:26`.
+```
+base64("<directorAddress>;<directorToken>;<deviceID>;<enrollmentID>")
+```
 
-## 2. What `VMETRIC_CONFIG_HASH` actually decodes to
-
-Decoding happens in `helper/service/config.go`, function `RunConfigurator`
-(line 111). It is base64-decoded, then split on `;`. **Two different shapes
-exist depending on which binary consumes it** — the function branches on
-`mode == "agent"`:
-
-### 2a. Agent-mode shape (`RunConfigurator(hash, "agent")`, line 113-172)
-
-Semicolon-delimited fields, **≥4 required**:
-
-| Index | Field | Struct written |
+| Index | Field | Notes |
 |---|---|---|
-| 0 | Director address (URL) | `DeviceConfig.Director.Address` |
-| 1 | Director token | `DeviceConfig.Director.Token` |
-| 2 | Device ID (optional, int64) | `DeviceConfig.Device.ID` |
-| 3 | Enrollment ID (optional, int64) | `DeviceConfig.Enrollment.ID` |
+| 0 | Director address | URL, **must** use `http`/`https` scheme, not `ws`/`wss` — the agent's own address validator rejects `ws`/`wss` outright. Internally the agent converts `https` to `wss` (plus a `/ws` path) for the actual connection. |
+| 1 | Director token | May be empty if the target device has no auth configured. |
+| 2 | Device ID | Optional int, but at least one of Device ID / Enrollment ID must be non-zero. |
+| 3 | Enrollment ID | Optional int. Pre-setting a known device ID and leaving this `0` is the supported way to skip an interactive enrollment handshake in a scripted context. |
 
-At least one of Device.ID / Enrollment.ID must be non-zero (line 149) or
-`RunConfigurator` errors out. The decoded struct
-(`model.DeviceConfig`, `model/device_config.go`) is YAML-marshaled and
-written to `<currentPath>/vmetric.yml` (`writeToYAMLFile`, config.go:427 —
-`toolkit.ServiceName + ".yml"`), replacing any existing file. This is the
-**agent's own bootstrap config file**, distinct from the director-side
-device definition.
+A malformed hash fails the agent's startup immediately (loud failure, not
+a silent no-op) before any other agent subsystem starts.
 
-The **encoder** for this exact format lives in
-`helper/vmmq/tools/tools.go:179` (`ReadConfigHash`):
-```go
-configHash := fmt.Sprintf("%s;%s;%d;%d", apiURL, token, deviceID, 0)
-return base64.StdEncoding.EncodeToString([]byte(configHash))
-```
-i.e. `base64("<directorAddress>;<directorToken>;<deviceID>;0")` — field 3
-(enrollment ID) is always `0` when a real device ID is already known, which
-is exactly the bench-agent shortcut noted in
-`helper/vmmq/server/vserver/authorization_test.go:668-670`:
+Instead of the env var, a case can also write the agent's own
+`vmetric.yml` directly (same fields: `device.id`, `director.address`,
+`director.token`), which is useful when the case also wants to set a
+`debug:` block the decode-and-boot path doesn't expose a way to set (see
+§6). Either form produces the same runtime result once the agent starts.
 
-> "The bench agent cases cannot catch this: they pre-set the device id in
-> `VMETRIC_CONFIG_HASH` and skip enrollment entirely."
+## 2. Director-side config required for an agent to connect
 
-This is a load-bearing precedent: pre-setting a device ID in the hash is
-the SUPPORTED way to skip the interactive enrollment handshake in a
-scripted/bench context — it's not a hack PipeBench would be inventing.
+### 2a. `environments:` is required for the agent-facing listener to bind
 
-### 2b. Non-agent (director/fleet) shape (line 175-224)
+The director's TLS listener that agents dial into (`proxy_tls`) **never
+binds at all** — no error, no timeout, just an indefinite wait — while
+the parsed system config has zero `environments:` entries. An
+`environments:` block is not optional decoration; it's required any time
+an agent needs to connect.
 
-`instance;directorID;token[;selfManagedToken]` — 3 or 4 fields, decoding
-into `FleetConfig{Fleet:{Instance,Token,Type}, Director:{ID}}`. This is the
-shape used by the serverless director templates in §1 and is NOT what an
-agent container consumes. (Included here only to avoid the two shapes being
-conflated — they share an encoding scheme but not a schema.)
+### 2b. Environment and node names must match the director's self-identity
 
-## 3. How the agent container boots with it
+The listener additionally requires an environment `name` and, within it,
+a node `name` that exactly match this director's own self-identity.
+With no `director.id`/`node.name` configured, a director's own name
+defaults to `"0"` for both — do not assume any other default (e.g. `"1"`)
+without checking; wrong names produce the same generic "can not find
+node information" failure as no `environments:` block at all. Verify the
+correct values via the director's own `/health` endpoint, which reports
+its resolved node name.
 
-`service/agent/main.go:26-36` (`Start()`): on process start, if
-`os.Getenv("VMETRIC_CONFIG_HASH")` is non-empty, it calls
-`service.RunConfigurator(resolved, "agent")` **before** anything else (before
-`NewServiceModel`/health monitor/controller). A failure here calls
-`os.Exit(1)` immediately — so a malformed hash fails loud and fast, not as a
-silent no-op.
+### 2c. `proxy_tls` must live under `nodes[].properties`, not top-level
 
-After that, normal agent startup proceeds
-(`controller.StartAgent`), which reads the just-written `vmetric.yml`
-(`Director.Address`, `Director.Token`, `Device.ID`) to open its VMMQ
-(NATS-over-websocket) connection to the director and identify itself as
-`DeviceID`.
+A **top-level** `proxy_tls:` key in a director's config parses without
+error and can even look like it's partially working (`status`/`mode`/
+`port` appear honored) — but in director/agent mode it is silently
+ignored before anything reads it: local per-service TLS settings are
+platform-delivered-only and are stripped from a locally-supplied config.
+The only path that survives is under a matching node's `properties:`
+block, which is merged into the live config. This applies specifically
+to `proxy_tls`; `debug:` is not subject to the same stripping, which is
+why a top-level `debug:` block behaves as expected while a top-level
+`proxy_tls:` block quietly does nothing.
 
-## 4. Does `cmd/director/Dockerfile.enterprise` bake the agent? Yes.
+Confirmed working shape:
 
-`cmd/director/Dockerfile.enterprise` (backend repo root as build context)
-is a two-stage build:
-
-- Stage `build`: compiles `./cmd/director` (`-tags docker`) **and**, in the
-  same stage, `./cmd/agent` (`-tags client`) — see lines 61-73. The comment
-  at line 69-72 is explicit about why: building the agent from source in
-  the SAME stage keeps it on the SAME vendored deps/Go toolchain as the
-  director, rather than risking a stale pre-built copy.
-- Final stage: copies the director binary to `/opt/vmetric/director`
-  (the stock `vmetric/director` entrypoint path, so it's a drop-in subject
-  image) **and** the linux/amd64 agent binary to
-  `/opt/vmetric/package/agent/linux/amd64/vmetric-agent` (line 107) — the
-  path the director itself would serve an agent installer from
-  (`<Root>/package/agent/<os>/<arch>/`).
-- `ENTRYPOINT ["/opt/vmetric/director"]` — this image's default command
-  always runs the **director**. To run the **agent** binary inside a
-  container built FROM this same image (which is exactly what
-  `AgentConfig.Image` documents — "vmetric/director-enterprise... avoiding a
-  separate published image"), the case must override the container command:
-  `["/opt/vmetric/package/agent/linux/amd64/vmetric-agent"]` (or a shell
-  wrapper — see §7 below for why a wrapper is actually required here).
-- No `vmetric.yml` is baked in for the director role either — the comment
-  block at the top of the Dockerfile says the subject mounts the case
-  config at `/config.yml` and runs `-config-path /config.yml`. Confirmed in
-  `helper/service/config.go:62` (`SetConfigFilePath` doc) and
-  `model/config_system.go:582-593` (`CheckSystemConfig`): **single-file mode
-  is a first-class, fully-supported way to carry `devices`, `targets`,
-  `routes` — the exact same top-level keys that a folder-scanned config
-  provides** ("the system config (devices, targets, routes) lives in one
-  file, not the Path.Config directory the scanner watches").
-
-## 5. How the agent gets its DEVICE definition (the dataset) after registering
-
-This is the part the task description calls out as needing tracing, and
-it's a **pull**, not a push at container-start time:
-
-1. Agent boots with `Device.ID` already known (§2a) — no enrollment
-   round-trip needed.
-2. Agent connects to the director's VMMQ (NATS JetStream over websocket)
-   using `Director.Address` / `Director.Token`.
-3. `helper/automation/helpers.go:GetLastConfigMessage` (line 97) is how the
-   agent (or a director acting on the agent's behalf) polls for its most
-   recent config: it reads the JetStream `vmetric-fleet-req` stream,
-   filtered to subject
-   `vmetric.fleet.req.agent.director.<DeviceID>.*.config`
-   (`GetLastMsgForSubject`), and if found, decodes + executes it through the
-   registered "config" `ICommand` — this is what actually applies the
-   device's dataset definitions to the running agent process.
-4. That message is produced by the **director**, in
-   `helper/automation/helpers.go:PublishConfigByID` (line 20): it looks up
-   the device's config via `command.GetDeviceConfig(serviceInfo, device.ID)`
-   and publishes it to
-   `vmetric.fleet.req.agent.director.<deviceID>.<unixTime>.config` via
-   `publishConf` (JetStream publish, line 82-92).
-5. `PublishConfigByID` is driven off `serviceInfo.Devices()`
-   (`model/config_system.go:61`, `map[int64]config.ConfigItem`) — i.e. the
-   **director's own parsed system config** (§4's `devices:` key, whether
-   from a folder scan or a single `-config-path` file). There is no
-   separate "push config to agent" trigger traced here beyond: a device
-   exists in the director's config with the given ID, and something calls
-   `PublishConfigByID`/the device-collector manager notices a config change
-   (`service/director/collector/device_manager.go` — polls every 1s,
-   compares `SystemConfigLastUpdate()`).
-
-**Net effect for a bench case**: the director's mounted `/config.yml` must
-contain a `devices:` entry whose `id:` matches the device ID baked into the
-agent's `VMETRIC_CONFIG_HASH`, with a `definitions:` block naming
-`linux_kubernetes_pod_log_collector` — exactly the shape shown in
-`config/devices/linux-filelog.example.yaml` (device `type: linux`,
-`definitions: [{name: linux_file_log_collector, inputs: [...]}]` — the pod
-log collector definition is documented in
-`docs/collectors/kubernetes-pod-logs-dataset.md`, format:
 ```yaml
-definitions:
-  - name: linux_kubernetes_pod_log_collector
-    status: true
-    inputs:
-      - name: pod-logs
+environments:
+  - name: "0"        # MUST match this director's self-identity — verify
+    status: true      # via its own /health endpoint's resolved node
+    nodes:              # name; defaults to "0" only when no
+      - name: "0"          # director.id/node.name is configured.
+        status: true
         properties:
-          path: "/data/pods/*/*/*.log"
-          pipeline_name: "kubernetes-pod-logs"
+          proxy_tls:
+            status: true
+            mode: self-signed
+            port: 8443
+            # Resolves relative to the binary's working dir against
+            # configs/certs/, auto-mounted read-only into the container
+            # by PipeBench whenever a case's configs/certs/ directory
+            # exists — no case.yaml flag needed (see §3).
+            cert_name: certs/cert.pem
+            key_name: certs/key.pem
+            ca_name: certs/ca.pem
 ```
-). The director then routes that device's output like any other device —
-existing PipeBench cases (`cases/sighup_correctness/configs/vmetric.yml`)
-show the `devices:`/`targets:`/`routes:` single-file shape already in
-active use, just for a `type: tcp` (director-listener) device rather than a
-`type: linux` (agent-fed) device.
 
-## 6. What PipeBench's `agent:` block already renders (confirmed, no gap)
+### 2d. The device definition the agent will run
 
-`internal/config/case.go:608-624` (`AgentConfig`) and
-`internal/orchestrator/docker.go:705-734` / `:2615-2644` together already
-support everything §1-§4 need:
+The director's config (single-file `-config-path` mode, same
+`devices:`/`targets:`/`routes:` shape as a folder-scanned config) needs a
+`devices:` entry whose `id:` matches the device ID embedded in the
+agent's `VMETRIC_CONFIG_HASH` (§1, field 2), with a `definitions:` block
+naming the desired collector:
 
-- `image:` — pin to the locally-built `vmetric/director-enterprise:dev`.
-- `env:` — set `VMETRIC_CONFIG_HASH` here (base64 computed as in §2a).
-- `command:` — overrides entrypoint+command (needed, since the enterprise
-  image's default `ENTRYPOINT` runs the director, not the agent — §4).
-- `mounts_shared_data: true` — mounts the SAME `shared-data:/data` volume
-  the generator/receiver/subject use, at `/data`, running as `0:0`.
-- Compose service is named `agent`, network `bench`, `depends_on:
-  <subject>: {condition: service_started}` — so it dials in only after the
-  director's listeners are bound.
-- `applyVersionIfUntagged` (docker.go:2628-2640) applies `--version` to an
-  untagged agent image the same way the subject gets one — pin an explicit
-  tag (`:dev`) to opt out, same as the documented
-  `director_old_agent_compat_deploy` pattern.
+```yaml
+devices:
+  - id: <N>
+    name: <device-name>
+    type: linux
+    status: true
+    definitions:
+      - name: linux_kubernetes_pod_log_collector
+        status: true
+        inputs:
+          - name: pod-logs
+            properties:
+              path: "/data/pods/*/*/*.log"
+              pipeline_name: "<pipeline-name-or-empty>"
+targets: [...]
+routes:
+  - devices: [{name: <device-name>}]
+    targets: [...]
+```
 
-**This part of the mechanism is NOT broken or unused-and-bitrotted** — it
-renders correctly. What's actually unused is the END-TO-END STORY around
-it: no case has ever supplied a real `VMETRIC_CONFIG_HASH` + a matching
-director-side device definition together. That composition is what this
-spike case adds.
+Once the device ID matches, the director publishes that device's config
+to the connecting agent automatically on startup — no case-side trigger
+is needed beyond the device existing in the director's config.
 
-## 7. Two genuine gaps found (not resolved by reading — need a live run or a harness change)
+For a pod-log collector specifically, the input format is CRI text, one
+record per physical line: `<RFC3339Nano> <stdout|stderr> <P|F>
+<message>`. The dataset pins decoder `cri`, so a docker-JSON envelope
+will not decode even if it is otherwise valid JSON.
 
-### 7a. `Endpoint` cannot seed files onto the shared-data volume
+## 3. Cert delivery
 
-The task brief's fallback plan ("if the file generator can't write nested
-paths, use an endpoints one-shot container to seed the tree") **does not
-work with the current harness**: `Endpoint` (`internal/config/case.go:653`)
-has no `mounts_shared_data`-equivalent field, and the compose template's
-per-endpoint block (`docker.go` endpoint range, ~line 678-704) never mounts
-`shared-data:/data` — only the generator/receiver/subject/verifier(local)/
-agent(opt-in) services do (grep hits: `docker.go:167,239,330,422,634,653,720`
-all belong to those five, never to the `{{- range .Endpoints }}` block).
-So an `Endpoint` cannot pre-create
-`/data/<ns>_<pod>_<uid>/<container>/` for the generator to write into.
+A case ships its own cert material under `configs/certs/` (e.g.
+`cert.pem`, `key.pem`, `ca.pem`). PipeBench auto-mounts that directory,
+read-only, into the subject container whenever it exists next to the
+case's config source — no `case.yaml` flag needed. `cert_name`/
+`key_name`/`ca_name` under `proxy_tls` (§2c) then resolve against it.
 
-Also confirmed: `containers/generator/main.go`'s file-mode writer
-(`runFileSingle`/`runFileParallel`) opens its target with
-`os.OpenFile(path, O_APPEND|O_CREATE|O_WRONLY, 0o644)` and **never calls
-`os.MkdirAll`** — the parent directory must already exist, or the generator
-fails immediately (no retry).
+## 4. Agent trust bootstrap workaround
 
-**The only container in this topology that (a) can mount `shared-data`
-AND (b) supports a `command:` override is the `agent` service itself**
-(`AgentConfig.Command` + `AgentConfig.MountsSharedData`). This case works
-around the gap by having the agent's own command wrap
-`mkdir -p /data/<pod-log-dir> && exec vmetric-agent ...` before running the
-real agent binary — but that only works if the agent container starts
-(and completes its mkdir) before the generator's first file open, and
-nothing in the harness enforces that ordering between `agent` and
-`generator` (no `depends_on` between them). This is a race, not a fix; it's
-documented as such in the case README.
+Once `proxy_tls` is correctly placed (§2c) and presenting a real
+certificate, the agent still needs to trust it. Both HTTP routes that
+could deliver that trust automatically are observed to fail in this
+setup:
 
-**Recommendation for a real (non-spike) fix**: add a
-`mounts_shared_data`-equivalent option to `Endpoint` (or a
-`pre_seed`/`init` hook independent of the generator/agent timing), so a
-one-shot endpoint can reliably create directory structure before ANYTHING
-else in the topology starts writing — this is a harness gap, not a vmetric
-gap.
+- The agent's own built-in CA-fetch (a `/dl/cert.pem`-style path) returns
+  404 — the path it requests does not exist on this director build.
+- The director's documented CA-download route (a `/ca.pem`-style path,
+  gated on self-signed mode + discovery being enabled, both true by
+  default here) **also** 404s, even though a sibling route under the
+  identical gate returns 200 in the same container in the same run. Not
+  fully root-caused.
 
-### 7b. Director listen address/port and auth token for a from-scratch bench director are unconfirmed
+**Workaround**: since a case already knows its own CA at authoring time
+(it's the same file used for `proxy_tls.ca_name` in §2c), have the
+agent's container command write that CA directly to the agent's expected
+local trust-store path (`storage/cert/ca.pem`, relative to the agent
+binary's working directory) before exec'ing the agent binary, instead of
+relying on either HTTP route.
 
-`RunConfigurator`'s `Director.Token` (§2a field 1) is written into the
-agent's `vmetric.yml` verbatim and presumably validated by the director's
-VMMQ auth layer (`helper/vmmq/server/vserver/authorization.go`) before the
-agent's JetStream consumers are authorized.
+## 5. Container architecture must match the host
 
-**Concrete, confirmed finding (not a guess): the raw NATS port is NOT
-externally dialable in standalone mode.** `helper/vmmq/server/server.go`,
-`resolveVMMQServer` (~line 165-192): the default node config comment says
-explicitly —
+The agent binary's CPU architecture must match the container host's. An
+amd64 agent binary run under QEMU emulation on an arm64 host (e.g.
+Apple Silicon via Colima) crashes with `SIGSEGV` during Go runtime
+package initialization, before `main()` runs and before any I/O —
+meaning it never gets far enough to attempt a connection at all. Build
+or select an arch-native agent image rather than relying on a
+convention-based path.
 
-> "The NATS server binds loopback only and is never externally exposed, so
-> address/port are not user-configurable: the client port is disabled in
-> standalone (`DontListen`) and the WebSocket port is assigned
-> dynamically."
-
-This branch (`resolved.NodeConfig` built from `config.DefaultVMMQAddress` /
-`config.DefaultVMMQPort`) is taken whenever `systemConfig.Environments` is
-empty (line ~198: `if len(systemConfig.Environments) > 0 { resolved.NodeConfig
-= config.ConfigItem{} }` — i.e. only a config WITH an `environments:` block
-overrides this default). A bare bench `/config.yml` with just
-`devices/targets/routes` (§4, no `environments:` block) is exactly this
-"standalone" case — meaning **the internal NATS/WS port an agent would
-naively dial is neither fixed nor externally reachable at all.** The
-reachable endpoint has to be the director's `proxy_tls` HTTPS/WSS listener,
-which fronts/proxies to that internal dynamic port — the same conclusion
-implied by every serverless install template (§1) treating `proxy_tls.port`
-as mandatory, and by `helper/vmmq/tools/tools.go:GetNATSURL` deriving the
-agent-facing NATS URL from `proxy_tls`/`external_url`, never from a raw
-node/cluster address.
-
-**Practical implication for this case**: the mounted `/config.yml` almost
-certainly needs an explicit `proxy_tls:` block (`status`, `port`, `mode` —
-`self-signed` | `custom` | `offloaded`, per
-`helper/config/enum.go:65-67`) for the agent to have anything reachable to
-dial, and `Director.Address` in the `VMETRIC_CONFIG_HASH` must point at
-that `proxy_tls.port`, not a guessed NATS port. **This was not confirmed
-empirically** (a live run was needed to nail down the exact scheme/host
-agents expect — `ws://`? `wss://`? does the bench director require TLS
-verification the harness would need to disable?) — treat this as the
-single highest-probability first failure point for a real run, ahead of
-the token question. Diagnose via `docker compose logs agent` (dial
-failure = wrong address/port; explicit auth rejection = token) and
-`docker compose logs subject` (whether `proxy_tls` bound successfully at
-all).
-
-## Summary contract (for the case author)
+To verify a binary's actual architecture, check its ELF header rather
+than `uname -m` inside the container (which reports the host kernel's
+architecture regardless of the binary's own):
 
 ```
+od -An -tx1 -j18 -N2 <path-to-vmetric-agent>
+```
+
+`b7 00` indicates arm64; `3e 00` indicates amd64.
+
+## 6. Diagnostics
+
+Setting `debug: {level: 5, console: {status: true}}` in the director's
+config surfaces verbose console logging useful for diagnosing
+provisioning problems (config-publish activity, device agent-mode
+handling, TLS cert resolution). Note that `console.status: true` alone
+is not sufficient — the default log level filters out everything below
+Error/Warning, so `level: 5` (Verbose) is required as well.
+
+## 7. Known observable gaps to plan around
+
+- **A one-shot endpoint container cannot seed the shared-data volume.**
+  Endpoint containers in this harness have no shared-data mount support,
+  and a generic file-mode data generator does not create parent
+  directories for its write target — it fails immediately if the
+  directory doesn't already exist. Of the container types available to a
+  case, only the agent service itself can both mount shared data and
+  have its command overridden. If a case needs nested directory
+  structure seeded before an agent-hosted collector can read it, do the
+  seeding from inside the agent container's own command, before
+  exec'ing the real agent binary — this also avoids any cross-container
+  startup-ordering race, since the same container does both steps in
+  sequence.
+- **The director's readiness is not guaranteed by container-start
+  ordering alone.** A `depends_on: {condition: service_started}`
+  relationship only guarantees the director's process has started, not
+  that it has finished parsing config and binding `proxy_tls` yet. Have
+  the agent's command wait (e.g. poll with a TCP connect check, with a
+  generous timeout and a fail-open fallback) for the director's agent
+  port to actually accept connections before exec'ing the agent binary.
+- **The two 404 routes in §4** are a live backend gap, not a
+  misconfiguration — plan for the trust-store workaround rather than the
+  HTTP fetch path.
+
+## Summary: confirmed-working shape
+
+```text
 Director-side config.yml (mounted at /config.yml, -config-path /config.yml):
+  environments:
+    - name: "0"   # match this director's self-identity — see §2b
+      status: true
+      nodes:
+        - name: "0"
+          status: true
+          properties:
+            proxy_tls:            # NOT top-level — see §2c
+              status: true
+              mode: self-signed
+              port: 8443
+              cert_name: certs/cert.pem
+              key_name: certs/key.pem
+              ca_name: certs/ca.pem
   devices:
     - id: <N>
       name: <device-name>
@@ -337,12 +254,18 @@ Director-side config.yml (mounted at /config.yml, -config-path /config.yml):
     - devices: [{name: <device-name>}]
       targets: [...]
 
-Agent container (image: vmetric/director-enterprise:dev, built from
-cmd/director/Dockerfile.enterprise):
-  command override -> the baked
-    /opt/vmetric/package/agent/linux/amd64/vmetric-agent binary
-    (default ENTRYPOINT runs the director, not the agent)
+Agent container (image rebuilt/selected to match the harness host's
+architecture — see §5):
+  command override -> the baked agent binary for the matching arch
+    (the enterprise image's default entrypoint runs the director, not
+    the agent), preceded by:
+      - any input seeding the case needs (§7)
+      - writing the agent's own bootstrap vmetric.yml (or relying on
+        VMETRIC_CONFIG_HASH — see §1), with device.id and
+        director.address = https://<subject-host>:<proxy_tls.port>
+      - writing the known CA directly into the agent's trust store
+        path (storage/cert/ca.pem) — see §4
   env:
-    VMETRIC_CONFIG_HASH: base64("<director-address>;<director-token>;<N>;0")
-  mounts_shared_data: true   # only if the agent needs to seed /data itself
+    VMETRIC_CONFIG_HASH: base64("https://<subject-host>:<proxy_tls.port>;<director-token>;<N>;0")
+  mounts_shared_data: true   # if the agent needs to seed /data itself
 ```

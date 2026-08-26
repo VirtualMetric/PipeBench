@@ -39,9 +39,9 @@ pipelines:
           target_prefix: k8s
           # No listener on the bench network at this hostname:port — DNS
           # resolves nowhere, so the watcher's background LIST never
-          # completes and Synced() never returns true. The URL itself must
-          # still be a well-formed absolute https:// address: NewWatcher's
-          # normalizeOptions rejects anything else (non-https, no host) at
+          # completes and it never reports itself synced. The URL itself
+          # must still be a well-formed absolute https:// address: the
+          # watcher rejects anything else (non-https, no host) at
           # CONSTRUCTION time, before any network use, which would fail the
           # pipeline outright instead of exercising the degraded path.
           api_server: "https://k8s-mock-unreachable.invalid:6443"

@@ -1,22 +1,133 @@
 # Director (subject) config for k8s_podlog_agent_correctness. Mounted at
 # /config.yml, loaded via `-config-path /config.yml` (single-file mode —
-# see cases/AGENT-PROVISIONING.md §4-5 for why devices/targets/routes are
+# see cases/AGENT-PROVISIONING.md for why devices/targets/routes are
 # fully supported this way, same as a folder-scanned config).
 #
-# proxy_tls is REQUIRED here, not optional decoration: per
-# AGENT-PROVISIONING.md §7b, a standalone director (no `environments:`
-# block, which this config deliberately has none of) disables its raw
-# NATS client port and assigns the WebSocket port dynamically
-# (helper/vmmq/server/server.go resolveVMMQServer) — the only externally
-# dialable, fixed endpoint for an agent to connect to is this proxy_tls
-# listener. Port 8443 is a bench-arbitrary choice that MUST match the
-# `wss://subject:8443` embedded in the agent's VMETRIC_CONFIG_HASH
-# (../case.yaml). NOT CONFIRMED to be sufficient by a passing run — see
-# the case README's "Known gaps" section.
-proxy_tls:
-  status: true
-  mode: self-signed
-  port: 8443
+# DIAGNOSTIC, KEPT DELIBERATELY (decision: keep, not remove — this case
+# is diagnosis-heavy and has already needed this more than once across
+# multiple rounds of investigation; the cost of leaving it on is a few
+# extra debug/verbose log lines, the cost of a case that goes silent on
+# the next failure is another multi-round investigation like this one).
+# Forces debug console output so config-publish / device-agent-mode /
+# TLS-cert-resolution log lines are visible in `docker logs
+# bench-subject-vmetric`; `level: 5` (Verbose) is required too, not
+# just `console.status` — a prior revision of this file set only the
+# latter and got zero log output as a result (Information/Debug/Verbose
+# lines are filtered below the default level; only Error/Warning passed
+# through). If this case starts passing cleanly and stays that way for a
+# while, it's reasonable to drop this block or dial level back down —
+# your call at that point, not a rule.
+debug:
+  level: 5
+  console:
+    status: true
+#
+# CORRECTED (previous revision of this file had this backwards): an
+# `environments:` block is NOT optional decoration for agent connectivity —
+# it is REQUIRED for proxy_tls to bind at all. The HTTPS interface that
+# binds proxy_tls (the SAME listener agents dial for the fleet/websocket
+# upgrade) loops forever, silently, whenever the parsed config has zero
+# environments — logging only an informational "waiting for environment
+# configuration" line, with no error and no timeout. With no
+# `environments:` block, :8443 NEVER binds, silently, forever. (An
+# earlier revision of this file claimed the opposite — that omitting
+# `environments:` was correct for a "standalone" director and proxy_tls
+# would bind anyway — that claim was wrong; a director health probe's
+# unrelated warning about a 15-minute free-use license timer was
+# mistaken for the cause during that investigation. The license timer is
+# real but does not gate proxy_tls.)
+#
+# The block below is modeled on the backend's own canonical minimal
+# standalone-environment example — single environment, single node, no
+# cluster grouping — but BOTH the environment `name` and the node `name`
+# are corrected to "0" to match what this director ACTUALLY
+# self-identifies as; the example's literal "1" for both does NOT work
+# here (confirmed empirically — see below).
+#
+# Two independent matches both have to land, and each one that doesn't
+# fails with the exact same unhelpful error, "can not find node
+# information":
+#
+# 1. Node match: the director requires an exact string match between a
+#    node's `name` (searched directly within its environment, since
+#    there's no cluster grouping here) and the director's own resolved
+#    node identity. That identity defaults to "0" when no explicit
+#    director/node identifier is configured — NOT "1" (confirmed via the
+#    subject's own `/health` endpoint: `"node":"0"`).
+#
+# 2. Environment match: LESS obvious, and the reason the node fix alone
+#    (name "0", environment still "1", the literal example) still failed
+#    with the identical error. The director only searches an
+#    environment's nodes when its own resolved environment name is blank
+#    or equals that environment's `name`. The environment name is NOT
+#    blank by default — it mirrors the node name unless explicitly
+#    configured otherwise, by design (there is no separate environment
+#    identifier in every deployment context this binary runs in, so the
+#    node identifier doubles as the environment identifier when neither
+#    is set explicitly). So the environment name is ALSO "0" here —
+#    meaning the environment's own `name` must be "0" too, or the
+#    director skips it (and every node inside it) before ever reaching
+#    the node loop.
+#
+# Both corrected to "0" below — confirmed by a passing run (health
+# endpoint showed `"vmmq":{"status":"ok"}`).
+#
+# proxy_tls LIVES UNDER nodes[].properties BELOW, NOT as a top-level key
+# — this is a nasty trap, worth documenting in full. A top-level
+# `proxy_tls:` key here PARSES fine and even LOOKS like it's being read
+# (a much earlier revision of this file had it there, and
+# proxy_tls.status/mode/port all appeared to "work") but it is SILENTLY
+# IGNORED before any accessor ever runs: in Director/Agent mode, these
+# settings are treated as platform-delivered-only and are stripped from
+# the locally-supplied config on parse — they must not be set locally.
+# The apparent "status/mode/port work" from that earlier revision was
+# coincidence, not evidence: `mode`'s own DEFAULT is already
+# "self-signed", and the HTTPS listener never actually started either
+# way, so there was nothing to observably distinguish "read from config"
+# from "fell back to hardcoded default" — the ONLY node key that both
+# worked as documented and directly proved the top-level block was being
+# read was `port: 8443`, and once the listener needed a REAL
+# cert_name/key_name value — not a default with an all-purpose fallback —
+# the block's true, ignored status became visible ("No TLS certificate
+# found", every attempt, regardless of what cert_name/key_name/ca_name
+# said, because the whole `proxy_tls:` map was already gone by the time
+# the listener looked for cert material).
+#
+# The correct delivery path: node-scoped settings placed under
+# `nodes[].properties` for the current node (matched by the "0"/"0"
+# lookup documented above) ARE recursively merged into the live service
+# config — this is the SAME mechanism a real platform uses to push
+# node-specific settings, and it's what survives the local-config
+# stripping described above. `debug:` above is NOT subject to that
+# stripping (hence why it works perfectly well at the top level, unlike
+# proxy_tls) — an inconsistency worth remembering rather than assuming
+# any given top-level system-ish key behaves the same way.
+environments:
+  - name: "0"
+    status: true
+    nodes:
+      - name: "0"
+        status: true
+        properties:
+          proxy_tls:
+            status: true
+            mode: self-signed
+            port: 8443
+            # File-path cert delivery (not inline PEM — inline PEM was
+            # tried first, before this node-properties fix was found,
+            # and neither form got a chance to work while proxy_tls was
+            # still (unknowingly) top-level and therefore ignored before
+            # ever being read; see AGENT-PROVISIONING.md for the full,
+            # now-resolved history). Paths resolve relative to the
+            # binary's working dir (/opt/vmetric in this image) against
+            # configs/certs/ (this case ships cert.pem/key.pem/ca.pem —
+            # an EC P-256 self-signed cert, SAN
+            # DNS:subject,DNS:localhost,IP:127.0.0.1), auto-mounted
+            # read-only at /opt/vmetric/certs by PipeBench whenever a
+            # case's configs/certs/ directory exists.
+            cert_name: certs/cert.pem
+            key_name: certs/key.pem
+            ca_name: certs/ca.pem
 
 devices:
   - id: 42
@@ -24,8 +135,8 @@ devices:
     type: linux
     status: true
     definitions:
-      # name must match the controller constant: linux_kubernetes_pod_log_collector
-      # (docs/collectors/kubernetes-pod-logs-dataset.md, §1)
+      # name must match the collector's documented dataset name:
+      # linux_kubernetes_pod_log_collector
       - name: linux_kubernetes_pod_log_collector
         status: true
         inputs:

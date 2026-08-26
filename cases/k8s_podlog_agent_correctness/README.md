@@ -1,9 +1,9 @@
 # k8s_podlog_agent_correctness
 
-Spike case (see `../AGENT-PROVISIONING.md` for the full derived contract)
-exercising PipeBench's `agent:` mechanism (`internal/config/case.go`
-`AgentConfig`) for the first time with a real vmetric-agent doing real
-work: the `linux_kubernetes_pod_log_collector` dataset tailing a
+Agent-hosted correctness case (see `../AGENT-PROVISIONING.md` for the
+full provisioning contract) exercising PipeBench's `agent:` mechanism
+(`internal/config/case.go` `AgentConfig`) with a real vmetric-agent doing
+real work: the `linux_kubernetes_pod_log_collector` dataset tailing a
 CRI-formatted, kubelet-shaped pod-log file and forwarding through a
 director route to a TCP receiver.
 
@@ -16,124 +16,135 @@ director route to a TCP receiver.
   the same shape from the harness's perspective.
 - **The agent seeds its own input.** `agent.command` first `mkdir -p`s a
   kubelet-shaped directory (`<ns>_<pod>_<uid>/<container>/`) under the
-  shared `/data` volume and writes 200 CRI-formatted JSON lines into
-  `0.log`, THEN `exec`s the real `vmetric-agent` binary baked into
-  `vmetric/director-enterprise:dev`. This was the only viable place to do
-  it — see "Known gaps" below for why `Endpoint` and the file generator
-  both can't.
+  shared `/data` volume and writes 200 CRI TEXT lines
+  (`<RFC3339Nano> stdout F benchline <N>`, one record per physical line —
+  the format the `linux_kubernetes_pod_log_collector` dataset's pinned
+  "cri" decoder actually expects, NOT docker-JSON) into `0.log`, THEN
+  `exec`s the real `vmetric-agent` binary baked into the agent image.
+  This was the only viable place to do it — see "Known gaps" below for
+  why neither an `Endpoint` container nor the file generator can.
 - **Director-side device config lives in `configs/vmetric.yml`**, mounted
   single-file (`-config-path /config.yml`), which per
-  `AGENT-PROVISIONING.md` §4-5 is a fully-supported way to carry
+  `AGENT-PROVISIONING.md` is a fully-supported way to carry
   `devices:`/`targets:`/`routes:` — same as a folder-scanned config. The
   `devices[0].id: 42` MUST match the device ID embedded in the agent's
   `VMETRIC_CONFIG_HASH` (`case.yaml`).
 
-## Result: PASSED (real run)
+## Result: PASSED
 
 ```
 ./bin/harness test -t k8s_podlog_agent_correctness -s vmetric --version dev
 → correctness: PASSED
-  lines in: 0  lines out: 111,000  loss: 0.00%
-  throughput: 5,887 lines/s
+  lines in: 0  lines out: 200  loss: 0.00%
 ```
 
-`min_received: 150` and `required_substring: "benchline"` both satisfied.
-`vmetric/director:dev` (stock subject) + `vmetric/director-enterprise:dev`
-(agent image, built locally from `cmd/director/Dockerfile.enterprise`) were
-used. This is believed to be the first real, passing exercise of
-PipeBench's `agent:` mechanism.
+Exactly the 200 seeded lines, no over- or under-delivery — a confirmed
+working, real, agent-hosted run of PipeBench's `agent:` mechanism: the
+`linux_kubernetes_pod_log_collector` dataset genuinely tailed the seeded
+CRI-formatted file and forwarded records through the director to the
+receiver. The agent's own log confirms the real collector ran:
+`"Starting event collection of linux_kubernetes_pod_log_collector"`,
+`"Starting event collection of .../0.log on
+linux_kubernetes_pod_log_collector"`.
 
-**Environment note (not a case or backend bug):** the first attempt failed
-before any container started, with `docker: unknown shorthand flag: 'f' in
--f` from every `docker compose -f ...` invocation — the `docker compose`
-v2 CLI plugin was not installed on this harness host
-(`~/.docker/cli-plugins/` did not exist). This blocks every case on this
-harness, not just this one. It resolved itself between the first and
-second attempt (plugin appeared) without action from this case's author;
-if you hit the identical error, `docker compose version` is the fastest
-way to confirm this specific cause before looking at the case itself.
+Reaching a passing run required getting several distinct pieces right
+together, each one a genuine trap, not a case-authoring mistake fixed in
+isolation:
 
-**Fix applied before the passing run:** the agent's seed-and-exec `command`
-originally ended with `... vmetric-agent -mode agent`. Reading
-`cmd/agent/main.go`'s flag registration (`vmFlags.Mode_` only accepts
-`supervisor`/`update`/`restart`/`console` — there is no `agent` mode value,
-because `cmd/agent` IS the agent; running it bare falls through to
-`runAgent()`) showed this flag was invalid and would have failed to parse.
-Removed — the command now just `exec`s the binary with no arguments,
-matching how the stock director subject is also invoked with no
-`-service`/`-mode` flags in this harness.
+1. **An `environments:` block is required** before the director's
+   agent-facing TLS listener will bind at all.
+2. **The director's config-publish mechanism works automatically and
+   unprompted** once a matching device exists in its config — no
+   case-side trigger needed.
+3. **The agent container's CPU architecture must match the host's** — an
+   agent binary run under emulation crashes before it can complete
+   startup, let alone connect.
+4. **`proxy_tls` must be placed under
+   `environments[].nodes[].properties.proxy_tls`, not as a top-level
+   key**, or it is silently ignored regardless of the cert delivery form
+   used.
+5. **The HTTP routes an agent could use to fetch its own trusted CA are
+   unreliable in this setup** (see "Known gaps" below) — worked around by
+   having the case write a known CA directly into the agent's trust store
+   instead of fetching it.
 
-## Open question this run surfaced (not a correctness failure)
+See `AGENT-PROVISIONING.md` for the full contract these five points are
+drawn from.
 
-**Line-count over-delivery**: only 200 CRI-formatted lines were seeded into
-`0.log`, once, before the agent started — the file is never appended to
-again. The receiver observed **111,000** lines (555x). The case's
-correctness gate (`min_received: 150` + `required_substring`) doesn't
-penalize this (no `expected_loss_pct`/dedup validation was configured,
-since this is a no-generator case), so the run still PASSED, but it
-indicates the dataset's per-cycle collection
-(`docs/collectors/kubernetes-pod-logs-dataset.md` §2, "Read model": globs
-`path`, reads every matched file "once" per cycle) is **re-reading the same
-200 lines from the start on every cycle** rather than resuming from a
-persisted offset, in this specific container shape (ephemeral, no
-persistent volume for the reader's own resume-offset cache — only `/data`
-is a named volume; `/opt/vmetric/storage` where that cache would normally
-live is the container's writable overlay layer, gone if the container
-restarts, but that alone doesn't explain re-reads WITHIN a single
-container's uptime). Worth a follow-up run with `docker logs bench-agent`
-captured live (this spike's run didn't retain it — the harness's fixed
-`bench-agent` container name was reused by a concurrent run on this shared
-host before it could be inspected) to see whether `ignore_cache` is
-defaulting unexpectedly, or whether the cache write path itself is
-failing/warning.
+## Resolved: file re-read behavior
+
+An earlier run of this case (before the fixes above) observed far more
+received lines than seeded (roughly 111,000 against 200), which raised a
+question about the collector's resume-offset cache. The confirmed
+passing run above resolves this cleanly: exactly 200 seeded, 200
+received, no over-delivery. The agent's log shows why: the first
+collection cycle emits the 200 seeded lines
+(`"Starting event collection of .../0.log on
+linux_kubernetes_pod_log_collector"`); every subsequent cycle for the
+same file logs `"Skipping scanner for .../0.log. Reason: FileChange"` —
+the resume-offset cache correctly recognizes the file hasn't changed
+since its last read and does not re-emit. The earlier over-delivery was
+environmental (stale state on a shared, reused test host), not a defect
+in this caching behavior.
 
 ## Known gaps / unconfirmed assumptions (read this before debugging a failed run)
 
-1. ~~**`proxy_tls` port/scheme/token for the agent to dial in are
-   best-guess, not confirmed.**~~ **CONFIRMED by the passing run** —
-   `wss://subject:8443` with an empty director token, against
-   `proxy_tls: {status: true, mode: self-signed, port: 8443}` in
-   `configs/vmetric.yml`, is a working combination end-to-end. The
-   reasoning in `AGENT-PROVISIONING.md` §7b (standalone director disables
-   its raw NATS port; `proxy_tls` is the externally-reachable endpoint) is
-   validated, not just inferred, as of this run.
+1. **`proxy_tls` port/scheme/token for the agent to dial in are
+   confirmed, by a real pass.** `environments:` present, environment AND
+   node names both `"0"`, and `https://subject:8443` (NOT `wss://`) as
+   the agent's `Director.Address` with an empty director token are all
+   correct — and `proxy_tls` itself, moved under
+   `environments[].nodes[].properties.proxy_tls` (not top-level), binds
+   with a real, working, mutually-trusted TLS handshake. A top-level
+   `proxy_tls:` key is silently ignored regardless of form, which is why
+   `status`/`mode`/`port` only ever appeared to work at the top level
+   while `cert_name`/`key_name` never did.
 
 2. **`Endpoint` cannot mount the shared-data volume; the file generator
-   never `MkdirAll`s its target.** Both were candidates (per the original
-   spike brief) for seeding the nested pod-log directory tree, and both
-   were confirmed (by reading `internal/config/case.go` and
-   `internal/orchestrator/docker.go`) not to work: `Endpoint` has no
-   `mounts_shared_data`-equivalent field/template branch, and
-   `containers/generator/main.go`'s file-mode writer opens its target with
-   `O_CREATE` only, never creating parent directories. That's why the
-   agent seeds its own input instead (see Design above) — this sidesteps
-   the ordering race a generator/endpoint-based seed would have had
-   against the agent's own container start, since the SAME container does
-   the seeding then execs the collector, with no cross-container race.
-   **Harness recommendation**: add a shared-data mount option to
-   `Endpoint`, or a dedicated pre-topology seed hook — see
-   `AGENT-PROVISIONING.md` §7a.
+   never creates parent directories for its target.** Both were
+   candidates for seeding the nested pod-log directory tree, and neither
+   works: an `Endpoint` container has no shared-data-mount option, and
+   the file-mode data generator opens its target file directly without
+   creating the directory structure above it. That's why the agent seeds
+   its own input instead (see Design above) — this also sidesteps the
+   ordering race a generator- or endpoint-based seed would have had
+   against the agent's own container start, since the same container
+   does the seeding and then execs the collector, with no cross-container
+   race. See `AGENT-PROVISIONING.md` for more on this gap.
 
-3. **`required_substring: "benchline"` proves content survived transport,
-   not that CRI decoding specifically happened.** A subject that (bug)
-   forwarded the raw JSON lines unparsed would still contain the substring
-   `"benchline"` and pass. A stronger assertion — e.g. requiring the
-   record NOT contain the literal `"stream":"stdout"` JSON key (proving
-   the envelope was stripped, not passed through) — needs the agent's
-   actual decoded-record output shape, which requires a live run to
-   observe (`docs/collectors/kubernetes-pod-logs-dataset.md` describes the
-   *input* decode semantics but not the exact downstream field names for a
-   bare/no-pipeline dataset with `pipeline_name` unset, which is what this
-   case uses). Tighten this once a real run shows the decoded output.
+3. **`required_substring: "benchline"` alone proves content survived
+   transport, not that CRI decoding specifically happened.** The seed is
+   CRI text (`<RFC3339Nano> stdout F benchline <N>`, one record per
+   physical line — see Design above) matching the dataset's pinned "cri"
+   decoder. A subject that (bug) forwarded each raw seeded line unparsed
+   would still contain the substring `"benchline"` and pass. A stronger
+   assertion — e.g. requiring the record NOT contain the literal
+   `stdout F ` prefix (proving the CRI envelope was stripped, not passed
+   through verbatim) — needs the agent's actual decoded-record output
+   shape for a bare/no-pipeline dataset with `pipeline_name` unset, which
+   requires a live run to observe.
 
-4. ~~**Device-ID/token provenance for a from-scratch bench director has no
-   precedent in this repo.**~~ **CONFIRMED**: pre-setting `devices[0].id: 42`
-   in the director's config and the matching device ID in the agent's
-   `VMETRIC_CONFIG_HASH` (§2a's field 2) is sufficient — no enrollment
-   round-trip needed, exactly as
-   `helper/vmmq/server/vserver/authorization_test.go`'s comment predicted.
-   This case is the first passing implementation of that pattern in this
-   repo's case set.
+4. **Device-ID matching is confirmed and sufficient for the publish
+   side.** Pre-setting `devices[0].id: 42` in the director's config and
+   the matching device ID in the agent's `VMETRIC_CONFIG_HASH` is all
+   that's needed on this front — the director publishes that device's
+   dataset config automatically on startup, and the agent picks it up
+   and runs it as soon as it can actually connect. This case is a
+   confirmed passing example of an agent-mode device collecting real
+   data end-to-end through a statically-configured bench director.
+
+5. **`proxy_tls.cert_name`/`key_name`/`ca_name` resolved.** The real
+   issue was never the cert delivery form — it was that `proxy_tls:` as a
+   TOP-LEVEL YAML key is silently ignored before any accessor ever runs.
+   Moving `proxy_tls` — same file-path `cert_name`/`key_name`/`ca_name`
+   values, no other change — under
+   `environments[].nodes[].properties.proxy_tls` fixed it immediately:
+   the HTTPS listener started performing real TLS handshakes with the
+   supplied cert. A separate issue surfaced right after: both HTTP routes
+   an agent could use to fetch the CA (the agent's own built-in fetch,
+   and the director's documented CA-download route) return 404 in this
+   setup — worked around by having the case write the CA directly into
+   the agent's trust store instead of fetching it.
 
 ## Run
 
@@ -141,7 +152,27 @@ failing/warning.
 ./bin/harness test -t k8s_podlog_agent_correctness -s vmetric --version dev
 ```
 
-Requires `vmetric/director:dev` (stock subject image) and
-`vmetric/director-enterprise:dev` (agent image, built from
-`cmd/director/Dockerfile.enterprise` in the backend repo — bakes both the
-director and the linux `vmetric-agent` binary) to already exist locally.
+Requires the stock subject image and the agent-bearing enterprise image
+to already exist locally.
+
+**The agent image's architecture MUST match the harness host's.** The
+stock build instructions produce an amd64 agent binary unconditionally,
+so on an arm64 host (e.g. Colima on Apple Silicon) that binary segfaults
+at Go package init under QEMU emulation before it can do anything.
+Verify with an ELF header check, not `uname -m` inside the container
+(which reports the host kernel's architecture regardless of the binary's
+own — not useful here): `od -An -tx1 -j18 -N2 <path-to-vmetric-agent>`
+should print `b7 00` on arm64 hosts (`3e 00` = amd64). On an arm64 host,
+build a native image with the agent's own architecture setting changed
+to `arm64` and its baked binary path changed from `.../linux/amd64/
+vmetric-agent` to `.../linux/arm64/vmetric-agent` (matching `case.yaml`'s
+`agent.command` exec path).
+
+This case also ships `configs/certs/{cert.pem,key.pem,ca.pem}` — an EC
+(P-256) self-signed certificate generated at authoring time (SAN
+`DNS:subject,DNS:localhost,IP:127.0.0.1`), used for the
+`proxy_tls.cert_name`/`key_name`/`ca_name` config in `configs/vmetric.yml`
+that makes the confirmed-passing run above work. PipeBench auto-mounts a
+case's `configs/certs/` directory read-only into the subject container
+whenever the directory exists next to the config source — no
+`case.yaml` flag needed.

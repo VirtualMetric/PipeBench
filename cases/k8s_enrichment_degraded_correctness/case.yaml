@@ -1,6 +1,6 @@
 name: k8s_enrichment_degraded_correctness
 type: correctness
-description: "Proves the kubernetes processor degrades gracefully when its API server is unreachable: with ignore_missing/ignore_failure set, a watcher that never completes its first LIST (Synced() stays false forever) must not drop, corrupt, or block events — every line passes through unenriched, zero loss. api_server points at a syntactically-valid https URL with no listener behind it (pkg/kubernetes.NewWatcher rejects non-https URLs outright, so the target must still be a well-formed https:// address — just one nothing answers)."
+description: "Proves the kubernetes processor degrades gracefully when its API server is unreachable: with ignore_missing/ignore_failure set, a watcher that never completes its first LIST (sync never succeeds) must not drop, corrupt, or block events — every line passes through unenriched, zero loss. api_server points at a syntactically-valid https URL with no listener behind it (the kubernetes processor's watcher rejects non-https URLs outright at construction, so the target must still be a well-formed https:// address — just one nothing answers)."
 
 duration: 45s
 warmup: 10s

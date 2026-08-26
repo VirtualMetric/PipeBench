@@ -107,9 +107,15 @@ func TestRequiredSubstringSkipInitialSeconds(t *testing.T) {
 		// within the window (elapsed ~0s < 5s), so it is exempt even
 		// though it is missing the substring.
 		v.recordLine([]byte("missing the marker"), cfg)
-		passed, errs := v.validate(cfg, 1)
+		// Backdate firstLineNs so a SECOND line lands past the window and
+		// is actually evaluated — otherwise substrChecked stays 0 and the
+		// zero-evaluated guard (Fix 4a) fails the run for an unrelated
+		// reason, masking what this subtest exists to prove.
+		v.firstLineNs.Store(time.Now().Add(-10 * time.Second).UnixNano())
+		v.recordLine([]byte("has the TOKEN right here"), cfg)
+		passed, errs := v.validate(cfg, 2)
 		if !passed {
-			t.Fatalf("expected pass for a line inside the skip window, got errs=%v", errs)
+			t.Fatalf("expected pass — the in-window miss must be exempt, and the out-of-window line matches, got errs=%v", errs)
 		}
 	})
 
@@ -129,10 +135,55 @@ func TestRequiredSubstringSkipInitialSeconds(t *testing.T) {
 	t.Run("matching lines pass regardless of the window", func(t *testing.T) {
 		v := newValidator()
 		cfg := config{RequiredSubstring: "TOKEN", SkipInitialSeconds: 5}
+		// A matching line landing INSIDE the window is exempted the same
+		// as any other line there (never evaluated at all, not
+		// "evaluated and passed") — so a second, matching line OUTSIDE
+		// the window is what actually exercises "matching lines pass",
+		// same reasoning as the subtest above.
 		v.recordLine([]byte("has the TOKEN right here"), cfg)
-		passed, errs := v.validate(cfg, 1)
+		v.firstLineNs.Store(time.Now().Add(-10 * time.Second).UnixNano())
+		v.recordLine([]byte("has the TOKEN right here"), cfg)
+		passed, errs := v.validate(cfg, 2)
 		if !passed {
-			t.Fatalf("expected pass for a matching line, got errs=%v", errs)
+			t.Fatalf("expected pass for matching lines, got errs=%v", errs)
+		}
+	})
+
+	t.Run("skip window does not exempt ValidateJSON", func(t *testing.T) {
+		v := newValidator()
+		cfg := config{ValidateJSON: true, SkipInitialSeconds: 5}
+		// Within the window (recorded immediately after firstLineNs is
+		// stamped) — SkipInitialSeconds only ever gates RequiredSubstring;
+		// invalid JSON must still be caught regardless.
+		v.recordLine([]byte("not json"), cfg)
+		passed, errs := v.validate(cfg, 1)
+		if passed {
+			t.Fatalf("expected ValidateJSON failure inside the skip window, got passed=true errs=%v", errs)
+		}
+	})
+
+	t.Run("required substring entirely inside the skip window fails via the evaluated counter", func(t *testing.T) {
+		v := newValidator()
+		cfg := config{RequiredSubstring: "TOKEN", SkipInitialSeconds: 60}
+		// Every line — matching or not — lands inside a 60s window, so
+		// substrChecked never leaves 0. This must fail loudly (a
+		// misconfigured skip window that swallows the whole run is not
+		// evidence of a passing check) rather than read as a silent pass
+		// because missingSubstr also stayed 0.
+		v.recordLine([]byte("has the TOKEN right here"), cfg)
+		v.recordLine([]byte("has the TOKEN right here"), cfg)
+		passed, errs := v.validate(cfg, 2)
+		if passed {
+			t.Fatalf("expected failure when the skip window covers every received line, got passed=true errs=%v", errs)
+		}
+		found := false
+		for _, e := range errs {
+			if strings.Contains(e, "never evaluated") {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("expected a %q error, got errs=%v", "never evaluated", errs)
 		}
 	})
 }

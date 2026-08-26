@@ -33,48 +33,151 @@ agent:
   image: "vmetric/director-enterprise:dev"
   mounts_shared_data: true
   # The enterprise image's default ENTRYPOINT runs the director (see
-  # AGENT-PROVISIONING.md §4), so this overrides command+entrypoint to run
+  # AGENT-PROVISIONING.md), so this overrides command+entrypoint to run
   # the baked agent binary instead. Before that, it seeds the pod-log file
   # itself: neither Endpoint (no shared-data mount) nor the file generator
-  # (no MkdirAll on its target) can create the nested kubelet-shaped
-  # directory PipeBench's harness would otherwise need pre-created — see
-  # AGENT-PROVISIONING.md §7a for the full gap writeup. Doing the seeding
-  # here, before `exec`-ing the agent, avoids the ordering race that an
-  # endpoint- or generator-based seed would have had against this same
-  # container.
+  # (which does not create parent directories for its target) can create
+  # the nested kubelet-shaped directory PipeBench's harness would
+  # otherwise need pre-created — see AGENT-PROVISIONING.md for the full
+  # gap writeup. Doing the seeding here, before `exec`-ing the agent,
+  # avoids the ordering race that an endpoint- or generator-based seed
+  # would have had against this same container.
+  #
+  # Seed format is CRI text, not docker-JSON: the
+  # linux_kubernetes_pod_log_collector dataset pins decoder "cri", which
+  # expects `<RFC3339Nano> <stdout|stderr> <P|F> <message>` per physical
+  # line — a docker-JSON envelope would never decode even if it were valid
+  # JSON. The printf format string below has exactly one `\n`, at the very
+  # end, so printf's own backslash-escape interpretation (POSIX: printf
+  # processes \n in its format argument regardless of shell quoting)
+  # terminates each record as a single physical line. An earlier version
+  # embedded `\n` mid-string inside a docker-JSON envelope
+  # (`{"time":...,"log":"benchline %s\n"}`), which printf expanded into a
+  # real newline INSIDE the record, splitting every seeded record across
+  # two physical lines (invalid either way) — the case still passed only
+  # because the malformed input fell through to the unparsed_paths:collect
+  # fallback rather than being CRI-decoded.
+  #
+  # Before `exec`-ing the agent, wait for the subject's proxy_tls (WSS)
+  # listener to actually accept TCP connections on :8443. compose's
+  # `agent depends_on subject: condition: service_started` (case.go/
+  # docker.go) only guarantees the subject's PID 1 has started — NOT that
+  # it has finished parsing config and binding proxy_tls yet.
+  # Up to 120s (240 x 0.5s), fail-open with a warning echo rather than a
+  # silent hang — widened from an original 30s after an under-emulation
+  # debug session observed the wait exhausting before the subject bound
+  # :8443. In that specific run the real failure turned out to be the
+  # agent binary itself, not this wait, but 120s is cheap insurance and
+  # removes one variable from future debugging.
   command:
     - "sh"
     - "-c"
-    - >-
+    - |-
       set -e;
       dir=/data/pods/bench-ns_bench-pod_11111111-2222-3333-4444-555555555555/app;
       mkdir -p "$dir";
       i=0;
       while [ "$i" -lt 200 ]; do
-        printf '{"time":"2024-01-01T00:00:00.000000000Z","stream":"stdout","log":"benchline %s\n"}\n' "$i" >> "$dir/0.log";
+        printf '2024-01-01T00:00:00.000000000Z stdout F benchline %s\n' "$i" >> "$dir/0.log";
         i=$((i+1));
       done;
-      exec /opt/vmetric/package/agent/linux/amd64/vmetric-agent
+      w=0;
+      while ! nc -z subject 8443 2>/dev/null; do
+        w=$((w+1));
+        if [ "$w" -ge 240 ]; then
+          echo "WARNING: subject:8443 never became reachable after 120s; proceeding anyway (fail-open) -- the agent will retry its own connection, but this is likely a hard failure, not a transient one.";
+          break;
+        fi;
+        sleep 0.5;
+      done;
+      # linux/arm64 (not amd64): the agent binary's path must match the
+      # HOST platform's architecture, not a fixed convention. This bench
+      # host (Colima on Apple Silicon) is native arm64, so the image used
+      # here bakes an arm64 vmetric-agent to match — an amd64 agent binary
+      # crashes under QEMU emulation on arm64 hosts before it can connect
+      # (see AGENT-PROVISIONING.md; the director binary itself runs fine
+      # under emulation since the host kernel is arm64 either way, only
+      # the agent hits this). A published, multi-arch image should bake
+      # both linux/amd64 and linux/arm64 agent binaries and this command
+      # should pick the one matching `uname -m` at container start, rather
+      # than hardcoding one.
+      cat > /opt/vmetric/package/agent/linux/arm64/vmetric.yml <<'VMCFG'
+      device:
+          id: 42
+      director:
+          address: https://subject:8443
+      debug:
+          level: 5
+          console:
+              status: true
+      VMCFG
+      # CA delivery: write the SAME CA (configs/certs/ca.pem) this case
+      # already ships for the director's proxy_tls, directly, rather than
+      # fetching it over HTTP -- BOTH HTTP CA-bootstrap routes this repo
+      # has are broken in this setup, confirmed by two separate live
+      # tests, not assumed:
+      #  1. https://subject:8443/dl/cert.pem -- what the agent's own
+      #     built-in CA-auto-fetch requests -- 404s. This is a generic
+      #     download-artifact path prefix, not a cert route, and it's on
+      #     the HTTPS listener besides -- confirmed to be a genuine
+      #     backend bug in that fetch, not a config issue.
+      #  2. http://subject:8080/ca.pem -- the route actually documented
+      #     for this purpose (gated on self-signed mode + discovery
+      #     enabled, both true here) -- ALSO 404s, even though a sibling
+      #     route under the exact same gate (/install.sh) returns 200 in
+      #     the same container. Not fully root-caused; most likely
+      #     explanation is that whatever serves this route captures its
+      #     certificate snapshot at a different point in startup than the
+      #     main HTTPS listener does, missing the node-properties-
+      #     delivered cert material and falling back to an on-disk path
+      #     that doesn't exist in a bench container.
+      # See AGENT-PROVISIONING.md for the full evidence on both.
+      # Writing the CA directly sidesteps needing either route to work.
+      mkdir -p /opt/vmetric/package/agent/linux/arm64/storage/cert;
+      cat > /opt/vmetric/package/agent/linux/arm64/storage/cert/ca.pem <<'CACERT'
+      -----BEGIN CERTIFICATE-----
+      MIIBnzCCAUSgAwIBAgIUW6cb5F/AXEBmdaavUtCeci9fzJ8wCgYIKoZIzj0EAwIw
+      EjEQMA4GA1UEAwwHc3ViamVjdDAeFw0yNjA4MjUxNzQ3MTJaFw0zNjA4MjIxNzQ3
+      MTJaMBIxEDAOBgNVBAMMB3N1YmplY3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNC
+      AASODMqCfOfkwF3zlgu/MPE9MtW/7nx6kN4VxQW8/y7Zr1DUgikAkaTEaI0QZCgQ
+      TiO2SCcbvC/Fy88w3T3c8T64o3gwdjAdBgNVHQ4EFgQUDyqwQhamr9H9yFgTQM3r
+      FtsUnAcwHwYDVR0jBBgwFoAUDyqwQhamr9H9yFgTQM3rFtsUnAcwDwYDVR0TAQH/
+      BAUwAwEB/zAjBgNVHREEHDAaggdzdWJqZWN0gglsb2NhbGhvc3SHBH8AAAEwCgYI
+      KoZIzj0EAwIDSQAwRgIhAICFRzoHRmDC0wpuRl5Ah8CG6O1M7OIIgI729ROHCdqH
+      AiEAgYmWAOkpr/s45NYm1M85f37b5s2t3oLb/WqthGvTwTk=
+      -----END CERTIFICATE-----
+      CACERT
+      unset VMETRIC_CONFIG_HASH;
+      exec /opt/vmetric/package/agent/linux/arm64/vmetric-agent
   env:
-    # base64("wss://subject:8443;;42;0") — see AGENT-PROVISIONING.md §2a for
-    # the field layout (director-address;director-token;deviceID;0) and §7b
-    # for why the address/port (wss://subject:8443) and empty token are
-    # BEST-GUESS values, not confirmed by a passing run: the standalone
-    # director's raw NATS/WS port is documented as dynamically-assigned and
-    # not externally reachable, so proxy_tls (configs/vmetric.yml, port
-    # 8443) is believed to be the actual dial target, but this composition
-    # was not proven end-to-end in the time available.
-    VMETRIC_CONFIG_HASH: "d3NzOi8vc3ViamVjdDo4NDQzOzs0Mjsw"
+    # VESTIGIAL / CURRENTLY UNUSED: the agent.command above writes the
+    # agent's own bootstrap config file directly (heredoc) and explicitly
+    # `unset VMETRIC_CONFIG_HASH` before exec-ing the agent, so this value
+    # is never actually decoded on this run. This was a debugging-era
+    # workaround: diagnosing the TLS/connection chain needed debug-level
+    # console output on the agent, which the VMETRIC_CONFIG_HASH
+    # decode-then-boot path doesn't expose a way to set (see
+    # AGENT-PROVISIONING.md). Kept set, with the correct scheme
+    # (base64("https://subject:8443;;42;0") — NOT "wss://", which the
+    # agent's own address validator rejects with "director address scheme
+    # %q is not allowed"), as a working reference for what a case NOT
+    # needing the debug workaround would use instead of the heredoc.
+    VMETRIC_CONFIG_HASH: "aHR0cHM6Ly9zdWJqZWN0Ojg0NDM7OzQyOzA="
 
 correctness:
   # No generator in this case, so MinReceived (not expected_loss_pct) is the
   # verdict floor — see CorrectnessConfig.MinReceived's doc comment.
   min_received: 150
-  # Proves the 200 seeded lines' payload text survived CRI-decode + pipeline
-  # + TCP transport intact (not proof of the {"time","stream","log"}
-  # envelope being *parsed* specifically — see README.md "Known gaps" for
-  # why a more rigorous shape-specific assertion needs a real run to derive
-  # from the agent's actual CRI-decoded output format).
+  # Proves the 200 seeded lines' payload text survived CRI-decode +
+  # pipeline + TCP transport intact. The seed is CRI text
+  # (`<RFC3339Nano> stdout F benchline <N>`, one record per physical line —
+  # see agent.command above) matching the
+  # linux_kubernetes_pod_log_collector dataset's pinned "cri" decoder, so a
+  # successful match here is evidence the decoder actually ran, not just
+  # that raw bytes passed through unparsed — see README.md "Known gaps" for
+  # the remaining caveat (this substring alone doesn't distinguish a
+  # correctly-stripped envelope from one where the " stdout F " prefix
+  # leaked into the forwarded message).
   required_substring: "benchline"
 
 configurations:

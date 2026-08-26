@@ -222,6 +222,15 @@ type validator struct {
 	missingSubstr     atomic.Int64
 	missingSubstrSamp []string
 
+	// substrChecked counts lines actually evaluated by the
+	// required-substring check — i.e. NOT exempted by SkipInitialSeconds.
+	// Exists so a misconfigured skip window (one that happens to cover
+	// every received line) fails loudly instead of silently validating
+	// nothing: RequiredSubstring set but zero lines ever checked means the
+	// check never ran, which is a config bug, not an absence of evidence
+	// of one.
+	substrChecked atomic.Int64
+
 	// firstLineNs is the wall-clock nanosecond of the first line recordLine
 	// ever saw, CAS-set once. Anchors SkipInitialSeconds: lines within that
 	// many seconds of THIS (not process start — the receiver listens
@@ -309,6 +318,7 @@ func (v *validator) recordLine(line []byte, cfg config) {
 	skippedInitial := cfg.SkipInitialSeconds > 0 &&
 		now-v.firstLineNs.Load() < int64(cfg.SkipInitialSeconds)*int64(time.Second)
 	if cfg.RequiredSubstring != "" && !skippedInitial {
+		v.substrChecked.Add(1)
 		if !bytes.Contains(line, []byte(cfg.RequiredSubstring)) {
 			v.missingSubstr.Add(1)
 			v.mu.Lock()
@@ -509,7 +519,24 @@ func (v *validator) validate(cfg config, totalLines int64) (bool, []string) {
 	// Without this the per-line check only SAMPLES violators; the verdict
 	// never fails on them.
 	if cfg.RequiredSubstring != "" {
-		if m := v.missingSubstr.Load(); m > 0 {
+		// A misconfigured (or simply too-long) SkipInitialSeconds window
+		// can exempt every received line, leaving substrChecked at 0 —
+		// missingSubstr would then ALSO be 0 (nothing was ever compared),
+		// which without this guard reads as a silent pass. Zero lines
+		// evaluated is not evidence of correctness; it means the check
+		// never ran at all, so fail loudly and specifically instead of
+		// reporting a clean substring match that never happened.
+		// Backward compatible: with SkipInitialSeconds unset (0), every
+		// received line is checked, so substrChecked == 0 only when
+		// totalLines == 0 too — a case already failing elsewhere (loss/
+		// MinReceived) that this makes explicit rather than silent.
+		if checked := v.substrChecked.Load(); checked == 0 {
+			errors = append(errors, fmt.Sprintf(
+				"required_substring %q never evaluated — skip window covered all received lines (0 of %d checked)",
+				cfg.RequiredSubstring, totalLines,
+			))
+			passed = false
+		} else if m := v.missingSubstr.Load(); m > 0 {
 			msg := fmt.Sprintf("required substring %q missing from %d line(s)", cfg.RequiredSubstring, m)
 			if len(v.missingSubstrSamp) > 0 {
 				msg += "; samples: " + strings.Join(v.missingSubstrSamp, " | ")

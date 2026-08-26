@@ -1,12 +1,12 @@
 name: k8s_enrichment_correctness
 type: correctness
-description: "Proves the kubernetes processor performs REAL enrichment against a live-ish API server: a mock Kubernetes API (endpoints: k8s-mock) serves a single pod over HTTPS with a self-signed cert; the subject's watcher (pkg/kubernetes.NewWatcher enforces https and always reads both CAPath and TokenPath — see configs/certs/{ca.pem,token} mounted at /opt/vmetric/certs via the case-certs mechanism) LISTs it, syncs, and the kubernetes processor enriches matching log lines with k8s.namespace/pod/node. Verifies the enriched namespace value reaches the wire on every line."
+description: "Proves the kubernetes processor performs REAL enrichment against a live-ish API server: a mock Kubernetes API (endpoints: k8s-mock) serves a single pod over HTTPS with a self-signed cert; the subject's kubernetes watcher (which requires https and always reads both a CA file and a token file — see configs/certs/{ca.pem,token} mounted at /opt/vmetric/certs via the case-certs mechanism) LISTs it, syncs, and the kubernetes processor enriches matching log lines with k8s.namespace/pod/node. Verifies the enriched namespace value reaches the wire on every line."
 
 # DIAGNOSED STARTUP RACE, FIXED VIA correctness.skip_initial_seconds:
 #
-# getKubernetesWatcher (helper/pipeline/kubernetes.go) builds and starts the
-# watcher LAZILY — on the FIRST event that reaches the kubernetes processor
-# — it is NOT pre-warmed by warmup: (which only polls the subject's listen
+# The kubernetes processor's watcher is built and started LAZILY — on the
+# FIRST event that reaches the kubernetes processor — it is NOT
+# pre-warmed by warmup: (which only polls the subject's listen
 # port; it never sends real traffic through the pipeline — see
 # GeneratorConfig.Warmup / waitForWarmup in containers/generator/main.go).
 # Every run (reproduced at rate:200/24 conns, rate:20/1 conn, and
@@ -46,8 +46,9 @@ endpoints:
     # watcher's store is fully seeded by the LIST response alone, so the
     # watch stream never needs to emit an event for this case to pass.
     # The cert's SAN is "DNS:k8s-mock", matching this endpoint's compose
-    # network alias/hostname, so Go's TLS client hostname verification
-    # (pkg/kubernetes sets RootCAs but no InsecureSkipVerify) succeeds.
+    # network alias/hostname, so the subject's TLS client hostname
+    # verification succeeds (it trusts the supplied CA but does not skip
+    # certificate/hostname verification).
     command:
       - sh
       - -c
@@ -65,7 +66,7 @@ endpoints:
       # failing enrichment — consistent with the director's watcher hitting
       # that window (TCP accepted, TLS handshake broken because the socket
       # isn't SSL-wrapped yet), failing its first LIST, and walking through
-      # NewWatcher's initialBackoff/nextBackoff sequence (500ms, 1s, 2s,
+      # the watcher's own retry/backoff sequence (500ms, 1s, 2s,
       # 4s, ...) before a retry lands after wrap_socket has run. `wget`
       # actually completes a TLS handshake (--no-check-certificate: the
       # self-signed leaf isn't the point here, only that TLS-serving is
@@ -105,7 +106,7 @@ subjects:
 correctness:
   validate_json: true
   expected_loss_pct: 0.0
-  # applyMeta (helper/pipeline/kubernetes.go) writes a field literally named
+  # The kubernetes processor writes a field literally named
   # "namespace" (nested under target_prefix "k8s") only on a real lookup
   # hit. The generator's raw input never uses that field name (see
   # input/pods.log — the raw identity fields are container_id/ns/pod_hint,

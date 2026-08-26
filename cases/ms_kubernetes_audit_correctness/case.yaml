@@ -1,6 +1,6 @@
 name: ms_kubernetes_audit_correctness
 type: correctness
-description: "Verifies the ms_kubernetes_audit content pack: raw Kubernetes audit.k8s.io/v1 Event JSON in, ASIM ASimAuditEventLogs normalized JSON out. Replays the pack's own fixture (helper/pipeline/content/microsoft/ms_kubernetes_audit/kubernetes_audit.log) over TCP and checks every emitted record decoded, normalized (EventVendor/EventSchema set unconditionally by the pack), and forwarded with zero loss."
+description: "Verifies the ms_kubernetes_audit content pack: raw Kubernetes audit.k8s.io/v1 Event JSON in, ASIM ASimAuditEventLogs normalized JSON out. Replays the content pack's own fixture over TCP and checks every emitted record decoded, normalized (EventVendor/EventSchema set unconditionally by the pack), and forwarded with zero loss."
 
 duration: 45s
 warmup: 15s

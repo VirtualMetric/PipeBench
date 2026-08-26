@@ -40,19 +40,18 @@ pipelines:
           # "k8s-mock" is the endpoints: entry's compose service name /
           # network alias (case.yaml) — the mock's cert SAN matches it.
           api_server: "https://k8s-mock:6443"
-          # apiClientHTTPClient (pkg/kubernetes/client.go) unconditionally
-          # os.ReadFile()s CAPath to build the trust pool, and
-          # newPathRequest unconditionally os.ReadFile()s TokenPath on
-          # every request — neither is "skip if unset": TokenPath defaults
-          # to the in-cluster path (which doesn't exist in this container)
-          # and would fail every request. Both files are shipped in this
-          # case's configs/certs/ and mounted read-only at
-          # /opt/vmetric/certs (Subject "vmetric"'s CaseCertsHost mount —
-          # see internal/orchestrator/docker.go). ca.pem is the mock's own
-          # self-signed leaf cert (self-signed == its own issuer, so the
-          # leaf doubles as the CA the client must trust). token's content
-          # is never checked by the mock — it only needs to exist and be
-          # readable so readToken() doesn't error.
+          # The kubernetes processor unconditionally reads the file at
+          # ca_path to build its trust pool, and unconditionally reads the
+          # file at token_path on every request — neither is "skip if
+          # unset": token_path defaults to the in-cluster service-account
+          # path (which doesn't exist in this container) and would fail
+          # every request if left unset here. Both files are shipped in
+          # this case's configs/certs/ and mounted read-only at
+          # /opt/vmetric/certs (PipeBench's case-certs mount for the
+          # "vmetric" subject). ca.pem is the mock's own self-signed leaf
+          # cert (self-signed == its own issuer, so the leaf doubles as
+          # the CA the client must trust). token's content is never
+          # checked by the mock — it only needs to exist and be readable.
           ca_path: "/opt/vmetric/certs/ca.pem"
           token_path: "/opt/vmetric/certs/token"
           ignore_missing: true
