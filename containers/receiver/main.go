@@ -255,10 +255,18 @@ func newValidator() *validator {
 
 func (v *validator) recordLine(line []byte, cfg config) {
 	// Stamp firstLineNs exactly once (CAS on the zero value) — anchors
-	// SkipInitialSeconds below, and costs nothing on every subsequent line
-	// since the CAS fails immediately once set.
-	now := time.Now().UnixNano()
-	v.firstLineNs.CompareAndSwap(0, now)
+	// SkipInitialSeconds below. Only meaningful when a case actually uses
+	// the skip window (RequiredSubstring set AND SkipInitialSeconds > 0):
+	// skippedInitial is unused otherwise, so the time.Now() + CAS used to
+	// run on every single line for nothing when dedup-only (or no)
+	// validation was enabled. Gate the work behind the same condition the
+	// check below already requires.
+	var skippedInitial bool
+	if cfg.RequiredSubstring != "" && cfg.SkipInitialSeconds > 0 {
+		now := time.Now().UnixNano()
+		v.firstLineNs.CompareAndSwap(0, now)
+		skippedInitial = now-v.firstLineNs.Load() < int64(cfg.SkipInitialSeconds)*int64(time.Second)
+	}
 
 	// Latency: extract TS=<nanos> and compute delta (always, no config needed)
 	if ts := extractTimestamp(line); ts > 0 {
@@ -314,9 +322,9 @@ func (v *validator) recordLine(line []byte, cfg config) {
 	// SkipInitialSeconds > 0 exempts lines within that many seconds of
 	// firstLineNs — see config.SkipInitialSeconds's doc comment. 0 (the
 	// default) exempts nothing, so this is a strict no-op unless a case
-	// opts in.
-	skippedInitial := cfg.SkipInitialSeconds > 0 &&
-		now-v.firstLineNs.Load() < int64(cfg.SkipInitialSeconds)*int64(time.Second)
+	// opts in; skippedInitial is computed above under the same
+	// (RequiredSubstring != "" && SkipInitialSeconds > 0) gate, so it's
+	// already false here whenever either condition doesn't hold.
 	if cfg.RequiredSubstring != "" && !skippedInitial {
 		v.substrChecked.Add(1)
 		if !bytes.Contains(line, []byte(cfg.RequiredSubstring)) {

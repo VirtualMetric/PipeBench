@@ -32,7 +32,7 @@ director route to a TCP receiver.
 
 ## Result: PASSED
 
-```
+```text
 ./bin/harness test -t k8s_podlog_agent_correctness -s vmetric --version dev
 → correctness: PASSED
   lines in: 0  lines out: 200  loss: 0.00%
@@ -148,25 +148,36 @@ in this caching behavior.
 
 ## Run
 
-```
+```sh
 ./bin/harness test -t k8s_podlog_agent_correctness -s vmetric --version dev
 ```
 
 Requires the stock subject image and the agent-bearing enterprise image
 to already exist locally.
 
-**The agent image's architecture MUST match the harness host's.** The
-stock build instructions produce an amd64 agent binary unconditionally,
-so on an arm64 host (e.g. Colima on Apple Silicon) that binary segfaults
-at Go package init under QEMU emulation before it can do anything.
-Verify with an ELF header check, not `uname -m` inside the container
-(which reports the host kernel's architecture regardless of the binary's
-own — not useful here): `od -An -tx1 -j18 -N2 <path-to-vmetric-agent>`
-should print `b7 00` on arm64 hosts (`3e 00` = amd64). On an arm64 host,
-build a native image with the agent's own architecture setting changed
-to `arm64` and its baked binary path changed from `.../linux/amd64/
-vmetric-agent` to `.../linux/arm64/vmetric-agent` (matching `case.yaml`'s
-`agent.command` exec path).
+**The locally built enterprise image must package an agent binary
+matching the docker host's architecture.** The stock build instructions
+produce an amd64 agent binary unconditionally, so an amd64 docker host
+can use that build as-is. An arm64 docker host (e.g. Colima on Apple
+Silicon) needs an arch-native build instead — the stock amd64 binary
+segfaults at Go package init under QEMU emulation before it can do
+anything. To build the arm64-native image, change the agent's own
+architecture setting to `arm64` and its baked binary path from
+`.../linux/amd64/vmetric-agent` to `.../linux/arm64/vmetric-agent`.
+Verify a binary's actual architecture with an ELF header check, not
+`uname -m` inside the container (which reports the host kernel's
+architecture regardless of the binary's own — not useful here):
+`od -An -tx1 -j18 -N2 /path/to/vmetric-agent` should print `b7 00` for
+arm64 (`3e 00` = amd64).
+
+`case.yaml`'s `agent.command` auto-selects the matching packaged binary
+at container start — it maps the container's own `uname -m` to
+`arm64`/`amd64` and picks that architecture's packaged directory, rather
+than hardcoding one, so the same case.yaml runs unmodified on either
+host architecture as long as the image bakes the matching binary. If it
+doesn't, the command fails loudly with a one-line error naming the
+expected arch directory instead of exec-ing a missing or wrong-arch
+binary.
 
 This case also ships `configs/certs/{cert.pem,key.pem,ca.pem}` — an EC
 (P-256) self-signed certificate generated at authoring time (SAN

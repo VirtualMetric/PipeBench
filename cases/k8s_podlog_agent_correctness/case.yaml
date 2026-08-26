@@ -74,6 +74,7 @@ agent:
     - "-c"
     - |-
       set -e;
+      a=$(uname -m); case "$a" in aarch64) p=arm64;; x86_64) p=amd64;; *) echo "unsupported arch $a"; exit 1;; esac;
       dir=/data/pods/bench-ns_bench-pod_11111111-2222-3333-4444-555555555555/app;
       mkdir -p "$dir";
       i=0;
@@ -90,18 +91,22 @@ agent:
         fi;
         sleep 0.5;
       done;
-      # linux/arm64 (not amd64): the agent binary's path must match the
-      # HOST platform's architecture, not a fixed convention. This bench
-      # host (Colima on Apple Silicon) is native arm64, so the image used
-      # here bakes an arm64 vmetric-agent to match — an amd64 agent binary
-      # crashes under QEMU emulation on arm64 hosts before it can connect
-      # (see AGENT-PROVISIONING.md; the director binary itself runs fine
-      # under emulation since the host kernel is arm64 either way, only
-      # the agent hits this). A published, multi-arch image should bake
-      # both linux/amd64 and linux/arm64 agent binaries and this command
-      # should pick the one matching `uname -m` at container start, rather
-      # than hardcoding one.
-      cat > /opt/vmetric/package/agent/linux/arm64/vmetric.yml <<'VMCFG'
+      # The agent binary's path must match the CONTAINER's actual CPU
+      # architecture, not a fixed convention -- an agent binary run under
+      # QEMU emulation (e.g. an amd64 binary on an arm64 host, or vice
+      # versa) crashes with SIGSEGV during Go runtime package init before
+      # it can connect (see AGENT-PROVISIONING.md; the director binary
+      # itself runs fine under emulation since it's the agent specifically
+      # that hits this). $p (arm64|amd64), resolved above from `uname -m`,
+      # selects the matching packaged binary directory so this command
+      # works unmodified on either host architecture, as long as the image
+      # actually bakes that arch's binary (see README.md's build note) --
+      # fail loudly rather than exec-ing a missing/wrong-arch binary.
+      if [ ! -x "/opt/vmetric/package/agent/linux/$p/vmetric-agent" ]; then
+        echo "ERROR: no vmetric-agent binary for detected arch linux/$p (expected at /opt/vmetric/package/agent/linux/$p/vmetric-agent) -- this image does not bake a $p agent binary";
+        exit 1;
+      fi;
+      cat > "/opt/vmetric/package/agent/linux/$p/vmetric.yml" <<'VMCFG'
       device:
           id: 42
       director:
@@ -133,8 +138,8 @@ agent:
       #     that doesn't exist in a bench container.
       # See AGENT-PROVISIONING.md for the full evidence on both.
       # Writing the CA directly sidesteps needing either route to work.
-      mkdir -p /opt/vmetric/package/agent/linux/arm64/storage/cert;
-      cat > /opt/vmetric/package/agent/linux/arm64/storage/cert/ca.pem <<'CACERT'
+      mkdir -p "/opt/vmetric/package/agent/linux/$p/storage/cert";
+      cat > "/opt/vmetric/package/agent/linux/$p/storage/cert/ca.pem" <<'CACERT'
       -----BEGIN CERTIFICATE-----
       MIIBnzCCAUSgAwIBAgIUW6cb5F/AXEBmdaavUtCeci9fzJ8wCgYIKoZIzj0EAwIw
       EjEQMA4GA1UEAwwHc3ViamVjdDAeFw0yNjA4MjUxNzQ3MTJaFw0zNjA4MjIxNzQ3
@@ -148,7 +153,7 @@ agent:
       -----END CERTIFICATE-----
       CACERT
       unset VMETRIC_CONFIG_HASH;
-      exec /opt/vmetric/package/agent/linux/arm64/vmetric-agent
+      exec "/opt/vmetric/package/agent/linux/$p/vmetric-agent"
   env:
     # VESTIGIAL / CURRENTLY UNUSED: the agent.command above writes the
     # agent's own bootstrap config file directly (heredoc) and explicitly
@@ -166,8 +171,19 @@ agent:
 
 correctness:
   # No generator in this case, so MinReceived (not expected_loss_pct) is the
-  # verdict floor — see CorrectnessConfig.MinReceived's doc comment.
-  min_received: 150
+  # verdict floor — see CorrectnessConfig.MinReceived's doc comment. The
+  # seed writes exactly 200 unique lines (benchline 0..199 — see
+  # agent.command above), so the floor is set to the exact count rather
+  # than a loose lower bound: a loose floor like 150 would still PASS a run
+  # that re-delivered duplicates well past the seeded total (a past
+  # contaminated run observed 555x over-delivery), since it only checks a
+  # minimum, not an exact match.
+  min_received: 200
+  # All 200 seeded lines are unique; dedup turns any re-read/duplicate
+  # delivery into a hard failure instead of a silent over-count. Enforced
+  # even with no generator: the receiver's dedup check runs against
+  # min_received independently (see runner's no-generator verdict path).
+  validate_dedup: true
   # Proves the 200 seeded lines' payload text survived CRI-decode +
   # pipeline + TCP transport intact. The seed is CRI text
   # (`<RFC3339Nano> stdout F benchline <N>`, one record per physical line —

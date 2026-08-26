@@ -20,7 +20,7 @@ to the agent's own local `vmetric.yml`.
 **Agent-mode shape**: base64 of a `;`-delimited string with at least 4
 fields:
 
-```
+```text
 base64("<directorAddress>;<directorToken>;<deviceID>;<enrollmentID>")
 ```
 
@@ -178,7 +178,7 @@ To verify a binary's actual architecture, check its ELF header rather
 than `uname -m` inside the container (which reports the host kernel's
 architecture regardless of the binary's own):
 
-```
+```sh
 od -An -tx1 -j18 -N2 <path-to-vmetric-agent>
 ```
 
