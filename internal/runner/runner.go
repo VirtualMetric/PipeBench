@@ -1403,11 +1403,13 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 	}
 	fmt.Printf("  total time: %.1fs\n", elapsed)
 
-	if passed {
+	// Print from the persisted result: applyMaxReceived may have failed it
+	// after the local verdict was computed.
+	if result.Passed != nil && *result.Passed {
 		fmt.Println("  persistence correctness: PASSED ✓")
 	} else {
 		fmt.Println("  persistence correctness: FAILED ✗")
-		for _, e := range errors {
+		for _, e := range strings.Split(result.FailReason, "; ") {
 			fmt.Printf("    - %s\n", e)
 		}
 	}
@@ -1726,11 +1728,13 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 	}
 	fmt.Printf("  total time: %.1fs\n", elapsed)
 
-	if passed {
+	// Print from the persisted result: applyMaxReceived may have failed it
+	// after the local verdict was computed.
+	if result.Passed != nil && *result.Passed {
 		fmt.Println("  persistence restart correctness: PASSED ✓")
 	} else {
 		fmt.Println("  persistence restart correctness: FAILED ✗")
-		for _, e := range errors {
+		for _, e := range strings.Split(result.FailReason, "; ") {
 			fmt.Printf("    - %s\n", e)
 		}
 	}
@@ -2029,12 +2033,6 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 	if metrics.IOThroughputAvg > 0 {
 		fmt.Printf("  io throughput: avg %.1f MB/s\n", metrics.IOThroughputAvg/(1024*1024))
 	}
-	if passed {
-		fmt.Printf("  %s: PASSED ✓\n", f.verdictLabel)
-	} else {
-		fmt.Printf("  %s: FAILED ✗\n", f.verdictLabel)
-	}
-
 	result := results.RunResult{
 		TestName:        tc.Name,
 		Config:          configName,
@@ -2076,8 +2074,17 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 	}
 
 	// Persist the result like every other run path — Run's contract is to
-	// return the *persisted* result.
+	// return the *persisted* result. The verdict is printed from it so a
+	// max_received failure shows up on the CLI as well.
 	applyMaxReceived(tc, recvMetrics.LinesReceived, &result)
+	if result.Passed != nil && *result.Passed {
+		fmt.Printf("  %s: PASSED ✓\n", f.verdictLabel)
+	} else {
+		fmt.Printf("  %s: FAILED ✗\n", f.verdictLabel)
+		for _, e := range strings.Split(result.FailReason, "; ") {
+			fmt.Printf("    - %s\n", e)
+		}
+	}
 
 	dir, err := r.saveResult(result, metricsCSVSrc)
 	if err != nil {
