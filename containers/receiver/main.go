@@ -27,11 +27,12 @@ type config struct {
 	Timeout     time.Duration
 
 	// Correctness validation (all optional, off by default)
-	ValidateDedup     bool
-	ValidateContent   bool   // O(1) per line, no heap map — safe for high-volume tests
-	ExpectedLines     int64  // 0 = don't check
-	RequiredSubstring string // empty = don't check; protocol-agnostic decode check
-	ValidateJSON      bool   // every emitted line must parse as JSON
+	ValidateDedup      bool
+	ValidateContent    bool   // O(1) per line, no heap map — safe for high-volume tests
+	ExpectedLines      int64  // 0 = don't check
+	RequiredSubstring  string // empty = don't check; protocol-agnostic decode check
+	ForbiddenSubstring string // empty = don't check; the verdict fails if any line contains it
+	ValidateJSON       bool   // every emitted line must parse as JSON
 
 	// RecordArrivalTimes, when true, has the receiver capture the
 	// wall-clock arrival nanosecond of every record into an in-memory
@@ -207,6 +208,12 @@ type validator struct {
 	missingSubstr     atomic.Int64
 	missingSubstrSamp []string
 
+	// Forbidden-substring check: no line may contain the configured token
+	// (e.g. the marker of objects a lookback / end_date / prefix window must
+	// exclude). Counts + up to 10 sample violators.
+	forbiddenHit     atomic.Int64
+	forbiddenHitSamp []string
+
 	// JSON-validity check: every emitted line must parse as a JSON value.
 	// Enabled by ValidateJSON. Without this, a JSON test could be passed
 	// by a subject that emits the right line count of garbage. Counts +
@@ -283,6 +290,23 @@ func (v *validator) recordLine(line []byte, cfg config) {
 					s = s[:120] + "…"
 				}
 				v.missingSubstrSamp = append(v.missingSubstrSamp, s)
+			}
+			v.mu.Unlock()
+		}
+	}
+
+	// Negative content check: a line carrying the forbidden token proves an
+	// exclusion (lookback / end_date / prefix pruning) was NOT enforced.
+	if cfg.ForbiddenSubstring != "" {
+		if bytes.Contains(line, []byte(cfg.ForbiddenSubstring)) {
+			v.forbiddenHit.Add(1)
+			v.mu.Lock()
+			if len(v.forbiddenHitSamp) < 10 {
+				s := string(line)
+				if len(s) > 120 {
+					s = s[:120] + "…"
+				}
+				v.forbiddenHitSamp = append(v.forbiddenHitSamp, s)
 			}
 			v.mu.Unlock()
 		}
@@ -484,6 +508,18 @@ func (v *validator) validate(cfg config, totalLines int64) (bool, []string) {
 		}
 	}
 
+	// Forbidden-substring — no emitted line may carry the configured token.
+	if cfg.ForbiddenSubstring != "" {
+		if m := v.forbiddenHit.Load(); m > 0 {
+			msg := fmt.Sprintf("forbidden substring %q present in %d line(s)", cfg.ForbiddenSubstring, m)
+			if len(v.forbiddenHitSamp) > 0 {
+				msg += "; samples: " + strings.Join(v.forbiddenHitSamp, " | ")
+			}
+			errors = append(errors, msg)
+			passed = false
+		}
+	}
+
 	return passed, errors
 }
 
@@ -547,7 +583,7 @@ func main() {
 		otlpShard := cnt.newShard()
 		onLine := func(line []byte) {
 			otlpShard.recordLine(int64(len(line)) + 1)
-			if cfg.ValidateDedup || cfg.ValidateContent || cfg.RequiredSubstring != "" {
+			if cfg.ValidateDedup || cfg.ValidateContent || cfg.RequiredSubstring != "" || cfg.ForbiddenSubstring != "" {
 				val.recordLine(line, cfg)
 			}
 		}
@@ -671,7 +707,7 @@ func handleConn(conn net.Conn, shard *connStats, val *validator, cfg config) {
 	// time, inflating the receive window when the sender idles before closing.
 	scanner := bufio.NewScanner(&stampingReader{r: conn, shard: shard})
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
-	needsValidation := cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.RequiredSubstring != ""
+	needsValidation := cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.RequiredSubstring != "" || cfg.ForbiddenSubstring != ""
 	// Pass the scanner's internal slice directly. shard.recordLine + validator
 	// only read len() and copy via `string(line)` / hash when they need to
 	// keep bytes — they never retain the slice past return. Skipping the
@@ -695,7 +731,7 @@ func handleConn(conn net.Conn, shard *connStats, val *validator, cfg config) {
 func receiveFile(cfg config, cnt *counters, val *validator) error {
 	shard := cnt.newShard()
 	defer shard.finish()
-	needsValidation := cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.RequiredSubstring != ""
+	needsValidation := cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.RequiredSubstring != "" || cfg.ForbiddenSubstring != ""
 
 	deadline := time.Now().Add(cfg.Timeout + 5*time.Minute) // generous for file tests
 	f, err := os.Open(cfg.Listen)
@@ -742,7 +778,7 @@ func receiveHTTP(cfg config, cnt *counters, val *validator) error {
 	// per-shard ceiling so contention here doesn't matter, and a single
 	// shard keeps the per-request bookkeeping trivial.
 	httpShard := cnt.newShard()
-	needsValidation := cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.RequiredSubstring != ""
+	needsValidation := cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.RequiredSubstring != "" || cfg.ForbiddenSubstring != ""
 	mux := http.NewServeMux()
 
 	// Generic POST handler — counts every line in the body
@@ -831,7 +867,7 @@ func receiveHTTP(cfg config, cnt *counters, val *validator) error {
 // POST. It handles both plain line-per-request and ES /_bulk NDJSON format.
 func startHTTPDataEndpoint(port string, cnt *counters, val *validator, cfg config) error {
 	httpShard := cnt.newShard()
-	needsValidation := cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.RequiredSubstring != ""
+	needsValidation := cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.RequiredSubstring != "" || cfg.ForbiddenSubstring != ""
 	lineCallback := func(line []byte) {
 		httpShard.recordLine(int64(len(line)) + 1)
 		if needsValidation {
@@ -942,7 +978,7 @@ func serveMetrics(port string, cnt *counters, val *validator, cfg config) {
 			"last_received_ns":  lastNs,
 		}
 		// Include correctness data if validation is enabled
-		if cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.ExpectedLines > 0 || cfg.RequiredSubstring != "" {
+		if cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.ExpectedLines > 0 || cfg.RequiredSubstring != "" || cfg.ForbiddenSubstring != "" {
 			passed, errors := val.validate(cfg, totalLines)
 			resp["passed"] = passed
 			if len(errors) > 0 {
@@ -1020,6 +1056,7 @@ func loadConfig() config {
 		ValidateContent:    getEnvBool("RECEIVER_VALIDATE_CONTENT", false),
 		ExpectedLines:      int64(getEnvInt("RECEIVER_EXPECTED_LINES", 0)),
 		RequiredSubstring:  getEnv("RECEIVER_REQUIRED_SUBSTRING", ""),
+		ForbiddenSubstring: getEnv("RECEIVER_FORBIDDEN_SUBSTRING", ""),
 		ValidateJSON:       getEnvBool("RECEIVER_VALIDATE_JSON", false),
 		RecordArrivalTimes: getEnvBool("RECEIVER_RECORD_ARRIVAL_TIMES", false),
 	}

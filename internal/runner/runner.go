@@ -955,6 +955,21 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		}
 	}
 
+	// Optional received ceiling, independent of the verdict chain above:
+	// proves an upper bound (e.g. an end_date cutoff) was enforced. 0 =
+	// disabled.
+	if tc.Correctness.MaxReceived > 0 && recvMetrics.LinesReceived > tc.Correctness.MaxReceived {
+		msg := fmt.Sprintf("max_received exceeded: expected <= %s lines, got %s",
+			formatCount(tc.Correctness.MaxReceived), formatCount(recvMetrics.LinesReceived))
+		if result.Passed != nil && !*result.Passed {
+			result.FailReason = result.FailReason + "; " + msg
+		} else {
+			f := false
+			result.Passed = &f
+			result.FailReason = msg
+		}
+	}
+
 	// Optional load-balance fairness check (Feature E). Disabled cases
 	// return Passed=true and the result has no LoadBalance key.
 	if tc.Correctness.LoadBalance.Enabled() && len(perReceiver) > 0 {

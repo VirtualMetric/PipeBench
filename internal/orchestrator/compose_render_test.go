@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/VirtualMetric/PipeBench/internal/config"
 	"gopkg.in/yaml.v3"
@@ -969,4 +970,124 @@ func mustNotContain(t *testing.T, hay, needle string) {
 	if strings.Contains(hay, needle) {
 		t.Errorf("rendered compose unexpectedly contains %q:\n%s", needle, hay)
 	}
+}
+
+// TestComposeRendersForbiddenSubstring verifies the negative-content
+// assertion reaches the receiver container as RECEIVER_FORBIDDEN_SUBSTRING.
+func TestComposeRendersForbiddenSubstring(t *testing.T) {
+	tc := &config.TestCase{
+		Name:     "forbid",
+		Type:     "correctness",
+		Duration: "10s",
+		Warmup:   "5s",
+		Generator: config.GeneratorConfig{
+			Mode:     "tcp",
+			Target:   "subject:9000",
+			Rate:     100,
+			LineSize: 256,
+			Format:   "raw",
+		},
+		Receiver: config.ReceiverConfig{Mode: "tcp", Listen: ":9001"},
+		Correctness: config.CorrectnessConfig{
+			RequiredSubstring:  "NEW-",
+			ForbiddenSubstring: "OLD-",
+		},
+	}
+	subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.3", ConfigPath: "/config.yml"}
+	tmp := t.TempDir()
+	composePath := filepath.Join(tmp, "compose.yaml")
+	cfg := RunConfig{
+		TestCase:         tc,
+		Subject:          subj,
+		ConfigName:       "default",
+		ConfigSrcPath:    composePath,
+		TmpDir:           tmp,
+		GeneratorImage:   "img-gen",
+		ReceiverImage:    "img-recv",
+		CollectorImage:   "img-coll",
+		ReceiverHostPort: 19001,
+	}
+	if err := writeCompose(composePath, cfg); err != nil {
+		t.Fatalf("writeCompose: %v", err)
+	}
+	data, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(data)
+	mustContain(t, out, "RECEIVER_REQUIRED_SUBSTRING: \"NEW-\"")
+	mustContain(t, out, "RECEIVER_FORBIDDEN_SUBSTRING: \"OLD-\"")
+}
+
+// TestRenderSubjectConfigT0Plus verifies a subject config can anchor an
+// absolute timestamp to the harness render instant via {{@.T0Plus N@}}.
+func TestRenderSubjectConfigT0Plus(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "vmetric.yml")
+	if err := os.WriteFile(src, []byte("properties:\n  end_date: \"{{@.T0Plus 90@}}\"\n  start_date: \"{{@.T0Plus -86400@}}\"\n  prefix: \"logs/%Y/\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outDir := filepath.Join(tmp, "out")
+	if err := os.Mkdir(outDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx := configTemplateContext{CPUs: 4, T0: time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)}
+	outPath, err := renderSubjectConfig(src, outDir, ctx)
+	if err != nil {
+		t.Fatalf("renderSubjectConfig: %v", err)
+	}
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(data)
+	mustContain(t, out, "end_date: \"2026-08-27T12:01:30Z\"")
+	// A negative offset (start_date one day before render) must render too.
+	mustContain(t, out, "start_date: \"2026-08-26T12:00:00Z\"")
+	// vmetric's own strftime prefix tokens must pass through untouched.
+	mustContain(t, out, "prefix: \"logs/%Y/\"")
+}
+
+// TestComposeScalesLocalStackHealthRetries verifies that seed_objects delays
+// extend the LocalStack healthcheck budget (the init hook sleeps before
+// "completed" flips true) instead of tripping the fixed 40-retry ceiling.
+func TestComposeScalesLocalStackHealthRetries(t *testing.T) {
+	render := func(t *testing.T, aws *config.AWSConfig) string {
+		tc := &config.TestCase{
+			Name:     "seeded",
+			Type:     "correctness",
+			Duration: "10s",
+			Warmup:   "5s",
+			AWS:      aws,
+			Receiver: config.ReceiverConfig{Mode: "tcp", Listen: ":9001"},
+		}
+		subj := config.Subject{Name: "vmetric", Image: "vmetric/director", Version: "2.0.3", ConfigPath: "/config.yml"}
+		tmp := t.TempDir()
+		composePath := filepath.Join(tmp, "compose.yaml")
+		cfg := RunConfig{
+			TestCase: tc, Subject: subj, ConfigName: "default", ConfigSrcPath: composePath, TmpDir: tmp,
+			GeneratorImage: "img-gen", ReceiverImage: "img-recv", CollectorImage: "img-coll", ReceiverHostPort: 19001,
+		}
+		if err := writeCompose(composePath, cfg); err != nil {
+			t.Fatalf("writeCompose: %v", err)
+		}
+		data, err := os.ReadFile(composePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+
+	plain := render(t, &config.AWSConfig{Buckets: []string{"bench-in"}})
+	mustContain(t, plain, "retries: 40\n")
+
+	delayed := render(t, &config.AWSConfig{
+		Buckets: []string{"bench-in"},
+		SeedObjects: []config.AWSSeedObjects{
+			{Bucket: "bench-in", Objects: 1, Lines: 1},
+			{Bucket: "bench-in", Prefix: "new/", Objects: 1, Lines: 1, DelaySeconds: 90},
+		},
+	})
+	// 40 base + ceil(90/3)=30 for the sleep + 10 slack.
+	mustContain(t, delayed, "retries: 80\n")
 }

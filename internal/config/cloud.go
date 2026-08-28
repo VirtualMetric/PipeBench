@@ -101,7 +101,45 @@ type AWSSeedObjects struct {
 	// against the cloud-name charset so it cannot inject into the init shell
 	// script.
 	Marker string `yaml:"marker"`
+	// DelaySeconds sleeps that many seconds inside the LocalStack init script
+	// immediately before this group's upload loop, giving consecutive seed
+	// groups real wall-clock separation in their S3 LastModified (LocalStack
+	// cannot backdate objects, so back-to-back groups otherwise share one
+	// second). 0 = no delay (default, existing behaviour).
+	DelaySeconds int `yaml:"delay_seconds"`
+	// Extension is the key suffix of every seeded object (default ".log").
+	// Bodies are always plain text, so a compressed-looking extension such
+	// as ".gz" deliberately produces a poison object whose decode fails —
+	// the fixture for retry-cap / skip-on-error cases. Must match
+	// SeedExtensionPattern.
+	Extension string `yaml:"extension"`
 }
+
+// SeedExtensionPattern bounds seed_objects[].extension: a leading dot then
+// lowercase alphanumerics/dots, so it can neither inject into the init shell
+// script nor produce a key the subject's extension dispatch cannot classify.
+var SeedExtensionPattern = regexp.MustCompile(`^\.[a-z0-9.]{1,15}$`)
+
+// TotalSeedDelaySeconds sums seed_objects[].delay_seconds — the wall-clock
+// the LocalStack init hook sleeps before it can report "completed", which the
+// compose healthcheck budget must cover.
+func (a *AWSConfig) TotalSeedDelaySeconds() int {
+	if a == nil {
+		return 0
+	}
+	total := 0
+	for _, so := range a.SeedObjects {
+		if so.DelaySeconds > 0 {
+			total += so.DelaySeconds
+		}
+	}
+	return total
+}
+
+// SeedTodayToken is the one prefix placeholder the harness substitutes itself
+// (UTC YYYY/MM/DD at render time) so a case can seed "today's" partition. It is
+// stripped before the charset check and never reaches the shell unexpanded.
+const SeedTodayToken = "$TODAY"
 
 // AWSStream declares a Kinesis stream created at init.
 type AWSStream struct {
@@ -449,9 +487,12 @@ func (tc *TestCase) validateAWS() error {
 			return fmt.Errorf("case %q: seed_objects references undeclared bucket %q", tc.Name, so.Bucket)
 		}
 		if so.Prefix != "" {
-			if err := validateCloudName(tc.Name, "aws seed prefix", so.Prefix); err != nil {
+			if err := validateCloudName(tc.Name, "aws seed prefix", strings.ReplaceAll(so.Prefix, SeedTodayToken, "")); err != nil {
 				return err
 			}
+		}
+		if so.DelaySeconds < 0 {
+			return fmt.Errorf("case %q: seed_objects for bucket %q delay_seconds must be non-negative, got %d", tc.Name, so.Bucket, so.DelaySeconds)
 		}
 		if so.Marker != "" {
 			if err := validateCloudName(tc.Name, "aws seed marker", so.Marker); err != nil {
@@ -463,6 +504,9 @@ func (tc *TestCase) validateAWS() error {
 		}
 		if so.Lines <= 0 {
 			return fmt.Errorf("case %q: seed_objects for bucket %q requires lines > 0, got %d", tc.Name, so.Bucket, so.Lines)
+		}
+		if so.Extension != "" && !SeedExtensionPattern.MatchString(so.Extension) {
+			return fmt.Errorf("case %q: seed_objects for bucket %q extension %q must match %s", tc.Name, so.Bucket, so.Extension, SeedExtensionPattern)
 		}
 	}
 	return nil
