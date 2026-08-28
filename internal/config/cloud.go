@@ -487,7 +487,9 @@ func (tc *TestCase) validateAWS() error {
 			return fmt.Errorf("case %q: seed_objects references undeclared bucket %q", tc.Name, so.Bucket)
 		}
 		if so.Prefix != "" {
-			if err := validateCloudName(tc.Name, "aws seed prefix", strings.ReplaceAll(so.Prefix, SeedTodayToken, "")); err != nil {
+			// Validate the token as the date shape it expands to, so a prefix that
+			// is only "$TODAY" is accepted like "logs/$TODAY/".
+			if err := validateCloudName(tc.Name, "aws seed prefix", strings.ReplaceAll(so.Prefix, SeedTodayToken, "2006/01/02")); err != nil {
 				return err
 			}
 		}

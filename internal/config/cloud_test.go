@@ -45,6 +45,16 @@ func TestValidateCloud(t *testing.T) {
 			wantErr: "delay_seconds must be non-negative",
 		},
 		{
+			name: "seed prefix that is only the $TODAY token",
+			tc: TestCase{
+				Name: "x",
+				AWS: &AWSConfig{
+					Buckets:     []string{"bench-in"},
+					SeedObjects: []AWSSeedObjects{{Bucket: "bench-in", Prefix: "$TODAY", Objects: 1, Lines: 1}},
+				},
+			},
+		},
+		{
 			name: "seed prefix with $TODAY token and delay",
 			tc: TestCase{
 				Name: "c",

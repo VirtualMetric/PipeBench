@@ -892,7 +892,7 @@ func TestClusterIPComposeRendersVIPPlumbing(t *testing.T) {
 	}
 	defer os.RemoveAll(srcDir)
 	srcCfg := filepath.Join(srcDir, "vmetric.yml")
-	if err := os.WriteFile(srcCfg, []byte("director:\n  id: {{@.NodeID@}}\n"), 0o644); err != nil {
+	if err := os.WriteFile(srcCfg, []byte("director:\n  id: {{@.NodeID@}}\nproperties:\n  start_date: \"{{@.T0Plus 90@}}\"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -955,6 +955,10 @@ func TestClusterIPComposeRendersVIPPlumbing(t *testing.T) {
 			t.Fatalf("read node %s config: %v", n.id, err)
 		}
 		mustContain(t, string(b), n.want)
+		// The cluster path shares the run-start instant with the singular
+		// path: a T0Plus template must render a real timestamp, not year 0001.
+		mustNotContain(t, string(b), "0001-01-01")
+		mustContain(t, string(b), "start_date: \"20")
 	}
 }
 

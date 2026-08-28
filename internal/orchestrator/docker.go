@@ -2051,7 +2051,7 @@ func writeCompose(path string, cfg RunConfig) error {
 	if tc.Cluster != nil && tc.Cluster.Nodes > 0 {
 		for i := 1; i <= tc.Cluster.Nodes; i++ {
 			nodeOut := filepath.Join(cfg.TmpDir, fmt.Sprintf("cluster-node-%d.yml", i))
-			if err := renderConfigToFile(cfg.ConfigSrcPath, nodeOut, configTemplateContext{CPUs: runtime.NumCPU(), NodeID: i}); err != nil {
+			if err := renderConfigToFile(cfg.ConfigSrcPath, nodeOut, configTemplateContext{CPUs: runtime.NumCPU(), NodeID: i, T0: t0}); err != nil {
 				return err
 			}
 			clusterNodes = append(clusterNodes, clusterNode{
