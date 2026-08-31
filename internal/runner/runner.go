@@ -1918,7 +1918,7 @@ func (r *Runner) runDiskPressureCorrectness(tc *config.TestCase, subject config.
 	// Capture storage usage while the container is (hopefully) still up so
 	// the report shows how full the volume actually got.
 	subjectAlive := containerRunning(subjectContainer)
-	if usage := subjectDiskUsage(subjectContainer, tc); usage != "" {
+	if usage := subjectDiskUsage(r.ctx, subjectContainer, tc); usage != "" {
 		fmt.Printf("  phase 3: subject storage usage after flood: %s (volume cap %s)\n", usage, tc.SubjectDisk.Size)
 	}
 	if subjectAlive {
@@ -2019,6 +2019,16 @@ func (r *Runner) runDiskPressureCorrectness(tc *config.TestCase, subject config.
 		passed = false
 		errors = append(errors, fmt.Sprintf("expected 0 duplicates, got %s", formatCount(recvMetrics.Duplicates)))
 	}
+	if tc.Correctness.ValidateContent && recvMetrics.MalformedLines > 0 {
+		passed = false
+		errors = append(errors, fmt.Sprintf("expected 0 malformed lines, got %s (memory corruption)",
+			formatCount(recvMetrics.MalformedLines)))
+	}
+	if tc.Correctness.ValidateJSON && recvMetrics.InvalidJSONLines > 0 {
+		passed = false
+		errors = append(errors, fmt.Sprintf("expected 0 invalid-JSON lines, got %s",
+			formatCount(recvMetrics.InvalidJSONLines)))
+	}
 
 	result := results.RunResult{
 		TestName:        tc.Name,
@@ -2060,6 +2070,8 @@ func (r *Runner) runDiskPressureCorrectness(tc *config.TestCase, subject config.
 		result.FailReason = strings.Join(errors, "; ")
 	}
 
+	applyMaxReceived(tc, recvMetrics.LinesReceived, &result)
+
 	dir, err := r.saveResult(result, metricsCSVSrc)
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
@@ -2073,11 +2085,13 @@ func (r *Runner) runDiskPressureCorrectness(tc *config.TestCase, subject config.
 	if metrics.DiskWrite > 0 {
 		fmt.Printf("  disk write: %s bytes\n", formatCount(metrics.DiskWrite))
 	}
-	if passed {
+	// Print from the persisted result: applyMaxReceived may have failed it
+	// after the local verdict was computed.
+	if result.Passed != nil && *result.Passed {
 		fmt.Println("  disk pressure correctness: PASSED ✓")
 	} else {
 		fmt.Println("  disk pressure correctness: FAILED ✗")
-		for _, e := range errors {
+		for _, e := range strings.Split(result.FailReason, "; ") {
 			fmt.Printf("    - %s\n", e)
 		}
 	}
@@ -2099,13 +2113,22 @@ func (r *Runner) runDiskPressureCorrectness(tc *config.TestCase, subject config.
 // du is invoked directly rather than through `sh -c`, with the case-supplied
 // path as its own argv element, so a path carrying shell metacharacters is
 // passed through as a literal filename instead of being interpreted.
-func subjectDiskUsage(container string, tc *config.TestCase) string {
+//
+// The probe is bounded: this is called right after a deliberate disk-full
+// flood, exactly the state in which the container is likely to be
+// unresponsive, and an unbounded `docker exec` would hang the run. Deriving
+// the timeout from the run's context (rather than Background) also lets
+// SIGINT cancel it. A timeout returns "" like any other failure, so the
+// caller just skips the usage line rather than failing the run.
+func subjectDiskUsage(ctx context.Context, container string, tc *config.TestCase) string {
 	if tc.SubjectDisk == nil {
 		return ""
 	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 	// Output() (not CombinedOutput) keeps du's stderr out of the reported
 	// size, replacing what the old `2>/dev/null` did.
-	out, err := exec.Command("docker", "exec", container, "du", "-sh", tc.SubjectDisk.Path).Output()
+	out, err := exec.CommandContext(ctx, "docker", "exec", container, "du", "-sh", tc.SubjectDisk.Path).Output()
 	if err != nil {
 		return ""
 	}
