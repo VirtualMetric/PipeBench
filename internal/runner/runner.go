@@ -955,6 +955,8 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		}
 	}
 
+	applyMaxReceived(tc, recvMetrics.LinesReceived, &result)
+
 	// Optional load-balance fairness check (Feature E). Disabled cases
 	// return Passed=true and the result has no LoadBalance key.
 	if tc.Correctness.LoadBalance.Enabled() && len(perReceiver) > 0 {
@@ -1104,6 +1106,28 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 //  4. Start receiver
 //  5. Wait for subject to forward buffered logs to receiver
 //  6. Verify: all logs should arrive with 0% loss
+//
+// applyMaxReceived enforces the optional correctness.max_received ceiling on a
+// result, independent of the verdict chain that produced it: it proves an upper
+// bound (e.g. an end_date cutoff or a retry cap) was honoured. 0 = disabled. It
+// is shared by the generic correctness path and the specialized runners that
+// have receiver metrics, so a case cannot pass after exceeding its ceiling
+// just because its type dispatches elsewhere.
+func applyMaxReceived(tc *config.TestCase, linesReceived int64, result *results.RunResult) {
+	if tc.Correctness.MaxReceived <= 0 || linesReceived <= tc.Correctness.MaxReceived {
+		return
+	}
+	msg := fmt.Sprintf("max_received exceeded: expected <= %s lines, got %s",
+		formatCount(tc.Correctness.MaxReceived), formatCount(linesReceived))
+	if result.Passed != nil && !*result.Passed {
+		result.FailReason = result.FailReason + "; " + msg
+		return
+	}
+	f := false
+	result.Passed = &f
+	result.FailReason = msg
+}
+
 func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
 	configName := r.opts.ConfigName
 	subject = r.applySubjectOverrides(subject)
@@ -1355,6 +1379,8 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 		result.FailReason = strings.Join(errors, "; ")
 	}
 
+	applyMaxReceived(tc, recvMetrics.LinesReceived, &result)
+
 	dir, err := r.saveResult(result, metricsCSVSrc)
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
@@ -1377,11 +1403,13 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 	}
 	fmt.Printf("  total time: %.1fs\n", elapsed)
 
-	if passed {
+	// Print from the persisted result: applyMaxReceived may have failed it
+	// after the local verdict was computed.
+	if result.Passed != nil && *result.Passed {
 		fmt.Println("  persistence correctness: PASSED ✓")
 	} else {
 		fmt.Println("  persistence correctness: FAILED ✗")
-		for _, e := range errors {
+		for _, e := range strings.Split(result.FailReason, "; ") {
 			fmt.Printf("    - %s\n", e)
 		}
 	}
@@ -1676,6 +1704,8 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 		result.FailReason = strings.Join(errors, "; ")
 	}
 
+	applyMaxReceived(tc, recvMetrics.LinesReceived, &result)
+
 	dir, err := r.saveResult(result, metricsCSVSrc)
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
@@ -1698,11 +1728,13 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 	}
 	fmt.Printf("  total time: %.1fs\n", elapsed)
 
-	if passed {
+	// Print from the persisted result: applyMaxReceived may have failed it
+	// after the local verdict was computed.
+	if result.Passed != nil && *result.Passed {
 		fmt.Println("  persistence restart correctness: PASSED ✓")
 	} else {
 		fmt.Println("  persistence restart correctness: FAILED ✗")
-		for _, e := range errors {
+		for _, e := range strings.Split(result.FailReason, "; ") {
 			fmt.Printf("    - %s\n", e)
 		}
 	}
@@ -2001,12 +2033,6 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 	if metrics.IOThroughputAvg > 0 {
 		fmt.Printf("  io throughput: avg %.1f MB/s\n", metrics.IOThroughputAvg/(1024*1024))
 	}
-	if passed {
-		fmt.Printf("  %s: PASSED ✓\n", f.verdictLabel)
-	} else {
-		fmt.Printf("  %s: FAILED ✗\n", f.verdictLabel)
-	}
-
 	result := results.RunResult{
 		TestName:        tc.Name,
 		Config:          configName,
@@ -2048,7 +2074,18 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 	}
 
 	// Persist the result like every other run path — Run's contract is to
-	// return the *persisted* result.
+	// return the *persisted* result. The verdict is printed from it so a
+	// max_received failure shows up on the CLI as well.
+	applyMaxReceived(tc, recvMetrics.LinesReceived, &result)
+	if result.Passed != nil && *result.Passed {
+		fmt.Printf("  %s: PASSED ✓\n", f.verdictLabel)
+	} else {
+		fmt.Printf("  %s: FAILED ✗\n", f.verdictLabel)
+		for _, e := range strings.Split(result.FailReason, "; ") {
+			fmt.Printf("    - %s\n", e)
+		}
+	}
+
 	dir, err := r.saveResult(result, metricsCSVSrc)
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)

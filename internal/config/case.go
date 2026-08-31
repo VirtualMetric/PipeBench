@@ -1215,6 +1215,9 @@ func (tc *TestCase) Validate() error {
 	if tc.Correctness.MaxOverDeliveryPct < 0 {
 		return fmt.Errorf("case %q: max_overdelivery_pct must be non-negative, got %.2f", tc.Name, tc.Correctness.MaxOverDeliveryPct)
 	}
+	if tc.Correctness.MaxReceived < 0 {
+		return fmt.Errorf("case %q: max_received must be non-negative (0 = disabled), got %d", tc.Name, tc.Correctness.MaxReceived)
+	}
 	if err := tc.validateVault(); err != nil {
 		return err
 	}
@@ -2668,6 +2671,11 @@ type CorrectnessConfig struct {
 	// successful decode is proven by the presence of a value the generator
 	// embedded in every record. Empty = check disabled.
 	RequiredSubstring string `yaml:"required_substring"`
+	// ForbiddenSubstring is the inverse of RequiredSubstring: the verdict FAILS
+	// if ANY received line contains it. It proves an exclusion (a lookback or
+	// end_date cutoff, prefix pruning) is enforced, not just that inclusion
+	// works. Generic — any correctness case may use it. Empty = disabled.
+	ForbiddenSubstring string `yaml:"forbidden_substring"`
 	// ValidateJSON, when true, requires every emitted line to parse as a
 	// JSON object. Without this, a subject can pass a JSON-shape test by
 	// truncating to a matching line count or by re-emitting binary garbage —
@@ -2691,6 +2699,12 @@ type CorrectnessConfig struct {
 	// "LinesReceived >= MinReceived" (default 1) AND the receiver didn't flag a
 	// content failure. Ignored when the case has a generator.
 	MinReceived int64 `yaml:"min_received"`
+	// MaxReceived, when > 0, fails the verdict if LinesReceived exceeds it —
+	// independent of expect_failure/loss/over-delivery logic. Use it to prove
+	// an upper bound (e.g. an end_date cutoff) where the exact count is
+	// timing-sensitive and only a ceiling is safe to assert. Generic — any
+	// correctness case may use it. 0 = disabled.
+	MaxReceived int64 `yaml:"max_received"`
 
 	// DrainSeconds extends how long the harness waits for backlog to
 	// arrive after the generator(s) stop. The case still finishes early if

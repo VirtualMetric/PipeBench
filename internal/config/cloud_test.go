@@ -34,6 +34,56 @@ func TestValidateCloud(t *testing.T) {
 			},
 		},
 		{
+			name: "seed group with negative delay",
+			tc: TestCase{
+				Name: "c",
+				AWS: &AWSConfig{
+					Buckets:     []string{"bench-in"},
+					SeedObjects: []AWSSeedObjects{{Bucket: "bench-in", Objects: 1, Lines: 1, DelaySeconds: -1}},
+				},
+			},
+			wantErr: "delay_seconds must be non-negative",
+		},
+		{
+			name: "seed prefix that is only the $TODAY token",
+			tc: TestCase{
+				Name: "x",
+				AWS: &AWSConfig{
+					Buckets:     []string{"bench-in"},
+					SeedObjects: []AWSSeedObjects{{Bucket: "bench-in", Prefix: "$TODAY", Objects: 1, Lines: 1}},
+				},
+			},
+		},
+		{
+			name: "seed prefix with $TODAY token and delay",
+			tc: TestCase{
+				Name: "c",
+				AWS: &AWSConfig{
+					Buckets:     []string{"bench-in"},
+					SeedObjects: []AWSSeedObjects{{Bucket: "bench-in", Prefix: "logs/$TODAY/", Objects: 1, Lines: 1, DelaySeconds: 45}},
+				},
+			},
+		},
+		{
+			name: "seed prefix with other shell token rejected",
+			tc: TestCase{
+				Name: "c",
+				AWS: &AWSConfig{
+					Buckets:     []string{"bench-in"},
+					SeedObjects: []AWSSeedObjects{{Bucket: "bench-in", Prefix: "logs/$HOME/", Objects: 1, Lines: 1}},
+				},
+			},
+			wantErr: "aws seed prefix",
+		},
+		{
+			name: "negative max_received rejected",
+			tc: TestCase{
+				Name:        "c",
+				Correctness: CorrectnessConfig{MaxReceived: -1},
+			},
+			wantErr: "max_received must be non-negative",
+		},
+		{
 			name: "azure block with container",
 			tc: TestCase{
 				Name:      "c",

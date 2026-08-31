@@ -49,6 +49,17 @@ type configTemplateContext struct {
 	// case's config once per node ({{@.NodeID@}} → director.id / node.name so each
 	// node self-identifies against the cluster's nodes list). 0 for non-cluster.
 	NodeID int
+	// T0 is the wall-clock instant the harness rendered this config, captured
+	// just before compose up — the closest proxy for "run start" a case can
+	// anchor an absolute timestamp to (see T0Plus). Containers take seconds to
+	// start after T0; a case must budget that latency into its offsets.
+	T0 time.Time
+}
+
+// T0Plus returns T0 + sec seconds as RFC3339 UTC, for absolute device
+// properties such as `end_date: "{{@.T0Plus 90@}}"`.
+func (c configTemplateContext) T0Plus(sec int) string {
+	return c.T0.Add(time.Duration(sec) * time.Second).UTC().Format(time.RFC3339)
 }
 
 // Harness template delimiters. Subject configs carry their OWN native
@@ -530,6 +541,9 @@ services:
 {{- if $.RecvRequiredSubstring }}
       RECEIVER_REQUIRED_SUBSTRING: "{{ $.RecvRequiredSubstring }}"
 {{- end }}
+{{- if $.RecvForbiddenSubstring }}
+      RECEIVER_FORBIDDEN_SUBSTRING: "{{ $.RecvForbiddenSubstring }}"
+{{- end }}
 {{- if $.RecvValidateJSON }}
       RECEIVER_VALIDATE_JSON: "true"
 {{- end }}
@@ -575,6 +589,9 @@ services:
 {{- end }}
 {{- if .RecvRequiredSubstring }}
       RECEIVER_REQUIRED_SUBSTRING: "{{ .RecvRequiredSubstring }}"
+{{- end }}
+{{- if .RecvForbiddenSubstring }}
+      RECEIVER_FORBIDDEN_SUBSTRING: "{{ .RecvForbiddenSubstring }}"
 {{- end }}
 {{- if .RecvValidateJSON }}
       RECEIVER_VALIDATE_JSON: "true"
@@ -1099,7 +1116,7 @@ services:
       test: ["CMD-SHELL", "curl -sf localhost:4566/_localstack/init/ready | grep -q '\"completed\": true'"]
       interval: 3s
       timeout: 5s
-      retries: 40
+      retries: {{ .AWSHealthRetries }}
       start_period: 10s
     restart: "no"
 {{- end }}
@@ -1883,19 +1900,20 @@ type composeVars struct {
 	DatabaseConfPath       string
 	DatabaseCAHost         string
 
-	RecvMode              string
-	RecvListen            string
-	RecvEnv               map[string]string
-	RecvAWSDep            bool
-	RecvAzureDep          bool
-	RecvMinioDep          bool
-	RecvValidateDedup     string
-	RecvValidateContent   string
-	RecvExpectedLines     int64
-	RecvRequiredSubstring string
-	RecvValidateJSON      bool
-	RecvRecordArrival     bool
-	DockerSocketGID       string
+	RecvMode               string
+	RecvListen             string
+	RecvEnv                map[string]string
+	RecvAWSDep             bool
+	RecvAzureDep           bool
+	RecvMinioDep           bool
+	RecvValidateDedup      string
+	RecvValidateContent    string
+	RecvExpectedLines      int64
+	RecvRequiredSubstring  string
+	RecvForbiddenSubstring string
+	RecvValidateJSON       bool
+	RecvRecordArrival      bool
+	DockerSocketGID        string
 
 	// Verifier (a case's `verifier:` block): a one-shot DuckDB container under
 	// the compose profile "verify", so the initial Up() skips it. The runner
@@ -1922,11 +1940,15 @@ type composeVars struct {
 	// Cloud emulator topology (a case's `aws:` / `azure:` blocks).
 	// AWSInitHost is the host path of the rendered LocalStack init script,
 	// bind-mounted into the emulator's ready.d hook directory.
-	AWSEnabled          bool
-	AWSImage            string
-	AWSServices         string
-	AWSRegion           string
-	AWSInitHost         string
+	AWSEnabled  bool
+	AWSImage    string
+	AWSServices string
+	AWSRegion   string
+	AWSInitHost string
+	// AWSHealthRetries is the LocalStack healthcheck retry count: the base
+	// budget plus one retry per healthcheck interval of seed_objects delay,
+	// so a delayed seed group cannot trip the "unhealthy" gate.
+	AWSHealthRetries    int
 	AzureEnabled        bool
 	AzureImage          string
 	AzureConnString     string
@@ -2000,11 +2022,15 @@ func resolveSampleHost(caseDir, sampleFile string) (host, dst string, err error)
 func writeCompose(path string, cfg RunConfig) error {
 	tc := cfg.TestCase
 	s := cfg.Subject
+	// One render instant shared by the subject config (T0Plus) and the
+	// LocalStack init script ($TODAY) so both anchor to the same clock.
+	t0 := time.Now().UTC()
 
-	// Render the subject config as a template (opt-in via {{...}}) so it can
-	// adapt to the host's CPU count.
+	// Render the subject config as a template (opt-in via {{@...@}}) so it can
+	// adapt to the host's CPU count or anchor timestamps to the run start.
 	renderedConfigSrc, err := renderSubjectConfig(cfg.ConfigSrcPath, cfg.TmpDir, configTemplateContext{
 		CPUs: runtime.NumCPU(),
+		T0:   t0,
 	})
 	if err != nil {
 		return err
@@ -2025,7 +2051,7 @@ func writeCompose(path string, cfg RunConfig) error {
 	if tc.Cluster != nil && tc.Cluster.Nodes > 0 {
 		for i := 1; i <= tc.Cluster.Nodes; i++ {
 			nodeOut := filepath.Join(cfg.TmpDir, fmt.Sprintf("cluster-node-%d.yml", i))
-			if err := renderConfigToFile(cfg.ConfigSrcPath, nodeOut, configTemplateContext{CPUs: runtime.NumCPU(), NodeID: i}); err != nil {
+			if err := renderConfigToFile(cfg.ConfigSrcPath, nodeOut, configTemplateContext{CPUs: runtime.NumCPU(), NodeID: i, T0: t0}); err != nil {
 				return err
 			}
 			clusterNodes = append(clusterNodes, clusterNode{
@@ -2240,11 +2266,12 @@ func writeCompose(path string, cfg RunConfig) error {
 		DockerSocketGID: cfg.DockerSocketGID,
 		TLSCertsHost:    tlsCertsHost,
 
-		RecvValidateDedup:     boolStr(tc.Correctness.ValidateDedup),
-		RecvValidateContent:   boolStr(tc.Correctness.ValidateContent),
-		RecvExpectedLines:     0,
-		RecvRequiredSubstring: tc.Correctness.RequiredSubstring,
-		RecvValidateJSON:      tc.Correctness.ValidateJSON,
+		RecvValidateDedup:      boolStr(tc.Correctness.ValidateDedup),
+		RecvValidateContent:    boolStr(tc.Correctness.ValidateContent),
+		RecvExpectedLines:      0,
+		RecvRequiredSubstring:  tc.Correctness.RequiredSubstring,
+		RecvForbiddenSubstring: tc.Correctness.ForbiddenSubstring,
+		RecvValidateJSON:       tc.Correctness.ValidateJSON,
 		// Arrival timestamp recording is opt-in via the rate_ceiling
 		// check; flipping it on unconditionally would burn memory in
 		// every performance run.
@@ -2528,10 +2555,11 @@ func writeCompose(path string, cfg RunConfig) error {
 		vars.AWSServices = tc.AWS.ServicesOrDefault()
 		vars.AWSRegion = tc.AWS.RegionOrDefault()
 		initPath := filepath.Join(cfg.TmpDir, "aws-init.sh")
-		if err := writeAWSInit(initPath, tc.AWS); err != nil {
+		if err := writeAWSInit(initPath, tc.AWS, t0); err != nil {
 			return err
 		}
 		vars.AWSInitHost = filepath.ToSlash(initPath)
+		vars.AWSHealthRetries = localStackHealthRetries(tc.AWS.TotalSeedDelaySeconds())
 	}
 	if tc.UsesAzure() {
 		vars.AzureEnabled = true
@@ -2712,4 +2740,15 @@ func applyVersionIfUntagged(image, version string) string {
 	}
 
 	return image + ":" + version
+}
+
+// localStackHealthRetries sizes the LocalStack healthcheck retry count (3s
+// interval) so the init hook's seed delays fit inside the budget: 40 base
+// retries plus one per 3s of delay plus 10 slack for the uploads themselves.
+func localStackHealthRetries(seedDelaySeconds int) int {
+	const base, intervalSec, slack = 40, 3, 10
+	if seedDelaySeconds <= 0 {
+		return base
+	}
+	return base + (seedDelaySeconds+intervalSec-1)/intervalSec + slack
 }
