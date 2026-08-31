@@ -1981,6 +1981,9 @@ func (r *Runner) runDiskPressureCorrectness(tc *config.TestCase, subject config.
 		return results.RunResult{}, fmt.Errorf("querying receiver metrics: %w", err)
 	}
 
+	metrics, metricsCSVSrc := r.harvestResourceMetrics(orch, tmpDir)
+	sysCPUs, sysMemMB := getSystemInfo()
+
 	elapsed := time.Since(startTime).Seconds()
 
 	lossPct := 0.0
@@ -2033,14 +2036,31 @@ func (r *Runner) runDiskPressureCorrectness(tc *config.TestCase, subject config.
 		LinesOut:        recvMetrics.LinesReceived,
 		BytesIn:         genStats.BytesSent,
 		BytesOut:        recvMetrics.BytesReceived,
+		LinesPerSec:     receiveWindowRate(recvMetrics),
 		LossPercent:     lossPct,
+		AvgCPUPercent:   metrics.CPUAvg,
+		MaxCPUPercent:   metrics.CPUMax,
+		AvgMemMB:        metrics.MemAvgMB,
+		MaxMemMB:        metrics.MemMaxMB,
+		DiskReadBytes:   metrics.DiskRead,
+		DiskWriteBytes:  metrics.DiskWrite,
+		NetRecvBytes:    metrics.NetRecv,
+		NetSendBytes:    metrics.NetSend,
+		IOThroughputAvg: metrics.IOThroughputAvg,
+		LoadAvg1:        metrics.LoadAvg1,
+		LoadAvg5:        metrics.LoadAvg5,
+		LoadAvg15:       metrics.LoadAvg15,
+		SystemCPUs:      sysCPUs,
+		SystemMemMB:     sysMemMB,
+		SubjectCPULimit: r.opts.CPULimit,
+		SubjectMemLimit: r.opts.MemLimit,
 		Passed:          &passed,
 	}
 	if !passed {
 		result.FailReason = strings.Join(errors, "; ")
 	}
 
-	dir, err := r.saveResult(result, "")
+	dir, err := r.saveResult(result, metricsCSVSrc)
 	if err != nil {
 		return result, fmt.Errorf("saving results: %w", err)
 	}
@@ -2048,6 +2068,11 @@ func (r *Runner) runDiskPressureCorrectness(tc *config.TestCase, subject config.
 	fmt.Printf("  done. results → %s\n", dir)
 	fmt.Printf("  lines sent: %s  lines received: %s  loss: %.2f%%\n",
 		formatCount(genStats.LinesSent), formatCount(recvMetrics.LinesReceived), lossPct)
+	fmt.Printf("  cpu: avg %.1f%% max %.1f%%  mem: avg %.0f MB max %.0f MB\n",
+		metrics.CPUAvg, metrics.CPUMax, metrics.MemAvgMB, metrics.MemMaxMB)
+	if metrics.DiskWrite > 0 {
+		fmt.Printf("  disk write: %s bytes\n", formatCount(metrics.DiskWrite))
+	}
 	if passed {
 		fmt.Println("  disk pressure correctness: PASSED ✓")
 	} else {
