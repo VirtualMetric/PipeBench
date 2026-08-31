@@ -1877,6 +1877,7 @@ func (r *Runner) runDiskPressureCorrectness(tc *config.TestCase, subject config.
 	_ = orch.Down()
 
 	startTime := time.Now()
+	runDeadline := startTime.Add(r.opts.Timeout)
 
 	cleanup := func() {
 		if !r.opts.NoCleanup {
@@ -1947,7 +1948,13 @@ func (r *Runner) runDiskPressureCorrectness(tc *config.TestCase, subject config.
 
 	var lastCount int64
 	stableRounds := 0
+	// Clamp the drain window to the run's overall ceiling so this case
+	// can't overrun Options.Timeout in a batch run, matching the other
+	// drain loops.
 	drainDeadline := time.Now().Add(drainTimeout)
+	if drainDeadline.After(runDeadline) {
+		drainDeadline = runDeadline
+	}
 	for time.Now().Before(drainDeadline) {
 		if err := sleepCtx(r.ctx, 5*time.Second); err != nil {
 			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
@@ -2063,16 +2070,27 @@ func (r *Runner) runDiskPressureCorrectness(tc *config.TestCase, subject config.
 // subjectDiskUsage reports the subject_disk mount's on-disk usage inside the
 // subject container ("du -sh" of the mount point), best-effort: empty when
 // the case has no subject_disk block or the container is not running.
+//
+// du is invoked directly rather than through `sh -c`, with the case-supplied
+// path as its own argv element, so a path carrying shell metacharacters is
+// passed through as a literal filename instead of being interpreted.
 func subjectDiskUsage(container string, tc *config.TestCase) string {
 	if tc.SubjectDisk == nil {
 		return ""
 	}
-	out, err := exec.Command("docker", "exec", container, "sh", "-c",
-		"du -sh "+tc.SubjectDisk.Path+" 2>/dev/null | cut -f1").CombinedOutput()
+	// Output() (not CombinedOutput) keeps du's stderr out of the reported
+	// size, replacing what the old `2>/dev/null` did.
+	out, err := exec.Command("docker", "exec", container, "du", "-sh", tc.SubjectDisk.Path).Output()
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(out))
+	// du prints the size, a tab, then the path; without a shell there is
+	// no `cut -f1`, so keep the leading size field here.
+	line := strings.TrimSpace(string(out))
+	if i := strings.IndexAny(line, " \t"); i >= 0 {
+		return line[:i]
+	}
+	return line
 }
 
 // midDeliveryFlow parameterizes the shared mid-delivery correctness driver

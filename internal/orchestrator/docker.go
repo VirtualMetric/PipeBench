@@ -2791,33 +2791,10 @@ func localStackHealthRetries(seedDelaySeconds int) int {
 }
 
 // parseByteSize converts a human byte-size string ("64m", "1g", "512kb",
-// or a plain integer byte count) to bytes. Suffixes are case-insensitive
-// with an optional trailing "b"; units are binary (1k = 1024).
+// or a plain integer byte count) to bytes. It delegates to
+// config.ParseByteSize — the same function TestCase.Validate accepts
+// subject_disk.size with — so case-load acceptance and compose-render
+// parsing can never drift apart.
 func parseByteSize(s string) (int64, error) {
-	v := strings.ToLower(strings.TrimSpace(s))
-	mult := int64(1)
-	switch {
-	case strings.HasSuffix(v, "kb"), strings.HasSuffix(v, "k"):
-		mult = 1 << 10
-		v = strings.TrimSuffix(strings.TrimSuffix(v, "b"), "k")
-	case strings.HasSuffix(v, "mb"), strings.HasSuffix(v, "m"):
-		mult = 1 << 20
-		v = strings.TrimSuffix(strings.TrimSuffix(v, "b"), "m")
-	case strings.HasSuffix(v, "gb"), strings.HasSuffix(v, "g"):
-		mult = 1 << 30
-		v = strings.TrimSuffix(strings.TrimSuffix(v, "b"), "g")
-	case strings.HasSuffix(v, "b"):
-		// Plain-bytes suffix ("64b"). Must come after the kb/mb/gb
-		// cases; keeps parsing consistent with the case-level
-		// subject_disk.size validation, which accepts it.
-		v = strings.TrimSuffix(v, "b")
-	}
-	n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid byte size (want e.g. 64m, 1g, or bytes): %w", err)
-	}
-	if n <= 0 {
-		return 0, fmt.Errorf("byte size must be positive, got %d", n)
-	}
-	return n * mult, nil
+	return config.ParseByteSize(s)
 }
