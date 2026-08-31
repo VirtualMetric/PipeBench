@@ -336,3 +336,11 @@ func (s Subject) WithImage(img string) Subject {
 	s.Image = img
 	return s
 }
+
+// WithEntrypoint returns a copy of the Subject with the entrypoint overridden.
+// Command is left alone, so the registry's arguments still reach the new
+// entrypoint — a wrapper script gets them as "$@".
+func (s Subject) WithEntrypoint(entrypoint []string) Subject {
+	s.Entrypoint = entrypoint
+	return s
+}

@@ -135,6 +135,17 @@ type TestCase struct {
 	SubjectImage   string `yaml:"subject_image"`
 	SubjectVersion string `yaml:"subject_version"`
 
+	// SubjectEntrypoint replaces the registry's entrypoint for this case, with
+	// the registry Command still appended as arguments. Same precedence and the
+	// same non-strict-decode tolerance as SubjectImage.
+	//
+	// Needed where the case is about the subject's own process lifecycle: the
+	// director self-update cases stop and restart the service they are updating,
+	// which ends the container when the service is PID 1. Pointing the entrypoint
+	// at a wrapper that runs the service as a CHILD keeps the container alive
+	// across that restart, so "the service came back" is observable at all.
+	SubjectEntrypoint []string `yaml:"subject_entrypoint"`
+
 	Subjects       []string                 `yaml:"subjects"`
 	Configurations map[string]Configuration `yaml:"configurations"`
 	Correctness    CorrectnessConfig        `yaml:"correctness"`
@@ -2063,7 +2074,13 @@ type EndpointSourceConfig struct {
 	// source must NOT deliver. The driver waits the settle window then asserts the
 	// receiver count stays <= ExpectMax. Proves auth/validation is load-bearing.
 	Reject bool `yaml:"reject"`
-	// ExpectMax is the ceiling for a reject case (default 0 — nothing delivered).
+	// ExpectMax is the ceiling. For a reject case it is the whole assertion
+	// (default 0 — nothing delivered). On a POSITIVE case it turns the count into a
+	// window: the driver waits past the floor and then fails on over-delivery,
+	// which is what a case needs when its records ARE its assertion (e.g. the
+	// director_update_* family, where one record stands for one proven outcome) —
+	// a floor alone cannot notice a subject that forwarded more than the case
+	// meant.
 	ExpectMax int `yaml:"expect_max"`
 }
 
@@ -2096,6 +2113,16 @@ func (tc *TestCase) validateEndpointSource() error {
 	}
 	if tc.EndpointSource.Reject && tc.EndpointSource.ExpectMax < 0 {
 		return fmt.Errorf("case %q: endpoint_source.expect_max must be >= 0", tc.Name)
+	}
+	// A ceiling below the floor can never be satisfied, so refuse it at load time
+	// rather than at the end of a ten-minute run. Every NONZERO value is checked, not
+	// just positive ones: zero is the documented "unset", and the runner enables the
+	// ceiling on the same `> 0` test, so `expect_max: -1` would otherwise pass
+	// validation AND silently disable the assertion it looks like it is making.
+	if !tc.EndpointSource.Reject && tc.EndpointSource.ExpectMax != 0 &&
+		tc.EndpointSource.ExpectMax < tc.EndpointSource.ExpectMin {
+		return fmt.Errorf("case %q: endpoint_source.expect_max (%d) must be >= expect_min (%d), or 0 for no ceiling",
+			tc.Name, tc.EndpointSource.ExpectMax, tc.EndpointSource.ExpectMin)
 	}
 	want := tc.EndpointSource.SenderContainerOrDefault()[len("bench-"):]
 	found := false
