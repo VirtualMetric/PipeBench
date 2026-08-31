@@ -271,6 +271,13 @@ services:
       - "{{ .VaultTLSHost }}:/vault-tls:ro"
 {{- end }}
 {{- end }}
+{{- if .SubjectDiskPath }}
+      - type: tmpfs
+        target: "{{ .SubjectDiskPath }}"
+        tmpfs:
+          size: {{ .SubjectDiskSizeBytes }}
+          mode: 01777
+{{- end }}
 {{- if .SubjectUser }}
     user: "{{ .SubjectUser }}"
 {{- end }}
@@ -1755,6 +1762,14 @@ type composeVars struct {
 	UseSharedData     bool
 	DeferReceiver     bool
 
+	// SubjectDiskPath / SubjectDiskSizeBytes render a size-limited tmpfs
+	// mount inside the singular subject service (case subject_disk block) —
+	// a small dedicated "disk" for disk-full / disk-backpressure cases.
+	// Size is pre-parsed to bytes so the compose file carries an
+	// unambiguous integer. Empty path emits nothing.
+	SubjectDiskPath      string
+	SubjectDiskSizeBytes int64
+
 	// BenchSubnet, when set, pins the bench bridge network's IPAM subnet (instead
 	// of letting Docker auto-assign one) so a cluster_ip_failover case can bind a
 	// known virtual IP that won't collide with a container's assigned address.
@@ -2214,6 +2229,25 @@ func writeCompose(path string, cfg RunConfig) error {
 		subjectCmd = "" // no config-path override; subject finds the service config in its workdir
 	}
 
+	// Resolve the subject_disk tmpfs mount up front so a malformed size
+	// string fails the run at compose-render time with a clear error,
+	// not as a cryptic docker-compose parse failure at up.
+	var (
+		subjectDiskPath      string
+		subjectDiskSizeBytes int64
+	)
+	if tc.SubjectDisk != nil {
+		if tc.SubjectDisk.Path == "" || tc.SubjectDisk.Size == "" {
+			return fmt.Errorf("subject_disk requires both path and size")
+		}
+		size, err := parseByteSize(tc.SubjectDisk.Size)
+		if err != nil {
+			return fmt.Errorf("subject_disk.size %q: %w", tc.SubjectDisk.Size, err)
+		}
+		subjectDiskPath = tc.SubjectDisk.Path
+		subjectDiskSizeBytes = size
+	}
+
 	vars := composeVars{
 		SubjectImage:      s.ImageRef(),
 		SubjectContainer:  subjectContainer,
@@ -2236,10 +2270,12 @@ func writeCompose(path string, cfg RunConfig) error {
 		// unset one (the old defaultStr(.., "1"/"1g") behavior) silently
 		// pinned --mem-limit-only runs to 1 CPU and --cpu-limit-only runs
 		// to 1 GB, which throttled the subject into bogus results.
-		HasResourceLimits: cfg.CPULimit != "" || cfg.MemLimit != "",
-		CPULimit:          cfg.CPULimit,
-		MemLimit:          cfg.MemLimit,
-		UseSharedData:     useSharedData,
+		HasResourceLimits:    cfg.CPULimit != "" || cfg.MemLimit != "",
+		CPULimit:             cfg.CPULimit,
+		MemLimit:             cfg.MemLimit,
+		UseSharedData:        useSharedData,
+		SubjectDiskPath:      subjectDiskPath,
+		SubjectDiskSizeBytes: subjectDiskSizeBytes,
 		// DeferReceiver drops the `generator.depends_on: receiver` link
 		// so `UpServices("generator")` doesn't transitively start the
 		// receiver. Needed for any test where the subject must buffer
@@ -2248,7 +2284,8 @@ func writeCompose(path string, cfg RunConfig) error {
 		// restart/crash phase has nothing left to recover.
 		DeferReceiver: tc.Type == "persistence_correctness" ||
 			tc.Type == "persistence_restart_correctness" ||
-			tc.Type == "persistence_crash_correctness",
+			tc.Type == "persistence_crash_correctness" ||
+			tc.Type == "disk_pressure_correctness",
 		GeneratorImage:   cfg.GeneratorImage,
 		ReceiverImage:    cfg.ReceiverImage,
 		CollectorImage:   cfg.CollectorImage,
@@ -2751,4 +2788,13 @@ func localStackHealthRetries(seedDelaySeconds int) int {
 		return base
 	}
 	return base + (seedDelaySeconds+intervalSec-1)/intervalSec + slack
+}
+
+// parseByteSize converts a human byte-size string ("64m", "1g", "512kb",
+// or a plain integer byte count) to bytes. It delegates to
+// config.ParseByteSize — the same function TestCase.Validate accepts
+// subject_disk.size with — so case-load acceptance and compose-render
+// parsing can never drift apart.
+func parseByteSize(s string) (int64, error) {
+	return config.ParseByteSize(s)
 }

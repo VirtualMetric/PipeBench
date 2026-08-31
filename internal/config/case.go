@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -119,6 +120,16 @@ type TestCase struct {
 	// the test topology plus a one-shot minio-init that creates the declared
 	// buckets. Mutually exclusive with AWS. See MinioConfig in cloud.go.
 	Minio *MinioConfig `yaml:"minio"`
+
+	// SubjectDisk, when set, mounts a size-limited tmpfs at Path inside the
+	// subject container, giving the subject a small dedicated "disk" for its
+	// storage/buffer directory without a specially built image. Lets a case
+	// exercise disk-full and disk-backpressure behavior: fill the volume with
+	// more data than it can hold and observe whether the subject crashes,
+	// drops, or backpressures. Used by the disk_pressure_correctness type but
+	// honored on the singular subject service for any type — Validate rejects
+	// it alongside cluster:, where the mount would silently not render.
+	SubjectDisk *SubjectDiskConfig `yaml:"subject_disk"`
 
 	// Requires lists subject capabilities every subject in this case must
 	// declare (Subject.Capabilities); the runner fails fast on subjects
@@ -1082,12 +1093,66 @@ func (tc *TestCase) IsKafkaType() bool {
 	return strings.HasPrefix(tc.Type, "kafka_")
 }
 
+// ParseByteSize converts a human byte-size string ("64m", "1g", "512kb",
+// or a plain integer byte count) to bytes. Suffixes are case-insensitive
+// with an optional trailing "b"; units are binary (1k = 1024). Sizes must
+// be positive — a zero-byte tmpfs is never what a case meant.
+//
+// This lives in config, not the orchestrator, so subject_disk.size
+// acceptance at case-load time and the byte count the compose renderer
+// emits come from one implementation: a case that passes Validate can
+// never fail at compose-render time.
+func ParseByteSize(s string) (int64, error) {
+	v := strings.ToLower(strings.TrimSpace(s))
+	mult := int64(1)
+	switch {
+	case strings.HasSuffix(v, "kb"), strings.HasSuffix(v, "k"):
+		mult = 1 << 10
+		v = strings.TrimSuffix(strings.TrimSuffix(v, "b"), "k")
+	case strings.HasSuffix(v, "mb"), strings.HasSuffix(v, "m"):
+		mult = 1 << 20
+		v = strings.TrimSuffix(strings.TrimSuffix(v, "b"), "m")
+	case strings.HasSuffix(v, "gb"), strings.HasSuffix(v, "g"):
+		mult = 1 << 30
+		v = strings.TrimSuffix(strings.TrimSuffix(v, "b"), "g")
+	case strings.HasSuffix(v, "b"):
+		// Plain-bytes suffix ("64b"). Must come after the kb/mb/gb
+		// cases so those units aren't stripped down to their digits.
+		v = strings.TrimSuffix(v, "b")
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid byte size (want e.g. 64m, 1g, or bytes): %w", err)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("byte size must be positive, got %d", n)
+	}
+	return n * mult, nil
+}
+
 // Validate runs structural checks that don't depend on runtime state.
 // Returns an error for cases where the singular and plural forms are both
 // set (ambiguous) or where required IDs on plural entries are missing.
 func (tc *TestCase) Validate() error {
 	if len(tc.Generators) > 0 && (tc.Generator.Mode != "" || tc.Generator.Target != "") {
 		return fmt.Errorf("case %q: both `generator:` and `generators:` are set — pick one", tc.Name)
+	}
+	if tc.SubjectDisk != nil {
+		if tc.SubjectDisk.Path == "" || tc.SubjectDisk.Size == "" {
+			return fmt.Errorf("case %q: subject_disk requires both `path` and `size`", tc.Name)
+		}
+		if !strings.HasPrefix(tc.SubjectDisk.Path, "/") {
+			return fmt.Errorf("case %q: subject_disk.path must be absolute, got %q", tc.Name, tc.SubjectDisk.Path)
+		}
+		if _, err := ParseByteSize(tc.SubjectDisk.Size); err != nil {
+			return fmt.Errorf("case %q: subject_disk.size %q is not a valid tmpfs size (e.g. 64m, 1g, 1048576): %w", tc.Name, tc.SubjectDisk.Size, err)
+		}
+		// The tmpfs mount only renders on the singular `subject:` compose
+		// service, so pairing it with `cluster:` would silently give every
+		// node the host's full volume and quietly void the whole scenario.
+		if tc.Cluster != nil {
+			return fmt.Errorf("case %q: subject_disk cannot be combined with `cluster:` — the size-limited mount only applies to a singular subject service", tc.Name)
+		}
 	}
 	if len(tc.Receivers) > 0 && (tc.Receiver.Mode != "" || tc.Receiver.Listen != "") {
 		return fmt.Errorf("case %q: both `receiver:` and `receivers:` are set — pick one", tc.Name)
@@ -1210,6 +1275,22 @@ func (tc *TestCase) Validate() error {
 			if g.KafkaBatch < 0 {
 				return fmt.Errorf("case %q: kafka_batch must be >= 1 (0/unset defaults to 1), got %d", tc.Name, g.KafkaBatch)
 			}
+		}
+	}
+	// The disk-pressure scenario is only meaningful against a size-limited
+	// volume driven by a flood: without `subject_disk:` the subject gets the
+	// host's whole disk and the run reports PASS without ever exercising
+	// backpressure, and without a generator the runner starts a `generator`
+	// service the compose template never emitted.
+	if tc.Type == "disk_pressure_correctness" {
+		if tc.SubjectDisk == nil {
+			return fmt.Errorf("case %q: type %q requires a `subject_disk:` block", tc.Name, tc.Type)
+		}
+		// HasGenerator, not len(AllGenerators()): the latter always
+		// returns at least the zero-value singular entry, so it can
+		// never be empty.
+		if !tc.HasGenerator() {
+			return fmt.Errorf("case %q: type %q requires a `generator:` block", tc.Name, tc.Type)
 		}
 	}
 	if tc.Correctness.MaxOverDeliveryPct < 0 {
@@ -2530,6 +2611,17 @@ func validateSampleFile(caseName, sampleFile string) error {
 		return fmt.Errorf("case %q: sample_file %q must not escape the case directory", caseName, sampleFile)
 	}
 	return nil
+}
+
+// SubjectDiskConfig mounts a size-limited tmpfs inside the subject container
+// (see TestCase.SubjectDisk). Path is the in-container mount point — for
+// vmetric that's /opt/vmetric/storage, the root of its NATS JetStream
+// StoreDir and queue/WAL files. Size is a docker-compose tmpfs size string
+// ("64m", "1g", or plain bytes). The mount is created mode 01777 so
+// non-root subject images can write to it.
+type SubjectDiskConfig struct {
+	Path string `yaml:"path"`
+	Size string `yaml:"size"`
 }
 
 type GeneratorConfig struct {

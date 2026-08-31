@@ -241,6 +241,14 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	if tc.Type == "persistence_file_restart_correctness" {
 		return r.runPersistenceFileRestartCorrectness(tc, subject)
 	}
+	// Disk pressure: the subject gets a small size-limited storage volume
+	// (subject_disk tmpfs) and the receiver stays down while the generator
+	// pushes far more data than the volume holds. The subject must apply
+	// backpressure (slow ingestion) instead of filling the disk and crashing;
+	// once the receiver comes up, everything accepted must be delivered.
+	if tc.Type == "disk_pressure_correctness" {
+		return r.runDiskPressureCorrectness(tc, subject)
+	}
 	// Kafka crash/restart correctness reuses the shutdown flow: produce to
 	// the broker while the receiver is down (the subject consumes from Kafka
 	// and buffers to its crash-resistant queue), kill/stop the subject, bring
@@ -1785,6 +1793,352 @@ func receiveWindowRate(rm ReceiverMetrics) float64 {
 		return float64(rm.LinesReceived) / (float64(rm.LastReceivedNs-rm.FirstReceivedNs) / 1e9)
 	}
 	return 0
+}
+
+// runDiskPressureCorrectness drives the disk-backpressure scenario. The
+// subject gets a small dedicated storage volume (case subject_disk block —
+// a size-limited tmpfs over its buffer/StoreDir root) and the receiver is
+// deliberately DOWN while a duration-bounded generator pushes far more
+// data than that volume can hold. A subject without disk admission control
+// fills the volume until its durable layer (e.g. embedded NATS JetStream)
+// hits ENOSPC — crashing outright or silently dropping records. A subject
+// with disk backpressure must instead slow ingestion (TCP flow control —
+// the generator simply sends fewer lines within its window; its per-write
+// deadline guarantees it still exits at the duration bound) and stay alive.
+// When the receiver comes up, every line the generator counted as sent
+// must drain: expected loss per the case (typically 0), and the subject
+// container must have been running continuously through the pressure
+// window.
+func (r *Runner) runDiskPressureCorrectness(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
+	configName := r.opts.ConfigName
+	subject = r.applySubjectOverrides(subject)
+
+	fmt.Printf("→ test=%s  subject=%s  version=%s  config=%s\n",
+		tc.Name, subject.Name, subject.Version, configName)
+
+	configSrc, err := tc.ConfigFilePath(r.opts.CasesDir, configName, subject)
+	if err != nil {
+		return results.RunResult{}, err
+	}
+	configSrc, err = filepath.Abs(configSrc)
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("resolving config path: %w", err)
+	}
+
+	tmpDir, err := os.MkdirTemp("", "bench-"+tc.Name+"-")
+	if err != nil {
+		return results.RunResult{}, err
+	}
+	if err := os.Chmod(tmpDir, 0o777); err != nil {
+		return results.RunResult{}, fmt.Errorf("chmod tmpdir: %w", err)
+	}
+	defer func() {
+		if !r.opts.NoCleanup {
+			os.RemoveAll(tmpDir)
+		}
+	}()
+
+	extraEnv := map[string]string{}
+	if cfg, ok := tc.Configurations[configName]; ok {
+		maps.Copy(extraEnv, cfg.Env)
+	}
+
+	caseDir, err := filepath.Abs(filepath.Join(r.opts.CasesDir, tc.Name))
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("resolving case directory: %w", err)
+	}
+
+	runCfg := orchestrator.RunConfig{
+		TestCase:         tc,
+		Subject:          subject,
+		ConfigName:       configName,
+		ConfigSrcPath:    configSrc,
+		CaseDir:          caseDir,
+		TmpDir:           tmpDir,
+		GeneratorImage:   r.opts.GeneratorImage,
+		ReceiverImage:    r.opts.ReceiverImage,
+		CollectorImage:   r.opts.CollectorImage,
+		ReceiverHostPort: r.opts.ReceiverHostPort,
+		ExtraSubjectEnv:  extraEnv,
+		CPULimit:         r.opts.CPULimit,
+		MemLimit:         r.opts.MemLimit,
+	}
+
+	cr, err := orchestrator.NewComposeRunner(r.ctx, runCfg)
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("compose setup: %w", err)
+	}
+	orch := cr
+
+	subjectContainer := "bench-subject-" + subject.Name
+	for _, c := range []string{"bench-generator", "bench-receiver", "bench-collector", subjectContainer} {
+		_ = exec.Command("docker", "rm", "-f", c).Run()
+	}
+	_ = orch.Down()
+
+	startTime := time.Now()
+	runDeadline := startTime.Add(r.opts.Timeout)
+
+	cleanup := func() {
+		if !r.opts.NoCleanup {
+			fmt.Println("  tearing down…")
+			_ = orch.Down()
+		}
+	}
+	defer cleanup()
+
+	// PHASE 1: subject + collector only — the receiver stays down so the
+	// subject cannot drain and its storage volume fills instead.
+	fmt.Println("  phase 1: starting subject on a size-limited storage volume (receiver is DOWN)…")
+	if err := orch.UpServices("subject", "collector"); err != nil {
+		return results.RunResult{}, fmt.Errorf("starting subject: %w", err)
+	}
+
+	// PHASE 2: duration-bounded flood — the generator is configured to
+	// attempt far more volume than subject_disk.size holds.
+	fmt.Println("  phase 2: flooding subject (receiver still DOWN)…")
+	if err := orch.UpServices("generator"); err != nil {
+		return results.RunResult{}, fmt.Errorf("starting generator: %w", err)
+	}
+
+	duration := tc.DurationOrDefault(60 * time.Second)
+	warmup := tc.WarmupOrDefault(5 * time.Second)
+	genTimeout := min(duration+warmup+2*time.Minute, r.opts.Timeout)
+
+	fmt.Printf("  waiting for generator (up to %s)…\n", genTimeout)
+	if err := orch.WaitForGeneratorExit(genTimeout); err != nil {
+		return results.RunResult{}, fmt.Errorf("waiting for generator: %w", err)
+	}
+
+	genStats := r.parseGeneratorStats(orch.GeneratorStdout())
+	fmt.Printf("  generator sent %s lines (%s bytes) under disk pressure\n",
+		formatCount(genStats.LinesSent), formatCount(genStats.BytesSent))
+
+	// PHASE 3: pressure verdict — the subject must have survived the flood.
+	// Capture storage usage while the container is (hopefully) still up so
+	// the report shows how full the volume actually got.
+	subjectAlive := containerRunning(subjectContainer)
+	if usage := subjectDiskUsage(r.ctx, subjectContainer, tc); usage != "" {
+		fmt.Printf("  phase 3: subject storage usage after flood: %s (volume cap %s)\n", usage, tc.SubjectDisk.Size)
+	}
+	if subjectAlive {
+		fmt.Println("  phase 3: subject survived the disk-pressure window ✓")
+	} else {
+		fmt.Println("  phase 3: subject is NOT running after the disk-pressure window ✗")
+		fmt.Fprintf(os.Stderr, "\n  --- subject (last 40 lines) ---\n%s", orch.Logs("subject", 40))
+	}
+
+	// PHASE 4: receiver up — whatever the subject accepted must now drain.
+	fmt.Println("  phase 4: starting receiver (drain)…")
+	if err := orch.UpServices("receiver"); err != nil {
+		return results.RunResult{}, fmt.Errorf("starting receiver: %w", err)
+	}
+	if err := sleepCtx(r.ctx, 3*time.Second); err != nil {
+		return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+	}
+
+	drainTimeout := 3 * time.Minute
+	fmt.Printf("  phase 5: waiting for logs to drain (up to %s)…\n", drainTimeout)
+
+	metricsPort, stopPortFwd, err := orch.ReceiverMetricsPort()
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("setting up receiver access: %w", err)
+	}
+	defer stopPortFwd()
+
+	var lastCount int64
+	stableRounds := 0
+	// Clamp the drain window to the run's overall ceiling so this case
+	// can't overrun Options.Timeout in a batch run, matching the other
+	// drain loops.
+	drainDeadline := time.Now().Add(drainTimeout)
+	if drainDeadline.After(runDeadline) {
+		drainDeadline = runDeadline
+	}
+	for time.Now().Before(drainDeadline) {
+		if err := sleepCtx(r.ctx, 5*time.Second); err != nil {
+			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+		}
+		rm, err := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+		if err != nil {
+			continue
+		}
+		fmt.Printf("    received: %s / %s lines\n", formatCount(rm.LinesReceived), formatCount(genStats.LinesSent))
+		if rm.LinesReceived == lastCount && rm.LinesReceived > 0 {
+			stableRounds++
+			if stableRounds >= 12 {
+				fmt.Println("    receiver stable — all logs drained")
+				break
+			}
+		} else {
+			stableRounds = 0
+		}
+		lastCount = rm.LinesReceived
+	}
+
+	recvMetrics, err := r.queryReceiverMetrics(metricsPort, 30*time.Second)
+	if err != nil {
+		return results.RunResult{}, fmt.Errorf("querying receiver metrics: %w", err)
+	}
+
+	metrics, metricsCSVSrc := r.harvestResourceMetrics(orch, tmpDir)
+	sysCPUs, sysMemMB := getSystemInfo()
+
+	elapsed := time.Since(startTime).Seconds()
+
+	lossPct := 0.0
+	if genStats.LinesSent > 0 {
+		lossPct = 100.0 * (1.0 - float64(recvMetrics.LinesReceived)/float64(genStats.LinesSent))
+		if lossPct < 0 {
+			lossPct = 0
+		}
+	}
+
+	passed := lossPct <= tc.Correctness.ExpectedLossPct
+	var errors []string
+	if !subjectAlive {
+		passed = false
+		errors = append(errors, "subject crashed/exited during disk pressure (container not running after the flood window)")
+	}
+	if lossPct > tc.Correctness.ExpectedLossPct {
+		errors = append(errors, fmt.Sprintf("expected loss <= %.2f%%, got %.2f%% (%s of %s lines lost)",
+			tc.Correctness.ExpectedLossPct, lossPct,
+			formatCount(genStats.LinesSent-recvMetrics.LinesReceived), formatCount(genStats.LinesSent)))
+	}
+	if recvMetrics.LinesReceived > genStats.LinesSent {
+		extra := recvMetrics.LinesReceived - genStats.LinesSent
+		if tc.Correctness.AllowOverDelivery {
+			fmt.Printf("  note: over-delivery of %s lines (at-least-once duplicates — not a failure)\n", formatCount(extra))
+		} else {
+			passed = false
+			errors = append(errors, fmt.Sprintf("over-delivery: received %s lines but only %s were sent (%s extra/duplicate lines)",
+				formatCount(recvMetrics.LinesReceived), formatCount(genStats.LinesSent), formatCount(extra)))
+		}
+	}
+	if tc.Correctness.ValidateDedup && recvMetrics.Duplicates > 0 {
+		passed = false
+		errors = append(errors, fmt.Sprintf("expected 0 duplicates, got %s", formatCount(recvMetrics.Duplicates)))
+	}
+	if tc.Correctness.ValidateContent && recvMetrics.MalformedLines > 0 {
+		passed = false
+		errors = append(errors, fmt.Sprintf("expected 0 malformed lines, got %s (memory corruption)",
+			formatCount(recvMetrics.MalformedLines)))
+	}
+	if tc.Correctness.ValidateJSON && recvMetrics.InvalidJSONLines > 0 {
+		passed = false
+		errors = append(errors, fmt.Sprintf("expected 0 invalid-JSON lines, got %s",
+			formatCount(recvMetrics.InvalidJSONLines)))
+	}
+
+	result := results.RunResult{
+		TestName:        tc.Name,
+		Config:          configName,
+		Subject:         subject.Name,
+		Version:         subject.Version,
+		Hardware:        hardwareID(),
+		Timestamp:       startTime,
+		DurationSec:     elapsed,
+		FirstSentNs:     genStats.FirstSentNs,
+		LastSentNs:      genStats.LastSentNs,
+		FirstReceivedNs: recvMetrics.FirstReceivedNs,
+		LastReceivedNs:  recvMetrics.LastReceivedNs,
+		LinesIn:         genStats.LinesSent,
+		LinesOut:        recvMetrics.LinesReceived,
+		BytesIn:         genStats.BytesSent,
+		BytesOut:        recvMetrics.BytesReceived,
+		LinesPerSec:     receiveWindowRate(recvMetrics),
+		LossPercent:     lossPct,
+		AvgCPUPercent:   metrics.CPUAvg,
+		MaxCPUPercent:   metrics.CPUMax,
+		AvgMemMB:        metrics.MemAvgMB,
+		MaxMemMB:        metrics.MemMaxMB,
+		DiskReadBytes:   metrics.DiskRead,
+		DiskWriteBytes:  metrics.DiskWrite,
+		NetRecvBytes:    metrics.NetRecv,
+		NetSendBytes:    metrics.NetSend,
+		IOThroughputAvg: metrics.IOThroughputAvg,
+		LoadAvg1:        metrics.LoadAvg1,
+		LoadAvg5:        metrics.LoadAvg5,
+		LoadAvg15:       metrics.LoadAvg15,
+		SystemCPUs:      sysCPUs,
+		SystemMemMB:     sysMemMB,
+		SubjectCPULimit: r.opts.CPULimit,
+		SubjectMemLimit: r.opts.MemLimit,
+		Passed:          &passed,
+	}
+	if !passed {
+		result.FailReason = strings.Join(errors, "; ")
+	}
+
+	applyMaxReceived(tc, recvMetrics.LinesReceived, &result)
+
+	dir, err := r.saveResult(result, metricsCSVSrc)
+	if err != nil {
+		return result, fmt.Errorf("saving results: %w", err)
+	}
+
+	fmt.Printf("  done. results → %s\n", dir)
+	fmt.Printf("  lines sent: %s  lines received: %s  loss: %.2f%%\n",
+		formatCount(genStats.LinesSent), formatCount(recvMetrics.LinesReceived), lossPct)
+	fmt.Printf("  cpu: avg %.1f%% max %.1f%%  mem: avg %.0f MB max %.0f MB\n",
+		metrics.CPUAvg, metrics.CPUMax, metrics.MemAvgMB, metrics.MemMaxMB)
+	if metrics.DiskWrite > 0 {
+		fmt.Printf("  disk write: %s bytes\n", formatCount(metrics.DiskWrite))
+	}
+	// Print from the persisted result: applyMaxReceived may have failed it
+	// after the local verdict was computed.
+	if result.Passed != nil && *result.Passed {
+		fmt.Println("  disk pressure correctness: PASSED ✓")
+	} else {
+		fmt.Println("  disk pressure correctness: FAILED ✗")
+		for _, e := range strings.Split(result.FailReason, "; ") {
+			fmt.Printf("    - %s\n", e)
+		}
+	}
+
+	if recvMetrics.LinesReceived == 0 {
+		fmt.Fprintln(os.Stderr, "\n  WARNING: 0 lines received. Container logs:")
+		fmt.Fprintf(os.Stderr, "\n  --- generator ---\n%s", orch.Logs("generator", 30))
+		fmt.Fprintf(os.Stderr, "\n  --- subject ---\n%s", orch.Logs("subject", 30))
+		fmt.Fprintf(os.Stderr, "\n  --- receiver ---\n%s", orch.Logs("receiver", 30))
+	}
+
+	return result, nil
+}
+
+// subjectDiskUsage reports the subject_disk mount's on-disk usage inside the
+// subject container ("du -sh" of the mount point), best-effort: empty when
+// the case has no subject_disk block or the container is not running.
+//
+// du is invoked directly rather than through `sh -c`, with the case-supplied
+// path as its own argv element, so a path carrying shell metacharacters is
+// passed through as a literal filename instead of being interpreted.
+//
+// The probe is bounded: this is called right after a deliberate disk-full
+// flood, exactly the state in which the container is likely to be
+// unresponsive, and an unbounded `docker exec` would hang the run. Deriving
+// the timeout from the run's context (rather than Background) also lets
+// SIGINT cancel it. A timeout returns "" like any other failure, so the
+// caller just skips the usage line rather than failing the run.
+func subjectDiskUsage(ctx context.Context, container string, tc *config.TestCase) string {
+	if tc.SubjectDisk == nil {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	// Output() (not CombinedOutput) keeps du's stderr out of the reported
+	// size, replacing what the old `2>/dev/null` did.
+	out, err := exec.CommandContext(ctx, "docker", "exec", container, "du", "-sh", tc.SubjectDisk.Path).Output()
+	if err != nil {
+		return ""
+	}
+	// du prints the size, a tab, then the path; without a shell there is
+	// no `cut -f1`, so keep the leading size field here.
+	line := strings.TrimSpace(string(out))
+	if i := strings.IndexAny(line, " \t"); i >= 0 {
+		return line[:i]
+	}
+	return line
 }
 
 // midDeliveryFlow parameterizes the shared mid-delivery correctness driver
