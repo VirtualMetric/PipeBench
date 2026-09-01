@@ -2293,27 +2293,70 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 	}
 	defer stopPortFwd()
 
-	// Wait until the receiver has seen ~half the records, then fire the
-	// disruptive action. Driving off receiver progress (not a fixed sleep)
-	// guarantees it lands mid-delivery regardless of run speed.
-	fmt.Printf("  waiting for mid-delivery (receiver >= %s of %s)…\n", formatCount(mid), formatCount(n))
+	// Wait for the moment the case wants to be disrupted, then fire the action.
+	//
+	// Two triggers, because receiver progress is the right signal only when the
+	// target sends as it goes. If the target HOLDS records (a scheduled sender
+	// pool), then "the receiver has seen half" cannot be true until a flush has
+	// happened, so this trigger necessarily fires just after one — when the
+	// least is in flight. With a bounded row count the first flush can deliver
+	// everything at once, and the halfway mark is only crossed after delivery is
+	// complete, so the disruption lands on an idle subject and the case proves
+	// nothing. Such a case anchors to the subject's own log instead.
+	triggerLog, triggerDelay, logAnchored, err := tc.MidDeliveryTrigger()
+	if err != nil {
+		return results.RunResult{}, err
+	}
+
 	fired := false
 	deadline := time.Now().Add(r.opts.Timeout)
-	for time.Now().Before(deadline) {
-		rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
-		if qerr == nil {
-			fmt.Printf("    received: %s\n", formatCount(rm.LinesReceived))
-			if rm.LinesReceived >= mid {
-				fmt.Printf("  mid-delivery reached — %s…\n", f.actionLog)
+
+	if logAnchored {
+		fmt.Printf("  waiting for mid-delivery (subject log %q, then %s)…\n", triggerLog, triggerDelay)
+		for time.Now().Before(deadline) {
+			if strings.Contains(orch.Logs("subject", 400), triggerLog) {
+				if triggerDelay > 0 {
+					if err := sleepCtx(r.ctx, triggerDelay); err != nil {
+						return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+					}
+				}
+				if rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second); qerr == nil {
+					fmt.Printf("    received so far: %s of %s\n", formatCount(rm.LinesReceived), formatCount(n))
+				}
+				fmt.Printf("  trigger seen — %s…\n", f.actionLog)
 				if err := f.action(orch); err != nil {
 					return results.RunResult{}, err
 				}
 				fired = true
+
 				break
 			}
+			if err := sleepCtx(r.ctx, 500*time.Millisecond); err != nil {
+				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+			}
 		}
-		if err := sleepCtx(r.ctx, 500*time.Millisecond); err != nil {
-			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+		if !fired {
+			return results.RunResult{}, fmt.Errorf("subject log never contained %q before timeout", triggerLog)
+		}
+	} else {
+		fmt.Printf("  waiting for mid-delivery (receiver >= %s of %s)…\n", formatCount(mid), formatCount(n))
+		for time.Now().Before(deadline) {
+			rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+			if qerr == nil {
+				fmt.Printf("    received: %s\n", formatCount(rm.LinesReceived))
+				if rm.LinesReceived >= mid {
+					fmt.Printf("  mid-delivery reached — %s…\n", f.actionLog)
+					if err := f.action(orch); err != nil {
+						return results.RunResult{}, err
+					}
+					fired = true
+
+					break
+				}
+			}
+			if err := sleepCtx(r.ctx, 500*time.Millisecond); err != nil {
+				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+			}
 		}
 	}
 	if !fired {
@@ -2397,9 +2440,13 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 	// build with the defect still in it. Counting distinct lines removes the
 	// masking; duplicates stay reported but never fail, because an at-least-once
 	// source is allowed to produce them.
+	// Ask the case whether the receiver was TOLD to track the distinct set,
+	// rather than inferring it from a non-zero count. The two agree today, but
+	// the count is an observation and the predicate is the contract: a run that
+	// tracked uniques and received nothing also reports zero.
 	accounted := recvMetrics.LinesReceived
 	basis := "received"
-	if recvMetrics.UniqueLines > 0 {
+	if tc.TracksUniqueLines() && recvMetrics.UniqueLines > 0 {
 		accounted = recvMetrics.UniqueLines
 		basis = "unique"
 	}
@@ -2451,6 +2498,7 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 		LastReceivedNs:  recvMetrics.LastReceivedNs,
 		LinesIn:         expectedSent,
 		LinesOut:        recvMetrics.LinesReceived,
+		UniqueOut:       recvMetrics.UniqueLines,
 		BytesIn:         genStats.BytesSent,
 		BytesOut:        recvMetrics.BytesReceived,
 		LinesPerSec:     receiveWindowRate(recvMetrics),

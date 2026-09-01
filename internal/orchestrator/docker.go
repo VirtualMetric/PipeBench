@@ -2219,25 +2219,26 @@ func writeCompose(path string, cfg RunConfig) error {
 	// pre-generated templateLine for every record, which that assertion can
 	// never satisfy — so enable sequenced (unique-per-record) generation for
 	// verifier cases too, the same way receiver dedup/content checks do.
-	sequenced := boolStr(tc.Correctness.ValidateDedup || tc.Correctness.ValidateContent || tc.UsesVerifier())
+	//
+	// TracksUniqueLines also needs it: a unique-set verdict over a generator
+	// source is meaningless unless the generator varies the payload per record,
+	// and sequenced mode is the only mechanism that does. It is gated to
+	// format: json there, whose encoder keeps the CONN=/SEQ= token inside a
+	// well-formed envelope.
+	sequenced := boolStr(tc.Correctness.ValidateDedup || tc.Correctness.ValidateContent ||
+		tc.UsesVerifier() || tc.TracksUniqueLines())
 
-	// Receiver-side unique/duplicate accounting is a SEPARATE decision from
-	// sequenced generation, and the mid-delivery drivers need the former without
-	// the latter.
+	// Receiver-side unique/duplicate accounting. The mid-delivery drivers verify
+	// "no loss" over a crash, and raw received lines cannot express that: a
+	// crash re-delivers heavily, so duplicates mask the rows actually lost
+	// (measured: 1,440 duplicates against a 600-row expectation hid a 10-row
+	// loss). The verdict runs over UniqueLines, which the receiver only tracks
+	// when told to.
 	//
-	// Those drivers verify "no loss" over a crash. Raw received lines cannot
-	// express that: a crash re-delivers heavily, so duplicates mask the rows
-	// actually lost (measured: 1,440 duplicates against a 600-row floor hid a
-	// 10-row loss). The verdict has to run over UniqueLines, which the receiver
-	// only tracks when told to.
-	//
-	// Enabled here only for cases WITHOUT a generator — i.e. database sources,
-	// whose rows carry their own unique markers. Generator-driven cases would
-	// additionally need GenSequenced, and that rewrites every line to
-	// "CONN=<id> SEQ=<n> ..." regardless of the case's `format`, which is a
-	// change to what those cases exercise (and has silently broken
-	// JSON-parsing subjects before). Not something to switch on implicitly.
-	trackUnique := tc.Database != nil && tc.Generator.TotalLines <= 0
+	// Same predicate the runner uses to pick the verdict basis — see
+	// config.TestCase.TracksUniqueLines. Deriving it separately here is how the
+	// two drift apart.
+	trackUnique := tc.TracksUniqueLines()
 	tlsCertsHost := filepath.ToSlash(cfg.TLSCertsHost)
 
 	// Fleet/managed subjects that receive a platform-delivered operational

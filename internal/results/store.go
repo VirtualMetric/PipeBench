@@ -44,6 +44,13 @@ type RunResult struct {
 	LinesPerSec float64 `json:"lines_per_sec"`
 	LossPercent float64 `json:"loss_percent"`
 
+	// UniqueOut is the DISTINCT line count, set only when the receiver was
+	// tracking it (config.TestCase.TracksUniqueLines). Where it is set,
+	// LossPercent is computed from it rather than from LinesOut, so without it
+	// recomputing loss from a stored row as 1-LinesOut/LinesIn disagrees with
+	// the verdict that was actually applied.
+	UniqueOut int64 `json:"unique_out,omitempty"`
+
 	// Resource usage (aggregated from metrics.csv during the run)
 	AvgCPUPercent float64 `json:"avg_cpu_percent"`
 	MaxCPUPercent float64 `json:"max_cpu_percent"`
@@ -136,6 +143,10 @@ type ResultEntry struct {
 	BytesOut    int64   `json:"bytes_out"`
 	LinesPerSec float64 `json:"lines_per_sec"`
 	LossPercent float64 `json:"loss_percent"`
+
+	// Set only when the verdict was judged over distinct lines — see
+	// RunResult.UniqueOut.
+	UniqueOut int64 `json:"unique_out,omitempty"`
 
 	AvgCPUPercent float64 `json:"avg_cpu_percent"`
 	MaxCPUPercent float64 `json:"max_cpu_percent"`
@@ -294,6 +305,7 @@ func (s *Store) Save(r RunResult, _unusedMetricsCSVSrc string) (string, error) {
 		BytesOut:        r.BytesOut,
 		LinesPerSec:     r.LinesPerSec,
 		LossPercent:     r.LossPercent,
+		UniqueOut:       r.UniqueOut,
 		AvgCPUPercent:   r.AvgCPUPercent,
 		MaxCPUPercent:   r.MaxCPUPercent,
 		AvgMemMB:        r.AvgMemMB,
