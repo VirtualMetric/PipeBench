@@ -596,6 +596,13 @@ type DatabaseConfig struct {
 	// /opt/vmetric/certs/ca.crt; whether a device trusts it is the device's
 	// own config choice (a negative case can withhold the CA to prove reject).
 	TLS bool `yaml:"tls"`
+	// ExpectedRows is how many rows the case's collector should ultimately
+	// deliver. The mid-delivery drivers (crash / restart / rotation) size their
+	// "act at ~50%" trigger off the expected total, which for every other source
+	// comes from generator.total_lines — a database case has no generator, its
+	// rows come from seed_sql or a writer sidecar. Set this so those drivers can
+	// run against a database source. Falls back to correctness.min_received.
+	ExpectedRows int64 `yaml:"expected_rows"`
 }
 
 // ImageOrDefault, PasswordOrDefault, DatabaseOrDefault centralize the

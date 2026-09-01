@@ -2262,7 +2262,18 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 		}
 	}()
 
+	// Expected total. Every generator-driven source states it as
+	// generator.total_lines; a DATABASE source has no generator (its rows come
+	// from database.seed_sql or a writer sidecar), so fall back to the case's
+	// own row count. Without this a database case cannot use any mid-delivery
+	// driver at all, which is why the DB collectors had no crash coverage.
 	n := tc.Generator.TotalLines
+	if n <= 0 && tc.Database != nil {
+		n = tc.Database.ExpectedRows
+		if n <= 0 {
+			n = tc.Correctness.MinReceived
+		}
+	}
 	if n <= 0 {
 		return results.RunResult{}, errors.New(f.totalLinesErr)
 	}
@@ -2506,8 +2517,9 @@ func (r *Runner) runInflightCrashCorrectness(tc *config.TestCase, subject config
 		verdictLabel:  "in-flight crash correctness",
 		actionLog:     "SIGKILL subject (no graceful shutdown), then restart",
 		overDelivNote: "expected for a mid-delivery crash",
-		totalLinesErr: "persistence_inflight_crash_correctness requires generator.total_lines > 0",
-		extraCleanup:  []string{"bench-localstack", "bench-azurite", "bench-azure-init"},
+		totalLinesErr: "persistence_inflight_crash_correctness requires generator.total_lines > 0 " +
+			"(or, for a database source, database.expected_rows / correctness.min_received)",
+		extraCleanup: []string{"bench-localstack", "bench-azurite", "bench-azure-init", "bench-database", "bench-database-init"},
 		action: func(orch orchestrator.Orchestrator) error {
 			if err := orch.KillServices("subject"); err != nil {
 				return fmt.Errorf("killing subject: %w", err)
