@@ -2369,9 +2369,26 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 	sysCPUs, sysMemMB := getSystemInfo()
 
 	elapsed := time.Since(startTime).Seconds()
+
+	// Expected input for the verdict. Every generator-driven source reports it
+	// as genStats.LinesSent; a DATABASE source has no generator, so that is 0
+	// and every loss check below would be vacuously satisfied — a case could
+	// receive nothing and still pass with lossPct == 0. Fall back to the same
+	// expected row count the mid-delivery trigger used.
+	//
+	// With a continuous writer sidecar the exact committed count is unknowable,
+	// so for a database case expected_rows behaves as a FLOOR EXPRESSED AS LOSS:
+	// at or above it passes, below it fails. That is the right shape for a crash
+	// case, and it is why such a floor has to be timing-safe rather than the
+	// arithmetic maximum the writer could reach.
+	expectedSent := genStats.LinesSent
+	if expectedSent <= 0 {
+		expectedSent = n
+	}
+
 	lossPct := 0.0
-	if genStats.LinesSent > 0 {
-		lossPct = 100.0 * (1.0 - float64(recvMetrics.LinesReceived)/float64(genStats.LinesSent))
+	if expectedSent > 0 {
+		lossPct = 100.0 * (1.0 - float64(recvMetrics.LinesReceived)/float64(expectedSent))
 		if lossPct < 0 {
 			lossPct = 0
 		}
@@ -2382,17 +2399,17 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 	if !passed {
 		errs = append(errs, fmt.Sprintf("expected loss <= %.2f%%, got %.2f%% (%s of %s lines lost)",
 			tc.Correctness.ExpectedLossPct, lossPct,
-			formatCount(genStats.LinesSent-recvMetrics.LinesReceived), formatCount(genStats.LinesSent)))
+			formatCount(expectedSent-recvMetrics.LinesReceived), formatCount(expectedSent)))
 	}
-	if recvMetrics.LinesReceived > genStats.LinesSent {
-		extra := recvMetrics.LinesReceived - genStats.LinesSent
-		overPct := 100.0 * float64(extra) / float64(genStats.LinesSent)
+	if recvMetrics.LinesReceived > expectedSent {
+		extra := recvMetrics.LinesReceived - expectedSent
+		overPct := 100.0 * float64(extra) / float64(expectedSent)
 		fmt.Printf("  over-delivery: %s duplicate lines (%.2f%%) — at-least-once, %s\n",
 			formatCount(extra), overPct, f.overDelivNote)
 	}
 
 	fmt.Printf("  lines sent: %s  lines received: %s  loss: %.2f%%\n",
-		formatCount(genStats.LinesSent), formatCount(recvMetrics.LinesReceived), lossPct)
+		formatCount(expectedSent), formatCount(recvMetrics.LinesReceived), lossPct)
 	fmt.Printf("  cpu: avg %.1f%% max %.1f%%  mem: avg %.0f MB max %.0f MB\n",
 		metrics.CPUAvg, metrics.CPUMax, metrics.MemAvgMB, metrics.MemMaxMB)
 	if metrics.IOThroughputAvg > 0 {
@@ -2410,7 +2427,7 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 		LastSentNs:      genStats.LastSentNs,
 		FirstReceivedNs: recvMetrics.FirstReceivedNs,
 		LastReceivedNs:  recvMetrics.LastReceivedNs,
-		LinesIn:         genStats.LinesSent,
+		LinesIn:         expectedSent,
 		LinesOut:        recvMetrics.LinesReceived,
 		BytesIn:         genStats.BytesSent,
 		BytesOut:        recvMetrics.BytesReceived,
