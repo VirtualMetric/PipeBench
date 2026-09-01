@@ -2332,6 +2332,22 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 	}
 	genStats := r.parseGeneratorStats(orch.GeneratorStdout())
 	fmt.Printf("  generator sent %s lines\n", formatCount(genStats.LinesSent))
+	// Expected input for the verdict AND for the progress line below. Every
+	// generator-driven source reports it as genStats.LinesSent; a DATABASE
+	// source has no generator, so that is 0 and every loss check would be
+	// vacuously satisfied — a case could receive nothing and still pass with
+	// lossPct == 0. Fall back to the same expected row count the mid-delivery
+	// trigger used.
+	//
+	// With a continuous writer sidecar the exact committed count is unknowable,
+	// so for a database case expected_rows behaves as a FLOOR EXPRESSED AS LOSS:
+	// at or above it passes, below it fails. That is the right shape for a crash
+	// case, and it is why such a floor has to be timing-safe rather than the
+	// arithmetic maximum the writer could reach.
+	expectedSent := genStats.LinesSent
+	if expectedSent <= 0 {
+		expectedSent = n
+	}
 
 	// Drain until the receiver count stabilizes.
 	drainTimeout := 3 * time.Minute
@@ -2347,7 +2363,7 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 		if qerr != nil {
 			continue
 		}
-		fmt.Printf("    received: %s / %s\n", formatCount(rm.LinesReceived), formatCount(genStats.LinesSent))
+		fmt.Printf("    received: %s / %s\n", formatCount(rm.LinesReceived), formatCount(expectedSent))
 		if rm.LinesReceived == lastCount && rm.LinesReceived > 0 {
 			stableRounds++
 			if stableRounds >= 6 {
@@ -2369,22 +2385,6 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 	sysCPUs, sysMemMB := getSystemInfo()
 
 	elapsed := time.Since(startTime).Seconds()
-
-	// Expected input for the verdict. Every generator-driven source reports it
-	// as genStats.LinesSent; a DATABASE source has no generator, so that is 0
-	// and every loss check below would be vacuously satisfied — a case could
-	// receive nothing and still pass with lossPct == 0. Fall back to the same
-	// expected row count the mid-delivery trigger used.
-	//
-	// With a continuous writer sidecar the exact committed count is unknowable,
-	// so for a database case expected_rows behaves as a FLOOR EXPRESSED AS LOSS:
-	// at or above it passes, below it fails. That is the right shape for a crash
-	// case, and it is why such a floor has to be timing-safe rather than the
-	// arithmetic maximum the writer could reach.
-	expectedSent := genStats.LinesSent
-	if expectedSent <= 0 {
-		expectedSent = n
-	}
 
 	lossPct := 0.0
 	if expectedSent > 0 {
@@ -2514,7 +2514,9 @@ func (r *Runner) runKafkaInflightCrash(tc *config.TestCase, subject config.Subje
 			if err := sleepCtx(r.ctx, 3*time.Second); err != nil {
 				return fmt.Errorf("interrupted: %w", err)
 			}
-			if err := orch.UpServices("subject"); err != nil {
+			// --no-deps: only the subject died, everything it depends on is
+			// still up. See Orchestrator.RestartServices.
+			if err := orch.RestartServices("subject"); err != nil {
 				return fmt.Errorf("restarting subject: %w", err)
 			}
 			return nil
@@ -2545,7 +2547,12 @@ func (r *Runner) runInflightCrashCorrectness(tc *config.TestCase, subject config
 			if err := sleepCtx(r.ctx, 3*time.Second); err != nil {
 				return fmt.Errorf("interrupted: %w", err)
 			}
-			if err := orch.UpServices("subject"); err != nil {
+			// --no-deps: only the subject died. A plain `up subject` would also
+			// restart an already-completed database-init, whose CREATE DATABASE
+			// and seed_sql are not idempotent — the case then fails on
+			// `database "bench" already exists` instead of on the thing it
+			// tests. Invisible for the s3/azure cases, which have no init.
+			if err := orch.RestartServices("subject"); err != nil {
 				return fmt.Errorf("restarting subject: %w", err)
 			}
 			return nil

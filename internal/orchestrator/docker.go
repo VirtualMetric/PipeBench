@@ -1406,6 +1406,15 @@ func (r *ComposeRunner) UpServices(services ...string) error {
 	return r.compose(args...)
 }
 
+// RestartServices is UpServices with --no-deps. See the interface for why the
+// distinction matters; in short, a plain `up <service>` also restarts an
+// already-completed one-shot dependency, and database-init is not idempotent.
+func (r *ComposeRunner) RestartServices(services ...string) error {
+	resolved := r.resolveServiceAliases(services)
+	args := append([]string{"up", "-d", "--quiet-pull", "--no-deps"}, resolved...)
+	return r.compose(args...)
+}
+
 // resolveServiceAliases expands the logical names "generator" and "receiver"
 // to the concrete plural service names when the case uses the plural form.
 // Other names are passed through unchanged. Lets existing callers like
