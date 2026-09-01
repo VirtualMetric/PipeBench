@@ -2220,6 +2220,24 @@ func writeCompose(path string, cfg RunConfig) error {
 	// never satisfy — so enable sequenced (unique-per-record) generation for
 	// verifier cases too, the same way receiver dedup/content checks do.
 	sequenced := boolStr(tc.Correctness.ValidateDedup || tc.Correctness.ValidateContent || tc.UsesVerifier())
+
+	// Receiver-side unique/duplicate accounting is a SEPARATE decision from
+	// sequenced generation, and the mid-delivery drivers need the former without
+	// the latter.
+	//
+	// Those drivers verify "no loss" over a crash. Raw received lines cannot
+	// express that: a crash re-delivers heavily, so duplicates mask the rows
+	// actually lost (measured: 1,440 duplicates against a 600-row floor hid a
+	// 10-row loss). The verdict has to run over UniqueLines, which the receiver
+	// only tracks when told to.
+	//
+	// Enabled here only for cases WITHOUT a generator — i.e. database sources,
+	// whose rows carry their own unique markers. Generator-driven cases would
+	// additionally need GenSequenced, and that rewrites every line to
+	// "CONN=<id> SEQ=<n> ..." regardless of the case's `format`, which is a
+	// change to what those cases exercise (and has silently broken
+	// JSON-parsing subjects before). Not something to switch on implicitly.
+	trackUnique := tc.Database != nil && tc.Generator.TotalLines <= 0
 	tlsCertsHost := filepath.ToSlash(cfg.TLSCertsHost)
 
 	// Fleet/managed subjects that receive a platform-delivered operational
@@ -2312,7 +2330,7 @@ func writeCompose(path string, cfg RunConfig) error {
 		DockerSocketGID: cfg.DockerSocketGID,
 		TLSCertsHost:    tlsCertsHost,
 
-		RecvValidateDedup:      boolStr(tc.Correctness.ValidateDedup),
+		RecvValidateDedup:      boolStr(tc.Correctness.ValidateDedup || trackUnique),
 		RecvValidateContent:    boolStr(tc.Correctness.ValidateContent),
 		RecvExpectedLines:      0,
 		RecvRequiredSubstring:  tc.Correctness.RequiredSubstring,

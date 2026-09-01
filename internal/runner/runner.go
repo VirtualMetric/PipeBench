@@ -2277,7 +2277,9 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 	if n <= 0 {
 		return results.RunResult{}, errors.New(f.totalLinesErr)
 	}
-	mid := n / 2
+	// Clamp: at an expected total of 1 the midpoint is 0, so the "half received"
+	// condition is already true and the crash lands before any row arrives.
+	mid := max(n/2, 1)
 
 	// Everything up, receiver INCLUDED — data will be flowing to the target.
 	fmt.Println("  starting all services (receiver UP throughout)…")
@@ -2386,9 +2388,25 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 
 	elapsed := time.Since(startTime).Seconds()
 
+	// Loss is measured over the UNIQUE set when the receiver is tracking it.
+	//
+	// Raw received lines cannot express "no loss" for a crash case: recovery
+	// re-delivers, so duplicates inflate the count and mask the rows genuinely
+	// lost. Measured on the database crash case — 1,440 duplicates against a
+	// 600-row floor kept a 10-row loss invisible, and the case passed against a
+	// build with the defect still in it. Counting distinct lines removes the
+	// masking; duplicates stay reported but never fail, because an at-least-once
+	// source is allowed to produce them.
+	accounted := recvMetrics.LinesReceived
+	basis := "received"
+	if recvMetrics.UniqueLines > 0 {
+		accounted = recvMetrics.UniqueLines
+		basis = "unique"
+	}
+
 	lossPct := 0.0
 	if expectedSent > 0 {
-		lossPct = 100.0 * (1.0 - float64(recvMetrics.LinesReceived)/float64(expectedSent))
+		lossPct = 100.0 * (1.0 - float64(accounted)/float64(expectedSent))
 		if lossPct < 0 {
 			lossPct = 0
 		}
@@ -2397,19 +2415,23 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 	passed := lossPct <= tc.Correctness.ExpectedLossPct
 	var errs []string
 	if !passed {
-		errs = append(errs, fmt.Sprintf("expected loss <= %.2f%%, got %.2f%% (%s of %s lines lost)",
+		errs = append(errs, fmt.Sprintf("expected loss <= %.2f%%, got %.2f%% (%s of %s lines lost, counted by %s)",
 			tc.Correctness.ExpectedLossPct, lossPct,
-			formatCount(expectedSent-recvMetrics.LinesReceived), formatCount(expectedSent)))
+			formatCount(expectedSent-accounted), formatCount(expectedSent), basis))
 	}
-	if recvMetrics.LinesReceived > expectedSent {
+	if recvMetrics.Duplicates > 0 {
+		fmt.Printf("  over-delivery: %s duplicate lines — at-least-once, %s\n",
+			formatCount(recvMetrics.Duplicates), f.overDelivNote)
+	} else if recvMetrics.LinesReceived > expectedSent {
 		extra := recvMetrics.LinesReceived - expectedSent
 		overPct := 100.0 * float64(extra) / float64(expectedSent)
 		fmt.Printf("  over-delivery: %s duplicate lines (%.2f%%) — at-least-once, %s\n",
 			formatCount(extra), overPct, f.overDelivNote)
 	}
 
-	fmt.Printf("  lines sent: %s  lines received: %s  loss: %.2f%%\n",
-		formatCount(expectedSent), formatCount(recvMetrics.LinesReceived), lossPct)
+	fmt.Printf("  lines sent: %s  lines received: %s  unique: %s  loss: %.2f%% (by %s)\n",
+		formatCount(expectedSent), formatCount(recvMetrics.LinesReceived),
+		formatCount(recvMetrics.UniqueLines), lossPct, basis)
 	fmt.Printf("  cpu: avg %.1f%% max %.1f%%  mem: avg %.0f MB max %.0f MB\n",
 		metrics.CPUAvg, metrics.CPUMax, metrics.MemAvgMB, metrics.MemMaxMB)
 	if metrics.IOThroughputAvg > 0 {
