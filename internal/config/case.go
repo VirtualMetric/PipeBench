@@ -183,6 +183,10 @@ type TestCase struct {
 	Configurations map[string]Configuration `yaml:"configurations"`
 	Correctness    CorrectnessConfig        `yaml:"correctness"`
 
+	// MidDelivery overrides when the mid-delivery driver fires its disruptive
+	// action. Unset keeps the receiver-progress default. See MidDeliveryConfig.
+	MidDelivery *MidDeliveryConfig `yaml:"mid_delivery"`
+
 	// Verifier, when set, replaces the receiver with a one-shot DuckDB
 	// verifier container that reads the subject's Avro/Parquet objects
 	// directly from the S3 emulator (httpfs) and emits a correctness verdict.
@@ -618,6 +622,13 @@ type DatabaseConfig struct {
 	// /opt/vmetric/certs/ca.crt; whether a device trusts it is the device's
 	// own config choice (a negative case can withhold the CA to prove reject).
 	TLS bool `yaml:"tls"`
+	// ExpectedRows is how many rows the case's collector should ultimately
+	// deliver. The mid-delivery drivers (crash / restart / rotation) size their
+	// "act at ~50%" trigger off the expected total, which for every other source
+	// comes from generator.total_lines — a database case has no generator, its
+	// rows come from seed_sql or a writer sidecar. Set this so those drivers can
+	// run against a database source. Falls back to correctness.min_received.
+	ExpectedRows int64 `yaml:"expected_rows"`
 }
 
 // ImageOrDefault, PasswordOrDefault, DatabaseOrDefault centralize the
@@ -994,6 +1005,106 @@ func (tc *TestCase) MultiReceiver() bool { return len(tc.Receivers) > 0 }
 // and does not gate the run on a generator exiting.
 func (tc *TestCase) HasGenerator() bool {
 	return tc.MultiGenerator() || tc.Generator.Mode != "" || tc.Generator.Target != ""
+}
+
+// MidDeliveryConfig overrides WHEN the mid-delivery driver fires its disruptive
+// action. Unset keeps the default: wait until the receiver has confirmed half
+// the expected records.
+//
+// That default is wrong whenever the target holds records before sending them.
+// Reaching "half received" REQUIRES a flush to have happened, so the action
+// lands just after one — when the least is in flight, which is the opposite of
+// what an in-flight crash case needs. With a held sink and a bounded row count
+// the first flush can deliver everything at once, so the halfway mark is only
+// crossed after delivery is already complete and the crash can never land
+// mid-flight at all.
+//
+// TriggerLog anchors the action to the subject's own progress instead: wait for
+// a line in the subject's log, then wait TriggerDelay. Set TriggerDelay shorter
+// than the target's flush interval so the kill lands while the payload is still
+// buffered.
+type MidDeliveryConfig struct {
+	// TriggerLog is a substring to wait for in the subject's container log.
+	TriggerLog string `yaml:"trigger_log"`
+	// TriggerDelay is how long to wait after TriggerLog appears, e.g. "6s".
+	TriggerDelay string `yaml:"trigger_delay"`
+}
+
+// MidDeliveryTrigger returns the configured log-anchored trigger, and whether
+// one is set. A malformed delay is reported so a case cannot silently fall back
+// to the default trigger it was written to avoid.
+func (tc *TestCase) MidDeliveryTrigger() (string, time.Duration, bool, error) {
+	if tc.MidDelivery == nil || tc.MidDelivery.TriggerLog == "" {
+		return "", 0, false, nil
+	}
+
+	delay := time.Duration(0)
+	if raw := strings.TrimSpace(tc.MidDelivery.TriggerDelay); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil {
+			return "", 0, false, fmt.Errorf("mid_delivery.trigger_delay %q: %w", raw, err)
+		}
+		if parsed < 0 {
+			return "", 0, false, fmt.Errorf("mid_delivery.trigger_delay %q must not be negative", raw)
+		}
+		delay = parsed
+	}
+
+	return tc.MidDelivery.TriggerLog, delay, true, nil
+}
+
+// IsMidDeliveryVerdictType reports whether the case runs through the shared
+// receiver-up mid-delivery driver (Runner.runMidDeliveryAction), which fires a
+// disruptive action partway through delivery and then judges loss.
+//
+// Kept in step with the dispatch in Runner.Run by hand — there is no registry
+// to derive it from, so a new case type routed to runMidDeliveryAction must be
+// added here too or it silently keeps the raw-count verdict.
+func (tc *TestCase) IsMidDeliveryVerdictType() bool {
+	switch tc.Type {
+	case "persistence_inflight_crash_correctness",
+		"kafka_inflight_crash_correctness",
+		"kafka_cert_rotation_correctness",
+		"syslog_tls_vault_cert_rotation_correctness":
+		return true
+	}
+
+	return false
+}
+
+// TracksUniqueLines reports whether the receiver records the DISTINCT set of
+// lines it saw, which is what licenses judging loss over unique lines instead of
+// raw ones.
+//
+// A mid-delivery crash case re-delivers on recovery, so a raw count cannot
+// express "nothing was lost": duplicates inflate it and hide the rows that went
+// missing. Measured on the database crash case — 1,440 duplicates against a
+// 600-row expectation kept a 10-row loss invisible.
+//
+// Two ways in, and both are narrow on purpose:
+//
+//   - A database source with no generator. Its rows carry their own markers, so
+//     the distinct set is meaningful with no help from the generator.
+//   - A mid-delivery case whose generator emits JSON. Uniqueness there comes
+//     from sequenced mode, and only the JSON encoder is safe to turn on: it
+//     puts CONN=/SEQ= inside a well-formed envelope
+//     (containers/generator/main.go generateSequencedJSONLine), while the
+//     syslog/raw path overwrites the head of the line regardless of format and
+//     would corrupt a structured payload.
+//
+// This is the single source of truth for both halves of the mechanism — the
+// orchestrator uses it to switch receiver dedup (and generator sequencing) on,
+// and the runner uses it to decide the verdict basis. They must agree; deriving
+// them separately is how they drift.
+func (tc *TestCase) TracksUniqueLines() bool {
+	if tc.Correctness.ValidateDedup {
+		return true
+	}
+	if tc.UsesDatabase() && !tc.HasGenerator() {
+		return true
+	}
+
+	return tc.IsMidDeliveryVerdictType() && tc.HasGenerator() && tc.Generator.Format == "json"
 }
 
 // UsesKafka reports whether the case adds a Redpanda broker to the topology.

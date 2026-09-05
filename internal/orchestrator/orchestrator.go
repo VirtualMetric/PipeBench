@@ -12,6 +12,15 @@ type Orchestrator interface {
 	// UpServices starts only the named compose services (e.g. "subject", "receiver").
 	UpServices(services ...string) error
 
+	// RestartServices brings the named services back up WITHOUT touching their
+	// dependencies. Use it to restart something that was killed mid-run: its
+	// dependencies are already running, and re-running them is wrong when any is
+	// a one-shot init (a `service_completed_successfully` dependency such as
+	// database-init). Compose restarts an exited init container on a plain
+	// `up <service>`, and a second run of a non-idempotent seed fails the case
+	// with `database "bench" already exists`.
+	RestartServices(services ...string) error
+
 	// StopServices sends SIGTERM to the named services and waits up to `timeout`
 	// for graceful exit before SIGKILL.
 	//   - persistence_restart_correctness: 30s timeout (subject must flush state to disk)

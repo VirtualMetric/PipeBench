@@ -1406,6 +1406,15 @@ func (r *ComposeRunner) UpServices(services ...string) error {
 	return r.compose(args...)
 }
 
+// RestartServices is UpServices with --no-deps. See the interface for why the
+// distinction matters; in short, a plain `up <service>` also restarts an
+// already-completed one-shot dependency, and database-init is not idempotent.
+func (r *ComposeRunner) RestartServices(services ...string) error {
+	resolved := r.resolveServiceAliases(services)
+	args := append([]string{"up", "-d", "--quiet-pull", "--no-deps"}, resolved...)
+	return r.compose(args...)
+}
+
 // resolveServiceAliases expands the logical names "generator" and "receiver"
 // to the concrete plural service names when the case uses the plural form.
 // Other names are passed through unchanged. Lets existing callers like
@@ -2210,7 +2219,26 @@ func writeCompose(path string, cfg RunConfig) error {
 	// pre-generated templateLine for every record, which that assertion can
 	// never satisfy — so enable sequenced (unique-per-record) generation for
 	// verifier cases too, the same way receiver dedup/content checks do.
-	sequenced := boolStr(tc.Correctness.ValidateDedup || tc.Correctness.ValidateContent || tc.UsesVerifier())
+	//
+	// TracksUniqueLines also needs it: a unique-set verdict over a generator
+	// source is meaningless unless the generator varies the payload per record,
+	// and sequenced mode is the only mechanism that does. It is gated to
+	// format: json there, whose encoder keeps the CONN=/SEQ= token inside a
+	// well-formed envelope.
+	sequenced := boolStr(tc.Correctness.ValidateDedup || tc.Correctness.ValidateContent ||
+		tc.UsesVerifier() || tc.TracksUniqueLines())
+
+	// Receiver-side unique/duplicate accounting. The mid-delivery drivers verify
+	// "no loss" over a crash, and raw received lines cannot express that: a
+	// crash re-delivers heavily, so duplicates mask the rows actually lost
+	// (measured: 1,440 duplicates against a 600-row expectation hid a 10-row
+	// loss). The verdict runs over UniqueLines, which the receiver only tracks
+	// when told to.
+	//
+	// Same predicate the runner uses to pick the verdict basis — see
+	// config.TestCase.TracksUniqueLines. Deriving it separately here is how the
+	// two drift apart.
+	trackUnique := tc.TracksUniqueLines()
 	tlsCertsHost := filepath.ToSlash(cfg.TLSCertsHost)
 
 	// Fleet/managed subjects that receive a platform-delivered operational
@@ -2303,7 +2331,7 @@ func writeCompose(path string, cfg RunConfig) error {
 		DockerSocketGID: cfg.DockerSocketGID,
 		TLSCertsHost:    tlsCertsHost,
 
-		RecvValidateDedup:      boolStr(tc.Correctness.ValidateDedup),
+		RecvValidateDedup:      boolStr(tc.Correctness.ValidateDedup || trackUnique),
 		RecvValidateContent:    boolStr(tc.Correctness.ValidateContent),
 		RecvExpectedLines:      0,
 		RecvRequiredSubstring:  tc.Correctness.RequiredSubstring,

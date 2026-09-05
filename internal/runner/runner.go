@@ -2277,11 +2277,24 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 		}
 	}()
 
+	// Expected total. Every generator-driven source states it as
+	// generator.total_lines; a DATABASE source has no generator (its rows come
+	// from database.seed_sql or a writer sidecar), so fall back to the case's
+	// own row count. Without this a database case cannot use any mid-delivery
+	// driver at all, which is why the DB collectors had no crash coverage.
 	n := tc.Generator.TotalLines
+	if n <= 0 && tc.Database != nil {
+		n = tc.Database.ExpectedRows
+		if n <= 0 {
+			n = tc.Correctness.MinReceived
+		}
+	}
 	if n <= 0 {
 		return results.RunResult{}, errors.New(f.totalLinesErr)
 	}
-	mid := n / 2
+	// Clamp: at an expected total of 1 the midpoint is 0, so the "half received"
+	// condition is already true and the crash lands before any row arrives.
+	mid := max(n/2, 1)
 
 	// Everything up, receiver INCLUDED — data will be flowing to the target.
 	fmt.Println("  starting all services (receiver UP throughout)…")
@@ -2295,27 +2308,70 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 	}
 	defer stopPortFwd()
 
-	// Wait until the receiver has seen ~half the records, then fire the
-	// disruptive action. Driving off receiver progress (not a fixed sleep)
-	// guarantees it lands mid-delivery regardless of run speed.
-	fmt.Printf("  waiting for mid-delivery (receiver >= %s of %s)…\n", formatCount(mid), formatCount(n))
+	// Wait for the moment the case wants to be disrupted, then fire the action.
+	//
+	// Two triggers, because receiver progress is the right signal only when the
+	// target sends as it goes. If the target HOLDS records (a scheduled sender
+	// pool), then "the receiver has seen half" cannot be true until a flush has
+	// happened, so this trigger necessarily fires just after one — when the
+	// least is in flight. With a bounded row count the first flush can deliver
+	// everything at once, and the halfway mark is only crossed after delivery is
+	// complete, so the disruption lands on an idle subject and the case proves
+	// nothing. Such a case anchors to the subject's own log instead.
+	triggerLog, triggerDelay, logAnchored, err := tc.MidDeliveryTrigger()
+	if err != nil {
+		return results.RunResult{}, err
+	}
+
 	fired := false
 	deadline := time.Now().Add(r.opts.Timeout)
-	for time.Now().Before(deadline) {
-		rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
-		if qerr == nil {
-			fmt.Printf("    received: %s\n", formatCount(rm.LinesReceived))
-			if rm.LinesReceived >= mid {
-				fmt.Printf("  mid-delivery reached — %s…\n", f.actionLog)
+
+	if logAnchored {
+		fmt.Printf("  waiting for mid-delivery (subject log %q, then %s)…\n", triggerLog, triggerDelay)
+		for time.Now().Before(deadline) {
+			if strings.Contains(orch.Logs("subject", 400), triggerLog) {
+				if triggerDelay > 0 {
+					if err := sleepCtx(r.ctx, triggerDelay); err != nil {
+						return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+					}
+				}
+				if rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second); qerr == nil {
+					fmt.Printf("    received so far: %s of %s\n", formatCount(rm.LinesReceived), formatCount(n))
+				}
+				fmt.Printf("  trigger seen — %s…\n", f.actionLog)
 				if err := f.action(orch); err != nil {
 					return results.RunResult{}, err
 				}
 				fired = true
+
 				break
 			}
+			if err := sleepCtx(r.ctx, 500*time.Millisecond); err != nil {
+				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+			}
 		}
-		if err := sleepCtx(r.ctx, 500*time.Millisecond); err != nil {
-			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+		if !fired {
+			return results.RunResult{}, fmt.Errorf("subject log never contained %q before timeout", triggerLog)
+		}
+	} else {
+		fmt.Printf("  waiting for mid-delivery (receiver >= %s of %s)…\n", formatCount(mid), formatCount(n))
+		for time.Now().Before(deadline) {
+			rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+			if qerr == nil {
+				fmt.Printf("    received: %s\n", formatCount(rm.LinesReceived))
+				if rm.LinesReceived >= mid {
+					fmt.Printf("  mid-delivery reached — %s…\n", f.actionLog)
+					if err := f.action(orch); err != nil {
+						return results.RunResult{}, err
+					}
+					fired = true
+
+					break
+				}
+			}
+			if err := sleepCtx(r.ctx, 500*time.Millisecond); err != nil {
+				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+			}
 		}
 	}
 	if !fired {
@@ -2336,6 +2392,22 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 	}
 	genStats := r.parseGeneratorStats(orch.GeneratorStdout())
 	fmt.Printf("  generator sent %s lines\n", formatCount(genStats.LinesSent))
+	// Expected input for the verdict AND for the progress line below. Every
+	// generator-driven source reports it as genStats.LinesSent; a DATABASE
+	// source has no generator, so that is 0 and every loss check would be
+	// vacuously satisfied — a case could receive nothing and still pass with
+	// lossPct == 0. Fall back to the same expected row count the mid-delivery
+	// trigger used.
+	//
+	// With a continuous writer sidecar the exact committed count is unknowable,
+	// so for a database case expected_rows behaves as a FLOOR EXPRESSED AS LOSS:
+	// at or above it passes, below it fails. That is the right shape for a crash
+	// case, and it is why such a floor has to be timing-safe rather than the
+	// arithmetic maximum the writer could reach.
+	expectedSent := genStats.LinesSent
+	if expectedSent <= 0 {
+		expectedSent = n
+	}
 
 	// Drain until the receiver count stabilizes.
 	drainTimeout := 3 * time.Minute
@@ -2351,7 +2423,7 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 		if qerr != nil {
 			continue
 		}
-		fmt.Printf("    received: %s / %s\n", formatCount(rm.LinesReceived), formatCount(genStats.LinesSent))
+		fmt.Printf("    received: %s / %s\n", formatCount(rm.LinesReceived), formatCount(expectedSent))
 		if rm.LinesReceived == lastCount && rm.LinesReceived > 0 {
 			stableRounds++
 			if stableRounds >= 6 {
@@ -2373,9 +2445,30 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 	sysCPUs, sysMemMB := getSystemInfo()
 
 	elapsed := time.Since(startTime).Seconds()
+
+	// Loss is measured over the UNIQUE set when the receiver is tracking it.
+	//
+	// Raw received lines cannot express "no loss" for a crash case: recovery
+	// re-delivers, so duplicates inflate the count and mask the rows genuinely
+	// lost. Measured on the database crash case — 1,440 duplicates against a
+	// 600-row floor kept a 10-row loss invisible, and the case passed against a
+	// build with the defect still in it. Counting distinct lines removes the
+	// masking; duplicates stay reported but never fail, because an at-least-once
+	// source is allowed to produce them.
+	// Ask the case whether the receiver was TOLD to track the distinct set,
+	// rather than inferring it from a non-zero count. The two agree today, but
+	// the count is an observation and the predicate is the contract: a run that
+	// tracked uniques and received nothing also reports zero.
+	accounted := recvMetrics.LinesReceived
+	basis := "received"
+	if tc.TracksUniqueLines() && recvMetrics.UniqueLines > 0 {
+		accounted = recvMetrics.UniqueLines
+		basis = "unique"
+	}
+
 	lossPct := 0.0
-	if genStats.LinesSent > 0 {
-		lossPct = 100.0 * (1.0 - float64(recvMetrics.LinesReceived)/float64(genStats.LinesSent))
+	if expectedSent > 0 {
+		lossPct = 100.0 * (1.0 - float64(accounted)/float64(expectedSent))
 		if lossPct < 0 {
 			lossPct = 0
 		}
@@ -2384,19 +2477,23 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 	passed := lossPct <= tc.Correctness.ExpectedLossPct
 	var errs []string
 	if !passed {
-		errs = append(errs, fmt.Sprintf("expected loss <= %.2f%%, got %.2f%% (%s of %s lines lost)",
+		errs = append(errs, fmt.Sprintf("expected loss <= %.2f%%, got %.2f%% (%s of %s lines lost, counted by %s)",
 			tc.Correctness.ExpectedLossPct, lossPct,
-			formatCount(genStats.LinesSent-recvMetrics.LinesReceived), formatCount(genStats.LinesSent)))
+			formatCount(expectedSent-accounted), formatCount(expectedSent), basis))
 	}
-	if recvMetrics.LinesReceived > genStats.LinesSent {
-		extra := recvMetrics.LinesReceived - genStats.LinesSent
-		overPct := 100.0 * float64(extra) / float64(genStats.LinesSent)
+	if recvMetrics.Duplicates > 0 {
+		fmt.Printf("  over-delivery: %s duplicate lines — at-least-once, %s\n",
+			formatCount(recvMetrics.Duplicates), f.overDelivNote)
+	} else if recvMetrics.LinesReceived > expectedSent {
+		extra := recvMetrics.LinesReceived - expectedSent
+		overPct := 100.0 * float64(extra) / float64(expectedSent)
 		fmt.Printf("  over-delivery: %s duplicate lines (%.2f%%) — at-least-once, %s\n",
 			formatCount(extra), overPct, f.overDelivNote)
 	}
 
-	fmt.Printf("  lines sent: %s  lines received: %s  loss: %.2f%%\n",
-		formatCount(genStats.LinesSent), formatCount(recvMetrics.LinesReceived), lossPct)
+	fmt.Printf("  lines sent: %s  lines received: %s  unique: %s  loss: %.2f%% (by %s)\n",
+		formatCount(expectedSent), formatCount(recvMetrics.LinesReceived),
+		formatCount(recvMetrics.UniqueLines), lossPct, basis)
 	fmt.Printf("  cpu: avg %.1f%% max %.1f%%  mem: avg %.0f MB max %.0f MB\n",
 		metrics.CPUAvg, metrics.CPUMax, metrics.MemAvgMB, metrics.MemMaxMB)
 	if metrics.IOThroughputAvg > 0 {
@@ -2414,8 +2511,9 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 		LastSentNs:      genStats.LastSentNs,
 		FirstReceivedNs: recvMetrics.FirstReceivedNs,
 		LastReceivedNs:  recvMetrics.LastReceivedNs,
-		LinesIn:         genStats.LinesSent,
+		LinesIn:         expectedSent,
 		LinesOut:        recvMetrics.LinesReceived,
+		UniqueOut:       recvMetrics.UniqueLines,
 		BytesIn:         genStats.BytesSent,
 		BytesOut:        recvMetrics.BytesReceived,
 		LinesPerSec:     receiveWindowRate(recvMetrics),
@@ -2499,7 +2597,9 @@ func (r *Runner) runKafkaInflightCrash(tc *config.TestCase, subject config.Subje
 			if err := sleepCtx(r.ctx, 3*time.Second); err != nil {
 				return fmt.Errorf("interrupted: %w", err)
 			}
-			if err := orch.UpServices("subject"); err != nil {
+			// --no-deps: only the subject died, everything it depends on is
+			// still up. See Orchestrator.RestartServices.
+			if err := orch.RestartServices("subject"); err != nil {
 				return fmt.Errorf("restarting subject: %w", err)
 			}
 			return nil
@@ -2519,8 +2619,9 @@ func (r *Runner) runInflightCrashCorrectness(tc *config.TestCase, subject config
 		verdictLabel:  "in-flight crash correctness",
 		actionLog:     "SIGKILL subject (no graceful shutdown), then restart",
 		overDelivNote: "expected for a mid-delivery crash",
-		totalLinesErr: "persistence_inflight_crash_correctness requires generator.total_lines > 0",
-		extraCleanup:  []string{"bench-localstack", "bench-azurite", "bench-azure-init"},
+		totalLinesErr: "persistence_inflight_crash_correctness requires generator.total_lines > 0 " +
+			"(or, for a database source, database.expected_rows / correctness.min_received)",
+		extraCleanup: []string{"bench-localstack", "bench-azurite", "bench-azure-init", "bench-database", "bench-database-init"},
 		action: func(orch orchestrator.Orchestrator) error {
 			if err := orch.KillServices("subject"); err != nil {
 				return fmt.Errorf("killing subject: %w", err)
@@ -2529,7 +2630,12 @@ func (r *Runner) runInflightCrashCorrectness(tc *config.TestCase, subject config
 			if err := sleepCtx(r.ctx, 3*time.Second); err != nil {
 				return fmt.Errorf("interrupted: %w", err)
 			}
-			if err := orch.UpServices("subject"); err != nil {
+			// --no-deps: only the subject died. A plain `up subject` would also
+			// restart an already-completed database-init, whose CREATE DATABASE
+			// and seed_sql are not idempotent — the case then fails on
+			// `database "bench" already exists` instead of on the thing it
+			// tests. Invisible for the s3/azure cases, which have no init.
+			if err := orch.RestartServices("subject"); err != nil {
 				return fmt.Errorf("restarting subject: %w", err)
 			}
 			return nil
