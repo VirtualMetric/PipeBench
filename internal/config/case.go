@@ -143,8 +143,30 @@ type TestCase struct {
 	// Leave empty to use the registry default (or whatever --image/--version
 	// specifies). Non-strict YAML decode means older harness binaries silently
 	// ignore these fields — they fall back to the registry default.
-	SubjectImage   string `yaml:"subject_image"`
-	SubjectVersion string `yaml:"subject_version"`
+	SubjectImage string `yaml:"subject_image"`
+
+	// SubjectCPULimit and SubjectMemLimit pin the subject container's cgroup
+	// ceilings for this case. Same syntax as the flags ("2", "0.5"; "512m",
+	// "4g").
+	//
+	// PRECEDENCE IS THE INVERSE of SubjectImage above — case pin > CLI flag,
+	// not CLI flag > case pin — and the inversion is deliberate. An image pin
+	// says "this case was written against this build", which an operator
+	// testing a different build should be able to override. A limits pin says
+	// "these ceilings are part of what this case ASSERTS", which an operator
+	// flag must not silently change.
+	//
+	// Concretely: director_container_resource_stats_correctness asserts the
+	// director reports exactly 2000 millicores. If --cpu-limit 8 won, a routine
+	// suite run would fail that case and report a product bug that is really a
+	// harness argument — the exact failure the pin exists to prevent.
+	//
+	// The rule for a new pinnable field: if a case sets it to make an assertion
+	// true, the case wins; if it only describes the environment the case was
+	// developed in, the flag wins.
+	SubjectCPULimit string `yaml:"subject_cpu_limit"`
+	SubjectMemLimit string `yaml:"subject_mem_limit"`
+	SubjectVersion  string `yaml:"subject_version"`
 
 	// SubjectEntrypoint replaces the registry's entrypoint for this case, with
 	// the registry Command still appended as arguments. Same precedence and the
@@ -1529,6 +1551,19 @@ type FleetConfig struct {
 	// EXACT match (deterministic: same input + same pipeline ⇒ same counts).
 	// Example: {route.in: {events_in: 500, dropped_count: 500, events_out: 0}}.
 	ExpectStats map[string]map[string]int64 `yaml:"expect_stats"`
+
+	// ExpectResources (stats scenario only) asserts on the DeviceResource
+	// (inputtype=4) rows the simulator decodes: CPU, memory, volumes and the
+	// runtime rows that say which environment the subject measured itself in.
+	// Keyed "<resource type>.<identifier>" (e.g. "cpu.container",
+	// "runtime.container") → field ("count" | "total" | "used" | "sockets" |
+	// "cores" | "threads" | "samples") → bound.
+	//
+	// Bounds rather than ExpectStats' exact match, because these are GAUGES:
+	// a CPU row says how busy the box was during one 250 ms sample, so the
+	// only honest assertions are "equals the configured ceiling" for a limit
+	// and "within [0, ceiling]" for a reading.
+	ExpectResources map[string]map[string]ResourceBound `yaml:"expect_resources"`
 
 	// BaselineSeconds (config_update data-plane mode only) is how long the driver
 	// confirms delivery is suppressed after the BEFORE config is delivered, before
@@ -2944,4 +2979,27 @@ func ListCases(casesDir string) ([]string, error) {
 		}
 	}
 	return names, nil
+}
+
+// ResourceBound constrains one DeviceResource gauge field. Set Eq for an exact
+// value, or Min/Max (either or both) for a range. An empty bound matches
+// anything, which is how a case asserts only that the row exists.
+type ResourceBound struct {
+	Eq  *int64 `yaml:"eq"`
+	Min *int64 `yaml:"min"`
+	Max *int64 `yaml:"max"`
+}
+
+// Check reports why v fails the bound, or nil when it passes.
+func (b ResourceBound) Check(v int64) error {
+	if b.Eq != nil && v != *b.Eq {
+		return fmt.Errorf("= %d, want exactly %d", v, *b.Eq)
+	}
+	if b.Min != nil && v < *b.Min {
+		return fmt.Errorf("= %d, want >= %d", v, *b.Min)
+	}
+	if b.Max != nil && v > *b.Max {
+		return fmt.Errorf("= %d, want <= %d", v, *b.Max)
+	}
+	return nil
 }
