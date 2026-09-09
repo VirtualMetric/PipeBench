@@ -3809,6 +3809,23 @@ func clusterLogLineExcluding(containers []string, exclude, needle string) (strin
 	return "", false
 }
 
+// clusterLogLineExcludingSince is clusterLogLineExcluding bounded to the log
+// lines written since the given RFC3339 timestamp, so an earlier occurrence of
+// the needle cannot satisfy a check that is about the disruption window.
+func clusterLogLineExcludingSince(containers []string, exclude, needle, since string) (string, bool) {
+	for i, c := range containers {
+		if strconv.Itoa(i+1) == exclude {
+			continue
+		}
+		for _, line := range strings.Split(dockerLogsSince(c, since), "\n") {
+			if strings.Contains(line, needle) {
+				return strings.TrimSpace(line), true
+			}
+		}
+	}
+	return "", false
+}
+
 func clusterReassignedFrom(containers []string, owner string) (string, bool) {
 	needle := fmt.Sprintf("from %s to ", owner)
 	for _, c := range containers {
@@ -4366,6 +4383,7 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 				ownerContainer = fmt.Sprintf("bench-subject-%s-%s", subject.Name, owner)
 				preFailover := finalCount
 				fmt.Printf("  placement device owner = node %s (%s); pausing it to freeze heartbeats and lease renewals…\n", owner, ownerContainer)
+				pausedAt := time.Now().UTC()
 				if perr := exec.Command("docker", "pause", ownerContainer).Run(); perr != nil {
 					actionOK = false
 					errs = append(errs, fmt.Sprintf("docker pause %s failed: %v (disruption did not happen)", ownerContainer, perr))
@@ -4389,7 +4407,9 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 					errs = append(errs, "no survivor ran a collection cycle while the owner was paused — device did not fail over")
 				}
 				// HARD 2: the survivor took the ownership lease, not merely the map slot.
-				if line, ok := clusterLogLineExcluding(nodes, owner, "Acquired ownership lease for device"); ok {
+				// Bounded to the disruption window: a lease taken during the initial
+				// placement churn, before the pause, must not satisfy this.
+				if line, ok := clusterLogLineExcludingSince(nodes, owner, "Acquired ownership lease for device", pausedAt.Format(time.RFC3339)); ok {
 					fmt.Printf("  lease taken over: %s\n", line)
 				} else {
 					actionOK = false
@@ -4450,7 +4470,7 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 				} else {
 					fmt.Printf("  (soft) old owner ran no poll cycle after waking ✓\n")
 				}
-				// SOFT: the fenced owner must not re-acquire while the survivor holds it.
+				// HARD: the fenced owner must not re-acquire while the survivor holds it.
 				if err := sleepCtx(r.ctx, 20*time.Second); err != nil {
 					return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
 				}
