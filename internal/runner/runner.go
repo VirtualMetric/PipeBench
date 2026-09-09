@@ -3793,6 +3793,39 @@ func waitDeviceCollectingExcluding(ctx context.Context, containers []string, exc
 // specific source node (the owner we stopped) so it can NOT be satisfied by the
 // INITIAL placement, which the backend logs as "Reassigned device ... from  to N"
 // (empty source) — that would make the failover assertion pass without a failover.
+// clusterLogLineExcluding returns the first full-history log line containing
+// needle on any node OTHER than exclude (a 1-based node name).
+func clusterLogLineExcluding(containers []string, exclude, needle string) (string, bool) {
+	for i, c := range containers {
+		if strconv.Itoa(i+1) == exclude {
+			continue
+		}
+		for _, line := range strings.Split(dockerLogsAll(c), "\n") {
+			if strings.Contains(line, needle) {
+				return strings.TrimSpace(line), true
+			}
+		}
+	}
+	return "", false
+}
+
+// clusterLogLineExcludingSince is clusterLogLineExcluding bounded to the log
+// lines written since the given RFC3339 timestamp, so an earlier occurrence of
+// the needle cannot satisfy a check that is about the disruption window.
+func clusterLogLineExcludingSince(containers []string, exclude, needle, since string) (string, bool) {
+	for i, c := range containers {
+		if strconv.Itoa(i+1) == exclude {
+			continue
+		}
+		for _, line := range strings.Split(dockerLogsSince(c, since), "\n") {
+			if strings.Contains(line, needle) {
+				return strings.TrimSpace(line), true
+			}
+		}
+	}
+	return "", false
+}
+
 func clusterReassignedFrom(containers []string, owner string) (string, bool) {
 	needle := fmt.Sprintf("from %s to ", owner)
 	for _, c := range containers {
@@ -4048,7 +4081,7 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 
 		isAgentless := tc.Cluster.Action == "agentless_failover"
 		isClusterIP := tc.Cluster.Action == "cluster_ip_failover"
-		isDeviceFailover := tc.Cluster.Action == "device_failover"
+		isDeviceFailover := tc.Cluster.Action == "device_failover" || tc.Cluster.Action == "owner_pause_fence"
 		var baselineOK bool
 		var owner, ownerContainer string
 
@@ -4336,6 +4369,119 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 				}
 				r.sampleDelivery(metricsPort, preFailover)
 			}
+		case "owner_pause_fence":
+			// The zombie-owner case the ownership lease exists for. Pausing the
+			// owner's container freezes the process: no device heartbeats, no lease
+			// renewals, but the container stays "running" and, when unpaused, the
+			// process resumes with a stale device map still naming it the owner.
+			// Without the lease it would keep collecting next to the survivor.
+			owner = agentlessDeviceOwner(nodes)
+			if owner == "" {
+				actionOK = false
+				errs = append(errs, "could not determine the placement device owner (no 'Assigned/Reassigned device' log) — fence untestable")
+			} else {
+				ownerContainer = fmt.Sprintf("bench-subject-%s-%s", subject.Name, owner)
+				preFailover := finalCount
+				fmt.Printf("  placement device owner = node %s (%s); pausing it to freeze heartbeats and lease renewals…\n", owner, ownerContainer)
+				pausedAt := time.Now().UTC()
+				if perr := exec.Command("docker", "pause", ownerContainer).Run(); perr != nil {
+					actionOK = false
+					errs = append(errs, fmt.Sprintf("docker pause %s failed: %v (disruption did not happen)", ownerContainer, perr))
+				}
+				fmt.Printf("  waiting %s for the leader to reassign and a survivor to take the ownership lease…\n", settle)
+				if err := sleepCtx(r.ctx, settle); err != nil {
+					return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+				}
+
+				// HARD 1: a survivor ran a collect cycle on the device while the owner
+				// was frozen — the device failed over.
+				collectDeadline := time.Now().Add(settle + 90*time.Second)
+				if collectDeadline.After(runDeadline) {
+					collectDeadline = runDeadline
+				}
+				newOwner, reHomed := waitDeviceCollectingExcluding(r.ctx, nodes, owner, "Starting event collection of", collectDeadline)
+				if reHomed {
+					fmt.Printf("  survivor node %s re-homed the device and ran a poll cycle ✓\n", newOwner)
+				} else {
+					actionOK = false
+					errs = append(errs, "no survivor ran a collection cycle while the owner was paused — device did not fail over")
+				}
+				// HARD 2: the survivor took the ownership lease, not merely the map slot.
+				// Bounded to the disruption window: a lease taken during the initial
+				// placement churn, before the pause, must not satisfy this.
+				if line, ok := clusterLogLineExcludingSince(nodes, owner, "Acquired ownership lease for device", pausedAt.Format(time.RFC3339)); ok {
+					fmt.Printf("  lease taken over: %s\n", line)
+				} else {
+					actionOK = false
+					errs = append(errs, "no survivor logged 'Acquired ownership lease for device' — the lease did not change hands")
+				}
+				// HARD 3: a leader still exists.
+				if _, ok := leaderExistsNow(nodes); !ok {
+					actionOK = false
+					errs = append(errs, "no leader while the owning node was paused")
+				}
+
+				// Thaw the zombie. It wakes believing it owns the device.
+				unpausedAt := time.Now().UTC()
+				fmt.Printf("  unpausing node %s (%s); it must fence itself instead of collecting…\n", owner, ownerContainer)
+				if uerr := exec.Command("docker", "unpause", ownerContainer).Run(); uerr != nil {
+					actionOK = false
+					errs = append(errs, fmt.Sprintf("docker unpause %s failed: %v", ownerContainer, uerr))
+				}
+				// HARD 4: the old owner gives the device up within the settle window,
+				// and its lease bookkeeping says so. Two paths are legitimate: the
+				// lease keeper's renew tick finds the key taken over and fences
+				// ("lost on node"), or the 1s placement gate sees the map naming the
+				// survivor first, stops the collector, and the revision-checked
+				// release refuses to touch the survivor's lease ("was not released").
+				// A successful "Released ownership lease" here would mean the old
+				// revision was still current, i.e. nobody took the lease — a failure.
+				fenceDeadline := time.Now().Add(settle)
+				if fenceDeadline.After(runDeadline) {
+					fenceDeadline = runDeadline
+				}
+				fenced := false
+				for time.Now().Before(fenceDeadline) {
+					logs := dockerLogsSince(ownerContainer, unpausedAt.Format(time.RFC3339))
+					if strings.Contains(logs, "Ownership lease for device") &&
+						(strings.Contains(logs, "lost on node "+owner) || strings.Contains(logs, "was not released by node "+owner)) {
+						fenced = true
+						break
+					}
+					if err := sleepCtx(r.ctx, 3*time.Second); err != nil {
+						return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+					}
+				}
+				if fenced {
+					fmt.Printf("  old owner node %s fenced itself after unpause ✓\n", owner)
+				} else {
+					actionOK = false
+					errs = append(errs, fmt.Sprintf("old owner node %s did not log the ownership-lease fence (lost / not released) within %s of being unpaused", owner, settle))
+				}
+				if strings.Contains(dockerLogsSince(ownerContainer, unpausedAt.Format(time.RFC3339)), "Released ownership lease for device") {
+					actionOK = false
+					errs = append(errs, fmt.Sprintf("old owner node %s released the ownership lease with its stale revision after unpause — the survivor never held it", owner))
+				}
+				// SOFT: whether the zombie managed a poll between waking and fencing.
+				// Bounded by the renew tick, harmless for cursor-based devices (the
+				// cursor lives in the replicated bucket), but worth knowing.
+				if strings.Contains(dockerLogsSince(ownerContainer, unpausedAt.Format(time.RFC3339)), "Starting event collection of") {
+					fmt.Printf("  (soft) old owner ran one poll cycle between waking and fencing\n")
+				} else {
+					fmt.Printf("  (soft) old owner ran no poll cycle after waking ✓\n")
+				}
+				// HARD: the fenced owner must not re-acquire while the survivor holds it.
+				if err := sleepCtx(r.ctx, 20*time.Second); err != nil {
+					return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+				}
+				if strings.Contains(dockerLogsSince(ownerContainer, unpausedAt.Format(time.RFC3339)), "Acquired ownership lease for device") {
+					actionOK = false
+					errs = append(errs, fmt.Sprintf("old owner node %s re-acquired the ownership lease after being fenced while a survivor owned the device", owner))
+				} else {
+					fmt.Printf("  old owner node %s did not re-acquire the lease ✓\n", owner)
+				}
+				r.sampleDelivery(metricsPort, preFailover)
+			}
 		case "cluster_ip_failover":
 			// The elected leader must hold the virtual IP; followers must not. Then
 			// restart the leader and assert the IP migrates to the newly elected leader
@@ -4431,7 +4577,7 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 		// soft-logs. When delivery DOES happen (owner co-located with the router),
 		// the receiver's dedup verdict shows the resumed cursor did not re-deliver;
 		// log it either way, but do not gate the cluster verdict on it.
-		if tc.Cluster != nil && tc.Cluster.Action == "device_failover" {
+		if tc.Cluster != nil && (tc.Cluster.Action == "device_failover" || tc.Cluster.Action == "owner_pause_fence") {
 			switch {
 			case rm.Passed != nil && !*rm.Passed:
 				fmt.Printf("  (soft) post-failover delivery correctness: FAILED — known cluster cross-node data-plane gap (%s)\n", strings.Join(rm.Errors, "; "))
