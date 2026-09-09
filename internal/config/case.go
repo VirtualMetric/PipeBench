@@ -1517,6 +1517,13 @@ type ClusterConfig struct {
 	//   device_failover    — the placement analogue of agentless_failover for a DB/file
 	//                        collector device: stop the node that OWNS the device so the
 	//                        leader reassigns it to ANOTHER node, then start it again.
+	//   owner_pause_fence  — the zombie-owner case: PAUSE (freeze) the node that owns a
+	//                        placement device so it stops heartbeating and renewing its
+	//                        ownership lease without ever exiting; a survivor must take
+	//                        the lease over and collect; then UNPAUSE the old owner and
+	//                        assert it fences itself ("Ownership lease ... lost ...;
+	//                        stopping collector") instead of collecting alongside the
+	//                        survivor.
 	//                        The hard verdict is that a survivor re-homes the device and
 	//                        runs a collect cycle resuming from the persisted checkpoint
 	//                        (a clean DB/file resume forwards 0 new rows, so it keys on
@@ -1566,7 +1573,7 @@ func (tc *TestCase) validateCluster() error {
 		return fmt.Errorf("case %q: cluster.nodes must be >= 3, got %d", tc.Name, tc.Cluster.Nodes)
 	}
 	switch tc.Cluster.Action {
-	case "", "restart_follower", "restart_leader", "stop_two_recover", "agentless_failover", "device_failover", "cluster_ip_failover":
+	case "", "restart_follower", "restart_leader", "stop_two_recover", "agentless_failover", "device_failover", "owner_pause_fence", "cluster_ip_failover":
 	default:
 		return fmt.Errorf("case %q: unknown cluster.action %q", tc.Name, tc.Cluster.Action)
 	}
