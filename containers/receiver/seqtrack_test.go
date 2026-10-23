@@ -92,6 +92,28 @@ func TestSeqTrackerLatencyWindow(t *testing.T) {
 	}
 }
 
+// TestSeqTrackerDuplicates checks that a line that arrives again is listed
+// with its send time, its first arrival and the arrival of the copy.
+func TestSeqTrackerDuplicates(t *testing.T) {
+	tr := newSeqTracker()
+	sent := time.Unix(1000, 0).UnixNano()
+	first := sent + int64(200*time.Millisecond)
+	again := sent + int64(2*time.Minute)
+	for seq := 0; seq < 10; seq++ {
+		tr.record([]byte(fmt.Sprintf("CONN=2 SEQ=%d TS=%d pad", seq, sent)), first)
+	}
+	tr.record([]byte(fmt.Sprintf("CONN=2 SEQ=7 TS=%d pad", sent)), again)
+
+	d := tr.duplicates()
+	if d.Count != 1 || len(d.Samples) != 1 || d.Truncated {
+		t.Fatalf("duplicates = %+v, want one sample", d)
+	}
+	s := d.Samples[0]
+	if s.Conn != 2 || s.Seq != 7 || s.SentNs != sent || s.FirstNs != first || s.AtNs != again {
+		t.Fatalf("sample = %+v, want conn 2 seq 7 sent %d first %d at %d", s, sent, first, again)
+	}
+}
+
 func TestParseAckedParam(t *testing.T) {
 	got, err := parseAckedParam("0:12, 3:0,")
 	if err != nil || len(got) != 2 || got[0] != 12 || got[3] != 0 {

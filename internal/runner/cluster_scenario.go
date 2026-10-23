@@ -1245,9 +1245,12 @@ type scenarioReport struct {
 	Leadership    leadershipStats      `json:"leadership"`
 	Generator     *generatorAck        `json:"generator,omitempty"`
 	SeqCheck      *seqCheckResult      `json:"seqcheck,omitempty"`
-	Failures      []string             `json:"failures,omitempty"`
-	Notes         []string             `json:"notes,omitempty"`
-	HealthTrail   []string             `json:"health_trail,omitempty"`
+	// DuplicateRanges groups the lines that arrived twice, with when the
+	// first copy and the second copy arrived.
+	DuplicateRanges []duplicateRange `json:"duplicate_ranges,omitempty"`
+	Failures        []string         `json:"failures,omitempty"`
+	Notes           []string         `json:"notes,omitempty"`
+	HealthTrail     []string         `json:"health_trail,omitempty"`
 	// LogsDir holds every container's log of the run, with docker's
 	// timestamps.
 	LogsDir string `json:"logs_dir,omitempty"`
@@ -1367,6 +1370,20 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 	for conn, cc := range check.Conns {
 		if cc.Missing > 0 {
 			fmt.Printf("    conn %s: missing %d, first ranges %v\n", conn, cc.Missing, cc.MissingRanges)
+		}
+	}
+	if check.Duplicates > 0 {
+		var d duplicatesView
+		if err := sr.receiverGet("/duplicates", &d); err == nil {
+			rep.DuplicateRanges = summarizeDuplicates(d.Samples, 50)
+			for i, dr := range rep.DuplicateRanges {
+				if i == 10 {
+					fmt.Printf("    … %d duplicate ranges in all, see the report\n", len(rep.DuplicateRanges))
+					break
+				}
+				fmt.Printf("    duplicates conn %d seq %d-%d: sent %s, the copy arrived %s after the first\n",
+					dr.Conn, dr.FromSeq, dr.ToSeq, dr.Sent.UTC().Format("15:04:05.000"), fmtMs(dr.CopyAfterMs))
+			}
 		}
 	}
 
@@ -1535,6 +1552,89 @@ func deliveryGapAfter(tl receiverTimeline, at time.Time, window time.Duration) (
 		resumeMs = 0
 	}
 	return gapMs, resumeMs
+}
+
+// duplicatesView is the receiver's /duplicates answer.
+type duplicatesView struct {
+	Count     int64       `json:"count"`
+	Samples   []dupSample `json:"samples"`
+	Truncated bool        `json:"truncated"`
+}
+
+// dupSample is one arrival of a line that had arrived before. FirstNs is
+// zero when the receiver does not know the first arrival.
+type dupSample struct {
+	Conn    int64 `json:"conn"`
+	Seq     int64 `json:"seq"`
+	SentNs  int64 `json:"sent_ns"`
+	FirstNs int64 `json:"first_ns"`
+	AtNs    int64 `json:"at_ns"`
+}
+
+// duplicateRange is a run of consecutive lines of one CONN that arrived
+// twice. Sent is the send time of its first line, First the earliest first
+// arrival, Again the earliest arrival of a copy, and CopyAfterMs how long
+// after the first copy the second one came.
+type duplicateRange struct {
+	Conn        int64     `json:"conn"`
+	FromSeq     int64     `json:"from_seq"`
+	ToSeq       int64     `json:"to_seq"`
+	Copies      int       `json:"copies"`
+	Sent        time.Time `json:"sent"`
+	First       time.Time `json:"first_arrival"`
+	Again       time.Time `json:"copy_arrival"`
+	CopyAfterMs int64     `json:"copy_after_first_ms"`
+}
+
+// summarizeDuplicates groups duplicate arrivals into runs of consecutive
+// lines per CONN, at most limit runs.
+func summarizeDuplicates(samples []dupSample, limit int) []duplicateRange {
+	s := append([]dupSample(nil), samples...)
+	sort.Slice(s, func(i, j int) bool {
+		if s[i].Conn != s[j].Conn {
+			return s[i].Conn < s[j].Conn
+		}
+		if s[i].Seq != s[j].Seq {
+			return s[i].Seq < s[j].Seq
+		}
+		return s[i].AtNs < s[j].AtNs
+	})
+	var out []duplicateRange
+	minTime := func(cur time.Time, ns int64) time.Time {
+		if ns <= 0 {
+			return cur
+		}
+		t := time.Unix(0, ns)
+		if cur.IsZero() || t.Before(cur) {
+			return t
+		}
+		return cur
+	}
+	for _, d := range s {
+		n := len(out)
+		if n > 0 && out[n-1].Conn == d.Conn && d.Seq <= out[n-1].ToSeq+1 {
+			r := &out[n-1]
+			r.ToSeq = max(r.ToSeq, d.Seq)
+			r.Copies++
+			r.Sent = minTime(r.Sent, d.SentNs)
+			r.First = minTime(r.First, d.FirstNs)
+			r.Again = minTime(r.Again, d.AtNs)
+			continue
+		}
+		if len(out) == limit {
+			break
+		}
+		out = append(out, duplicateRange{
+			Conn: d.Conn, FromSeq: d.Seq, ToSeq: d.Seq, Copies: 1,
+			Sent: minTime(time.Time{}, d.SentNs), First: minTime(time.Time{}, d.FirstNs), Again: minTime(time.Time{}, d.AtNs),
+		})
+	}
+	for i := range out {
+		if !out[i].First.IsZero() && !out[i].Again.IsZero() {
+			out[i].CopyAfterMs = out[i].Again.Sub(out[i].First).Milliseconds()
+		}
+	}
+	return out
 }
 
 // arrivalsAfter returns when the last line reached the receiver, and how

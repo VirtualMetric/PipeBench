@@ -16,7 +16,8 @@ package main
 // the seconds around a node kill (/latency).
 //
 // /timeline counts arrivals in 100 ms buckets, which shows when delivery
-// stalled and when it came back.
+// stalled and when it came back. /duplicates lists the lines that arrived
+// more than once, with the time of each copy.
 
 import (
 	"encoding/json"
@@ -40,7 +41,22 @@ type seqConn struct {
 type latSample struct {
 	sent int64 // TS the generator stamped, unix nanos
 	lat  int64 // arrival minus sent, nanos
+	seq  int64
+	conn int64
 }
+
+// dupSample is one arrival of a line that had arrived before.
+type dupSample struct {
+	Conn    int64 `json:"conn"`
+	Seq     int64 `json:"seq"`
+	SentNs  int64 `json:"sent_ns,omitempty"`
+	FirstNs int64 `json:"first_ns,omitempty"` // first arrival, when it is known
+	AtNs    int64 `json:"at_ns"`
+}
+
+// maxDupSamples bounds the duplicates the tracker remembers one by one. It
+// counts every duplicate either way.
+const maxDupSamples = 2000
 
 type tlBucket struct {
 	unique int32
@@ -56,6 +72,7 @@ type seqTracker struct {
 	unparsed int64
 	samples  []latSample
 	buckets  []tlBucket
+	dupList  []dupSample
 }
 
 func newSeqTracker() *seqTracker {
@@ -131,6 +148,9 @@ func (t *seqTracker) record(line []byte, now int64) {
 	}
 	if c.bits[word]&(1<<bit) != 0 {
 		t.dups++
+		if len(t.dupList) < maxDupSamples {
+			t.dupList = append(t.dupList, dupSample{Conn: conn, Seq: seq, SentNs: ts, AtNs: now})
+		}
 		return
 	}
 	c.bits[word] |= 1 << bit
@@ -141,7 +161,7 @@ func (t *seqTracker) record(line []byte, now int64) {
 	t.unique++
 	b.unique++
 	if ts > 0 && now > ts {
-		t.samples = append(t.samples, latSample{sent: ts, lat: now - ts})
+		t.samples = append(t.samples, latSample{sent: ts, lat: now - ts, seq: seq, conn: conn})
 	}
 }
 
@@ -296,6 +316,40 @@ func (t *seqTracker) timeline() timelineView {
 	return v
 }
 
+type duplicatesView struct {
+	Count     int64       `json:"count"`
+	Samples   []dupSample `json:"samples"`
+	Truncated bool        `json:"truncated,omitempty"`
+}
+
+// duplicates lists the lines that arrived again, with the time each one
+// first arrived, so the harness can tell a re-delivery seconds later from
+// one minutes later.
+func (t *seqTracker) duplicates() duplicatesView {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := duplicatesView{Count: t.dups, Samples: append([]dupSample(nil), t.dupList...)}
+	out.Truncated = t.dups > int64(len(out.Samples))
+	if len(out.Samples) == 0 {
+		return out
+	}
+	type key struct{ conn, seq int64 }
+	first := make(map[key]int64, len(out.Samples))
+	for _, d := range out.Samples {
+		first[key{d.Conn, d.Seq}] = 0
+	}
+	for _, s := range t.samples {
+		k := key{s.conn, s.seq}
+		if at, ok := first[k]; ok && at == 0 {
+			first[k] = s.sent + s.lat
+		}
+	}
+	for i := range out.Samples {
+		out.Samples[i].FirstNs = first[key{out.Samples[i].Conn, out.Samples[i].Seq}]
+	}
+	return out
+}
+
 func (t *seqTracker) counts() (unique, dups int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -355,5 +409,8 @@ func registerSeqHandlers(mux *http.ServeMux, t *seqTracker) {
 	})
 	mux.HandleFunc("/timeline", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, t.timeline())
+	})
+	mux.HandleFunc("/duplicates", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, t.duplicates())
 	})
 }

@@ -135,6 +135,37 @@ func TestArrivalsAfter(t *testing.T) {
 	}
 }
 
+func TestSummarizeDuplicates(t *testing.T) {
+	base := time.Unix(2000, 0)
+	ns := func(d time.Duration) int64 { return base.Add(d).UnixNano() }
+	samples := []dupSample{
+		// A batch of three lines on CONN 1, copied two minutes later.
+		{Conn: 1, Seq: 12, SentNs: ns(0), FirstNs: ns(time.Second), AtNs: ns(121 * time.Second)},
+		{Conn: 1, Seq: 10, SentNs: ns(0), FirstNs: ns(time.Second), AtNs: ns(121 * time.Second)},
+		{Conn: 1, Seq: 11, SentNs: ns(0), FirstNs: ns(time.Second), AtNs: ns(121 * time.Second)},
+		// A separate line on CONN 1, and one on CONN 0 whose first arrival
+		// is unknown.
+		{Conn: 1, Seq: 50, SentNs: ns(5 * time.Second), FirstNs: ns(6 * time.Second), AtNs: ns(7 * time.Second)},
+		{Conn: 0, Seq: 3, SentNs: ns(time.Second), AtNs: ns(9 * time.Second)},
+	}
+	got := summarizeDuplicates(samples, 10)
+	if len(got) != 3 {
+		t.Fatalf("got %d ranges, want 3: %+v", len(got), got)
+	}
+	if r := got[0]; r.Conn != 0 || r.FromSeq != 3 || r.CopyAfterMs != 0 {
+		t.Fatalf("first range = %+v", r)
+	}
+	if r := got[1]; r.Conn != 1 || r.FromSeq != 10 || r.ToSeq != 12 || r.Copies != 3 || r.CopyAfterMs != 120000 {
+		t.Fatalf("second range = %+v, want conn 1 seq 10-12, 3 copies, copy after 120000 ms", r)
+	}
+	if r := got[2]; r.FromSeq != 50 || r.CopyAfterMs != 1000 {
+		t.Fatalf("third range = %+v", r)
+	}
+	if len(summarizeDuplicates(samples, 1)) != 1 {
+		t.Fatalf("the limit was not applied")
+	}
+}
+
 func TestParseGeneratorAck(t *testing.T) {
 	out := `{
   "lines_sent": 30,
