@@ -206,12 +206,16 @@ func (s ScenarioStep) DurationOr(field string, def time.Duration) time.Duration 
 	return d
 }
 
+// minProbeInterval is the shortest cluster.scenario.probe_interval a case
+// may set.
+const minProbeInterval = 200 * time.Millisecond
+
 // ProbeIntervalOrDefault returns the /health read interval.
 func (sc *ScenarioConfig) ProbeIntervalOrDefault() time.Duration {
 	if sc == nil || sc.ProbeInterval == "" {
 		return time.Second
 	}
-	if d, err := time.ParseDuration(sc.ProbeInterval); err == nil && d >= 200*time.Millisecond {
+	if d, err := time.ParseDuration(sc.ProbeInterval); err == nil && d >= minProbeInterval {
 		return d
 	}
 	return time.Second
@@ -347,8 +351,14 @@ func (tc *TestCase) validateClusterScenario() error {
 		proxies[p.Name] = true
 	}
 	if sc.ProbeInterval != "" {
-		if _, err := time.ParseDuration(sc.ProbeInterval); err != nil {
+		d, err := time.ParseDuration(sc.ProbeInterval)
+		if err != nil {
 			return fmt.Errorf("case %q: cluster.scenario.probe_interval: %w", tc.Name, err)
+		}
+		// Each round runs `docker exec` on every node; faster than this,
+		// rounds overlap and the probe slows the nodes it measures.
+		if d < minProbeInterval {
+			return fmt.Errorf("case %q: cluster.scenario.probe_interval must be at least %s, got %s", tc.Name, minProbeInterval, sc.ProbeInterval)
 		}
 	}
 
