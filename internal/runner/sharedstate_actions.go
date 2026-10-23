@@ -414,7 +414,9 @@ func (run *ssRun) scaleOutIn() {
 	}
 	took := time.Since(issued)
 	endedAt := containerFinishedAt(rep.Container, time.Now())
-	run.book.refresh(rep.Container)
+	if err := run.book.refresh(rep.Container); err != nil {
+		run.fail("reading %s's log after the scale-in: %v", rep.Service, err)
+	}
 	run.running[n] = false
 	run.ended = append(run.ended, ssEvent{At: endedAt, Container: rep.Container, Kind: ssProcessEnd, Text: "harness: scale-in"})
 	run.measures["scale_in_exit_seconds"] = took.Seconds()
@@ -432,7 +434,10 @@ func (run *ssRun) waitStoreMembers(want int, d time.Duration) int {
 	deadline := time.Now().Add(d)
 	got := 0
 	for {
-		run.book.refresh("bench-azurite")
+		if err := run.book.refresh("bench-azurite"); err != nil {
+			run.fail("reading Azurite's access log: %v", err)
+			return got
+		}
 		got = len(liveStoreMembers(parseAzuriteCalls(run.book.all("bench-azurite")), run.ss.StoreContainerOrDefault(), 6*time.Second))
 		if got == want || time.Now().After(deadline) || sleepCtx(run.r.ctx, 2*time.Second) != nil {
 			return got
@@ -496,7 +501,11 @@ func (run *ssRun) coldRestart() {
 		}
 	}
 	for _, rep := range running {
-		run.book.refresh(rep.Container)
+		// The new containers take the old ones' logs with them, so this is
+		// the last read of what the replicas logged before the restart.
+		if err := run.book.refresh(rep.Container); err != nil {
+			run.fail("reading %s's log before replacing it: %v", rep.Service, err)
+		}
 		run.running[rep.N] = false
 		run.ended = append(run.ended, ssEvent{At: containerFinishedAt(rep.Container, time.Now()), Container: rep.Container, Kind: ssProcessEnd, Text: "harness: cold restart"})
 	}
@@ -557,7 +566,10 @@ func (run *ssRun) measureIdle() {
 	if sleepCtx(run.r.ctx, d) != nil {
 		return
 	}
-	run.book.refresh("bench-azurite")
+	if err := run.book.refresh("bench-azurite"); err != nil {
+		run.fail("reading Azurite's access log: %v", err)
+		return
+	}
 	skew := run.daemonSkew()
 	rates := storeCallRates(parseAzuriteCalls(run.book.all("bench-azurite")), run.ss.StoreContainerOrDefault(), from.Add(skew), time.Now().Add(skew))
 	run.measures["store_calls_idle"] = rates
@@ -573,7 +585,10 @@ func (run *ssRun) storeCalls() {
 	if sleepCtx(run.r.ctx, d) != nil {
 		return
 	}
-	run.book.refresh("bench-azurite")
+	if err := run.book.refresh("bench-azurite"); err != nil {
+		run.fail("reading Azurite's access log: %v", err)
+		return
+	}
 	skew := run.daemonSkew()
 	rates := storeCallRates(parseAzuriteCalls(run.book.all("bench-azurite")), run.ss.StoreContainerOrDefault(), from.Add(skew), time.Now().Add(skew))
 	run.measures["store_calls_load"] = rates
