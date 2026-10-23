@@ -97,6 +97,7 @@ func TestSharedStateRefusals(t *testing.T) {
 		}, "needs shared_state.placed_devices"},
 		"unknown generator": {func(tc *TestCase) { tc.SharedState.Streams[0].Generator = "kafka" }, "names generator \"kafka\""},
 		"unknown receiver":  {func(tc *TestCase) { tc.SharedState.Streams[0].Receiver = "s3" }, "names receiver \"s3\""},
+		"sample file":       {func(tc *TestCase) { tc.Generators[1].SampleFile = "samples/syslog.log" }, "stream \"listener\" uses generator \"syslog\", which replays sample_file"},
 		"same stream twice": {func(tc *TestCase) { tc.SharedState.Streams[1].Name = "blob" }, "two streams named"},
 		"short secret":      {func(tc *TestCase) { tc.SharedState.SecretValues = []string{"abc"} }, "shorter than 8"},
 		"bad account":       {func(tc *TestCase) { tc.Azure.Accounts = []AzureAccount{{Name: "State_Store", Key: "a2V5"}} }, "lowercase letters and digits"},

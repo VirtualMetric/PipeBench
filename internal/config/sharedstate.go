@@ -295,9 +295,9 @@ func (tc *TestCase) validateSharedState() error {
 	if s.MaxFailoverSeconds < 0 {
 		return fmt.Errorf("case %q: shared_state.max_failover_seconds must not be negative", tc.Name)
 	}
-	gens := map[string]bool{}
+	gens := map[string]GeneratorConfig{}
 	for _, g := range tc.Generators {
-		gens[g.ID] = true
+		gens[g.ID] = g
 	}
 	recvs := map[string]bool{}
 	for _, r := range tc.Receivers {
@@ -305,8 +305,15 @@ func (tc *TestCase) validateSharedState() error {
 	}
 	names := map[string]bool{}
 	for i, st := range s.Streams {
-		if !gens[st.Generator] {
+		g, ok := gens[st.Generator]
+		if !ok {
 			return fmt.Errorf("case %q: shared_state.streams[%d] names generator %q, which `generators:` does not define", tc.Name, i, st.Generator)
+		}
+		// The driver counts loss and duplicates from numbered lines. A sample
+		// file is replayed without numbers, so its repeated lines would count
+		// as duplicates.
+		if g.SampleFile != "" {
+			return fmt.Errorf("case %q: shared_state stream %q uses generator %q, which replays sample_file %q; a shared-state stream needs the numbered lines the generator makes itself", tc.Name, st.StreamName(), g.ID, g.SampleFile)
 		}
 		if !recvs[st.Receiver] {
 			return fmt.Errorf("case %q: shared_state.streams[%d] names receiver %q, which `receivers:` does not define", tc.Name, i, st.Receiver)
