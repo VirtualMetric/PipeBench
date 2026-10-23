@@ -360,7 +360,9 @@ func (tc *TestCase) validateClusterScenario() error {
 		if !known {
 			return fmt.Errorf("case %q: cluster.scenario.steps[%d]: unknown action %q", tc.Name, i, st.Do)
 		}
-		if needsNode {
+		// A step that acts on a node must name it. A wait that may name one
+		// (wait_leader, wait_log) must name it the same way when it does.
+		if needsNode || st.Node != "" {
 			if err := validateNodeSelector(st.Node, maxNodes, names); err != nil {
 				return fmt.Errorf("%s: %w", where, err)
 			}
