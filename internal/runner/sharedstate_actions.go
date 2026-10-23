@@ -642,8 +642,27 @@ func (run *ssRun) scaleBacklog() {
 	if sleepCtx(run.r.ctx, pause) != nil {
 		return
 	}
-	samples := map[string]ssScale{}
+	// Each replica publishes its sample every few seconds, and the replicas
+	// read each other's at different moments, so one round of answers can
+	// catch a replica a sample behind. The driver asks every replica every 5
+	// seconds for up to 30, and keeps each replica's highest total and the
+	// loaded replica's highest own backlog. A replica whose total never
+	// reaches its share of that backlog reports only itself.
+	last := map[string]ssScale{}
+	highest := map[string]int64{}
 	var loadedLocal int64
+	met := func() bool {
+		want := int64(float64(loadedLocal) * run.ss.ScaleMinShareOrDefault())
+		if loadedLocal <= 0 || len(highest) == 0 {
+			return false
+		}
+		for _, rep := range run.replicas {
+			if run.running[rep.N] && highest[rep.Service] < want {
+				return false
+			}
+		}
+		return true
+	}
 	deadline := earliest(time.Now().Add(30*time.Second), run.deadline)
 	for {
 		for _, rep := range run.replicas {
@@ -655,27 +674,29 @@ func (run *ssRun) scaleBacklog() {
 				run.note("/scale of %s: %v", rep.Service, err)
 				continue
 			}
-			samples[rep.Service] = s
+			last[rep.Service] = s
+			highest[rep.Service] = max(highest[rep.Service], s.Backlog.Total)
 			if rep.N == loaded {
-				loadedLocal = s.Backlog.Local
+				loadedLocal = max(loadedLocal, s.Backlog.Local)
 			}
 		}
-		if loadedLocal > 0 || time.Now().After(deadline) || sleepCtx(run.r.ctx, 5*time.Second) != nil {
+		if met() || time.Now().After(deadline) || sleepCtx(run.r.ctx, 5*time.Second) != nil {
 			break
 		}
 	}
-	run.measures["scale"] = samples
-	for name, s := range samples {
-		fmt.Printf("    /scale %s: backlog total %d, local %d, members %d, coordination %q, pressure %d\n", name, s.Backlog.Total, s.Backlog.Local, s.Members, s.Coordination, s.Pressure)
+	run.measures["scale"] = map[string]any{"last": last, "highest_total": highest, "loaded_local": loadedLocal}
+	for name, s := range last {
+		fmt.Printf("    /scale %s: backlog total %d (highest %d), local %d, unacked %d, members %d, coordination %q, pressure %d\n",
+			name, s.Backlog.Total, highest[name], s.Backlog.Local, s.Backlog.Unacked, s.Members, s.Coordination, s.Pressure)
 	}
 	if loadedLocal <= 0 {
 		run.fail("scale_backlog: %s reports no backlog of its own after its receiver was paused for %s", run.replica(loaded).Service, pause)
 		return
 	}
 	want := int64(float64(loadedLocal) * run.ss.ScaleMinShareOrDefault())
-	for name, s := range samples {
-		if s.Backlog.Total < want {
-			run.fail("/scale on %s reports a backlog of %d; the replica set holds at least %d (%s's own)", name, s.Backlog.Total, loadedLocal, run.replica(loaded).Service)
+	for _, rep := range run.replicas {
+		if run.running[rep.N] && highest[rep.Service] < want {
+			run.fail("/scale on %s never reported more than %d; the replica set held up to %d (%s's own)", rep.Service, highest[rep.Service], loadedLocal, run.replica(loaded).Service)
 		}
 	}
 }
@@ -688,9 +709,10 @@ type ssScale struct {
 	Pressure int `json:"pressure"`
 	Members  int `json:"members"`
 	Backlog  struct {
-		Total int64 `json:"total"`
-		Local int64 `json:"local"`
-		Max   int64 `json:"max"`
+		Total   int64 `json:"total"`
+		Local   int64 `json:"local"`
+		Unacked int64 `json:"unacked"`
+		Max     int64 `json:"max"`
 	} `json:"backlog"`
 	Coordinated  bool   `json:"coordinated"`
 	Coordination string `json:"coordination"`
