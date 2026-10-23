@@ -103,6 +103,23 @@ func TestSharedStateRefusals(t *testing.T) {
 		"bad account":       {func(tc *TestCase) { tc.Azure.Accounts = []AzureAccount{{Name: "State_Store", Key: "a2V5"}} }, "lowercase letters and digits"},
 		"account key":       {func(tc *TestCase) { tc.Azure.Accounts = []AzureAccount{{Name: "statestore", Key: "not base64!"}} }, "must be base64"},
 		"dev account again": {func(tc *TestCase) { tc.Azure.Accounts = []AzureAccount{{Name: AzuriteAccount, Key: "a2V5"}} }, "twice"},
+		"outage stream":     {func(tc *TestCase) { tc.SharedState.OutageStreams = []string{"nope"} }, "outage_streams names \"nope\""},
+		"wrong credentials, no replica": {func(tc *TestCase) {
+			tc.SharedState.Action = SharedStateActionWrongCredentials
+		}, "needs shared_state.bad_replica"},
+		"bad replica, other action": {func(tc *TestCase) { tc.SharedState.BadReplica = 2 }, "only used by the wrong_credentials action"},
+		"scale out, no standby": {func(tc *TestCase) {
+			tc.SharedState.Action = SharedStateActionScaleOutIn
+			tc.SharedState.Standby = 0
+		}, "needs a standby replica"},
+		"scale backlog, no stream": {func(tc *TestCase) { tc.SharedState.Action = SharedStateActionScaleBacklog }, "scale_stream to name a stream"},
+		"bad replica health":       {func(tc *TestCase) { tc.SharedState.BadHealth = "red" }, "bad_health must be"},
+		"negative outage":          {func(tc *TestCase) { tc.SharedState.OutageSeconds = -1 }, "must not be negative"},
+		"hold, other action":       {func(tc *TestCase) { tc.SharedState.OutageHoldOthersSeconds = 5 }, "only used by the pause_store action"},
+		"hold too long": {func(tc *TestCase) {
+			tc.SharedState.Action = SharedStateActionPauseStore
+			tc.SharedState.OutageHoldOthersSeconds = 15
+		}, "must be 1 to 12"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
