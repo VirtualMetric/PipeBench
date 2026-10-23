@@ -967,3 +967,75 @@ func (run *ssRun) replaceAll(ns []int) {
 		}
 	}
 }
+
+// rollingRestart stops each replica in turn, gracefully, and replaces it with
+// a new container on an empty disk, as a new revision of a container app does:
+// the followers first, the leader last. Before it stops the next replica, the
+// new one must have rejoined and the replica set must have settled.
+func (run *ssRun) rollingRestart() {
+	run.refreshAll()
+	leaders := run.leaders(current())
+	var order []int
+	for _, rep := range run.replicas {
+		if run.running[rep.N] && !slices.Contains(leaders, rep.N) {
+			order = append(order, rep.N)
+		}
+	}
+	order = append(order, leaders...)
+	exits := map[string]float64{}
+	run.measures["rolling_restart_exit_seconds"] = exits
+	for _, n := range order {
+		rep := run.replica(n)
+		fmt.Printf("  restarting %s…\n", rep.Service)
+		issued := time.Now()
+		if err := exec.Command("docker", "stop", "-t", "30", rep.Container).Run(); err != nil {
+			run.fail("docker stop %s: %v", rep.Service, err)
+			return
+		}
+		exits[rep.Service] = time.Since(issued).Seconds()
+		fmt.Printf("    %s exited %.1fs after the stop began\n", rep.Service, exits[rep.Service])
+		endedAt := containerFinishedAt(rep.Container, time.Now())
+		// The new container takes the old one's log with it.
+		if err := run.book.refresh(rep.Container); err != nil {
+			run.fail("reading %s's log before replacing it: %v", rep.Service, err)
+		}
+		run.running[n] = false
+		run.ended = append(run.ended, ssEvent{At: endedAt, Container: rep.Container, Kind: ssProcessEnd, Text: "harness: rolling restart"})
+		run.replaceAll([]int{n})
+		if !run.checkSettled("after restarting "+rep.Service, earliest(time.Now().Add(time.Duration(run.ss.SettleOrDefault())*time.Second), run.deadline)) {
+			return
+		}
+	}
+	run.checkHealthAll("after")
+}
+
+// checkLogOnce fails the case for a replica that did not log a line of
+// expect_log_once exactly once for every time its director started.
+func (run *ssRun) checkLogOnce() {
+	for _, want := range run.ss.ExpectLogOnce {
+		for _, rep := range run.replicas {
+			lines := run.book.all(rep.Container)
+			if len(lines) == 0 {
+				continue // a standby that never ran
+			}
+			starts, seen := countStartsAndLines(lines, want)
+			if seen != starts {
+				run.fail("%s logged %q %d times over %d starts of its director; want it once a start", rep.Service, want, seen, starts)
+			}
+		}
+	}
+}
+
+// countStartsAndLines counts the starts of a director in a replica's log, and
+// the lines that contain want.
+func countStartsAndLines(lines []ssLine, want string) (starts, seen int) {
+	for _, l := range lines {
+		if strings.Contains(l.Text, "vmetric-director started") {
+			starts++
+		}
+		if strings.Contains(l.Text, want) {
+			seen++
+		}
+	}
+	return starts, seen
+}

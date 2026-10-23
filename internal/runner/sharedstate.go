@@ -288,6 +288,12 @@ func (run *ssRun) drive() bool {
 	if !run.waitBaseline() {
 		return false
 	}
+	if d := time.Duration(run.ss.ActionDelaySeconds) * time.Second; d > 0 {
+		fmt.Printf("  waiting %s before the action…\n", d)
+		if sleepCtx(run.r.ctx, d) != nil {
+			return false
+		}
+	}
 
 	run.act()
 
@@ -785,6 +791,12 @@ func (run *ssRun) act() {
 		run.scaleBacklog()
 	case config.SharedStateActionMoveThenKill:
 		run.moveThenKill()
+	case config.SharedStateActionStopOwner:
+		if owner, ok := run.ownerNotLeading(); ok {
+			run.disruptAndReplace(owner, "stop", false)
+		}
+	case config.SharedStateActionRollingRestart:
+		run.rollingRestart()
 	}
 }
 
@@ -862,6 +874,14 @@ func (run *ssRun) watchPlacement(d time.Duration) {
 // devices it ran, and then replaces it with a new container, as a container
 // platform would, and measures how long that takes to rejoin.
 func (run *ssRun) disrupt(n int, how string) {
+	run.disruptAndReplace(n, how, true)
+}
+
+// disruptAndReplace kills or stops replica n, measures the takeover and, when
+// replace is set, replaces the replica as the platform does. Without it, the
+// replica set must settle on the replicas that are left, as after a
+// scale-in.
+func (run *ssRun) disruptAndReplace(n int, how string, replace bool) {
 	rep := run.replica(n)
 	run.refreshAll()
 	now := current()
@@ -957,6 +977,12 @@ func (run *ssRun) disrupt(n int, how string) {
 		if limit := run.ss.MaxFailoverSeconds; limit > 0 && worst > limit {
 			run.fail("the slowest moved device took %.1fs to run again, above max_failover_seconds %.0f", worst, limit)
 		}
+	}
+
+	if !replace {
+		run.checkSettled("after", earliest(time.Now().Add(60*time.Second), run.deadline))
+		run.checkHealthAll("after")
+		return
 	}
 
 	// The platform replaces the lost replica with a new one, on an empty disk.
@@ -1102,6 +1128,7 @@ func (run *ssRun) analyse() {
 	run.checkOwnershipOverlaps()
 	run.countStoreCalls()
 	run.checkSecrets()
+	run.checkLogOnce()
 }
 
 // checkStreams compares what each generator sent with what its receiver

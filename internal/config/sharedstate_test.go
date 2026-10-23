@@ -151,6 +151,12 @@ func TestSharedStateRefusals(t *testing.T) {
 			tc.SharedState.Action = SharedStateActionMoveThenKill
 			tc.SharedState.PlacedDevices = nil
 		}, "move_then_kill needs shared_state.placed_devices"},
+		"stop owner, no devices": {func(tc *TestCase) {
+			tc.SharedState.Action = SharedStateActionStopOwner
+			tc.SharedState.PlacedDevices = nil
+		}, "stop_owner needs shared_state.placed_devices"},
+		"negative action delay": {func(tc *TestCase) { tc.SharedState.ActionDelaySeconds = -1 }, "must not be negative"},
+		"short expected line":   {func(tc *TestCase) { tc.SharedState.ExpectLogOnce = []string{"ignores"} }, "expect_log_once[0] is shorter than 8"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {

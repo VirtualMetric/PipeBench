@@ -56,6 +56,15 @@ const (
 	// and kills the replica that runs the shared bus with SIGKILL as soon as
 	// the device's new owner says it took the device over.
 	SharedStateActionMoveThenKill = "move_then_kill"
+	// SharedStateActionStopOwner stops, gracefully, a replica that runs placed
+	// devices and does not lead, and does not replace it: a scale-in of a
+	// replica that has work.
+	SharedStateActionStopOwner = "stop_owner"
+	// SharedStateActionRollingRestart stops each replica in turn, gracefully,
+	// and replaces it with a new container on an empty disk, as a new revision
+	// of a container app does. It waits for each new replica to rejoin and for
+	// the replica set to settle before it stops the next. The leader goes last.
+	SharedStateActionRollingRestart = "rolling_restart"
 )
 
 var sharedStateActions = []string{
@@ -72,6 +81,8 @@ var sharedStateActions = []string{
 	SharedStateActionStoreCalls,
 	SharedStateActionScaleBacklog,
 	SharedStateActionMoveThenKill,
+	SharedStateActionStopOwner,
+	SharedStateActionRollingRestart,
 }
 
 // SharedStateConfig describes the replicas of one serverless director that
@@ -191,6 +202,14 @@ type SharedStateConfig struct {
 	// over move_then_kill must have sent SIGKILL to the replica that runs the
 	// shared bus (default 2000).
 	MoveKillWithinMs int `yaml:"move_kill_within_ms"`
+	// ActionDelaySeconds is how long the driver waits, once every stream has
+	// reached its baseline, before it runs the action (default 0). A director
+	// that writes its state to the store only every so often has more to lose
+	// the longer it has run since its last write.
+	ActionDelaySeconds int `yaml:"action_delay_seconds"`
+	// ExpectLogOnce are lines each replica must log exactly once for every
+	// time its director starts, matched as plain text.
+	ExpectLogOnce []string `yaml:"expect_log_once"`
 }
 
 // StateWriteToleranceOrDefault returns StateWriteToleranceSeconds, or a tenth
@@ -449,7 +468,7 @@ func (tc *TestCase) validateSharedState() error {
 	default:
 		return fmt.Errorf("case %q: shared_state.expect_health must be ok, not_configured or error, got %q", tc.Name, s.ExpectHealth)
 	}
-	if (s.Action == SharedStateActionKillOwner || s.Action == SharedStateActionMoveThenKill) && len(s.PlacedDevices) == 0 {
+	if (s.Action == SharedStateActionKillOwner || s.Action == SharedStateActionMoveThenKill || s.Action == SharedStateActionStopOwner) && len(s.PlacedDevices) == 0 {
 		return fmt.Errorf("case %q: shared_state.action %s needs shared_state.placed_devices", tc.Name, s.Action)
 	}
 	if s.MaxFailoverSeconds < 0 {
@@ -492,6 +511,11 @@ func (tc *TestCase) validateSharedState() error {
 	for i, v := range s.SecretValues {
 		if len(v) < 8 {
 			return fmt.Errorf("case %q: shared_state.secret_values[%d] is shorter than 8 characters, which would match by chance", tc.Name, i)
+		}
+	}
+	for i, v := range s.ExpectLogOnce {
+		if len(v) < 8 {
+			return fmt.Errorf("case %q: shared_state.expect_log_once[%d] is shorter than 8 characters, which would match by chance", tc.Name, i)
 		}
 	}
 	for _, name := range s.OutageStreams {
@@ -545,7 +569,7 @@ func (tc *TestCase) validateSharedState() error {
 		return fmt.Errorf("case %q: shared_state.state_write_interval_seconds is only judged by the store_calls action", tc.Name)
 	}
 	if s.OutageSeconds < 0 || s.IdleSeconds < 0 || s.LoadSeconds < 0 || s.MaxStoreWritesPerSec < 0 || s.MaxStoreReadsPerSec < 0 || s.ScaleMinShare < 0 ||
-		s.StateWriteIntervalSeconds < 0 || s.StateWriteToleranceSeconds < 0 || s.MoveKillWithinMs < 0 {
+		s.StateWriteIntervalSeconds < 0 || s.StateWriteToleranceSeconds < 0 || s.MoveKillWithinMs < 0 || s.ActionDelaySeconds < 0 {
 		return fmt.Errorf("case %q: shared_state's seconds, call rates and shares must not be negative", tc.Name)
 	}
 	return nil

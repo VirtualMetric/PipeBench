@@ -77,3 +77,17 @@ func TestOutageBaseline(t *testing.T) {
 		t.Errorf("growth = %v, want syslog 0 and blob 20", growth)
 	}
 }
+
+func TestCountStartsAndLines(t *testing.T) {
+	lines := parseDockerLogLines(`2026-10-24T08:00:00.000Z [2026-10-24 08:00:00] [Information] [director] vmetric-director started; reason recorded as unknown.
+2026-10-24T08:00:01.000Z [2026-10-24 08:00:01] [Warning] [director] This director runs in crash-resistant mode, so it ignores shared_state.write_interval. In this mode the director confirms each write only once the write is in the store.
+2026-10-24T08:05:00.000Z [2026-10-24 08:05:00] [Information] [director] vmetric-director started; reason recorded as unknown.
+2026-10-24T08:05:01.000Z [2026-10-24 08:05:01] [Warning] [director] This director runs in crash-resistant mode, so it ignores shared_state.write_interval. In this mode the director confirms each write only once the write is in the store.`)
+	starts, seen := countStartsAndLines(lines, "so it ignores shared_state.write_interval")
+	if starts != 2 || seen != 2 {
+		t.Errorf("starts = %d, seen = %d; want 2 and 2: once for each start of the director", starts, seen)
+	}
+	if _, seen := countStartsAndLines(lines, "a line nobody logs"); seen != 0 {
+		t.Errorf("a line nobody logs was seen %d times", seen)
+	}
+}
