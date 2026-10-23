@@ -903,7 +903,12 @@ func (run *ssRun) disrupt(n int, how string) {
 
 	// The platform replaces the lost replica with a new one, on an empty disk.
 	fmt.Printf("  replacing %s with a new container…\n", rep.Service)
-	run.book.refresh(rep.Container)
+	// The replacement takes the container's log with it, so this is the last
+	// read of the lost replica's lines. An earlier read that failed is caught
+	// up here.
+	if err := run.book.refresh(rep.Container); err != nil {
+		run.fail("reading %s's log before replacing it: %v", rep.Service, err)
+	}
 	if err := run.orch.RecreateServices(rep.Service); err != nil {
 		run.fail("replacing %s: %v", rep.Service, err)
 		return
