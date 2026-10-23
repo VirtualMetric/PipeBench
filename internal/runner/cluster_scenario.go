@@ -1263,6 +1263,9 @@ type scenarioReport struct {
 	Failures        []string         `json:"failures,omitempty"`
 	Notes           []string         `json:"notes,omitempty"`
 	HealthTrail     []string         `json:"health_trail,omitempty"`
+	// Timeline is the receiver's count of arrivals per 100 ms, so that a
+	// delivery gap can be measured again after the run.
+	Timeline *receiverTimeline `json:"timeline,omitempty"`
 	// LogsDir holds every container's log of the run, with docker's
 	// timestamps.
 	LogsDir string `json:"logs_dir,omitempty"`
@@ -1429,10 +1432,19 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 			a.P50, a.P95, a.P99, a.Max, a.Count)
 	}
 	timeline, terr := sr.receiverTimeline()
+	if terr == nil {
+		rep.Timeline = &timeline
+	}
 	for i := range sr.events {
 		ev := &sr.events[i]
+		// A gap belongs to this disruption if it starts before the next one,
+		// so that a later disruption's gap is not reported again here.
+		window := 120 * time.Second
+		if i+1 < len(sr.events) {
+			window = min(window, sr.events[i+1].At.Sub(ev.At))
+		}
 		if terr == nil {
-			ev.GapMs, ev.ResumeMs = deliveryGapAfter(timeline, ev.At, 120*time.Second)
+			ev.GapMs, ev.ResumeMs = deliveryGapAfter(timeline, ev.At, window)
 		}
 		if ls, err := sr.receiverLatency(ev.At.Add(-2*time.Second), ev.At.Add(60*time.Second)); err == nil && ls.Count > 0 {
 			ev.LatencyAfter = &ls
@@ -1546,34 +1558,30 @@ func drainSeqCheck(ctx context.Context, read func() (seqCheckResult, error), dea
 }
 
 // deliveryGapAfter finds the longest stretch without a first arrival that
-// starts within window after at, and how long after at arrivals resumed.
+// starts within window after at, and how long after at arrivals resumed. A
+// gap that starts within the window is measured to its end, even past the
+// window: the window says which gaps belong to this disruption, not how long
+// they may last.
 func deliveryGapAfter(tl receiverTimeline, at time.Time, window time.Duration) (gapMs, resumeMs int64) {
 	if tl.BucketMs <= 0 || len(tl.Unique) == 0 {
 		return 0, 0
 	}
 	bucket := time.Duration(tl.BucketMs) * time.Millisecond
-	first := int(at.UnixNano()-tl.StartNs) / int(bucket)
-	last := first + int(window/bucket)
-	if first < 0 {
-		first = 0
-	}
-	if last > len(tl.Unique) {
-		last = len(tl.Unique)
-	}
+	first := max(int(at.UnixNano()-tl.StartNs)/int(bucket), 0)
+	last := min(first+int(window/bucket), len(tl.Unique))
 	bestLen, bestEnd := 0, -1
-	run := 0
-	for i := first; i < last; i++ {
-		if tl.Unique[i] == 0 {
-			run++
+	for i := first; i < last; {
+		if tl.Unique[i] != 0 {
+			i++
 			continue
 		}
-		if run > bestLen {
-			bestLen, bestEnd = run, i
+		start := i
+		for i < len(tl.Unique) && tl.Unique[i] == 0 {
+			i++
 		}
-		run = 0
-	}
-	if run > bestLen {
-		bestLen, bestEnd = run, last
+		if i-start > bestLen {
+			bestLen, bestEnd = i-start, i
+		}
 	}
 	if bestLen == 0 {
 		return 0, 0

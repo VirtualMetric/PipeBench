@@ -107,6 +107,37 @@ func TestDeliveryGapAfter(t *testing.T) {
 	}
 }
 
+// TestDeliveryGapAfterWindow checks that a gap belongs to the disruption it
+// starts after, and is measured to its end even past the window.
+func TestDeliveryGapAfterWindow(t *testing.T) {
+	start := time.Unix(5000, 0)
+	tl := receiverTimeline{StartNs: start.UnixNano(), BucketMs: 100}
+	add := func(n int, v int32) {
+		for range n {
+			tl.Unique = append(tl.Unique, v)
+		}
+	}
+	// A 1 s gap at 1 s, arrivals, then a 5 s gap at 3 s, then arrivals.
+	add(10, 5)
+	add(10, 0)
+	add(10, 5)
+	add(50, 0)
+	add(10, 5)
+
+	// The first disruption at 0.9 s, the second at 2.9 s: the first one's
+	// window ends where the second begins, so it does not take the 5 s gap.
+	gap, resume := deliveryGapAfter(tl, start.Add(900*time.Millisecond), 2*time.Second)
+	if gap != 1000 || resume != 1100 {
+		t.Fatalf("first disruption: gap %d ms, resumed after %d ms; want 1000, 1100", gap, resume)
+	}
+	// The second one's 5 s gap starts inside a 1 s window and is measured
+	// to its end.
+	gap, resume = deliveryGapAfter(tl, start.Add(2900*time.Millisecond), time.Second)
+	if gap != 5000 || resume != 5100 {
+		t.Fatalf("second disruption: gap %d ms, resumed after %d ms; want 5000, 5100", gap, resume)
+	}
+}
+
 func TestArrivalsAfter(t *testing.T) {
 	start := time.Unix(5000, 0)
 	tl := receiverTimeline{StartNs: start.UnixNano(), BucketMs: 100}
