@@ -397,34 +397,80 @@ func (c ssStoreCall) inContainer(container string) bool {
 	return rest == container || strings.HasPrefix(rest, container+"/") || strings.HasPrefix(rest, container+"?")
 }
 
+// kind sorts a store call by what it carries: the state's own segments,
+// snapshots and stream manifests, which follow the director's write interval,
+// or the replicas' member records and the lease, which keep their own pace.
+// A list call counts as the kind of the prefix it lists.
+func (c ssStoreCall) kind() string {
+	path, err := url.PathUnescape(c.Path)
+	if err != nil {
+		path = c.Path
+	}
+	switch {
+	case strings.Contains(path, "/o/segments/"):
+		return "segments"
+	case strings.Contains(path, "/o/snapshots/"):
+		return "snapshots"
+	case strings.Contains(path, "/r/streams/"):
+		return "streams"
+	case strings.Contains(path, "/r/shared/members/"):
+		return "members"
+	case strings.Contains(path, "/r/shared/active"):
+		return "lease"
+	}
+	return "other"
+}
+
+// isWrite reports whether Azure bills the call as a write.
+func (c ssStoreCall) isWrite() bool {
+	switch c.Method {
+	case "PUT", "POST", "DELETE", "PATCH":
+		return true
+	}
+	return false
+}
+
+// ssKindCalls are one kind's calls in a window.
+type ssKindCalls struct {
+	Writes        int     `json:"writes"`
+	ReadsAndLists int     `json:"reads_and_lists"`
+	WritesPerSec  float64 `json:"writes_per_sec"`
+	ReadsPerSec   float64 `json:"reads_and_lists_per_sec"`
+}
+
 // ssCallRates are the store calls per second in a window, split as Azure
 // prices them: writes (PUT, POST, DELETE), and reads and lists (GET, HEAD).
+// ByKind splits them again by what they carry (see ssStoreCall.kind).
 type ssCallRates struct {
-	Seconds        float64 `json:"seconds"`
-	Writes         int     `json:"writes"`
-	ReadsAndLists  int     `json:"reads_and_lists"`
-	Lists          int     `json:"lists"`
-	WritesPerSec   float64 `json:"writes_per_sec"`
-	ReadsPerSec    float64 `json:"reads_and_lists_per_sec"`
-	FailedRequests int     `json:"failed_requests"`
+	Seconds        float64                `json:"seconds"`
+	Writes         int                    `json:"writes"`
+	ReadsAndLists  int                    `json:"reads_and_lists"`
+	Lists          int                    `json:"lists"`
+	WritesPerSec   float64                `json:"writes_per_sec"`
+	ReadsPerSec    float64                `json:"reads_and_lists_per_sec"`
+	FailedRequests int                    `json:"failed_requests"`
+	ByKind         map[string]ssKindCalls `json:"by_kind,omitempty"`
 }
 
 // storeCallRates counts the calls to one blob container in [from, to).
 func storeCallRates(calls []ssStoreCall, container string, from, to time.Time) ssCallRates {
-	r := ssCallRates{Seconds: to.Sub(from).Seconds()}
+	r := ssCallRates{Seconds: to.Sub(from).Seconds(), ByKind: map[string]ssKindCalls{}}
 	for _, c := range calls {
 		if c.At.Before(from) || !c.At.Before(to) || !c.inContainer(container) {
 			continue
 		}
-		switch c.Method {
-		case "PUT", "POST", "DELETE", "PATCH":
+		k := r.ByKind[c.kind()]
+		if c.isWrite() {
 			r.Writes++
-		default:
+			k.Writes++
+		} else {
 			r.ReadsAndLists++
+			k.ReadsAndLists++
 			if strings.Contains(c.Path, "comp=list") {
 				r.Lists++
 			}
 		}
+		r.ByKind[c.kind()] = k
 		// 404 is how a store answers a read of a key that is not there, and
 		// 409 and 412 are the answers to a conditional write that lost, which
 		// the replicas make on purpose. Anything else from 400 up failed.
@@ -435,8 +481,57 @@ func storeCallRates(calls []ssStoreCall, container string, from, to time.Time) s
 	if r.Seconds > 0 {
 		r.WritesPerSec = float64(r.Writes) / r.Seconds
 		r.ReadsPerSec = float64(r.ReadsAndLists) / r.Seconds
+		for name, k := range r.ByKind {
+			k.WritesPerSec = float64(k.Writes) / r.Seconds
+			k.ReadsPerSec = float64(k.ReadsAndLists) / r.Seconds
+			r.ByKind[name] = k
+		}
 	}
 	return r
+}
+
+// segmentWrites returns, for each segment writer, the times it wrote a new
+// segment to one blob container in [from, to): a PUT the store accepted. The
+// writer is the path component after o/segments/, a member name with a
+// generation of its own.
+func segmentWrites(calls []ssStoreCall, container string, from, to time.Time) map[string][]time.Time {
+	out := map[string][]time.Time{}
+	for _, c := range calls {
+		if c.At.Before(from) || !c.At.Before(to) || c.Method != "PUT" || c.Status != 201 || !c.inContainer(container) {
+			continue
+		}
+		path, err := url.PathUnescape(c.Path)
+		if err != nil {
+			continue
+		}
+		_, rest, ok := strings.Cut(path, "/o/segments/")
+		if !ok {
+			continue
+		}
+		writer, _, _ := strings.Cut(rest, "/")
+		out[writer] = append(out[writer], c.At)
+	}
+	return out
+}
+
+// busiestWriter returns the writer with the most writes, and its writes.
+func busiestWriter(writes map[string][]time.Time) (string, []time.Time) {
+	best := ""
+	for w, ts := range writes {
+		if best == "" || len(ts) > len(writes[best]) || (len(ts) == len(writes[best]) && w < best) {
+			best = w
+		}
+	}
+	return best, writes[best]
+}
+
+// writeGaps returns the time between each pair of consecutive writes.
+func writeGaps(ts []time.Time) []time.Duration {
+	var gaps []time.Duration
+	for i := 1; i < len(ts); i++ {
+		gaps = append(gaps, ts[i].Sub(ts[i-1]))
+	}
+	return gaps
 }
 
 // secretNeedles returns what to look for to find a secret in text: the

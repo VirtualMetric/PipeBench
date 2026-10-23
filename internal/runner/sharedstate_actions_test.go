@@ -45,6 +45,14 @@ func TestJudgeStream(t *testing.T) {
 	if got := judgeStream(normal, 100, ReceiverMetrics{LinesReceived: 100, UniqueLines: 97, Duplicates: 3}); len(got) != 2 {
 		t.Errorf("3 lost and about 3%% repeated: %v, want two failures", got)
 	}
+	limit := int64(3600)
+	counted := config.SharedStateStream{Name: "blob", MaxDuplicates: &limit}
+	if got := judgeStream(counted, 9000, ReceiverMetrics{LinesReceived: 12600, UniqueLines: 9000, Duplicates: 3600}); len(got) != 0 {
+		t.Errorf("max_duplicates replaces the share: 3600 repeated of 9000 is within a bound of 3600: %v", got)
+	}
+	if got := judgeStream(counted, 9000, ReceiverMetrics{LinesReceived: 12601, UniqueLines: 9000, Duplicates: 3601}); len(got) != 1 || !strings.Contains(got[0], "max_duplicates 3600") {
+		t.Errorf("3601 repeated: %v, want one failure naming max_duplicates", got)
+	}
 }
 
 func TestOutageBaseline(t *testing.T) {

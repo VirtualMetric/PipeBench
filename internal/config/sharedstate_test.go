@@ -133,6 +133,24 @@ func TestSharedStateRefusals(t *testing.T) {
 			tc.SharedState.Action = SharedStateActionPauseStore
 			tc.SharedState.OutageHoldOthersSeconds = 15
 		}, "must be 1 to 12"},
+		"negative max_duplicates": {func(tc *TestCase) {
+			n := int64(-1)
+			tc.SharedState.Streams[0].MaxDuplicates = &n
+		}, "must not be negative"},
+		"both duplicate bounds": {func(tc *TestCase) {
+			n := int64(10)
+			tc.SharedState.Streams[0].MaxDuplicates = &n
+			tc.SharedState.Streams[0].MaxDuplicatePct = 5
+		}, "set one"},
+		"interval, other action": {func(tc *TestCase) { tc.SharedState.StateWriteIntervalSeconds = 60 }, "only judged by the store_calls action"},
+		"negative interval": {func(tc *TestCase) {
+			tc.SharedState.Action = SharedStateActionStoreCalls
+			tc.SharedState.StateWriteIntervalSeconds = -60
+		}, "must not be negative"},
+		"move then kill, no devices": {func(tc *TestCase) {
+			tc.SharedState.Action = SharedStateActionMoveThenKill
+			tc.SharedState.PlacedDevices = nil
+		}, "move_then_kill needs shared_state.placed_devices"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {

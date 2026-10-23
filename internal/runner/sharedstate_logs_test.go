@@ -191,6 +191,45 @@ func TestStoreCallRates(t *testing.T) {
 	}
 }
 
+func TestStoreCallKinds(t *testing.T) {
+	cases := map[string]string{
+		"/statestore/director-state/bench%2F7001%2Fstate%2Fo%2Fsegments%2Fsubject-1-ab-cd-e7baf38d%2F00000000000000000015":    "segments",
+		"/statestore/director-state/bench/7001/state/o/snapshots/$G/KV_devices/subject-1-ab-cd-e7baf38d-9":                    "snapshots",
+		"/statestore/director-state/bench/7001/state/r/streams/$G/KV_persistent":                                              "streams",
+		"/statestore/director-state/bench/7001/state/r/shared/members/subject-2-47d4":                                         "members",
+		"/statestore/director-state/bench%2F7001%2Fstate%2Fr%2Fshared%2Factive":                                               "lease",
+		"/statestore/director-state?comp=list&prefix=bench%2F7001%2Fstate%2Fo%2Fsegments%2Fsubject-1-ab%2F&restype=container": "segments",
+		"/statestore/director-state?restype=container":                                                                        "other",
+	}
+	for path, want := range cases {
+		if got := (ssStoreCall{Path: path}).kind(); got != want {
+			t.Errorf("kind(%q) = %q, want %q", path, got, want)
+		}
+	}
+	base := time.Date(2026, 10, 23, 18, 0, 0, 0, time.UTC)
+	calls := []ssStoreCall{
+		{At: base, Method: "PUT", Status: 201, Path: "/statestore/director-state/bench%2Fo%2Fsegments%2Fold-writer%2F00000000000000000001"},
+		{At: base.Add(60 * time.Second), Method: "PUT", Status: 201, Path: "/statestore/director-state/bench/o/segments/w%2F00000000000000000001"},
+		{At: base.Add(61 * time.Second), Method: "PUT", Status: 201, Path: "/statestore/director-state/bench/r/shared/members/m1"},
+		{At: base.Add(120 * time.Second), Method: "PUT", Status: 201, Path: "/statestore/director-state/bench/o/segments/w%2F00000000000000000002"},
+		{At: base.Add(121 * time.Second), Method: "PUT", Status: 409, Path: "/statestore/director-state/bench/o/segments/w%2F00000000000000000002"},
+		{At: base.Add(181 * time.Second), Method: "PUT", Status: 201, Path: "/statestore/director-state/bench/o/segments/w%2F00000000000000000003"},
+		{At: base.Add(182 * time.Second), Method: "GET", Status: 200, Path: "/statestore/director-state/bench/o/segments/w%2F00000000000000000003"},
+	}
+	r := storeCallRates(calls, "director-state", base, base.Add(200*time.Second))
+	if r.ByKind["segments"].Writes != 5 || r.ByKind["members"].Writes != 1 || r.ByKind["segments"].ReadsAndLists != 1 {
+		t.Errorf("by kind = %+v, want 5 segment writes, 1 segment read and 1 member write", r.ByKind)
+	}
+	writer, ts := busiestWriter(segmentWrites(calls, "director-state", base, base.Add(200*time.Second)))
+	if writer != "w" || len(ts) != 3 {
+		t.Fatalf("busiest writer = %q with %d writes, want w with 3: a refused write is not a write", writer, len(ts))
+	}
+	gaps := writeGaps(ts)
+	if len(gaps) != 2 || gaps[0] != 60*time.Second || gaps[1] != 61*time.Second {
+		t.Errorf("gaps = %v, want 1m0s and 1m1s", gaps)
+	}
+}
+
 func TestScanForSecrets(t *testing.T) {
 	key := "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
 	texts := map[string]string{

@@ -613,6 +613,7 @@ func (run *ssRun) measureIdle() {
 	rates := storeCallRates(parseAzuriteCalls(run.book.all("bench-azurite")), run.ss.StoreContainerOrDefault(), from.Add(skew), time.Now().Add(skew))
 	run.measures["store_calls_idle"] = rates
 	fmt.Printf("    idle: %.2f writes/s, %.2f reads and lists/s\n", rates.WritesPerSec, rates.ReadsPerSec)
+	printCallKinds(rates)
 }
 
 // storeCalls counts the store calls under load, and judges them against the
@@ -629,14 +630,71 @@ func (run *ssRun) storeCalls() {
 		return
 	}
 	skew := run.daemonSkew()
-	rates := storeCallRates(parseAzuriteCalls(run.book.all("bench-azurite")), run.ss.StoreContainerOrDefault(), from.Add(skew), time.Now().Add(skew))
+	to := time.Now()
+	calls := parseAzuriteCalls(run.book.all("bench-azurite"))
+	rates := storeCallRates(calls, run.ss.StoreContainerOrDefault(), from.Add(skew), to.Add(skew))
 	run.measures["store_calls_load"] = rates
 	fmt.Printf("    under load: %.2f writes/s, %.2f reads and lists/s (%d failed)\n", rates.WritesPerSec, rates.ReadsPerSec, rates.FailedRequests)
+	printCallKinds(rates)
 	if limit := run.ss.MaxStoreWritesPerSec; limit > 0 && rates.WritesPerSec > limit {
 		run.fail("under load the replicas wrote to the store %.2f times a second, above max_store_writes_per_sec %.2f", rates.WritesPerSec, limit)
 	}
 	if limit := run.ss.MaxStoreReadsPerSec; limit > 0 && rates.ReadsPerSec > limit {
 		run.fail("under load the replicas read or listed the store %.2f times a second, above max_store_reads_per_sec %.2f", rates.ReadsPerSec, limit)
+	}
+	run.checkStateWrites(calls, from.Add(skew), to.Add(skew))
+}
+
+// checkStateWrites reports when the replica that runs the shared bus wrote
+// the state's segments in a window, and, when the case names the director's
+// write interval, checks each gap between two writes against it. The window
+// is one of steady load: no device moves in it, and a move is written at once
+// whatever the interval.
+func (run *ssRun) checkStateWrites(calls []ssStoreCall, from, to time.Time) {
+	writer, ts := busiestWriter(segmentWrites(calls, run.ss.StoreContainerOrDefault(), from, to))
+	gaps := writeGaps(ts)
+	secs := make([]float64, len(gaps))
+	for i, g := range gaps {
+		secs[i] = g.Seconds()
+	}
+	run.measures["state_writes_load"] = map[string]any{"writer": writer, "writes": len(ts), "gaps_seconds": secs}
+	fmt.Printf("    state writes under load: %d by the bus's writer, %d apart (seconds): %v\n", len(ts), len(gaps), roundSeconds(secs))
+	n := run.ss.StateWriteIntervalSeconds
+	if n <= 0 {
+		return
+	}
+	want := time.Duration(n) * time.Second
+	tol := run.ss.StateWriteToleranceOrDefault()
+	if len(gaps) == 0 {
+		run.fail("the bus's writer wrote %d state segments in %s of load; checking a %s write interval needs at least two", len(ts), to.Sub(from).Round(time.Second), want)
+		return
+	}
+	for i, g := range gaps {
+		if g < want-tol || g > want+tol {
+			run.fail("state write %d came %s after the one before it; the write interval is %s, give or take %s", i+2, g.Round(100*time.Millisecond), want, tol)
+		}
+	}
+}
+
+// roundSeconds rounds each value to a tenth, for printing.
+func roundSeconds(secs []float64) []float64 {
+	out := make([]float64, len(secs))
+	for i, s := range secs {
+		out[i] = float64(int(s*10+0.5)) / 10
+	}
+	return out
+}
+
+// printCallKinds prints the write and read rates of each kind of store call.
+func printCallKinds(rates ssCallRates) {
+	kinds := make([]string, 0, len(rates.ByKind))
+	for k := range rates.ByKind {
+		kinds = append(kinds, k)
+	}
+	slices.Sort(kinds)
+	for _, k := range kinds {
+		c := rates.ByKind[k]
+		fmt.Printf("      %-9s %.2f writes/s, %.2f reads and lists/s\n", k, c.WritesPerSec, c.ReadsPerSec)
 	}
 }
 
@@ -772,4 +830,140 @@ func (run *ssRun) scaleOf(n int) (ssScale, error) {
 		return ssScale{}, fmt.Errorf("unreadable answer: %s", strings.TrimSpace(string(out)))
 	}
 	return s, nil
+}
+
+// moveThenKill stops, gracefully, a replica that runs placed devices and does
+// not lead, so the leader moves its devices at once. As soon as one of them
+// has a new owner, it kills the replica that runs the shared bus with
+// SIGKILL. A device's change of owner must reach the store when it happens,
+// whatever the director's write interval: a new bus that read an older owner
+// from the store would hand the device to a third replica while its new
+// owner still runs it. The overlap check at the end of the case catches that.
+func (run *ssRun) moveThenKill() {
+	owner, ok := run.ownerNotLeading()
+	if !ok {
+		return
+	}
+	run.refreshAll()
+	var moving []int64
+	for _, d := range run.ss.PlacedDevices {
+		if slices.Contains(run.owners(d, current()), owner) {
+			moving = append(moving, d)
+		}
+	}
+	orep := run.replica(owner)
+	fmt.Printf("  stopping %s (runs devices %v), and killing the bus's replica once a device has moved…\n", orep.Service, moving)
+	run.measures["victim"] = map[string]any{"replica": orep.Service, "devices": moving, "how": "move_then_kill"}
+
+	skew := run.daemonSkew()
+	issued := time.Now()
+	stopped := make(chan error, 1)
+	go func() { stopped <- exec.Command("docker", "stop", "-t", "30", orep.Container).Run() }()
+
+	// Watch the other replicas for the first new owner of a moved device.
+	since := issued.Add(skew)
+	deadline := earliest(time.Now().Add(60*time.Second), run.deadline)
+	var newOwner int
+	var device int64
+	var tookAt time.Time
+	for newOwner == 0 && time.Now().Before(deadline) {
+		for _, rep := range run.replicas {
+			if rep.N == owner || !run.running[rep.N] {
+				continue
+			}
+			_ = run.book.refresh(rep.Container)
+			for _, e := range run.events(rep.Container) {
+				if e.Kind == ssLeaseAcquired && e.At.After(since) && slices.Contains(moving, e.Device) {
+					newOwner, device, tookAt = rep.N, e.Device, e.At
+					break
+				}
+			}
+			if newOwner != 0 {
+				break
+			}
+		}
+		if newOwner == 0 && sleepCtx(run.r.ctx, 100*time.Millisecond) != nil {
+			break
+		}
+	}
+	if newOwner == 0 {
+		run.fail("no replica took over a device of %s within 60s of its stop", orep.Service)
+		<-stopped
+		return
+	}
+
+	// The replica that runs the bus is the one that leads now. When the new
+	// owner leads, it is the one killed.
+	leaders := run.leaders(current())
+	if len(leaders) != 1 {
+		run.fail("%d replicas lead (%s) when the device moved; the kill needs one", len(leaders), run.names(leaders))
+		<-stopped
+		return
+	}
+	target := run.replica(leaders[0])
+	if err := exec.Command("docker", "kill", "-s", "KILL", target.Container).Run(); err != nil {
+		run.fail("docker kill %s: %v (the kill did not happen)", target.Service, err)
+		<-stopped
+		return
+	}
+	killedAt := containerFinishedAt(target.Container, time.Now())
+	lag := killedAt.Sub(tookAt)
+	fmt.Printf("    %s took device %d; %s, which runs the bus, was killed %.2fs later\n", run.replica(newOwner).Service, device, target.Service, lag.Seconds())
+	run.measures["move_then_kill"] = map[string]any{
+		"stopped": orep.Service, "device": device, "new_owner": run.replica(newOwner).Service,
+		"killed": target.Service, "new_owner_was_killed": newOwner == leaders[0], "kill_lag_seconds": lag.Seconds(),
+	}
+	if within := run.ss.MoveKillWithinOrDefault(); lag > within {
+		run.fail("the kill came %.2fs after the device moved, later than move_kill_within_ms %d", lag.Seconds(), within.Milliseconds())
+	}
+	if err := run.book.refresh(target.Container); err != nil {
+		run.fail("reading %s's log after the kill: %v", target.Service, err)
+	}
+	run.running[target.N] = false
+	run.ended = append(run.ended, ssEvent{At: killedAt, Container: target.Container, Kind: ssProcessEnd, Text: "harness: docker kill"})
+
+	if err := <-stopped; err != nil {
+		run.fail("docker stop %s: %v", orep.Service, err)
+	}
+	if err := run.book.refresh(orep.Container); err != nil {
+		run.fail("reading %s's log after its stop: %v", orep.Service, err)
+	}
+	run.running[owner] = false
+	run.ended = append(run.ended, ssEvent{At: containerFinishedAt(orep.Container, time.Now()), Container: orep.Container, Kind: ssProcessEnd, Text: "harness: docker stop"})
+
+	// The replica set must settle on what is left before the platform brings
+	// the two back.
+	if !run.checkSettled("after the kill", earliest(time.Now().Add(time.Duration(run.ss.SettleOrDefault())*time.Second), run.deadline)) {
+		return
+	}
+	run.replaceAll([]int{owner, target.N})
+	run.checkSettled("after", earliest(time.Now().Add(60*time.Second), run.deadline))
+	run.checkHealthAll("after")
+}
+
+// replaceAll replaces lost replicas with new containers on empty disks, as the
+// platform does, and waits for each to rejoin.
+func (run *ssRun) replaceAll(ns []int) {
+	var services []string
+	for _, n := range ns {
+		services = append(services, run.replica(n).Service)
+	}
+	fmt.Printf("  replacing %s with new containers…\n", strings.Join(services, ", "))
+	started := time.Now()
+	if err := run.orch.RecreateServices(services...); err != nil {
+		run.fail("replacing %s: %v", strings.Join(services, ", "), err)
+		return
+	}
+	for _, n := range ns {
+		run.running[n] = true
+	}
+	for _, n := range ns {
+		rep := run.replica(n)
+		since := containerStartedAt(rep.Container, started)
+		if at, ok := run.waitReady(n, since, earliest(time.Now().Add(run.replicaWarmup()), run.deadline)); ok {
+			fmt.Printf("    %s rejoined after %.1fs\n", rep.Service, at.Sub(since).Seconds())
+		} else {
+			run.fail("%s did not rejoin after it was replaced: %s", rep.Service, run.readiness(n, since))
+		}
+	}
 }

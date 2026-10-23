@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
+	"time"
 )
 
 // The actions a director_shared_state_correctness case can run once its
@@ -50,6 +51,11 @@ const (
 	// replica that stream's generator sends to keeps a backlog, and reads
 	// /scale on every replica.
 	SharedStateActionScaleBacklog = "scale_backlog"
+	// SharedStateActionMoveThenKill stops, gracefully, a replica that runs a
+	// placed device and does not lead, so the leader moves the device at once,
+	// and kills the replica that runs the shared bus with SIGKILL as soon as
+	// the device's new owner says it took the device over.
+	SharedStateActionMoveThenKill = "move_then_kill"
 )
 
 var sharedStateActions = []string{
@@ -65,6 +71,7 @@ var sharedStateActions = []string{
 	SharedStateActionWrongCredentials,
 	SharedStateActionStoreCalls,
 	SharedStateActionScaleBacklog,
+	SharedStateActionMoveThenKill,
 }
 
 // SharedStateConfig describes the replicas of one serverless director that
@@ -170,6 +177,37 @@ type SharedStateConfig struct {
 	// ScaleMinShare is the share of the loaded replica's own backlog that
 	// /scale must report as the total on every other replica (default 0.5).
 	ScaleMinShare float64 `yaml:"scale_min_share"`
+	// StateWriteIntervalSeconds is how often the replica that runs the shared
+	// bus should write the state to the store, when the case sets the
+	// director's write interval. store_calls then checks, under load, that
+	// each gap between two of that replica's segment writes lasts the
+	// interval, give or take StateWriteToleranceSeconds. Membership and lease
+	// writes keep their own pace and are not judged. 0 only reports the gaps.
+	StateWriteIntervalSeconds int `yaml:"state_write_interval_seconds"`
+	// StateWriteToleranceSeconds is how far a gap may stray from the interval
+	// (default: a tenth of the interval, at least 2 seconds).
+	StateWriteToleranceSeconds int `yaml:"state_write_tolerance_seconds"`
+	// MoveKillWithinMs is how soon after the moved device's new owner took it
+	// over move_then_kill must have sent SIGKILL to the replica that runs the
+	// shared bus (default 2000).
+	MoveKillWithinMs int `yaml:"move_kill_within_ms"`
+}
+
+// StateWriteToleranceOrDefault returns StateWriteToleranceSeconds, or a tenth
+// of the interval, at least 2 seconds.
+func (s *SharedStateConfig) StateWriteToleranceOrDefault() time.Duration {
+	if s.StateWriteToleranceSeconds > 0 {
+		return time.Duration(s.StateWriteToleranceSeconds) * time.Second
+	}
+	return max(2*time.Second, time.Duration(s.StateWriteIntervalSeconds)*time.Second/10)
+}
+
+// MoveKillWithinOrDefault returns MoveKillWithinMs, or 2 seconds.
+func (s *SharedStateConfig) MoveKillWithinOrDefault() time.Duration {
+	if s.MoveKillWithinMs > 0 {
+		return time.Duration(s.MoveKillWithinMs) * time.Millisecond
+	}
+	return 2 * time.Second
 }
 
 // MinOutageForStreamsSeconds is the shortest outage whose outage_streams the
@@ -234,6 +272,10 @@ type SharedStateStream struct {
 	// MaxDuplicatePct is how many repeated records may arrive, as a percentage
 	// of the distinct ones (default 0).
 	MaxDuplicatePct float64 `yaml:"max_duplicate_pct"`
+	// MaxDuplicates is how many repeated records may arrive, as a count. When
+	// set, it replaces max_duplicate_pct: a bound such as "no more than one
+	// write interval of records" is a number of records, not a share.
+	MaxDuplicates *int64 `yaml:"max_duplicates"`
 	// ExpectNothing says that no record of the stream may arrive: its devices
 	// must not run at all, as on a director that keeps its shared state in
 	// memory. Loss is not judged then.
@@ -407,8 +449,8 @@ func (tc *TestCase) validateSharedState() error {
 	default:
 		return fmt.Errorf("case %q: shared_state.expect_health must be ok, not_configured or error, got %q", tc.Name, s.ExpectHealth)
 	}
-	if s.Action == SharedStateActionKillOwner && len(s.PlacedDevices) == 0 {
-		return fmt.Errorf("case %q: shared_state.action kill_owner needs shared_state.placed_devices", tc.Name)
+	if (s.Action == SharedStateActionKillOwner || s.Action == SharedStateActionMoveThenKill) && len(s.PlacedDevices) == 0 {
+		return fmt.Errorf("case %q: shared_state.action %s needs shared_state.placed_devices", tc.Name, s.Action)
 	}
 	if s.MaxFailoverSeconds < 0 {
 		return fmt.Errorf("case %q: shared_state.max_failover_seconds must not be negative", tc.Name)
@@ -440,8 +482,11 @@ func (tc *TestCase) validateSharedState() error {
 			return fmt.Errorf("case %q: shared_state.streams has two streams named %q", tc.Name, st.StreamName())
 		}
 		names[st.StreamName()] = true
-		if st.MaxLoss < 0 || st.MaxDuplicatePct < 0 || st.MinBaseline < 0 {
-			return fmt.Errorf("case %q: shared_state.streams[%d]: max_loss, max_duplicate_pct and min_baseline must not be negative", tc.Name, i)
+		if st.MaxLoss < 0 || st.MaxDuplicatePct < 0 || st.MinBaseline < 0 || (st.MaxDuplicates != nil && *st.MaxDuplicates < 0) {
+			return fmt.Errorf("case %q: shared_state.streams[%d]: max_loss, max_duplicates, max_duplicate_pct and min_baseline must not be negative", tc.Name, i)
+		}
+		if st.MaxDuplicates != nil && st.MaxDuplicatePct > 0 {
+			return fmt.Errorf("case %q: shared_state.streams[%d] sets both max_duplicates and max_duplicate_pct; set one", tc.Name, i)
 		}
 	}
 	for i, v := range s.SecretValues {
@@ -496,7 +541,11 @@ func (tc *TestCase) validateSharedState() error {
 	default:
 		return fmt.Errorf("case %q: shared_state.bad_health must be ok, not_configured, error or starting, got %q", tc.Name, s.BadHealth)
 	}
-	if s.OutageSeconds < 0 || s.IdleSeconds < 0 || s.LoadSeconds < 0 || s.MaxStoreWritesPerSec < 0 || s.MaxStoreReadsPerSec < 0 || s.ScaleMinShare < 0 {
+	if s.StateWriteIntervalSeconds != 0 && s.Action != SharedStateActionStoreCalls {
+		return fmt.Errorf("case %q: shared_state.state_write_interval_seconds is only judged by the store_calls action", tc.Name)
+	}
+	if s.OutageSeconds < 0 || s.IdleSeconds < 0 || s.LoadSeconds < 0 || s.MaxStoreWritesPerSec < 0 || s.MaxStoreReadsPerSec < 0 || s.ScaleMinShare < 0 ||
+		s.StateWriteIntervalSeconds < 0 || s.StateWriteToleranceSeconds < 0 || s.MoveKillWithinMs < 0 {
 		return fmt.Errorf("case %q: shared_state's seconds, call rates and shares must not be negative", tc.Name)
 	}
 	return nil

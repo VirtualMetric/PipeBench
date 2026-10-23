@@ -783,6 +783,8 @@ func (run *ssRun) act() {
 		run.storeCalls()
 	case config.SharedStateActionScaleBacklog:
 		run.scaleBacklog()
+	case config.SharedStateActionMoveThenKill:
+		run.moveThenKill()
 	}
 }
 
@@ -1160,7 +1162,12 @@ func judgeStream(st config.SharedStateStream, sent int64, m ReceiverMetrics) []s
 	if m.UniqueLines > 0 {
 		dupPct = 100 * float64(m.Duplicates) / float64(m.UniqueLines)
 	}
-	if dupPct > st.MaxDuplicatePct {
+	switch {
+	case st.MaxDuplicates != nil:
+		if m.Duplicates > *st.MaxDuplicates {
+			out = append(out, fmt.Sprintf("stream %s: %d records arrived more than once, above max_duplicates %d", st.StreamName(), m.Duplicates, *st.MaxDuplicates))
+		}
+	case dupPct > st.MaxDuplicatePct:
 		out = append(out, fmt.Sprintf("stream %s: %d records arrived more than once (%.2f%%), above max_duplicate_pct %.2f", st.StreamName(), m.Duplicates, dupPct, st.MaxDuplicatePct))
 	}
 	return out
@@ -1214,8 +1221,10 @@ func (run *ssRun) countStoreCalls() {
 	run.measures["store_calls"] = rates
 	fmt.Printf("  store calls to %q: %.2f writes/s, %.2f reads and lists/s over the run (%d failed)\n",
 		container, whole.WritesPerSec, whole.ReadsPerSec, whole.FailedRequests)
+	printCallKinds(whole)
 	if l, ok := rates["under_load"].(ssCallRates); ok {
 		fmt.Printf("  store calls under load: %.2f writes/s, %.2f reads and lists/s over %.0fs\n", l.WritesPerSec, l.ReadsPerSec, l.Seconds)
+		printCallKinds(l)
 	}
 }
 
