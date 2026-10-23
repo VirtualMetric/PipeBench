@@ -125,6 +125,18 @@ func TestLeadershipAndOwnership(t *testing.T) {
 	if ssLeadingAt(killed, at(t, "2026-10-23T16:41:40Z")) {
 		t.Error("a killed replica does not lead")
 	}
+
+	// A leader whose bus disables JetStream leads no more, although its
+	// manager never says so: that is how the replica set got stuck after a
+	// store outage.
+	fenced := ssEventsOf("c1", parseDockerLogLines(`2026-10-23T16:45:30.420Z [2026-10-23 16:45:30] [Information] [director] Node subject-3-f4d7 became leader on 7001
+2026-10-23T16:45:30.797Z [2026-10-23 16:45:30] [Warning] [director] State bus: JetStream segment store: this node can no longer write its streams; disabling JetStream`))
+	if !ssLeadingAt(fenced, at(t, "2026-10-23T16:45:30.500Z")) {
+		t.Error("the replica leads once it logs it")
+	}
+	if ssLeadingAt(fenced, at(t, "2026-10-23T16:45:31Z")) {
+		t.Error("a replica whose bus disabled JetStream does not lead")
+	}
 }
 
 func TestOverlaps(t *testing.T) {

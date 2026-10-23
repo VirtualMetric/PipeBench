@@ -26,6 +26,30 @@ const (
 	SharedStateActionKillOwner = "kill_owner"
 	// SharedStateActionStopLeader stops the leader gracefully (docker stop).
 	SharedStateActionStopLeader = "stop_leader"
+	// SharedStateActionPauseStore pauses Azurite for outage_seconds, so no
+	// replica can reach the store, and then lets it go on.
+	SharedStateActionPauseStore = "pause_store"
+	// SharedStateActionIsolateReplica disconnects the leader from the network
+	// for outage_seconds, so it reaches neither the store nor the other
+	// replicas, and then connects it again.
+	SharedStateActionIsolateReplica = "isolate_replica"
+	// SharedStateActionScaleOutIn starts the standby replica, as a scale-out
+	// does, and later stops it gracefully, as a scale-in does.
+	SharedStateActionScaleOutIn = "scale_out_in"
+	// SharedStateActionColdRestart stops every replica and starts new
+	// containers for all of them, on empty disks.
+	SharedStateActionColdRestart = "cold_restart"
+	// SharedStateActionWrongCredentials runs one replica (bad_replica) with a
+	// config whose store credentials are wrong. It has no action after the
+	// start: the start is the test.
+	SharedStateActionWrongCredentials = "wrong_credentials"
+	// SharedStateActionStoreCalls counts the store calls while no data flows
+	// (idle_seconds) and under load (load_seconds).
+	SharedStateActionStoreCalls = "store_calls"
+	// SharedStateActionScaleBacklog stops the receiver of scale_stream, so the
+	// replica that stream's generator sends to keeps a backlog, and reads
+	// /scale on every replica.
+	SharedStateActionScaleBacklog = "scale_backlog"
 )
 
 var sharedStateActions = []string{
@@ -34,6 +58,13 @@ var sharedStateActions = []string{
 	SharedStateActionKillLeader,
 	SharedStateActionKillOwner,
 	SharedStateActionStopLeader,
+	SharedStateActionPauseStore,
+	SharedStateActionIsolateReplica,
+	SharedStateActionScaleOutIn,
+	SharedStateActionColdRestart,
+	SharedStateActionWrongCredentials,
+	SharedStateActionStoreCalls,
+	SharedStateActionScaleBacklog,
 }
 
 // SharedStateConfig describes the replicas of one serverless director that
@@ -100,6 +131,89 @@ type SharedStateConfig struct {
 	SecretValues []string `yaml:"secret_values"`
 	// Streams say how the data of each generator must arrive at its receiver.
 	Streams []SharedStateStream `yaml:"streams"`
+
+	// OutageSeconds is how long pause_store pauses the store, how long
+	// isolate_replica keeps the replica off the network, and how long
+	// scale_backlog pauses the receiver (default 30).
+	OutageSeconds int `yaml:"outage_seconds"`
+	// OutageStreams are streams that must go on arriving while the store is
+	// away: their senders feed devices that keep no shared state.
+	OutageStreams []string `yaml:"outage_streams"`
+	// OutageHoldOthersSeconds makes pause_store freeze every replica but the
+	// one that led before the outage while the store comes back, and for
+	// this many seconds after (0, the default, freezes none). The replica
+	// that led is then the only one that can take the store's lease again,
+	// which is the takeover a director must survive most carefully: its own
+	// state from before the outage meets its new state. It must stay under
+	// the 15 seconds after which a replica that renews nothing counts as
+	// gone.
+	OutageHoldOthersSeconds int `yaml:"outage_hold_others_seconds"`
+	// BadReplica is the replica whose config carries wrong store credentials
+	// (wrong_credentials). The case's config gives it them through
+	// {{@.NodeID@}}.
+	BadReplica int `yaml:"bad_replica"`
+	// BadHealth is the shared_state status /health must report on the bad
+	// replica (default "error").
+	BadHealth string `yaml:"bad_health"`
+	// IdleSeconds and LoadSeconds are the windows store_calls counts the store
+	// calls over, before the generators start and while they run (default 60
+	// each).
+	IdleSeconds int `yaml:"idle_seconds"`
+	LoadSeconds int `yaml:"load_seconds"`
+	// MaxStoreWritesPerSec and MaxStoreReadsPerSec fail store_calls when the
+	// replicas make more calls a second than this under load. 0 only reports.
+	MaxStoreWritesPerSec float64 `yaml:"max_store_writes_per_sec"`
+	MaxStoreReadsPerSec  float64 `yaml:"max_store_reads_per_sec"`
+	// ScaleStream is the stream whose receiver scale_backlog stops, so the
+	// replica its generator sends to builds a backlog.
+	ScaleStream string `yaml:"scale_stream"`
+	// ScaleMinShare is the share of the loaded replica's own backlog that
+	// /scale must report as the total on every other replica (default 0.5).
+	ScaleMinShare float64 `yaml:"scale_min_share"`
+}
+
+// MinOutageForStreamsSeconds is the shortest outage whose outage_streams the
+// driver can judge: it counts them first 15 seconds into the outage, and a
+// stream needs a few seconds after that to show it still arrives.
+const MinOutageForStreamsSeconds = 20
+
+// OutageOrDefault returns OutageSeconds, or 30.
+func (s *SharedStateConfig) OutageOrDefault() int {
+	if s == nil || s.OutageSeconds <= 0 {
+		return 30
+	}
+	return s.OutageSeconds
+}
+
+// BadHealthOrDefault returns BadHealth, or "error".
+func (s *SharedStateConfig) BadHealthOrDefault() string {
+	if s == nil || s.BadHealth == "" {
+		return "error"
+	}
+	return s.BadHealth
+}
+
+// IdleOrDefault and LoadOrDefault return the store_calls windows, or 60.
+func (s *SharedStateConfig) IdleOrDefault() int {
+	if s == nil || s.IdleSeconds <= 0 {
+		return 60
+	}
+	return s.IdleSeconds
+}
+
+func (s *SharedStateConfig) LoadOrDefault() int {
+	if s == nil || s.LoadSeconds <= 0 {
+		return 60
+	}
+	return s.LoadSeconds
+}
+
+// ScaleMinShareOrDefault returns ScaleMinShare, or 0.5.
+func (s *SharedStateConfig) ScaleMinShareOrDefault() float64 {
+	if s == nil || s.ScaleMinShare <= 0 {
+		return 0.5
+	}
+	return s.ScaleMinShare
 }
 
 // SharedStateStream ties one generator to the receiver its records reach, and
@@ -120,6 +234,10 @@ type SharedStateStream struct {
 	// MaxDuplicatePct is how many repeated records may arrive, as a percentage
 	// of the distinct ones (default 0).
 	MaxDuplicatePct float64 `yaml:"max_duplicate_pct"`
+	// ExpectNothing says that no record of the stream may arrive: its devices
+	// must not run at all, as on a director that keeps its shared state in
+	// memory. Loss is not judged then.
+	ExpectNothing bool `yaml:"expect_nothing"`
 }
 
 // StreamName returns the stream's label.
@@ -330,6 +448,56 @@ func (tc *TestCase) validateSharedState() error {
 		if len(v) < 8 {
 			return fmt.Errorf("case %q: shared_state.secret_values[%d] is shorter than 8 characters, which would match by chance", tc.Name, i)
 		}
+	}
+	for _, name := range s.OutageStreams {
+		if !names[name] {
+			return fmt.Errorf("case %q: shared_state.outage_streams names %q, which shared_state.streams does not define", tc.Name, name)
+		}
+	}
+	if len(s.OutageStreams) > 0 {
+		switch s.Action {
+		case SharedStateActionPauseStore, SharedStateActionIsolateReplica:
+			// The driver counts the outage streams first 15 seconds into the
+			// outage, and judges their growth from there to its end.
+			if s.OutageOrDefault() < MinOutageForStreamsSeconds {
+				return fmt.Errorf("case %q: shared_state.outage_streams needs outage_seconds of %d or more: the streams are counted from 15 seconds into the outage, so a shorter outage leaves too little to judge", tc.Name, MinOutageForStreamsSeconds)
+			}
+		default:
+			return fmt.Errorf("case %q: shared_state.outage_streams is only judged by the pause_store and isolate_replica actions", tc.Name)
+		}
+	}
+	switch s.Action {
+	case SharedStateActionWrongCredentials:
+		if s.BadReplica < 1 || s.BadReplica > s.Replicas {
+			return fmt.Errorf("case %q: shared_state.action wrong_credentials needs shared_state.bad_replica in 1..%d", tc.Name, s.Replicas)
+		}
+	case SharedStateActionScaleOutIn:
+		if s.Standby < 1 {
+			return fmt.Errorf("case %q: shared_state.action scale_out_in needs a standby replica (shared_state.standby)", tc.Name)
+		}
+	case SharedStateActionScaleBacklog:
+		if !names[s.ScaleStream] {
+			return fmt.Errorf("case %q: shared_state.action scale_backlog needs shared_state.scale_stream to name a stream", tc.Name)
+		}
+	}
+	if s.BadReplica != 0 && s.Action != SharedStateActionWrongCredentials {
+		return fmt.Errorf("case %q: shared_state.bad_replica is only used by the wrong_credentials action", tc.Name)
+	}
+	if s.OutageHoldOthersSeconds != 0 {
+		if s.Action != SharedStateActionPauseStore {
+			return fmt.Errorf("case %q: shared_state.outage_hold_others_seconds is only used by the pause_store action", tc.Name)
+		}
+		if s.OutageHoldOthersSeconds < 0 || s.OutageHoldOthersSeconds > 12 {
+			return fmt.Errorf("case %q: shared_state.outage_hold_others_seconds must be 1 to 12: a replica that renews nothing for 15 seconds counts as gone", tc.Name)
+		}
+	}
+	switch s.BadHealthOrDefault() {
+	case "ok", "not_configured", "error", "starting":
+	default:
+		return fmt.Errorf("case %q: shared_state.bad_health must be ok, not_configured, error or starting, got %q", tc.Name, s.BadHealth)
+	}
+	if s.OutageSeconds < 0 || s.IdleSeconds < 0 || s.LoadSeconds < 0 || s.MaxStoreWritesPerSec < 0 || s.MaxStoreReadsPerSec < 0 || s.ScaleMinShare < 0 {
+		return fmt.Errorf("case %q: shared_state's seconds, call rates and shares must not be negative", tc.Name)
 	}
 	return nil
 }

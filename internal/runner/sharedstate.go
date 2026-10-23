@@ -195,6 +195,9 @@ type ssRun struct {
 
 	replicas []ssReplica
 	running  map[int]bool
+	// bad is the replica whose store credentials are wrong
+	// (wrong_credentials), or 0.
+	bad int
 	// ended are the process ends the harness caused, which no replica logs.
 	ended []ssEvent
 
@@ -220,6 +223,9 @@ func newSSRun(r *Runner, tc *config.TestCase, subject config.Subject, orch *orch
 		evidence:    filepath.Join(r.opts.ResultsDir, hardwareID(), "shared-state", tc.Name),
 	}
 	run.measures["evidence"] = run.evidence
+	if tc.SharedState.Action == config.SharedStateActionWrongCredentials {
+		run.bad = tc.SharedState.BadReplica
+	}
 	for n := 1; n <= tc.ReplicaNodes(); n++ {
 		run.replicas = append(run.replicas, ssReplica{
 			N:         n,
@@ -268,6 +274,9 @@ func (run *ssRun) drive() bool {
 	run.checkHealthAll("start")
 	if len(run.errs) > 0 {
 		return false
+	}
+	if ss.Action == config.SharedStateActionStoreCalls {
+		run.measureIdle()
 	}
 
 	run.measures["generators_started"] = time.Now().UTC()
@@ -337,6 +346,12 @@ func (run *ssRun) startReplicas() bool {
 		deadline := earliest(time.Now().Add(run.replicaWarmup()), run.deadline)
 		for _, n := range group {
 			rep := run.replica(n)
+			if n == run.bad {
+				// A replica with wrong store credentials never gets ready. It
+				// must say why on /health instead.
+				run.waitBadHealth(n, deadline)
+				continue
+			}
 			// The process's start, on the clock its log lines carry.
 			since := containerStartedAt(rep.Container, at)
 			readyAt, ok := run.waitReady(n, since, deadline)
@@ -355,6 +370,26 @@ func (run *ssRun) startReplicas() bool {
 	}
 	run.measures["ready_seconds"] = formation
 	return true
+}
+
+// waitBadHealth waits for the bad replica's /health to report the status the
+// case expects for its shared_state, and keeps the reason it gives.
+func (run *ssRun) waitBadHealth(n int, deadline time.Time) {
+	rep := run.replica(n)
+	want := run.ss.BadHealthOrDefault()
+	var status, message string
+	for {
+		status, message, _, _ = run.healthOf(n, "bad")
+		if status == want && message != "" {
+			break
+		}
+		if time.Now().After(deadline) || sleepCtx(run.r.ctx, 3*time.Second) != nil {
+			run.fail("%s (wrong store credentials): /health reports shared_state %q (%q), want %q with a reason", rep.Service, status, message, want)
+			return
+		}
+	}
+	run.measures["bad_replica_health"] = map[string]string{"status": status, "message": message}
+	fmt.Printf("    %s (wrong store credentials): /health shared_state %s: %s\n", rep.Service, status, message)
 }
 
 // replicaWarmup is the case's warmup: how long a group of replicas may take to
@@ -661,11 +696,14 @@ func (run *ssRun) healthOf(n int, label string) (status, message, overall string
 
 // checkHealthAll checks the shared_state component of every running replica.
 func (run *ssRun) checkHealthAll(label string) {
-	want := run.ss.ExpectHealthOrDefault()
 	got := map[string]string{}
 	for _, rep := range run.replicas {
 		if !run.running[rep.N] {
 			continue
+		}
+		want := run.ss.ExpectHealthOrDefault()
+		if rep.N == run.bad {
+			want = run.ss.BadHealthOrDefault()
 		}
 		status, message, overall, ok := run.healthOf(rep.N, label)
 		if !ok {
@@ -687,6 +725,9 @@ func (run *ssRun) waitBaseline() bool {
 	deadline := earliest(time.Now().Add(2*time.Minute), run.deadline)
 	ports := run.orch.ReceiverMetricsPorts()
 	for _, st := range run.ss.Streams {
+		if st.ExpectNothing {
+			continue
+		}
 		want := max(st.MinBaseline, 1)
 		var have int64
 		for {
@@ -727,6 +768,21 @@ func (run *ssRun) act() {
 		if owner, ok := run.ownerNotLeading(); ok {
 			run.disrupt(owner, "kill")
 		}
+	case config.SharedStateActionPauseStore:
+		run.pauseStore()
+	case config.SharedStateActionIsolateReplica:
+		run.isolateReplica()
+	case config.SharedStateActionScaleOutIn:
+		run.scaleOutIn()
+	case config.SharedStateActionColdRestart:
+		run.coldRestart()
+	case config.SharedStateActionWrongCredentials:
+		// The start was the test; the run goes on under load to show the good
+		// replicas are not disturbed.
+	case config.SharedStateActionStoreCalls:
+		run.storeCalls()
+	case config.SharedStateActionScaleBacklog:
+		run.scaleBacklog()
 	}
 }
 
@@ -1074,17 +1130,40 @@ func (run *ssRun) checkStreams() {
 		run.perReceiver[st.Receiver] = m.LinesReceived
 		fmt.Printf("  stream %s: sent %d, received %d (%d distinct, %d repeated, %.2f%%), lost %d\n",
 			st.StreamName(), sent, m.LinesReceived, m.UniqueLines, m.Duplicates, dupPct, loss)
-		if sent == 0 {
-			run.fail("stream %s: the generator sent nothing", st.StreamName())
-		}
-		if loss > st.MaxLoss {
-			run.fail("stream %s: %d records were lost, above max_loss %d", st.StreamName(), loss, st.MaxLoss)
-		}
-		if dupPct > st.MaxDuplicatePct {
-			run.fail("stream %s: %d records arrived more than once (%.2f%%), above max_duplicate_pct %.2f", st.StreamName(), m.Duplicates, dupPct, st.MaxDuplicatePct)
+		for _, why := range judgeStream(st, sent, m) {
+			run.fail("%s", why)
 		}
 	}
 	run.measures["streams"] = streams
+}
+
+// judgeStream returns why a stream fails, if it does, from what its generator
+// sent and what its receiver holds.
+func judgeStream(st config.SharedStateStream, sent int64, m ReceiverMetrics) []string {
+	// A stream whose devices must not run is judged on arrivals alone. Its
+	// generator may send nothing at all: a TCP sender whose listener never
+	// started can give up before its first write.
+	if st.ExpectNothing {
+		if m.LinesReceived > 0 {
+			return []string{fmt.Sprintf("stream %s: %d records arrived, and none may: its devices must not run", st.StreamName(), m.LinesReceived)}
+		}
+		return nil
+	}
+	if sent == 0 {
+		return []string{fmt.Sprintf("stream %s: the generator sent nothing", st.StreamName())}
+	}
+	var out []string
+	if loss := max(sent-m.UniqueLines, 0); loss > st.MaxLoss {
+		out = append(out, fmt.Sprintf("stream %s: %d records were lost, above max_loss %d", st.StreamName(), loss, st.MaxLoss))
+	}
+	dupPct := 0.0
+	if m.UniqueLines > 0 {
+		dupPct = 100 * float64(m.Duplicates) / float64(m.UniqueLines)
+	}
+	if dupPct > st.MaxDuplicatePct {
+		out = append(out, fmt.Sprintf("stream %s: %d records arrived more than once (%.2f%%), above max_duplicate_pct %.2f", st.StreamName(), m.Duplicates, dupPct, st.MaxDuplicatePct))
+	}
+	return out
 }
 
 // checkOwnershipOverlaps fails the case for every time two replicas ran the
