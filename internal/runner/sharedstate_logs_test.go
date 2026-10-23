@@ -207,3 +207,15 @@ func TestScanForSecrets(t *testing.T) {
 		t.Error("a hit in a text without the secret")
 	}
 }
+
+// A log the harness cannot read is an error, so the final checks can fail the
+// case instead of passing on part of the evidence.
+func TestSSLogBookRefreshReportsALogItCannotRead(t *testing.T) {
+	book := newSSLogBook()
+	if err := book.refresh("pipebench-test-no-such-container"); err == nil {
+		t.Fatal("reading the log of a container that does not exist reported no error")
+	}
+	if lines := book.all("pipebench-test-no-such-container"); len(lines) != 0 {
+		t.Fatalf("the book holds %d lines of a container it could not read", len(lines))
+	}
+}

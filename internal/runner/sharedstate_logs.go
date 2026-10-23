@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"fmt"
 	"net/url"
 	"os/exec"
 	"regexp"
@@ -35,8 +36,10 @@ func newSSLogBook() *ssLogBook {
 	return &ssLogBook{lines: map[string][]ssLine{}, last: map[string]time.Time{}}
 }
 
-// refresh reads the lines the container wrote since the last refresh.
-func (b *ssLogBook) refresh(container string) {
+// refresh reads the lines the container wrote since the last refresh. A read
+// that fails leaves the book as it was, and the next refresh reads the lines
+// it missed. So only the final checks need to act on the error.
+func (b *ssLogBook) refresh(container string) error {
 	b.mu.Lock()
 	since := b.last[container]
 	b.mu.Unlock()
@@ -47,7 +50,7 @@ func (b *ssLogBook) refresh(container string) {
 	}
 	out, err := exec.Command("docker", append(args, container)...).CombinedOutput()
 	if err != nil {
-		return
+		return fmt.Errorf("docker logs %s: %w", container, err)
 	}
 	fresh := parseDockerLogLines(string(out))
 
@@ -60,6 +63,7 @@ func (b *ssLogBook) refresh(container string) {
 		b.lines[container] = append(b.lines[container], l)
 		b.last[container] = l.At
 	}
+	return nil
 }
 
 // all returns a copy of every line the container wrote.

@@ -501,13 +501,18 @@ func (run *ssRun) events(container string) []ssEvent {
 	return events
 }
 
-// refreshAll reads the new lines of every replica that ran.
-func (run *ssRun) refreshAll() {
+// refreshAll reads the new lines of every replica that ran. It returns the
+// reads that failed.
+func (run *ssRun) refreshAll() []error {
+	var errs []error
 	for _, rep := range run.replicas {
 		if run.running[rep.N] || len(run.book.all(rep.Container)) > 0 {
-			run.book.refresh(rep.Container)
+			if err := run.book.refresh(rep.Container); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
+	return errs
 }
 
 // leaders returns the running replicas that lead at time t.
@@ -1025,7 +1030,11 @@ func (run *ssRun) drain() {
 // analyse checks the streams, the ownership over the whole run, the secrets,
 // and counts the store calls.
 func (run *ssRun) analyse() {
-	run.refreshAll()
+	// The ownership and secret checks read the replicas' logs. A log the
+	// harness could not read would let them pass on part of the evidence.
+	for _, err := range run.refreshAll() {
+		run.fail("reading a replica's log for the final checks: %v", err)
+	}
 	run.checkStreams()
 	run.checkOwnershipOverlaps()
 	run.countStoreCalls()
@@ -1097,7 +1106,9 @@ func (run *ssRun) checkOwnershipOverlaps() {
 // countStoreCalls counts the replicas' calls to the shared state's container,
 // over the run and under load.
 func (run *ssRun) countStoreCalls() {
-	run.book.refresh("bench-azurite")
+	if err := run.book.refresh("bench-azurite"); err != nil {
+		run.fail("reading Azurite's access log to count the store calls: %v", err)
+	}
 	calls := parseAzuriteCalls(run.book.all("bench-azurite"))
 	container := run.ss.StoreContainerOrDefault()
 	whole := storeCallRates(calls, container, run.started, time.Now())
