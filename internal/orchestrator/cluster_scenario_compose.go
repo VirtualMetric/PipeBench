@@ -64,6 +64,15 @@ func applyClusterScenarioTopology(vars *composeVars, cfg RunConfig) error {
 	// The load starts once the cluster is ready, at the start_load step.
 	vars.GenDeferred = true
 
+	// The driver checks every acknowledged line against the receiver's
+	// sequence tracking (/seqcheck). Without it the loss of the run is
+	// unknown, so it is on for every receiver of a scenario case.
+	trackSeq := map[string]string{"RECEIVER_TRACK_SEQ": "true"}
+	vars.RecvEnv = mergeEnv(vars.RecvEnv, trackSeq)
+	for i := range vars.Receivers {
+		vars.Receivers[i].Env = mergeEnv(vars.Receivers[i].Env, trackSeq)
+	}
+
 	// Every cluster node already waits for azure-init when the case uses
 	// Azurite (the node block's AzureEnabled entry).
 	if tc.UsesMinio() {

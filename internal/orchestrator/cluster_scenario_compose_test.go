@@ -218,6 +218,34 @@ func TestClusterComposeKeepsOtherCasesUnchanged(t *testing.T) {
 	if limits["cpus"] != "1" {
 		t.Fatalf("cluster node caps: %v", limits)
 	}
+	if env, _ := service(t, doc, "receiver")["environment"].(map[string]any); env["RECEIVER_TRACK_SEQ"] != nil {
+		t.Fatalf("a plain cluster case must not get sequence tracking: %v", env)
+	}
+}
+
+// TestClusterScenarioComposeTracksSequences checks that every receiver of a
+// scenario case tracks sequences, even when the case does not ask for it:
+// the driver's loss check reads /seqcheck.
+func TestClusterScenarioComposeTracksSequences(t *testing.T) {
+	steps := []config.ScenarioStep{{Do: "wait_ready"}}
+	src := "director:\n  id: {{@.NodeID@}}\n"
+
+	tc := scenarioCase(&config.ScenarioConfig{Steps: steps})
+	tc.Receiver.Env = nil
+	doc, _, _ := renderScenario(t, tc, src)
+	if env, _ := service(t, doc, "receiver")["environment"].(map[string]any); env["RECEIVER_TRACK_SEQ"] != "true" {
+		t.Fatalf("the receiver of a scenario case must track sequences: %v", env)
+	}
+
+	tc = scenarioCase(&config.ScenarioConfig{Steps: steps})
+	tc.Receiver = config.ReceiverConfig{}
+	tc.Receivers = []config.ReceiverConfig{{ID: "a", Mode: "tcp", Listen: ":9001"}, {ID: "b", Mode: "tcp", Listen: ":9002"}}
+	doc, _, _ = renderScenario(t, tc, src)
+	for _, name := range []string{"receiver-a", "receiver-b"} {
+		if env, _ := service(t, doc, name)["environment"].(map[string]any); env["RECEIVER_TRACK_SEQ"] != "true" {
+			t.Fatalf("%s of a scenario case must track sequences: %v", name, env)
+		}
+	}
 }
 
 func TestLimitHelperServicesLeavesNodesAndExistingCaps(t *testing.T) {
