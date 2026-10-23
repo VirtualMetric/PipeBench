@@ -184,6 +184,15 @@ func TestClusterScenarioComposeRendersTopology(t *testing.T) {
 		t.Fatalf("rendering a missing template must fail")
 	}
 	_ = before
+	// The Toxiproxy image keeps its binary at /toxiproxy: a mount there
+	// stops the container from starting, so the config goes elsewhere.
+	tp := service(t, doc, "toxiproxy")
+	if vols, _ := tp["volumes"].([]any); len(vols) != 1 || !strings.HasSuffix(vols[0].(string), ":/etc/toxiproxy:ro") {
+		t.Fatalf("toxiproxy must mount its config at /etc/toxiproxy: %v", tp["volumes"])
+	}
+	if cmd, _ := tp["command"].([]any); len(cmd) != 2 || cmd[1] != "-config=/etc/toxiproxy/toxiproxy.json" {
+		t.Fatalf("toxiproxy must read its config from /etc/toxiproxy: %v", tp["command"])
+	}
 	toxi, err := os.ReadFile(filepath.Join(tmp, "toxiproxy", "toxiproxy.json"))
 	if err != nil || !strings.Contains(string(toxi), `"upstream": "azurite:10000"`) || !strings.Contains(string(toxi), `"listen": "0.0.0.0:20000"`) {
 		t.Fatalf("toxiproxy config: %s (%v)", toxi, err)

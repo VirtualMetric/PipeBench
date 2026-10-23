@@ -732,11 +732,12 @@ services:
     container_name: "bench-toxiproxy"
     hostname: "toxiproxy"
     networks: [bench]
-    command: ["-host=0.0.0.0", "-config=/toxiproxy/toxiproxy.json"]
+    # The image keeps its binary at /toxiproxy, so the config goes elsewhere.
+    command: ["-host=0.0.0.0", "-config=/etc/toxiproxy/toxiproxy.json"]
     ports:
       - "127.0.0.1:{{ .ToxiproxyHostPort }}:8474"
     volumes:
-      - "{{ .ToxiproxyConfigHost }}:/toxiproxy:ro"
+      - "{{ .ToxiproxyConfigHost }}:/etc/toxiproxy:ro"
     restart: "no"
 {{- end }}
 {{- if .VerifierLocalDir }}
