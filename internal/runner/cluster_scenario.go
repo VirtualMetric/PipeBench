@@ -489,6 +489,7 @@ func describeStepArgs(st config.ScenarioStep) string {
 	add("proxy", st.Proxy)
 	add("latency", st.Latency)
 	add("log", st.Log)
+	add("logs", strings.Join(st.Logs, " | "))
 	add("since", st.Since)
 	add("sent_before", st.SentBefore)
 	if st.Nodes > 0 {
@@ -781,10 +782,10 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		if err := sleepCtx(sr.ctx, hold); err != nil {
 			return false, "", fmt.Errorf("interrupted: %w", err)
 		}
-		if at, found := firstLogLineSince(sr.containers[n-1], st.Log, from); found {
-			return false, fmt.Sprintf("node %d logged %q %s after %s", n, st.Log, fmtMs(at.Sub(from).Milliseconds()), fromWhat), nil
+		if at, line, found := firstLogLineSinceAny(sr.containers[n-1], st.LogLines(), from); found {
+			return false, fmt.Sprintf("node %d logged %q %s after %s", n, line, fmtMs(at.Sub(from).Milliseconds()), fromWhat), nil
 		}
-		return true, fmt.Sprintf("node %d did not log %q from %s for %s", n, st.Log, fromWhat, fmtMs(end.Sub(from).Milliseconds())), nil
+		return true, fmt.Sprintf("node %d did not log %s from %s for %s", n, quoteLines(st.LogLines()), fromWhat, fmtMs(end.Sub(from).Milliseconds())), nil
 
 	case "count_pending":
 		// Count the lines sent before the mark that have reached the receiver
@@ -858,15 +859,15 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 				if st.Node == "" && !containerRunning(sr.containers[n-1]) {
 					continue
 				}
-				if at, found := firstLogLineSince(sr.containers[n-1], st.Log, since); found {
+				if at, line, found := firstLogLineSinceAny(sr.containers[n-1], st.LogLines(), since); found {
 					ms := at.Sub(since).Milliseconds()
 					sr.record(st.Record, float64(ms))
 					rep.Node = n
-					return true, fmt.Sprintf("node %d logged %q %s after the disruption", n, st.Log, fmtMs(ms)), nil
+					return true, fmt.Sprintf("node %d logged %q %s after the disruption", n, line, fmtMs(ms)), nil
 				}
 			}
 			if time.Now().After(deadline) {
-				return false, fmt.Sprintf("no node logged %q within %s", st.Log, within), nil
+				return false, fmt.Sprintf("no node logged %s within %s", quoteLines(st.LogLines()), within), nil
 			}
 			if err := sleepCtx(sr.ctx, time.Second); err != nil {
 				return false, "", fmt.Errorf("interrupted: %w", err)
@@ -1910,20 +1911,45 @@ func containerNetwork(container string) string {
 // firstLogLineSince returns the docker timestamp of the first line since t
 // that contains needle.
 func firstLogLineSince(container, needle string, t time.Time) (time.Time, bool) {
+	at, _, found := firstLogLineSinceAny(container, []string{needle}, t)
+	return at, found
+}
+
+// firstLogLineSinceAny returns the docker timestamp of the first line since t
+// that contains any of the needles, and the needle it contains.
+func firstLogLineSinceAny(container string, needles []string, t time.Time) (time.Time, string, bool) {
 	out, err := exec.Command("docker", "logs", "-t", "--since", t.UTC().Format(time.RFC3339Nano), container).CombinedOutput()
 	if err != nil {
-		return time.Time{}, false
+		return time.Time{}, "", false
 	}
-	for _, line := range strings.Split(string(out), "\n") {
-		if !strings.Contains(line, needle) {
-			continue
-		}
-		ts, _, _ := strings.Cut(line, " ")
-		if at, perr := time.Parse(time.RFC3339Nano, ts); perr == nil {
-			return at, true
+	return firstMatchingLine(string(out), needles)
+}
+
+// firstMatchingLine finds the first line of `docker logs -t` output that
+// contains any of the needles, and returns its timestamp and that needle.
+func firstMatchingLine(out string, needles []string) (time.Time, string, bool) {
+	for _, line := range strings.Split(out, "\n") {
+		for _, needle := range needles {
+			if !strings.Contains(line, needle) {
+				continue
+			}
+			ts, _, _ := strings.Cut(line, " ")
+			if at, perr := time.Parse(time.RFC3339Nano, ts); perr == nil {
+				return at, needle, true
+			}
 		}
 	}
-	return time.Time{}, false
+	return time.Time{}, "", false
+}
+
+// quoteLines names the texts a log step looks for: one quoted text, or the
+// quoted texts joined with "or".
+func quoteLines(lines []string) string {
+	quoted := make([]string, len(lines))
+	for i, l := range lines {
+		quoted[i] = strconv.Quote(l)
+	}
+	return strings.Join(quoted, " or ")
 }
 
 // readGeneratorProgress returns the generator's last PROGRESS line.

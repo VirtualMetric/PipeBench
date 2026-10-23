@@ -143,8 +143,12 @@ type ScenarioStep struct {
 	// Nodes is the cluster size a scale_to step moves to.
 	Nodes int `yaml:"nodes"`
 
-	// Log is the text wait_log waits for.
+	// Log is the text wait_log waits for, or that expect_no_log must not see.
 	Log string `yaml:"log"`
+	// Logs lists several such texts, for an outcome a node can log in more
+	// than one way: wait_log is satisfied by the first of them to appear, and
+	// expect_no_log fails on any of them. A step names log or logs, not both.
+	Logs []string `yaml:"logs"`
 
 	// Since names an earlier mark. An expect_no_log step then checks the
 	// node's log from that mark to the end of its own window, not from its
@@ -210,6 +214,18 @@ var nodeActionSteps = map[string]bool{
 
 // ScenarioActionNeedsNode reports whether the action takes a node.
 func ScenarioActionNeedsNode(do string) bool { return scenarioActions[do] }
+
+// LogLines returns the texts a wait_log or expect_no_log step looks for: its
+// logs, or its one log.
+func (s ScenarioStep) LogLines() []string {
+	if len(s.Logs) > 0 {
+		return s.Logs
+	}
+	if s.Log == "" {
+		return nil
+	}
+	return []string{s.Log}
+}
 
 // DurationOr parses s, or returns def when s is empty.
 func (s ScenarioStep) DurationOr(field string, def time.Duration) time.Duration {
@@ -431,6 +447,9 @@ func (tc *TestCase) validateClusterScenario() error {
 		if st.SentBefore != "" && st.Do != "count_pending" {
 			return fmt.Errorf("%s: sent_before only applies to count_pending", where)
 		}
+		if len(st.Logs) > 0 && st.Do != "wait_log" && st.Do != "expect_no_log" {
+			return fmt.Errorf("%s: logs only applies to wait_log and expect_no_log", where)
+		}
 		switch st.Do {
 		case "sleep":
 			if st.For == "" {
@@ -476,8 +495,16 @@ func (tc *TestCase) validateClusterScenario() error {
 				return fmt.Errorf("%s: nodes must be between 1 and %d (cluster.nodes + spare_nodes), got %d", where, maxNodes, st.Nodes)
 			}
 		case "wait_log", "expect_no_log":
-			if st.Log == "" {
+			if st.Log != "" && len(st.Logs) > 0 {
+				return fmt.Errorf("%s: names log and logs; name one of them", where)
+			}
+			if st.Log == "" && len(st.Logs) == 0 {
 				return fmt.Errorf("%s: needs log", where)
+			}
+			for _, l := range st.Logs {
+				if l == "" {
+					return fmt.Errorf("%s: logs has an empty line, which every log line contains", where)
+				}
 			}
 		}
 	}

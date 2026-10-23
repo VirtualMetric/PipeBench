@@ -84,6 +84,14 @@ func TestValidateClusterScenarioRejects(t *testing.T) {
 		"count_pending naming no mark":        {func(tc *TestCase) { tc.Cluster.Scenario.Steps[10].SentBefore = "ghost" }, "which no earlier step sets"},
 		"count_pending without a record name": {func(tc *TestCase) { tc.Cluster.Scenario.Steps[10].Record = "" }, "needs record"},
 		"count_pending without a load":        {func(tc *TestCase) { tc.Generator = GeneratorConfig{} }, "has no generator"},
+		"log and logs together": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Steps[9].Logs = []string{"stopping collector"}
+		}, "name one of them"},
+		"an empty line in logs": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Steps[9].Log = ""
+			tc.Cluster.Scenario.Steps[9].Logs = []string{"stopping collector", ""}
+		}, "empty line"},
+		"logs on another action": {func(tc *TestCase) { tc.Cluster.Scenario.Steps[3].Logs = []string{"x"} }, "only applies to wait_log and expect_no_log"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -117,5 +125,24 @@ func TestScenarioDefaults(t *testing.T) {
 	}
 	if !strings.Contains(sc.ToxiproxyImageOrDefault(), ":2.") {
 		t.Fatalf("the Toxiproxy image must be pinned to a release")
+	}
+}
+
+func TestValidateClusterScenarioAcceptsLogs(t *testing.T) {
+	tc := validScenarioCase()
+	st := &tc.Cluster.Scenario.Steps[9]
+	st.Log = ""
+	st.Logs = []string{"lost on node", "placement has been changed to"}
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if got := st.LogLines(); len(got) != 2 || got[1] != "placement has been changed to" {
+		t.Fatalf("LogLines() = %q", got)
+	}
+	if got := (ScenarioStep{Log: "one"}).LogLines(); len(got) != 1 || got[0] != "one" {
+		t.Fatalf("LogLines() of a step with log = %q", got)
+	}
+	if got := (ScenarioStep{}).LogLines(); got != nil {
+		t.Fatalf("LogLines() of a step with neither = %q", got)
 	}
 }

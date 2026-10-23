@@ -376,3 +376,30 @@ func TestArrivedSince(t *testing.T) {
 		}
 	}
 }
+
+func TestFirstMatchingLine(t *testing.T) {
+	out := "2026-10-24T01:30:25.731000000Z Moving device 1 off node 1\n" +
+		"not a timestamp Device pg-bench placement has been changed to 2\n" +
+		"2026-10-24T01:30:25.732000000Z Device pg-bench placement has been changed to 2. Stopping the collector...\n" +
+		"2026-10-24T01:30:26.000000000Z Ownership lease for device 1 (pg-bench) lost on node 1\n"
+	needles := []string{"lost on node", "placement has been changed to"}
+	at, line, ok := firstMatchingLine(out, needles)
+	if !ok || line != "placement has been changed to" {
+		t.Fatalf("firstMatchingLine = %v, %q, %v; want the placement line, the first with a timestamp", at, line, ok)
+	}
+	if want := time.Date(2026, 10, 24, 1, 30, 25, 732000000, time.UTC); !at.Equal(want) {
+		t.Fatalf("at = %v, want %v", at, want)
+	}
+	if _, _, ok := firstMatchingLine(out, []string{"never logged"}); ok {
+		t.Fatalf("firstMatchingLine found a line that is not there")
+	}
+}
+
+func TestQuoteLines(t *testing.T) {
+	if got := quoteLines([]string{"a"}); got != `"a"` {
+		t.Fatalf("quoteLines(a) = %s", got)
+	}
+	if got := quoteLines([]string{"a", "b"}); got != `"a" or "b"` {
+		t.Fatalf("quoteLines(a, b) = %s", got)
+	}
+}
