@@ -46,3 +46,26 @@ func TestJudgeStream(t *testing.T) {
 		t.Errorf("3 lost and about 3%% repeated: %v, want two failures", got)
 	}
 }
+
+func TestOutageBaseline(t *testing.T) {
+	calls := 0
+	count := func() map[string]int64 { calls++; return map[string]int64{"syslog": 1304} }
+
+	early := newOutageBaseline(time.Now())
+	early.take(count)
+	if early.counts != nil || calls != 0 {
+		t.Fatalf("a count taken at the start of an outage would let records sent before it pass for growth: counts %v after %d calls", early.counts, calls)
+	}
+
+	due := newOutageBaseline(time.Now().Add(-outageBaselineDelay))
+	due.take(count)
+	due.take(count)
+	if due.counts["syslog"] != 1304 || calls != 1 {
+		t.Errorf("once the delay has passed the streams are counted once: counts %v after %d calls", due.counts, calls)
+	}
+
+	growth := outageGrowth(map[string]int64{"syslog": 1304, "blob": 40}, map[string]int64{"syslog": 1304, "blob": 60})
+	if growth["syslog"] != 0 || growth["blob"] != 20 {
+		t.Errorf("growth = %v, want syslog 0 and blob 20", growth)
+	}
+}

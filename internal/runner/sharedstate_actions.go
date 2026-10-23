@@ -23,7 +23,6 @@ func (run *ssRun) pauseStore() {
 	outage := time.Duration(run.ss.OutageOrDefault()) * time.Second
 	hold := time.Duration(run.ss.OutageHoldOthersSeconds) * time.Second
 	run.refreshAll()
-	before := run.streamCounts()
 	// With a hold, the replica that leads now is the one that must take the
 	// lease again once the store is back.
 	leader := 0
@@ -44,7 +43,9 @@ func (run *ssRun) pauseStore() {
 	// While the store is away: /health on every replica, and the streams.
 	health := map[string]map[string]int{}
 	end := earliest(paused.Add(outage), run.deadline)
+	base := newOutageBaseline(paused)
 	for time.Now().Before(end) {
+		base.take(run.streamCounts)
 		for _, rep := range run.replicas {
 			if !run.running[rep.N] {
 				continue
@@ -74,7 +75,7 @@ func (run *ssRun) pauseStore() {
 	run.measures["outage_to"] = resumed.UTC()
 	run.measures["outage_health"] = health
 	fmt.Printf("    /health while the store was away: %v\n", health)
-	run.judgeOutageStreams(before, during, resumed.Sub(paused))
+	run.judgeOutageStreams(base, during, resumed)
 
 	run.recoverAfterOutage(paused, resumed, "")
 
@@ -173,7 +174,6 @@ func (run *ssRun) isolateReplica() {
 	outage := time.Duration(run.ss.OutageOrDefault()) * time.Second
 	fmt.Printf("  cutting %s (the leader, runs devices %v) off the network for %s…\n", rep.Service, owned, outage)
 	run.measures["victim"] = map[string]any{"replica": rep.Service, "leader": true, "devices": owned, "how": "isolate"}
-	before := run.streamCounts()
 	cut := time.Now()
 	if err := exec.Command("docker", "network", "disconnect", network, rep.Container).Run(); err != nil {
 		run.fail("docker network disconnect %s: %v (the outage did not happen)", rep.Service, err)
@@ -182,7 +182,9 @@ func (run *ssRun) isolateReplica() {
 	run.measures["outage_from"] = cut.UTC()
 	statuses := map[string]int{}
 	end := earliest(cut.Add(outage), run.deadline)
+	base := newOutageBaseline(cut)
 	for time.Now().Before(end) {
+		base.take(run.streamCounts)
 		status, _, _, _ := run.healthOf(victim, "isolated")
 		statuses[status]++
 		if sleepCtx(run.r.ctx, 3*time.Second) != nil {
@@ -198,7 +200,7 @@ func (run *ssRun) isolateReplica() {
 	run.measures["outage_to"] = back.UTC()
 	run.measures["isolated_health"] = statuses
 	fmt.Printf("    /health of %s while it was cut off: %v\n", rep.Service, statuses)
-	run.judgeOutageStreams(before, during, back.Sub(cut))
+	run.judgeOutageStreams(base, during, back)
 
 	run.recoverAfterOutage(cut, back, rep.Container)
 }
@@ -310,23 +312,60 @@ func (run *ssRun) recoverAfterOutage(from, to time.Time, victim string) {
 }
 
 // judgeOutageStreams fails the case for an outage stream that stopped
-// arriving while the store was away. The first 15 seconds of the outage are
-// left out: records sent before it began may still be on their way.
-func (run *ssRun) judgeOutageStreams(before, during map[string]int64, outage time.Duration) {
-	growth := map[string]int64{}
-	for name, n := range during {
-		growth[name] = n - before[name]
-	}
-	run.measures["outage_stream_growth"] = growth
-	fmt.Printf("    records that arrived during the outage: %v\n", growth)
-	if outage < 20*time.Second {
+// arriving during the outage. It judges the growth from the baseline, taken
+// 15 seconds into the outage, to the outage's end: records sent before the
+// outage began may still be on their way in its first seconds.
+func (run *ssRun) judgeOutageStreams(base *outageBaseline, during map[string]int64, ended time.Time) {
+	if base.counts == nil {
+		// The outage ended before its baseline was due: there is no window to
+		// judge. Validation refuses outage_streams with such a short outage.
 		return
 	}
+	window := ended.Sub(base.at)
+	growth := outageGrowth(base.counts, during)
+	run.measures["outage_stream_growth"] = growth
+	run.measures["outage_stream_window_seconds"] = window.Seconds()
+	fmt.Printf("    records that arrived in the last %s of the outage: %v\n", window.Round(time.Second), growth)
 	for _, name := range run.ss.OutageStreams {
 		if growth[name] <= 0 {
-			run.fail("stream %s stopped while the store was away: no record arrived in %s", name, outage.Round(time.Second))
+			run.fail("stream %s stopped during the outage: no record arrived in its last %s", name, window.Round(time.Second))
 		}
 	}
+}
+
+// outageBaselineDelay is how far into an outage the driver counts the outage
+// streams for the first time. Records sent before the outage can still be on
+// their way in its first seconds, and a count taken earlier would let a
+// stream that stopped when the outage began pass on them.
+const outageBaselineDelay = 15 * time.Second
+
+// outageBaseline is the count of each stream, taken once outageBaselineDelay
+// into an outage.
+type outageBaseline struct {
+	began  time.Time
+	at     time.Time
+	counts map[string]int64
+}
+
+func newOutageBaseline(began time.Time) *outageBaseline { return &outageBaseline{began: began} }
+
+// take counts the streams with count once the delay has passed, and only
+// once.
+func (b *outageBaseline) take(count func() map[string]int64) {
+	if b.counts != nil || time.Since(b.began) < outageBaselineDelay {
+		return
+	}
+	b.at = time.Now()
+	b.counts = count()
+}
+
+// outageGrowth is how many records each stream gained between two counts.
+func outageGrowth(before, after map[string]int64) map[string]int64 {
+	growth := map[string]int64{}
+	for name, n := range after {
+		growth[name] = n - before[name]
+	}
+	return growth
 }
 
 // streamCounts returns how many records each stream's receiver holds.
