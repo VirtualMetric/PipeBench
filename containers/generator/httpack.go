@@ -67,6 +67,7 @@ type ackConfig struct {
 	timeout     time.Duration
 	backoff     time.Duration
 	cooldown    time.Duration
+	maxCooldown time.Duration
 	drain       time.Duration
 	contentType string
 	progress    time.Duration
@@ -79,6 +80,7 @@ func loadAckConfig(cfg config) ackConfig {
 		timeout:     envDuration("GENERATOR_HTTP_TIMEOUT", 5*time.Second),
 		backoff:     envDuration("GENERATOR_RETRY_BACKOFF", 200*time.Millisecond),
 		cooldown:    envDuration("GENERATOR_TARGET_COOLDOWN", 3*time.Second),
+		maxCooldown: envDuration("GENERATOR_TARGET_COOLDOWN_MAX", 10*time.Second),
 		drain:       envDuration("GENERATOR_DRAIN_TIMEOUT", 60*time.Second),
 		contentType: getEnv("GENERATOR_HTTP_CONTENT_TYPE", "text/plain"),
 		progress:    envDuration("GENERATOR_PROGRESS_INTERVAL", time.Second),
@@ -115,20 +117,40 @@ func envDuration(key string, def time.Duration) time.Duration {
 	return def
 }
 
-// targetPicker chooses the target for each post. A target that just failed
-// cools down for a while, so a dead node does not cost every batch a failed
-// attempt. When every target is cooling down, it picks one anyway.
+// targetPicker chooses the target for each post. A target that fails gets no
+// post until its cooldown is over. The cooldown doubles with each failure in
+// a row, up to maxCooldown. After the cooldown, one post at a time tries the
+// target again, and the other workers keep away from it until that post
+// succeeds. So a dead node costs one worker a failed attempt now and then. It
+// does not stall every worker at once, which would also stall the load. When
+// no target can take a post, the picker chooses one anyway.
 type targetPicker struct {
-	mu       sync.Mutex
-	targets  []string
-	policy   string
-	cooldown time.Duration
-	next     int
-	until    []time.Time
+	mu          sync.Mutex
+	targets     []string
+	policy      string
+	cooldown    time.Duration
+	maxCooldown time.Duration
+	next        int
+	until       []time.Time
+	fails       []int
+	probing     []bool
 }
 
-func newTargetPicker(targets []string, policy string, cooldown time.Duration) *targetPicker {
-	return &targetPicker{targets: targets, policy: policy, cooldown: cooldown, until: make([]time.Time, len(targets))}
+func newTargetPicker(targets []string, policy string, cooldown, maxCooldown time.Duration) *targetPicker {
+	n := len(targets)
+	return &targetPicker{
+		targets: targets, policy: policy, cooldown: cooldown, maxCooldown: max(cooldown, maxCooldown),
+		until: make([]time.Time, n), fails: make([]int, n), probing: make([]bool, n),
+	}
+}
+
+// usable says whether target idx may take a post now. A target that failed
+// last time takes one post at a time, once its cooldown is over.
+func (p *targetPicker) usable(idx int, now time.Time) bool {
+	if p.fails[idx] == 0 {
+		return true
+	}
+	return !now.Before(p.until[idx]) && !p.probing[idx]
 }
 
 // pick returns the index of the target to post the next batch to. fresh is
@@ -144,7 +166,10 @@ func (p *targetPicker) pick(now time.Time, fresh bool) int {
 	}
 	for i := range n {
 		idx := (start + i) % n
-		if !now.Before(p.until[idx]) {
+		if p.usable(idx, now) {
+			if p.fails[idx] > 0 {
+				p.probing[idx] = true
+			}
 			p.next = idx
 			return idx
 		}
@@ -153,14 +178,29 @@ func (p *targetPicker) pick(now time.Time, fresh bool) int {
 	return start
 }
 
-// failed marks a target as cooling down and moves the next pick past it.
+// failed starts a target's cooldown and moves the next pick past it.
 func (p *targetPicker) failed(idx int, now time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.until[idx] = now.Add(p.cooldown)
+	p.fails[idx]++
+	d := p.cooldown
+	for i := 1; i < p.fails[idx] && d < p.maxCooldown; i++ {
+		d *= 2
+	}
+	p.until[idx] = now.Add(min(d, p.maxCooldown))
+	p.probing[idx] = false
 	if p.next == idx {
 		p.next = (idx + 1) % len(p.targets)
 	}
+}
+
+// succeeded makes a target fully usable again.
+func (p *targetPicker) succeeded(idx int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.fails[idx] = 0
+	p.probing[idx] = false
+	p.until[idx] = time.Time{}
 }
 
 type ackStats struct {
@@ -251,7 +291,7 @@ func runHTTPAck(cfg config, clock *sendClock) (int64, int64, error) {
 	}
 
 	stats := &ackStats{status: map[string]int64{}, perConn: map[string]int64{}, perTarget: map[string]int64{}}
-	picker := newTargetPicker(ac.targets, ac.policy, ac.cooldown)
+	picker := newTargetPicker(ac.targets, ac.policy, ac.cooldown, ac.maxCooldown)
 
 	start := time.Now()
 	stats.start = start
@@ -402,6 +442,7 @@ func runAckWorker(cfg config, ac ackConfig, conn int, stats *ackStats, picker *t
 				stats.noteAck(conn, target, ac.batch, len(body), time.Now().UnixNano())
 				stats.notePostLatency(postStart, time.Since(postStart))
 				clock.RecordSend()
+				picker.succeeded(idx)
 				acked = true
 			case err != nil:
 				stats.failures.Add(1)

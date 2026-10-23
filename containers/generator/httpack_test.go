@@ -153,7 +153,7 @@ func TestHTTPAckFailsOverAndResendsSameBytes(t *testing.T) {
 }
 
 func TestTargetPickerSkipsCoolingTarget(t *testing.T) {
-	p := newTargetPicker([]string{"a", "b", "c"}, "round_robin", time.Minute)
+	p := newTargetPicker([]string{"a", "b", "c"}, "round_robin", time.Minute, time.Minute)
 	now := time.Now()
 	p.failed(1, now)
 	for range 10 {
@@ -166,6 +166,55 @@ func TestTargetPickerSkipsCoolingTarget(t *testing.T) {
 	// Every target cools down: one is still picked.
 	if got := p.pick(now, true); got < 0 || got > 2 {
 		t.Fatalf("pick out of range: %d", got)
+	}
+}
+
+// TestTargetPickerTriesFailedTargetOneAtATime checks that once a failed
+// target's cooldown is over, only one post at a time goes to it, and that it
+// takes every worker's posts again after one of them succeeds.
+func TestTargetPickerTriesFailedTargetOneAtATime(t *testing.T) {
+	p := newTargetPicker([]string{"a", "b", "c"}, "round_robin", time.Second, 10*time.Second)
+	now := time.Now()
+	p.failed(1, now)
+	later := now.Add(2 * time.Second)
+
+	tries := 0
+	for range 30 {
+		if p.pick(later, true) == 1 {
+			tries++
+		}
+	}
+	if tries != 1 {
+		t.Fatalf("target b was tried by %d posts at once after its cooldown, want 1", tries)
+	}
+
+	p.succeeded(1)
+	tries = 0
+	for range 30 {
+		if p.pick(later, true) == 1 {
+			tries++
+		}
+	}
+	if tries != 10 {
+		t.Fatalf("target b took %d of 30 round-robin posts after it recovered, want 10", tries)
+	}
+}
+
+// TestTargetPickerCooldownGrows checks that the cooldown doubles with each
+// failure in a row, stops at the maximum, and starts over after a success.
+func TestTargetPickerCooldownGrows(t *testing.T) {
+	p := newTargetPicker([]string{"a", "b"}, "round_robin", time.Second, 5*time.Second)
+	now := time.Now()
+	for _, want := range []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 5 * time.Second, 5 * time.Second} {
+		p.failed(0, now)
+		if got := p.until[0].Sub(now); got != want {
+			t.Fatalf("cooldown after %d failures in a row is %s, want %s", p.fails[0], got, want)
+		}
+	}
+	p.succeeded(0)
+	p.failed(0, now)
+	if got := p.until[0].Sub(now); got != time.Second {
+		t.Fatalf("cooldown after a success and one failure is %s, want 1s", got)
 	}
 }
 
