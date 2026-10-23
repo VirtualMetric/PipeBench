@@ -1567,10 +1567,13 @@ func deliveryGapAfter(tl receiverTimeline, at time.Time, window time.Duration) (
 		return 0, 0
 	}
 	bucket := time.Duration(tl.BucketMs) * time.Millisecond
-	first := max(int(at.UnixNano()-tl.StartNs)/int(bucket), 0)
-	last := min(first+int(window/bucket), len(tl.Unique))
+	// A gap starts where its first empty bucket starts. The gaps of this
+	// disruption start at or after at and before at+window.
+	first := min(bucketAtOrAfter(tl, at), len(tl.Unique))
+	last := min(bucketAtOrAfter(tl, at.Add(window)), len(tl.Unique))
+	i := first
 	bestLen, bestEnd := 0, -1
-	for i := first; i < last; {
+	for i < last {
 		if tl.Unique[i] != 0 {
 			i++
 			continue
@@ -1593,6 +1596,17 @@ func deliveryGapAfter(tl receiverTimeline, at time.Time, window time.Duration) (
 		resumeMs = 0
 	}
 	return gapMs, resumeMs
+}
+
+// bucketAtOrAfter returns the index of the first timeline bucket that starts
+// at or after t.
+func bucketAtOrAfter(tl receiverTimeline, t time.Time) int {
+	b := tl.BucketMs * int64(time.Millisecond)
+	off := t.UnixNano() - tl.StartNs
+	if off <= 0 {
+		return 0
+	}
+	return int((off + b - 1) / b)
 }
 
 // duplicatesView is the receiver's /duplicates answer.

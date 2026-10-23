@@ -138,6 +138,37 @@ func TestDeliveryGapAfterWindow(t *testing.T) {
 	}
 }
 
+// TestDeliveryGapAfterBoundaryBetweenBuckets checks that the window is
+// bounded by time, not by the bucket a disruption falls in. With 100 ms
+// buckets, a disruption at 950 ms and the next at 1050 ms, a gap that starts
+// at 1000 ms belongs to the first one.
+func TestDeliveryGapAfterBoundaryBetweenBuckets(t *testing.T) {
+	start := time.Unix(5000, 0)
+	tl := receiverTimeline{StartNs: start.UnixNano(), BucketMs: 100}
+	add := func(n int, v int32) {
+		for range n {
+			tl.Unique = append(tl.Unique, v)
+		}
+	}
+	add(10, 5) // 0-1000 ms
+	add(5, 0)  // 1000-1500 ms: the gap
+	add(10, 5)
+
+	gap, resume := deliveryGapAfter(tl, start.Add(950*time.Millisecond), 100*time.Millisecond)
+	if gap != 500 || resume != 550 {
+		t.Fatalf("disruption at 950 ms: gap %d ms, resumed after %d ms; want 500, 550", gap, resume)
+	}
+	if b := bucketAtOrAfter(tl, start.Add(1000*time.Millisecond)); b != 10 {
+		t.Fatalf("bucketAtOrAfter(1000 ms) = %d, want 10", b)
+	}
+	if b := bucketAtOrAfter(tl, start.Add(1001*time.Millisecond)); b != 11 {
+		t.Fatalf("bucketAtOrAfter(1001 ms) = %d, want 11", b)
+	}
+	if b := bucketAtOrAfter(tl, start.Add(-time.Second)); b != 0 {
+		t.Fatalf("bucketAtOrAfter(before the start) = %d, want 0", b)
+	}
+}
+
 func TestArrivalsAfter(t *testing.T) {
 	start := time.Unix(5000, 0)
 	tl := receiverTimeline{StartNs: start.UnixNano(), BucketMs: 100}
