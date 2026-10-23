@@ -168,6 +168,7 @@ var scenarioActions = map[string]bool{
 	"wait_delivery":          false,
 	"expect_writes_stop":     false,
 	"expect_writes_continue": false,
+	"expect_delivery_stops":  false,
 	"wait_healthy":           false,
 	"witness_down":           false,
 	"witness_up":             false,

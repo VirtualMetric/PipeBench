@@ -23,6 +23,7 @@ func validScenarioCase() *TestCase {
 				{Do: "scale_to", Nodes: 4},
 				{Do: "sleep", For: "5s"},
 				{Do: "mark", Label: "end"},
+				{Do: "expect_delivery_stops", Within: "60s", For: "20s", Record: "stopped"},
 			},
 		}},
 	}

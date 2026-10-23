@@ -619,6 +619,38 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 			}
 		}
 
+	case "expect_delivery_stops":
+		// No line may reach the receiver for `for`, starting within `within`
+		// of the disruption: a cluster without a quorum must not pass records
+		// on. A director in crash-resistant mode goes on acknowledging what
+		// it can keep on its own disk, so this, not expect_writes_stop, is
+		// what shows that the cluster stopped. Lines that were already past
+		// the cluster's queues may still arrive at first.
+		within := st.DurationOr("within", 60*time.Second)
+		hold := st.DurationOr("for", 20*time.Second)
+		since := sr.lastDisruption
+		deadline := since.Add(within).Add(hold)
+		var last time.Time
+		var after int64
+		for {
+			if tl, err := sr.receiverTimeline(); err == nil {
+				last, after = arrivalsAfter(tl, since)
+				if time.Since(last) >= hold {
+					stoppedMs := max(last.Sub(since).Milliseconds(), 0)
+					sr.record(st.Record, float64(stoppedMs))
+					sr.record(st.Record+"_lines_after", float64(after))
+					return true, fmt.Sprintf("deliveries stopped %s after the disruption; %d lines arrived after it", fmtMs(stoppedMs), after), nil
+				}
+			}
+			if time.Now().After(deadline) {
+				sr.record(st.Record+"_lines_after", float64(after))
+				return false, fmt.Sprintf("lines kept arriving: %d since the disruption, the last %s ago", after, fmtMs(time.Since(last).Milliseconds())), nil
+			}
+			if err := sleepCtx(sr.ctx, time.Second); err != nil {
+				return false, "", fmt.Errorf("interrupted: %w", err)
+			}
+		}
+
 	case "expect_writes_continue":
 		hold := st.DurationOr("for", 20*time.Second)
 		first, _ := readGeneratorProgress()
@@ -1503,6 +1535,28 @@ func deliveryGapAfter(tl receiverTimeline, at time.Time, window time.Duration) (
 		resumeMs = 0
 	}
 	return gapMs, resumeMs
+}
+
+// arrivalsAfter returns when the last line reached the receiver, and how
+// many distinct lines arrived after at. When none arrived after at, last is
+// at itself.
+func arrivalsAfter(tl receiverTimeline, at time.Time) (last time.Time, count int64) {
+	last = at
+	if tl.BucketMs <= 0 {
+		return last, 0
+	}
+	bucket := time.Duration(tl.BucketMs) * time.Millisecond
+	first := max(int((at.UnixNano()-tl.StartNs)/int64(bucket)), 0)
+	for i := first; i < len(tl.Unique); i++ {
+		if tl.Unique[i] == 0 {
+			continue
+		}
+		count += int64(tl.Unique[i])
+		if end := time.Unix(0, tl.StartNs+int64(i+1)*int64(bucket)); end.After(last) {
+			last = end
+		}
+	}
+	return last, count
 }
 
 // healthTrail keeps one line for every round whose state differs from the

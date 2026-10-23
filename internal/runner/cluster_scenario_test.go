@@ -105,6 +105,36 @@ func TestDeliveryGapAfter(t *testing.T) {
 	}
 }
 
+func TestArrivalsAfter(t *testing.T) {
+	start := time.Unix(5000, 0)
+	tl := receiverTimeline{StartNs: start.UnixNano(), BucketMs: 100}
+	// 1 s of arrivals, 2 s without, then one bucket of 7 lines.
+	for range 10 {
+		tl.Unique = append(tl.Unique, 5)
+	}
+	for range 20 {
+		tl.Unique = append(tl.Unique, 0)
+	}
+	tl.Unique = append(tl.Unique, 7)
+
+	last, n := arrivalsAfter(tl, start.Add(500*time.Millisecond))
+	if n != 5*5+7 {
+		t.Fatalf("%d lines after the disruption, want 32", n)
+	}
+	if want := start.Add(3100 * time.Millisecond); !last.Equal(want) {
+		t.Fatalf("last arrival at %s, want %s", last, want)
+	}
+
+	// Nothing arrived after the disruption: the last arrival is the disruption.
+	at := start.Add(10 * time.Second)
+	if last, n := arrivalsAfter(tl, at); n != 0 || !last.Equal(at) {
+		t.Fatalf("arrivalsAfter(after the last line) = %s, %d; want %s, 0", last, n, at)
+	}
+	if last, n := arrivalsAfter(receiverTimeline{}, at); n != 0 || !last.Equal(at) {
+		t.Fatalf("an empty timeline has no arrivals")
+	}
+}
+
 func TestParseGeneratorAck(t *testing.T) {
 	out := `{
   "lines_sent": 30,
