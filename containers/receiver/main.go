@@ -40,7 +40,15 @@ type config struct {
 	// rate-ceiling validator (correctness.rate_ceiling) and nothing
 	// else; default off so existing perf runs are byte-identical.
 	RecordArrivalTimes bool
+
+	// TrackSeq follows the CONN/SEQ/TS lines of the http_ack generator: which
+	// lines arrived, duplicates, first-arrival latency and an arrival
+	// timeline (seqtrack.go). Default off.
+	TrackSeq bool
 }
+
+// seqTrack is the sequence tracker when RECEIVER_TRACK_SEQ is on, else nil.
+var seqTrack *seqTracker
 
 // connStats holds per-connection counters. We keep the running totals in a
 // per-connection struct (rather than a single shared counter) so multiple
@@ -547,6 +555,9 @@ func main() {
 
 	cnt := &counters{recordTimes: cfg.RecordArrivalTimes}
 	val := newValidator()
+	if cfg.TrackSeq {
+		seqTrack = newSeqTracker()
+	}
 
 	// Start metrics HTTP server on a separate port
 	go serveMetrics(cfg.MetricsPort, cnt, val, cfg)
@@ -718,6 +729,9 @@ func handleConn(conn net.Conn, shard *connStats, val *validator, cfg config) {
 		shard.recordLine(int64(len(b)) + 1)
 		if needsValidation {
 			val.recordLine(b, cfg)
+		}
+		if seqTrack != nil {
+			seqTrack.record(b, time.Now().UnixNano())
 		}
 	}
 	// A scan error (oversized line, connection reset) silently truncates the
@@ -1018,8 +1032,24 @@ func serveMetrics(port string, cnt *counters, val *validator, cfg config) {
 			resp["latency_p95_ms"] = p95
 			resp["latency_p99_ms"] = p99
 		}
+		// Sequence tracking reports distinct lines and first-arrival latency
+		// on its own, without the hash-based dedup check.
+		if seqTrack != nil {
+			unique, dups := seqTrack.counts()
+			resp["unique_lines"] = unique
+			resp["duplicates"] = dups
+			if ls := seqTrack.latency(0, 0); ls.Count > 0 {
+				resp["latency_p50_ms"] = ls.P50Ms
+				resp["latency_p95_ms"] = ls.P95Ms
+				resp["latency_p99_ms"] = ls.P99Ms
+				resp["latency_max_ms"] = ls.MaxMs
+			}
+		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})
+	if seqTrack != nil {
+		registerSeqHandlers(mux, seqTrack)
+	}
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -1059,6 +1089,7 @@ func loadConfig() config {
 		ForbiddenSubstring: getEnv("RECEIVER_FORBIDDEN_SUBSTRING", ""),
 		ValidateJSON:       getEnvBool("RECEIVER_VALIDATE_JSON", false),
 		RecordArrivalTimes: getEnvBool("RECEIVER_RECORD_ARRIVAL_TIMES", false),
+		TrackSeq:           getEnvBool("RECEIVER_TRACK_SEQ", false),
 	}
 }
 
