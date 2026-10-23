@@ -155,8 +155,13 @@ type scenarioRun struct {
 
 	probe *clusterProbe
 
-	names          map[string]int
-	disconnected   map[int]bool
+	names        map[string]int
+	disconnected map[int]bool
+	// down holds the members a step took out of service on purpose (killed,
+	// stopped, paused). Every other member must be up for the cluster to be
+	// healthy, so a probe round taken while a start was still under way
+	// cannot pass for a healthy cluster.
+	down           map[int]bool
 	lastDisruption time.Time
 	upAt           time.Time
 	loadStarted    time.Time
@@ -167,6 +172,9 @@ type scenarioRun struct {
 	measures map[string]float64
 	failures []string
 	notes    []string
+
+	imageID     string
+	imageLabels map[string]string
 }
 
 func (r *Runner) runClusterScenario(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
@@ -192,6 +200,8 @@ func (r *Runner) runClusterScenario(tc *config.TestCase, subject config.Subject)
 
 	fmt.Printf("→ test=%s  subject=%s  version=%s  config=%s  (cluster scenario: %d nodes + %d spare, %d steps, node limits %s CPU / %s)\n",
 		tc.Name, subject.Name, subject.Version, configName, tc.Cluster.Nodes, sc.SpareNodes, len(sc.Steps), r.runCPULimit, r.runMemLimit)
+	imageID, imageLabels := imageIdentity(subject.ImageRef())
+	fmt.Printf("  image %s is %s %v\n", subject.ImageRef(), imageID, imageLabels)
 
 	srcCfg, err := tc.ConfigFilePath(r.opts.CasesDir, configName, subject)
 	if err != nil {
@@ -265,7 +275,8 @@ func (r *Runner) runClusterScenario(tc *config.TestCase, subject config.Subject)
 		r: r, ctx: r.ctx, tc: tc, sc: sc, subject: subject, orch: orch,
 		containers: containers, active: map[int]bool{}, size: tc.Cluster.Nodes,
 		tmpDir: tmpDir, configSrc: srcCfg, recvPort: r.opts.ReceiverHostPort,
-		names: map[string]int{}, disconnected: map[int]bool{}, measures: map[string]float64{},
+		names: map[string]int{}, disconnected: map[int]bool{}, down: map[int]bool{}, measures: map[string]float64{},
+		imageID: imageID, imageLabels: imageLabels,
 	}
 	for i := 1; i <= tc.Cluster.Nodes; i++ {
 		sr.active[i] = true
@@ -729,18 +740,27 @@ func (sr *scenarioRun) nodeAction(i int, st config.ScenarioStep, rep *scenarioSt
 			sig = "SIGKILL"
 		}
 		sr.disrupt(i, "kill "+sig, n)
+		// SIGCONT wakes a node that SIGSTOP froze; every other signal this
+		// step sends takes the node out of service.
+		if sig == "SIGCONT" {
+			delete(sr.down, n)
+		} else {
+			sr.down[n] = true
+		}
 		if err := dockerCmd(sr.ctx, 30*time.Second, "kill", "-s", sig, c); err != nil {
 			return false, fmt.Sprintf("docker kill -s %s %s: %v", sig, c, err), nil
 		}
 		return true, fmt.Sprintf("sent %s to node %d", sig, n), nil
 	case "stop":
 		sr.disrupt(i, "stop", n)
+		sr.down[n] = true
 		if err := dockerCmd(sr.ctx, grace+30*time.Second, "stop", "-t", graceSecs, c); err != nil {
 			return false, fmt.Sprintf("docker stop %s: %v", c, err), nil
 		}
 		return true, fmt.Sprintf("stopped node %d in %s", n, fmtMs(time.Since(start).Milliseconds())), nil
 	case "restart":
 		sr.disrupt(i, "restart", n)
+		delete(sr.down, n)
 		if err := dockerCmd(sr.ctx, grace+60*time.Second, "restart", "-t", graceSecs, c); err != nil {
 			return false, fmt.Sprintf("docker restart %s: %v", c, err), nil
 		}
@@ -753,6 +773,7 @@ func (sr *scenarioRun) nodeAction(i int, st config.ScenarioStep, rep *scenarioSt
 			}
 		}
 		sr.disrupt(i, "start", n)
+		delete(sr.down, n)
 		if err := dockerCmd(sr.ctx, 60*time.Second, "start", c); err != nil {
 			_ = os.Remove(argsFile)
 			return false, fmt.Sprintf("docker start %s: %v", c, err), nil
@@ -781,6 +802,9 @@ func (sr *scenarioRun) nodeAction(i int, st config.ScenarioStep, rep *scenarioSt
 	case "pause", "unpause":
 		if st.Do == "pause" {
 			sr.disrupt(i, "pause", n)
+			sr.down[n] = true
+		} else {
+			delete(sr.down, n)
 		}
 		if err := dockerCmd(sr.ctx, 30*time.Second, st.Do, c); err != nil {
 			return false, fmt.Sprintf("docker %s %s: %v", st.Do, c, err), nil
@@ -847,7 +871,7 @@ func (sr *scenarioRun) resolveNode(sel string) (int, error) {
 			return leader, nil
 		}
 		for n := 1; n <= len(sr.containers); n++ {
-			if sr.active[n] && n != leader && !sr.disconnected[n] && containerRunning(sr.containers[n-1]) {
+			if sr.active[n] && n != leader && !sr.disconnected[n] && !sr.down[n] && containerRunning(sr.containers[n-1]) {
 				return n, nil
 			}
 		}
@@ -860,20 +884,22 @@ func (sr *scenarioRun) resolveNode(sel string) (int, error) {
 	return n, nil
 }
 
-// healthy reports whether every member node that is running and on the
-// network answers, has its message queue up and agrees on one leader, with
-// no stream short of replicas. A member that a step stopped, killed or cut
-// off is left out: the check is about the nodes that are meant to work.
+// healthy reports whether every member node that is meant to work runs,
+// answers, has its message queue up and agrees on one leader, with no
+// stream short of replicas. A member that a step took out of service on
+// purpose (killed, stopped, paused, cut off) is left out. Any other member
+// that is not running yet, such as one a step is still starting, makes the
+// cluster not healthy.
 func (sr *scenarioRun) healthy(r healthRound) bool {
 	leaders := map[string]bool{}
 	checked := 0
 	for n := range sr.active {
-		h, ok := r.node(n)
-		if !ok || h.State != "running" || sr.disconnected[n] {
+		if sr.down[n] || sr.disconnected[n] {
 			continue
 		}
+		h, ok := r.node(n)
 		checked++
-		if !h.Reachable || h.Phase != "running" || h.VMMQ != "ok" {
+		if !ok || h.State != "running" || !h.Reachable || h.Phase != "running" || h.VMMQ != "ok" {
 			return false
 		}
 		if h.Clustered {
@@ -1099,19 +1125,23 @@ func defaultStr(v, def string) string {
 
 // scenarioReport is the run's full record, written next to the results.
 type scenarioReport struct {
-	Case       string                  `json:"case"`
-	Image      string                  `json:"image"`
-	Nodes      int                     `json:"nodes"`
-	NodeCPU    string                  `json:"node_cpu_limit"`
-	NodeMem    string                  `json:"node_mem_limit"`
-	Acked      int64                   `json:"acked"`
-	Received   int64                   `json:"received"`
-	Unique     int64                   `json:"unique"`
-	Missing    int64                   `json:"missing"`
-	Duplicates int64                   `json:"duplicates"`
-	Extra      int64                   `json:"extra"`
-	Latency    latencyStats            `json:"latency"`
-	Windows    map[string]latencyStats `json:"latency_windows,omitempty"`
+	Case  string `json:"case"`
+	Image string `json:"image"`
+	// ImageID and ImageLabels say exactly which build ran: a tag can move,
+	// the ID cannot, and a build usually labels the commit it came from.
+	ImageID     string                  `json:"image_id,omitempty"`
+	ImageLabels map[string]string       `json:"image_labels,omitempty"`
+	Nodes       int                     `json:"nodes"`
+	NodeCPU     string                  `json:"node_cpu_limit"`
+	NodeMem     string                  `json:"node_mem_limit"`
+	Acked       int64                   `json:"acked"`
+	Received    int64                   `json:"received"`
+	Unique      int64                   `json:"unique"`
+	Missing     int64                   `json:"missing"`
+	Duplicates  int64                   `json:"duplicates"`
+	Extra       int64                   `json:"extra"`
+	Latency     latencyStats            `json:"latency"`
+	Windows     map[string]latencyStats `json:"latency_windows,omitempty"`
 	// AckMaxWindows is the slowest acknowledgement the client waited for in
 	// each window between marks, in milliseconds.
 	AckMaxWindows map[string]int64     `json:"ack_latency_max_ms_windows,omitempty"`
@@ -1129,6 +1159,8 @@ type scenarioReport struct {
 // summary is the compact part of the report kept in the result row.
 func (rep scenarioReport) summary() map[string]any {
 	out := map[string]any{
+		"image":                    rep.Image,
+		"image_id":                 rep.ImageID,
 		"acked":                    rep.Acked,
 		"missing":                  rep.Missing,
 		"duplicates":               rep.Duplicates,
@@ -1137,6 +1169,11 @@ func (rep scenarioReport) summary() map[string]any {
 		"max_self_claimed_leaders": rep.Leadership.MaxSelfClaimed,
 		"stream_split_ms":          rep.Leadership.StreamSplitMs,
 		"leader_changes":           rep.Leadership.LeaderChanges,
+	}
+	for k, v := range rep.ImageLabels {
+		if lk := strings.ToLower(k); strings.Contains(lk, "commit") || strings.Contains(lk, "revision") {
+			out["image_revision"] = v
+		}
 	}
 	for k, v := range rep.Measures {
 		out["ms_"+k] = v
@@ -1154,13 +1191,15 @@ type scenarioVerdict struct {
 
 func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 	rep := scenarioReport{
-		Case:     sr.tc.Name,
-		Image:    sr.subject.ImageRef(),
-		Nodes:    sr.tc.Cluster.Nodes,
-		NodeCPU:  sr.r.runCPULimit,
-		NodeMem:  sr.r.runMemLimit,
-		Measures: sr.measures,
-		Notes:    sr.notes,
+		Case:        sr.tc.Name,
+		Image:       sr.subject.ImageRef(),
+		ImageID:     sr.imageID,
+		ImageLabels: sr.imageLabels,
+		Nodes:       sr.tc.Cluster.Nodes,
+		NodeCPU:     sr.r.runCPULimit,
+		NodeMem:     sr.r.runMemLimit,
+		Measures:    sr.measures,
+		Notes:       sr.notes,
 	}
 
 	if !sr.tc.HasGenerator() {
@@ -1635,4 +1674,21 @@ func toxiproxySetLatency(port int, proxy string, latency, jitter time.Duration) 
 		}
 	}
 	return nil
+}
+
+// imageIdentity returns the local image's short ID and its labels, so a
+// result always says which build it ran on.
+func imageIdentity(ref string) (string, map[string]string) {
+	out, err := exec.Command("docker", "image", "inspect", "-f", "{{.Id}}|{{json .Config.Labels}}", ref).Output()
+	if err != nil {
+		return "", nil
+	}
+	id, labelsJSON, _ := strings.Cut(strings.TrimSpace(string(out)), "|")
+	id = strings.TrimPrefix(id, "sha256:")
+	if len(id) > 12 {
+		id = id[:12]
+	}
+	var labels map[string]string
+	_ = json.Unmarshal([]byte(labelsJSON), &labels)
+	return id, labels
 }
