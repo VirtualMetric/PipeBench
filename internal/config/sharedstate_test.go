@@ -104,6 +104,19 @@ func TestSharedStateRefusals(t *testing.T) {
 		"account key":       {func(tc *TestCase) { tc.Azure.Accounts = []AzureAccount{{Name: "statestore", Key: "not base64!"}} }, "must be base64"},
 		"dev account again": {func(tc *TestCase) { tc.Azure.Accounts = []AzureAccount{{Name: AzuriteAccount, Key: "a2V5"}} }, "twice"},
 		"outage stream":     {func(tc *TestCase) { tc.SharedState.OutageStreams = []string{"nope"} }, "outage_streams names \"nope\""},
+		"outage stream, no outage": {func(tc *TestCase) {
+			tc.SharedState.OutageStreams = []string{"listener"}
+		}, "only judged by the pause_store and isolate_replica actions"},
+		"outage stream, short pause": {func(tc *TestCase) {
+			tc.SharedState.Action = SharedStateActionPauseStore
+			tc.SharedState.OutageSeconds = 15
+			tc.SharedState.OutageStreams = []string{"listener"}
+		}, "needs outage_seconds of 20 or more"},
+		"outage stream, short isolation": {func(tc *TestCase) {
+			tc.SharedState.Action = SharedStateActionIsolateReplica
+			tc.SharedState.OutageSeconds = 19
+			tc.SharedState.OutageStreams = []string{"listener"}
+		}, "needs outage_seconds of 20 or more"},
 		"wrong credentials, no replica": {func(tc *TestCase) {
 			tc.SharedState.Action = SharedStateActionWrongCredentials
 		}, "needs shared_state.bad_replica"},
@@ -142,5 +155,17 @@ func TestAzuriteAccountsEnv(t *testing.T) {
 	want := AzuriteAccount + ":" + AzuriteKey + ";statestore:c2VjcmV0"
 	if got := a.AzuriteAccountsEnv(); got != want {
 		t.Errorf("got %q, want %q: Azurite drops its development account once the variable is set", got, want)
+	}
+}
+
+func TestOutageStreamsNeedAnOutageToJudge(t *testing.T) {
+	for _, outage := range []int{0, 20, 30} {
+		tc := sharedStateCase()
+		tc.SharedState.Action = SharedStateActionPauseStore
+		tc.SharedState.OutageSeconds = outage
+		tc.SharedState.OutageStreams = []string{"listener"}
+		if err := tc.Validate(); err != nil {
+			t.Errorf("outage_seconds %d (0 means the default, 30) with outage_streams was refused: %v", outage, err)
+		}
 	}
 }

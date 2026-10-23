@@ -172,6 +172,11 @@ type SharedStateConfig struct {
 	ScaleMinShare float64 `yaml:"scale_min_share"`
 }
 
+// MinOutageForStreamsSeconds is the shortest outage whose outage_streams the
+// driver can judge: it counts them first 15 seconds into the outage, and a
+// stream needs a few seconds after that to show it still arrives.
+const MinOutageForStreamsSeconds = 20
+
 // OutageOrDefault returns OutageSeconds, or 30.
 func (s *SharedStateConfig) OutageOrDefault() int {
 	if s == nil || s.OutageSeconds <= 0 {
@@ -447,6 +452,18 @@ func (tc *TestCase) validateSharedState() error {
 	for _, name := range s.OutageStreams {
 		if !names[name] {
 			return fmt.Errorf("case %q: shared_state.outage_streams names %q, which shared_state.streams does not define", tc.Name, name)
+		}
+	}
+	if len(s.OutageStreams) > 0 {
+		switch s.Action {
+		case SharedStateActionPauseStore, SharedStateActionIsolateReplica:
+			// The driver counts the outage streams first 15 seconds into the
+			// outage, and judges their growth from there to its end.
+			if s.OutageOrDefault() < MinOutageForStreamsSeconds {
+				return fmt.Errorf("case %q: shared_state.outage_streams needs outage_seconds of %d or more: the streams are counted from 15 seconds into the outage, so a shorter outage leaves too little to judge", tc.Name, MinOutageForStreamsSeconds)
+			}
+		default:
+			return fmt.Errorf("case %q: shared_state.outage_streams is only judged by the pause_store and isolate_replica actions", tc.Name)
 		}
 	}
 	switch s.Action {
