@@ -1112,6 +1112,11 @@ func (tc *TestCase) TracksUniqueLines() bool {
 	if tc.UsesDatabase() && !tc.HasGenerator() {
 		return true
 	}
+	// The shared-state driver counts loss and duplicates from unique lines, so
+	// its cases track them whatever the case file says.
+	if tc.IsDirectorSharedStateType() {
+		return true
+	}
 
 	return tc.IsMidDeliveryVerdictType() && tc.HasGenerator() && tc.Generator.Format == "json"
 }

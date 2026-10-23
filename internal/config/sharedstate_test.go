@@ -63,6 +63,19 @@ func TestSharedStateValidates(t *testing.T) {
 	}
 }
 
+// The driver counts loss from unique lines, so a shared-state case tracks
+// them even when its file does not turn on dedup validation. Without them,
+// every line sent would count as lost.
+func TestSharedStateTracksUniqueLines(t *testing.T) {
+	tc := sharedStateCase()
+	if tc.Correctness.ValidateDedup {
+		t.Fatal("the test case must leave dedup validation off")
+	}
+	if !tc.TracksUniqueLines() {
+		t.Error("a shared-state case does not track unique lines")
+	}
+}
+
 func TestSharedStateRefusals(t *testing.T) {
 	cases := map[string]struct {
 		change func(*TestCase)
