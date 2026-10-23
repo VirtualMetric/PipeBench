@@ -734,7 +734,7 @@ services:
     networks: [bench]
     command: ["-host=0.0.0.0", "-config=/toxiproxy/toxiproxy.json"]
     ports:
-      - "{{ .ToxiproxyHostPort }}:8474"
+      - "127.0.0.1:{{ .ToxiproxyHostPort }}:8474"
     volumes:
       - "{{ .ToxiproxyConfigHost }}:/toxiproxy:ro"
     restart: "no"

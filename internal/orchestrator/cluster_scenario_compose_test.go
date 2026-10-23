@@ -162,8 +162,10 @@ func TestClusterScenarioComposeRendersTopology(t *testing.T) {
 	if cmd, _ := wi["command"].([]any); len(cmd) != 1 || strings.Contains(cmd[0].(string), "/witness") {
 		t.Fatalf("witness-init's command must not carry the directory itself: %v", wi["command"])
 	}
-	if !strings.Contains(raw, "18474:8474") {
-		t.Fatalf("Toxiproxy's API port is not published")
+	// Toxiproxy's API can change the cluster's network, so only this host's
+	// loopback may reach it.
+	if !strings.Contains(raw, `"127.0.0.1:18474:8474"`) {
+		t.Fatalf("Toxiproxy's API port must be published on 127.0.0.1 only")
 	}
 
 	// Members 1..3 name three nodes; the spare names four.

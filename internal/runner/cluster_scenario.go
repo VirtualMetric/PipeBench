@@ -1902,7 +1902,8 @@ func toxiproxyDo(port int, method, path string, body any) error {
 		}
 		rd = strings.NewReader(string(b))
 	}
-	req, err := http.NewRequest(method, fmt.Sprintf("http://localhost:%d%s", port, path), rd) //nolint:noctx // short local call
+	// Toxiproxy's API is published on IPv4 loopback only, so name it exactly.
+	req, err := http.NewRequest(method, fmt.Sprintf("http://127.0.0.1:%d%s", port, path), rd) //nolint:noctx // short local call
 	if err != nil {
 		return err
 	}
