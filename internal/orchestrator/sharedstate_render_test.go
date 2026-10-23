@@ -111,6 +111,11 @@ func TestSharedStateComposeRendersReplicas(t *testing.T) {
 	if got := parsed.Services["azurite"].Env["AZURITE_ACCOUNTS"]; got != config.AzuriteAccount+":"+config.AzuriteKey+";statestore:c2VjcmV0" {
 		t.Errorf("AZURITE_ACCOUNTS = %q", got)
 	}
+	// Loss is counted on the records' sequence numbers. Without them a line
+	// that arrived cut counts as a distinct record and hides a lost one.
+	if got := parsed.Services["receiver-blob"].Env["RECEIVER_TRACK_SEQ"]; got != "true" {
+		t.Errorf("receiver-blob RECEIVER_TRACK_SEQ = %q, want true", got)
+	}
 
 	// One config per replica, the same apart from what a case asks for.
 	read := func(n int) string {

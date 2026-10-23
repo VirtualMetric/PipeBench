@@ -161,3 +161,29 @@ func TestParseAckedParam(t *testing.T) {
 		t.Fatalf("parseAckedParam accepted an entry without a colon")
 	}
 }
+
+// TestSeqTrackerSkipsACutLine: a record that arrives without its head is a
+// distinct line to the hash check, so a loss counted as sent minus distinct
+// lines comes out at 0. The tracker finds no sequence number in it: one
+// record is missing and one line is unparsed.
+func TestSeqTrackerSkipsACutLine(t *testing.T) {
+	lines := []string{
+		"CONN=0 SEQ=0 aaaaaaaaaaaaaaaaaaaaaaaa",
+		"CONN=0 SEQ=1 bbbbbbbbbbbbbbbbbbbbbbbb",
+		"cccccccccccc", // the tail of SEQ=2, whose head never arrived
+	}
+	val := newValidator()
+	tr := newSeqTracker()
+	now := time.Now().UnixNano()
+	for _, l := range lines {
+		val.recordLine([]byte(l), config{ValidateDedup: true})
+		tr.record([]byte(l), now)
+	}
+	if unique, _ := val.dedupStats(); unique != 3 {
+		t.Fatalf("hash check: %d distinct lines, want 3: the cut line counts as a record there", unique)
+	}
+	got := tr.check(map[int64]int64{0: 3}, 5)
+	if got.Unique != 2 || got.Missing != 1 || got.Unparsed != 1 {
+		t.Errorf("tracker: unique %d missing %d unparsed %d, want 2 1 1", got.Unique, got.Missing, got.Unparsed)
+	}
+}

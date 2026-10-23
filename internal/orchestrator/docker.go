@@ -2970,6 +2970,11 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 	if err := applyClusterScenarioTopology(&vars, cfg); err != nil {
 		return err
 	}
+	// Shared-state topology: sequence tracking on every receiver
+	// (sharedstate_compose.go).
+	if err := applySharedStateTopology(&vars, cfg); err != nil {
+		return err
+	}
 
 	tmpl, err := template.New("compose").Parse(composeTemplate)
 	if err != nil {

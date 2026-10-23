@@ -3,7 +3,9 @@ package runner
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"maps"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -254,7 +256,12 @@ func (run *ssRun) markStarted(n int) {
 // only read again by the final checks. A read that fails here fails the run,
 // because the checks would then pass on part of the evidence; endReplica
 // reports whether the read succeeded.
-func (run *ssRun) endReplica(n int, at time.Time, how string) bool {
+//
+// stopped says the harness asked the process to stop (docker stop: SIGTERM,
+// then SIGKILL 30 seconds later). Such a process must have exited by itself:
+// one that Docker had to kill did not stop gracefully, whatever else the
+// case then measures.
+func (run *ssRun) endReplica(n int, at time.Time, how string, stopped bool) bool {
 	rep := run.replica(n)
 	err := run.book.refresh(rep.Container)
 	if err != nil {
@@ -262,7 +269,43 @@ func (run *ssRun) endReplica(n int, at time.Time, how string) bool {
 	}
 	run.running[n] = false
 	run.ended = append(run.ended, ssEvent{At: at, Container: rep.Container, Kind: ssProcessEnd, Text: "harness: " + how})
+	if stopped {
+		run.checkGracefulExit(rep, how)
+	}
 	return err == nil
+}
+
+// containerExit reads how a container's process ended: its exit code, and
+// whether the kernel killed it for memory. Tests replace it.
+var containerExit = func(container string) (code int, oomKilled bool, err error) {
+	out, err := exec.Command("docker", "inspect", "-f", "{{.State.ExitCode}} {{.State.OOMKilled}}", container).Output()
+	if err != nil {
+		return 0, false, fmt.Errorf("docker inspect %s: %w", container, err)
+	}
+	_, err = fmt.Sscanf(strings.TrimSpace(string(out)), "%d %t", &code, &oomKilled)
+	return code, oomKilled, err
+}
+
+// checkGracefulExit fails the run when a replica the harness stopped did not
+// exit by itself, and keeps its exit code.
+func (run *ssRun) checkGracefulExit(rep ssReplica, how string) {
+	code, oom, err := containerExit(rep.Container)
+	if err != nil {
+		run.fail("reading how %s's process ended after the %s: %v", rep.Service, how, err)
+		return
+	}
+	codes, _ := run.measures["stop_exit_codes"].(map[string][]int)
+	if codes == nil {
+		codes = map[string][]int{}
+		run.measures["stop_exit_codes"] = codes
+	}
+	codes[rep.Service] = append(codes[rep.Service], code)
+	switch {
+	case oom:
+		run.fail("%s ran out of memory in the %s, so its process did not stop by itself", rep.Service, how)
+	case code == 137:
+		run.fail("%s did not exit within 30s of the SIGTERM of the %s, so Docker killed it (exit code 137): the stop was not graceful", rep.Service, how)
+	}
 }
 
 // fail records why the case fails.
@@ -943,7 +986,7 @@ func (run *ssRun) disruptAndReplace(n int, how string, replace bool) {
 	took := time.Since(issued)
 	// The daemon's own time of the end is on the clock the log lines carry.
 	endedAt := containerFinishedAt(rep.Container, time.Now())
-	run.endReplica(n, endedAt, "docker "+how)
+	run.endReplica(n, endedAt, "docker "+how, how == "stop")
 	// A kill ends the process at once. A stop starts the handover when the
 	// signal is sent: the end, less the time the stop took, on the same clock.
 	from := endedAt
@@ -1159,7 +1202,8 @@ func (run *ssRun) analyse() {
 }
 
 // checkStreams compares what each generator sent with what its receiver
-// holds.
+// holds. It counts records by the sequence numbers the generator put in
+// them, so a line that arrived cut or garbled is not taken for a record.
 func (run *ssRun) checkStreams() {
 	ports := run.orch.ReceiverMetricsPorts()
 	streams := map[string]any{}
@@ -1171,37 +1215,73 @@ func (run *ssRun) checkStreams() {
 			run.fail("stream %s: the receiver did not answer: %v", st.StreamName(), err)
 			continue
 		}
-		loss := max(sent-m.UniqueLines, 0)
-		dupPct := 0.0
-		if m.UniqueLines > 0 {
-			dupPct = 100 * float64(m.Duplicates) / float64(m.UniqueLines)
+		seq, err := receiverSeqCounts(ports[st.Receiver])
+		if err != nil {
+			run.fail("stream %s: the receiver did not count the records' sequence numbers (%v); these cases need the receiver of PipeBench v0.4.7 or later", st.StreamName(), err)
+			continue
 		}
+		got := ssStreamCounts{Received: m.LinesReceived, Unique: seq.Unique, Duplicates: seq.Duplicates, Unparsed: seq.Unparsed}
+		loss := max(sent-got.Unique, 0)
+		dupPct := got.duplicatePct()
 		streams[st.StreamName()] = map[string]any{
-			"sent": sent, "received": m.LinesReceived, "unique": m.UniqueLines,
-			"duplicates": m.Duplicates, "duplicate_pct": dupPct, "lost": loss,
+			"sent": sent, "received": got.Received, "unique": got.Unique,
+			"duplicates": got.Duplicates, "duplicate_pct": dupPct, "lost": loss,
+			"unnumbered": got.Unparsed,
 		}
 		run.linesIn += sent
-		run.linesOut += m.LinesReceived
-		run.uniqueOut += m.UniqueLines
-		run.perReceiver[st.Receiver] = m.LinesReceived
-		fmt.Printf("  stream %s: sent %d, received %d (%d distinct, %d repeated, %.2f%%), lost %d\n",
-			st.StreamName(), sent, m.LinesReceived, m.UniqueLines, m.Duplicates, dupPct, loss)
-		for _, why := range judgeStream(st, sent, m) {
+		run.linesOut += got.Received
+		run.uniqueOut += got.Unique
+		run.perReceiver[st.Receiver] = got.Received
+		fmt.Printf("  stream %s: sent %d, received %d (%d distinct, %d repeated, %.2f%%, %d without a number), lost %d\n",
+			st.StreamName(), sent, got.Received, got.Unique, got.Duplicates, dupPct, got.Unparsed, loss)
+		for _, why := range judgeStream(st, sent, got) {
 			run.fail("%s", why)
 		}
 	}
 	run.measures["streams"] = streams
 }
 
+// ssStreamCounts is what a receiver holds of one stream: every line that
+// arrived, the distinct records among them by their sequence numbers, the
+// copies of records that arrived before, and the lines that carry no number.
+type ssStreamCounts struct {
+	Received, Unique, Duplicates, Unparsed int64
+}
+
+func (c ssStreamCounts) duplicatePct() float64 {
+	if c.Unique == 0 {
+		return 0
+	}
+	return 100 * float64(c.Duplicates) / float64(c.Unique)
+}
+
+// receiverSeqCounts reads what a receiver's sequence tracking counted.
+func receiverSeqCounts(port int) (seqCheckResult, error) {
+	var out seqCheckResult
+	resp, err := receiverClient.Get(fmt.Sprintf("http://localhost:%d/seqcheck?acked=", port)) //nolint:noctx // short local call
+	if err != nil {
+		return out, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return out, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return out, fmt.Errorf("/seqcheck: %s", resp.Status)
+	}
+	return out, json.Unmarshal(body, &out)
+}
+
 // judgeStream returns why a stream fails, if it does, from what its generator
 // sent and what its receiver holds.
-func judgeStream(st config.SharedStateStream, sent int64, m ReceiverMetrics) []string {
+func judgeStream(st config.SharedStateStream, sent int64, got ssStreamCounts) []string {
 	// A stream whose devices must not run is judged on arrivals alone. Its
 	// generator may send nothing at all: a TCP sender whose listener never
 	// started can give up before its first write.
 	if st.ExpectNothing {
-		if m.LinesReceived > 0 {
-			return []string{fmt.Sprintf("stream %s: %d records arrived, and none may: its devices must not run", st.StreamName(), m.LinesReceived)}
+		if got.Received > 0 {
+			return []string{fmt.Sprintf("stream %s: %d records arrived, and none may: its devices must not run", st.StreamName(), got.Received)}
 		}
 		return nil
 	}
@@ -1209,20 +1289,23 @@ func judgeStream(st config.SharedStateStream, sent int64, m ReceiverMetrics) []s
 		return []string{fmt.Sprintf("stream %s: the generator sent nothing", st.StreamName())}
 	}
 	var out []string
-	if loss := max(sent-m.UniqueLines, 0); loss > st.MaxLoss {
+	if got.Unparsed > 0 {
+		out = append(out, fmt.Sprintf("stream %s: %d lines arrived without a record's sequence number, so they arrived cut or garbled", st.StreamName(), got.Unparsed))
+	}
+	if got.Unique > sent {
+		out = append(out, fmt.Sprintf("stream %s: %d distinct records arrived, %d more than the generator sent", st.StreamName(), got.Unique, got.Unique-sent))
+	}
+	if loss := max(sent-got.Unique, 0); loss > st.MaxLoss {
 		out = append(out, fmt.Sprintf("stream %s: %d records were lost, above max_loss %d", st.StreamName(), loss, st.MaxLoss))
 	}
-	dupPct := 0.0
-	if m.UniqueLines > 0 {
-		dupPct = 100 * float64(m.Duplicates) / float64(m.UniqueLines)
-	}
+	dupPct := got.duplicatePct()
 	switch {
 	case st.MaxDuplicates != nil:
-		if m.Duplicates > *st.MaxDuplicates {
-			out = append(out, fmt.Sprintf("stream %s: %d records arrived more than once, above max_duplicates %d", st.StreamName(), m.Duplicates, *st.MaxDuplicates))
+		if got.Duplicates > *st.MaxDuplicates {
+			out = append(out, fmt.Sprintf("stream %s: %d records arrived more than once, above max_duplicates %d", st.StreamName(), got.Duplicates, *st.MaxDuplicates))
 		}
 	case dupPct > st.MaxDuplicatePct:
-		out = append(out, fmt.Sprintf("stream %s: %d records arrived more than once (%.2f%%), above max_duplicate_pct %.2f", st.StreamName(), m.Duplicates, dupPct, st.MaxDuplicatePct))
+		out = append(out, fmt.Sprintf("stream %s: %d records arrived more than once (%.2f%%), above max_duplicate_pct %.2f", st.StreamName(), got.Duplicates, dupPct, st.MaxDuplicatePct))
 	}
 	return out
 }
@@ -1235,17 +1318,43 @@ func (run *ssRun) checkOwnershipOverlaps() {
 	for _, rep := range run.replicas {
 		intervals = append(intervals, ssOwnership(rep.Container, run.events(rep.Container), until)...)
 	}
-	overlaps := ssOverlaps(intervals, time.Second)
+	overlaps := ssOverlaps(intervals, 0)
 	var report []map[string]any
 	for _, o := range overlaps {
 		report = append(report, map[string]any{
 			"device": o.Device, "a": o.A, "b": o.B,
-			"from": o.From.UTC(), "seconds": o.Seconds(),
+			"from": o.From.UTC(), "seconds": o.Seconds(), "judged": o.To.Sub(o.From) > ssOverlapTolerance,
 		})
-		run.fail("device %d ran on %s and %s at once for %.1fs, from %s", o.Device, o.A, o.B, o.Seconds(), o.From.UTC().Format("15:04:05.000"))
+	}
+	fails, notes := judgeOverlaps(overlaps)
+	for _, f := range fails {
+		run.fail("%s", f)
+	}
+	for _, n := range notes {
+		run.note("%s", n)
 	}
 	run.measures["ownership_overlaps"] = report
 	run.measures["ownership_intervals"] = len(intervals)
+}
+
+// ssOverlapTolerance is how long two replicas may seem to run one device at
+// once before the case fails. Docker stamps each line as it reads it from its
+// container, so the lines of two containers can come out a few milliseconds
+// out of order. A double run of a tenth of a second is no such jitter.
+const ssOverlapTolerance = 100 * time.Millisecond
+
+// judgeOverlaps fails every overlap longer than ssOverlapTolerance, and
+// reports the shorter ones as notes, so that none goes unseen.
+func judgeOverlaps(overlaps []ssOverlap) (fails, notes []string) {
+	for _, o := range overlaps {
+		what := fmt.Sprintf("device %d ran on %s and %s at once for %.3fs, from %s", o.Device, o.A, o.B, o.Seconds(), o.From.UTC().Format("15:04:05.000"))
+		if o.To.Sub(o.From) > ssOverlapTolerance {
+			fails = append(fails, what)
+		} else {
+			notes = append(notes, what+fmt.Sprintf(": within the %s the log stamps of two containers can be apart, so it is reported, not judged", ssOverlapTolerance))
+		}
+	}
+	return fails, notes
 }
 
 // countStoreCalls counts the replicas' calls to the shared state's container,

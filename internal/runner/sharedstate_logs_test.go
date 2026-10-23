@@ -149,7 +149,7 @@ func TestOverlaps(t *testing.T) {
 		iv("b", 11, 100, 200), // a clean handover: no overlap
 		iv("c", 11, 150, 160), // b and c both run device 11 for 10 seconds
 		iv("a", 12, 0, 100),   // another device: never compared with 11
-		iv("b", 12, 99, 150),  // one second of jitter at the handover is tolerated
+		iv("b", 12, 100, 150), // a handover on the second: no overlap
 		iv("b", 11, 300, 400), // the same container twice: never an overlap
 		iv("b", 11, 350, 360),
 	}
@@ -268,5 +268,32 @@ func TestSSLogBookRefreshReportsALogItCannotRead(t *testing.T) {
 	}
 	if lines := book.all("pipebench-test-no-such-container"); len(lines) != 0 {
 		t.Fatalf("the book holds %d lines of a container it could not read", len(lines))
+	}
+}
+
+// TestOverlapUnderASecond: the lines of a pause_store run against a dev build.
+// Once the store was back, subject-1 took the three pollers' leases again.
+// subject-2, the new leader, took them over a second later, because
+// subject-1's member record had lapsed during the outage, and subject-1 found
+// out a second after that. Both ran the pollers for 0.949 seconds. The old
+// one-second tolerance passed the run.
+func TestOverlapUnderASecond(t *testing.T) {
+	s1 := parseDockerLogLines(`2026-10-23T20:30:35.762000000Z [2026-10-23 20:30:35] [Information] [director] [azblob-12] Acquired ownership lease for device 12 (blob-1) on node 7001 (epoch 1)
+2026-10-23T20:30:37.763000000Z [2026-10-23 20:30:37] [Debug] [director] Ownership lease for device 12 (blob-1) was not released by node subject-1-8dae988b-b667-4da3-a493-6de981d7b8f6: devicekv: revision mismatch`)
+	s2 := parseDockerLogLines(`2026-10-23T20:30:36.814000000Z [2026-10-23 20:30:36] [Information] [director] Taking over the ownership lease of device 12 from node subject-1-8dae988b-b667-4da3-a493-6de981d7b8f6, which is no longer a live member (lease valid for another 16s); epoch 2 on node subject-2-77344d38-320d-4401-9c61-cb9159653e41
+2026-10-23T20:30:36.814000000Z [2026-10-23 20:30:36] [Information] [director] [azblob-12] Acquired ownership lease for device 12 (blob-1) on node 7001 (epoch 2)`)
+	until := at(t, "2026-10-23T20:31:00Z")
+	intervals := append(ssOwnership("subject-1", ssEventsOf("subject-1", s1), until), ssOwnership("subject-2", ssEventsOf("subject-2", s2), until)...)
+	if old := ssOverlaps(intervals, time.Second); len(old) != 0 {
+		t.Fatalf("the old tolerance found %v; the run passed", old)
+	}
+	fails, notes := judgeOverlaps(ssOverlaps(intervals, 0))
+	if len(fails) != 1 || !strings.Contains(fails[0], "device 12 ran on subject-1 and subject-2 at once for 0.949s, from 20:30:36.814") || len(notes) != 0 {
+		t.Errorf("fails %q, notes %q; want the 0.949s double run", fails, notes)
+	}
+	// Two containers' stamps a few milliseconds apart are reported, not judged.
+	jitter := []ssOverlap{{Device: 11, A: "subject-1", B: "subject-2", From: until, To: until.Add(40 * time.Millisecond)}}
+	if fails, notes := judgeOverlaps(jitter); len(fails) != 0 || len(notes) != 1 || !strings.Contains(notes[0], "reported, not judged") {
+		t.Errorf("40ms: fails %q, notes %q", fails, notes)
 	}
 }

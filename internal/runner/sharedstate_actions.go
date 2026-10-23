@@ -3,6 +3,7 @@ package runner
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/url"
 	"os/exec"
 	"slices"
@@ -327,10 +328,49 @@ func (run *ssRun) judgeOutageStreams(base *outageBaseline, during map[string]int
 	run.measures["outage_stream_window_seconds"] = window.Seconds()
 	fmt.Printf("    records that arrived in the last %s of the outage: %v\n", window.Round(time.Second), growth)
 	for _, name := range run.ss.OutageStreams {
-		if growth[name] <= 0 {
-			run.fail("stream %s stopped during the outage: no record arrived in its last %s", name, window.Round(time.Second))
+		if why := outageShortfall(name, growth[name], window, run.streamPace(name)); why != "" {
+			run.fail("%s", why)
 		}
 	}
+}
+
+// outageShortfall says why an outage stream's arrivals in the window fall
+// short, or "". A record or two would only show that something arrived, so
+// the stream must keep at least half the pace its generator sends at.
+func outageShortfall(name string, growth int64, window time.Duration, perSec float64) string {
+	if growth <= 0 {
+		return fmt.Sprintf("stream %s stopped during the outage: no record arrived in its last %s", name, window.Round(time.Second))
+	}
+	paced := perSec * window.Seconds()
+	if perSec > 0 && float64(growth) < paced/2 {
+		return fmt.Sprintf("stream %s slowed during the outage: in its last %s, %s arrived of the %.0f its generator sends in that time; at least half must arrive", name, window.Round(time.Second), countOf(growth, "record"), paced)
+	}
+	return ""
+}
+
+// countOf says n of a thing: "1 record", "2 records".
+func countOf(n int64, thing string) string {
+	if n == 1 {
+		return "1 " + thing
+	}
+	return strconv.FormatInt(n, 10) + " " + thing + "s"
+}
+
+// streamPace is how many records a second the generator of the named stream
+// sends: its rate on each of its connections. It is 0 for a stream whose
+// generator has no rate limit.
+func (run *ssRun) streamPace(name string) float64 {
+	for _, st := range run.ss.Streams {
+		if st.StreamName() != name {
+			continue
+		}
+		for _, g := range run.tc.AllGenerators() {
+			if g.ID == st.Generator {
+				return float64(g.Rate) * float64(max(g.Connections, 1))
+			}
+		}
+	}
+	return 0
 }
 
 // outageBaselineDelay is how far into an outage the driver counts the outage
@@ -452,7 +492,7 @@ func (run *ssRun) scaleOutIn() {
 		return
 	}
 	took := time.Since(issued)
-	run.endReplica(n, containerFinishedAt(rep.Container, time.Now()), "scale-in")
+	run.endReplica(n, containerFinishedAt(rep.Container, time.Now()), "scale-in", true)
 	run.measures["scale_in_exit_seconds"] = took.Seconds()
 	fmt.Printf("    %s exited %.1fs after the stop began\n", rep.Service, took.Seconds())
 	if got := run.waitStoreMembers(run.ss.Replicas, 30*time.Second); got != run.ss.Replicas {
@@ -535,7 +575,7 @@ func (run *ssRun) coldRestart() {
 		}
 	}
 	for _, rep := range running {
-		run.endReplica(rep.N, containerFinishedAt(rep.Container, time.Now()), "cold restart")
+		run.endReplica(rep.N, containerFinishedAt(rep.Container, time.Now()), "cold restart", true)
 	}
 	fmt.Printf("    all stopped after %.1fs; starting new containers…\n", time.Since(stopped).Seconds())
 	var services []string
@@ -631,15 +671,100 @@ func (run *ssRun) storeCalls() {
 	if limit := run.ss.MaxStoreReadsPerSec; limit > 0 && rates.ReadsPerSec > limit {
 		run.fail("under load the replicas read or listed the store %.2f times a second, above max_store_reads_per_sec %.2f", rates.ReadsPerSec, limit)
 	}
-	run.checkStateWrites(calls, from.Add(skew), to.Add(skew))
+	// The window must be steady. A replica that stopped leading, a device
+	// that moved, a bus that started again or a store that stood still all
+	// make the replicas write at once, whatever the interval, so the window
+	// would say nothing about the interval.
+	run.refreshAll()
+	var events []ssEvent
+	for _, rep := range run.replicas {
+		events = append(events, run.events(rep.Container)...)
+	}
+	disturbed := windowDisturbances(events, calls, run.ss.StoreContainerOrDefault(), from.Add(skew), to.Add(skew))
+	run.measures["store_calls_load_disturbances"] = disturbed
+	for _, d := range disturbed {
+		run.fail("the load window was not steady, so its store calls are no evidence: %s", d)
+	}
+	run.checkStateWrites(calls, from.Add(skew), to.Add(skew), len(disturbed) == 0)
+}
+
+// ssStoreStall is how long Azurite may serve no request at all before the
+// driver calls it a stall. Every replica renews its member record every two
+// seconds, so a store that is quiet this long stood still, or the machine
+// did.
+const ssStoreStall = 5 * time.Second
+
+// windowDisturbances lists what happened in [from, to) that a steady window
+// does not hold: a replica that started or stopped leading, a device that
+// started, stopped or was placed, a bus or process that started or stopped,
+// the state bus writing as more than one writer, and Azurite serving no
+// request for ssStoreStall or longer.
+func windowDisturbances(events []ssEvent, calls []ssStoreCall, container string, from, to time.Time) []string {
+	var out []string
+	sorted := slices.Clone(events)
+	sortSSEvents(sorted)
+	for _, e := range sorted {
+		if e.At.Before(from) || !e.At.Before(to) {
+			continue
+		}
+		if what := disturbanceOf(e); what != "" {
+			out = append(out, fmt.Sprintf("%s %s at %s", e.Container, what, e.At.UTC().Format("15:04:05.000")))
+		}
+	}
+	writers := slices.Sorted(maps.Keys(segmentWrites(calls, container, from, to)))
+	if len(writers) > 1 {
+		out = append(out, fmt.Sprintf("the state bus wrote its segments as %d writers (%s): it moved or started again", len(writers), strings.Join(writers, ", ")))
+	}
+	last := from
+	for _, c := range calls {
+		if c.At.Before(from) || !c.At.Before(to) {
+			continue
+		}
+		if gap := c.At.Sub(last); gap >= ssStoreStall {
+			out = append(out, fmt.Sprintf("Azurite served no request for %.1fs from %s", gap.Seconds(), last.UTC().Format("15:04:05.000")))
+		}
+		last = c.At
+	}
+	if gap := to.Sub(last); gap >= ssStoreStall {
+		out = append(out, fmt.Sprintf("Azurite served no request for %.1fs from %s", gap.Seconds(), last.UTC().Format("15:04:05.000")))
+	}
+	return out
+}
+
+// disturbanceOf says what an event changed, or "" for an event a steady
+// replica set also logs.
+func disturbanceOf(e ssEvent) string {
+	switch e.Kind {
+	case ssProcessStart:
+		return "started its director"
+	case ssProcessEnd:
+		return "ended its process"
+	case ssBusStarted:
+		return "started its state bus"
+	case ssBusStopped:
+		return "stopped its state bus"
+	case ssFenced:
+		return "could no longer write its bus's streams"
+	case ssLeaderUp:
+		return "became the leader"
+	case ssLeaderDown:
+		return "stopped leading"
+	case ssLeaseAcquired:
+		return fmt.Sprintf("started device %d", e.Device)
+	case ssLeaseEnded:
+		return fmt.Sprintf("stopped device %d", e.Device)
+	case ssPlaced:
+		return fmt.Sprintf("placed device %d on %s", e.Device, e.Member)
+	}
+	return ""
 }
 
 // checkStateWrites reports when the replica that runs the shared bus wrote
-// the state's segments in a window, and, when the case names the director's
-// write interval, checks each gap between two writes against it. The window
-// is one of steady load: no device moves in it, and a move is written at once
-// whatever the interval.
-func (run *ssRun) checkStateWrites(calls []ssStoreCall, from, to time.Time) {
+// the state's segments in a window, and when the snapshot rounds came. When
+// judge is set and the case names the director's write interval, it checks
+// each gap between two writes against it. The window must be one of steady
+// load (windowDisturbances): a move is written at once whatever the interval.
+func (run *ssRun) checkStateWrites(calls []ssStoreCall, from, to time.Time, judge bool) {
 	container := run.ss.StoreContainerOrDefault()
 	writer, ts := busiestWriter(segmentWrites(calls, container, from, to))
 	gaps := writeGaps(ts)
@@ -663,14 +788,26 @@ func (run *ssRun) checkStateWrites(calls []ssStoreCall, from, to time.Time) {
 	for i, g := range roundGaps {
 		roundSecs[i] = g.Seconds()
 	}
-	run.measures["state_writes_load"] = map[string]any{
-		"writer": writer, "writes": len(ts), "gaps_seconds": secs, "with_snapshot": nForced,
-		"snapshot_rounds": len(snapRounds), "snapshot_round_gaps_seconds": roundSecs,
+	writeTimes := make([]string, len(ts))
+	for i, t := range ts {
+		writeTimes[i] = t.UTC().Format("15:04:05.000")
 	}
-	fmt.Printf("    state writes under load: %d by the bus's writer (%d with a snapshot), %d apart (seconds): %v\n", len(ts), nForced, len(gaps), roundSeconds(secs))
-	fmt.Printf("    snapshot rounds under load: %d, apart (seconds): %v\n", len(snapRounds), roundSeconds(roundSecs))
+	roundTimes := make([]string, len(snapRounds))
+	for i, t := range snapRounds {
+		roundTimes[i] = t.UTC().Format("15:04:05.000")
+	}
+	run.measures["state_writes_load"] = map[string]any{
+		"writer": writer, "writes": len(ts), "write_times": writeTimes, "gaps_seconds": secs, "with_snapshot": nForced,
+		"snapshot_rounds": len(snapRounds), "snapshot_round_times": roundTimes, "snapshot_round_gaps_seconds": roundSecs,
+	}
+	fmt.Printf("    state writes under load: %d by the bus's writer (%d with a snapshot), at %v, %d apart (seconds): %v\n", len(ts), nForced, writeTimes, len(gaps), roundSeconds(secs))
+	fmt.Printf("    snapshot rounds under load: %d, at %v, apart (seconds): %v\n", len(snapRounds), roundTimes, roundSeconds(roundSecs))
 	n := run.ss.StateWriteIntervalSeconds
 	if n <= 0 {
+		return
+	}
+	if !judge {
+		fmt.Printf("    the write interval is not judged: the window was not steady\n")
 		return
 	}
 	want := time.Duration(n) * time.Second
@@ -987,12 +1124,12 @@ func (run *ssRun) moveThenKill() {
 	if within := run.ss.MoveKillWithinOrDefault(); lag > within {
 		run.fail("the kill came %.2fs after the device moved, later than move_kill_within_ms %d", lag.Seconds(), within.Milliseconds())
 	}
-	run.endReplica(target.N, killedAt, "docker kill")
+	run.endReplica(target.N, killedAt, "docker kill", false)
 
 	if err := <-stopped; err != nil {
 		run.fail("docker stop %s: %v", orep.Service, err)
 	}
-	run.endReplica(owner, containerFinishedAt(orep.Container, time.Now()), "docker stop")
+	run.endReplica(owner, containerFinishedAt(orep.Container, time.Now()), "docker stop", true)
 
 	// The replica set must settle on what is left before the platform brings
 	// the two back.
@@ -1086,7 +1223,7 @@ func (run *ssRun) restartOne(n int, exits map[string]float64) bool {
 	exits[rep.Service] = time.Since(issued).Seconds()
 	fmt.Printf("    %s exited %.1fs after the stop began\n", rep.Service, exits[rep.Service])
 	// The new container takes the old one's log with it.
-	if !run.endReplica(n, containerFinishedAt(rep.Container, time.Now()), "rolling restart") {
+	if !run.endReplica(n, containerFinishedAt(rep.Container, time.Now()), "rolling restart", true) {
 		return false
 	}
 	if !run.replaceAll([]int{n}) {
