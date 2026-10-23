@@ -163,8 +163,12 @@ type scenarioRun struct {
 	// cannot pass for a healthy cluster.
 	down           map[int]bool
 	lastDisruption time.Time
-	upAt           time.Time
-	loadStarted    time.Time
+	// disruptionAcked is the client's acknowledged line count at the last
+	// disruption. disruptionAckedOK is false when it could not be read.
+	disruptionAcked   int64
+	disruptionAckedOK bool
+	upAt              time.Time
+	loadStarted       time.Time
 
 	steps    []scenarioStepReport
 	events   []scenarioEvent
@@ -582,6 +586,12 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		hold := st.DurationOr("for", 20*time.Second)
 		since := sr.lastDisruption
 		startProg, _ := readGeneratorProgress()
+		// Count from the disruption when the client's count at that moment
+		// is known, and from the start of this step otherwise.
+		base, from := startProg.Acked, "since this step began"
+		if sr.disruptionAckedOK {
+			base, from = sr.disruptionAcked, "since the disruption"
+		}
 		deadline := since.Add(within)
 		var flatSince time.Time
 		var last genProgress
@@ -593,15 +603,16 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 					last = p
 				}
 				if time.Since(flatSince) >= hold {
-					after := last.Acked - startProg.Acked
+					after := last.Acked - base
 					stoppedMs := flatSince.Sub(since).Milliseconds()
 					sr.record(st.Record, float64(stoppedMs))
 					sr.record(st.Record+"_acked_after", float64(after))
-					return true, fmt.Sprintf("writes stopped %s after the disruption; %d lines were acknowledged after it", fmtMs(stoppedMs), after), nil
+					return true, fmt.Sprintf("writes stopped %s after the disruption; %d lines were acknowledged %s", fmtMs(stoppedMs), after, from), nil
 				}
 			}
 			if time.Now().After(deadline.Add(hold)) {
-				return false, fmt.Sprintf("the cluster kept acknowledging writes (%d lines since the disruption)", last.Acked-startProg.Acked), nil
+				sr.record(st.Record+"_acked_after", float64(last.Acked-base))
+				return false, fmt.Sprintf("the cluster kept acknowledging writes: %d lines %s", last.Acked-base, from), nil
 			}
 			if err := sleepCtx(sr.ctx, 500*time.Millisecond); err != nil {
 				return false, "", fmt.Errorf("interrupted: %w", err)
@@ -760,6 +771,14 @@ func (sr *scenarioRun) disrupt(step int, do string, node int) {
 	at := time.Now()
 	sr.lastDisruption = at
 	sr.events = append(sr.events, scenarioEvent{Step: step, Do: do, Node: node, At: at})
+	// Remember how many lines the client had acknowledged at this moment, so
+	// that a later step can count the acknowledgements that came after it.
+	sr.disruptionAcked, sr.disruptionAckedOK = 0, false
+	if !sr.loadStarted.IsZero() {
+		if p, ok := readGeneratorProgress(); ok {
+			sr.disruptionAcked, sr.disruptionAckedOK = p.Acked, true
+		}
+	}
 }
 
 func (sr *scenarioRun) nodeAction(i int, st config.ScenarioStep, rep *scenarioStepReport) (bool, string, error) {
