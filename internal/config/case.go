@@ -219,6 +219,15 @@ type TestCase struct {
 	// runDirectorClusterCorrectness.
 	Cluster *ClusterConfig `yaml:"cluster"`
 
+	// SharedState, when set, makes the subject the replicas of one serverless
+	// director that keep the state they share in a store: Replicas containers
+	// (bench-subject-<name>-1..N, hostnames subject-1..N) rendered from one
+	// config, with no node list, the way a container platform runs the
+	// replicas of one app. It parameterizes the
+	// director_shared_state_correctness driver. See SharedStateConfig and
+	// runDirectorSharedStateCorrectness.
+	SharedState *SharedStateConfig `yaml:"shared_state"`
+
 	// Fleet, when set, parameterizes the fleet_automation_correctness driver
 	// (runFleetAutomationCorrectness): the director dials the bench fleet
 	// simulator (an `endpoints:` container running vmetric/bench-fleetsim) over a
@@ -1283,8 +1292,8 @@ func (tc *TestCase) Validate() error {
 		// The tmpfs mount only renders on the singular `subject:` compose
 		// service, so pairing it with `cluster:` would silently give every
 		// node the host's full volume and quietly void the whole scenario.
-		if tc.Cluster != nil {
-			return fmt.Errorf("case %q: subject_disk cannot be combined with `cluster:` — the size-limited mount only applies to a singular subject service", tc.Name)
+		if tc.Cluster != nil || tc.SharedState != nil {
+			return fmt.Errorf("case %q: subject_disk cannot be combined with `cluster:` or `shared_state:` — the size-limited mount only applies to a singular subject service", tc.Name)
 		}
 	}
 	if len(tc.Receivers) > 0 && (tc.Receiver.Mode != "" || tc.Receiver.Listen != "") {
@@ -1457,6 +1466,9 @@ func (tc *TestCase) Validate() error {
 		return err
 	}
 	if err := tc.validateCluster(); err != nil {
+		return err
+	}
+	if err := tc.validateSharedState(); err != nil {
 		return err
 	}
 	if err := tc.validateFleet(); err != nil {

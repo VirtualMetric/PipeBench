@@ -105,6 +105,11 @@ type RunResult struct {
 	// disabled.
 	LoadBalance map[string]any `json:"load_balance,omitempty"`
 
+	// SharedState holds what a director_shared_state_correctness run
+	// measured: failover times, loss and duplicates per stream, store calls
+	// per second, and where its evidence lies. Omitted for other cases.
+	SharedState map[string]any `json:"shared_state,omitempty"`
+
 	// MetricsFile used to point at a copy of metrics.csv; with the
 	// subject-file layout we don't archive the raw CSV per run any more.
 	// Kept on the struct so old code paths compile; always empty now.
@@ -182,6 +187,7 @@ type ResultEntry struct {
 	PerReceiver map[string]int64 `json:"per_receiver,omitempty"`
 	RateWindow  map[string]any   `json:"rate_window,omitempty"`
 	LoadBalance map[string]any   `json:"load_balance,omitempty"`
+	SharedState map[string]any   `json:"shared_state,omitempty"`
 }
 
 // Store manages writing the subject-file layout.
@@ -330,6 +336,7 @@ func (s *Store) Save(r RunResult, _unusedMetricsCSVSrc string) (string, error) {
 		PerReceiver:     r.PerReceiver,
 		RateWindow:      r.RateWindow,
 		LoadBalance:     r.LoadBalance,
+		SharedState:     r.SharedState,
 	}
 
 	// Replace matching (test, config) or append.
