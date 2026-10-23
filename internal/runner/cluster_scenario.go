@@ -39,6 +39,14 @@ import (
 	"github.com/VirtualMetric/PipeBench/internal/results"
 )
 
+// wait_delivery counts only lines sent at least deliveryMargin after the
+// disruption, and needs deliveryLines of them: a tenth of a second of the
+// cases' load of 1,000 lines a second.
+const (
+	deliveryMargin = time.Second
+	deliveryLines  = 100
+)
+
 // scenarioStepReport is what one step did, for the report.
 type scenarioStepReport struct {
 	Index      int       `json:"index"`
@@ -559,12 +567,16 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		return true, fmt.Sprintf("no leader after %s, and none for %s", fmtMs(lostMs), hold), nil
 
 	case "wait_delivery":
+		// Delivery is back once lines sent after the disruption arrive. Only
+		// lines sent at least deliveryMargin after it count, so that lines
+		// already on their way, and a small difference between this host's
+		// clock and the containers' clock, cannot satisfy the wait.
 		within := st.DurationOr("within", 90*time.Second)
 		since := sr.lastDisruption
 		deadline := time.Now().Add(within)
 		for {
-			ls, err := sr.receiverLatency(since, time.Time{})
-			if err == nil && ls.Count >= 20 {
+			ls, err := sr.receiverLatency(since.Add(deliveryMargin), time.Time{})
+			if err == nil && ls.Count >= deliveryLines {
 				ms := time.Since(since).Milliseconds()
 				sr.record(st.Record, float64(ms))
 				return true, fmt.Sprintf("lines sent after the disruption arrive (seen %s after it)", fmtMs(ms)), nil
