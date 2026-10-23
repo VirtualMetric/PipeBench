@@ -146,6 +146,21 @@ type ScenarioStep struct {
 	// Log is the text wait_log waits for.
 	Log string `yaml:"log"`
 
+	// Since names an earlier mark. An expect_no_log step then checks the
+	// node's log from that mark to the end of its own window, not from its
+	// own start, so one check also covers the steps between the mark and
+	// itself. A case uses it to check that an old owner collected nothing
+	// from the moment it woke up, through the wait for the line that says it
+	// gave the device up, and for a window after that.
+	Since string `yaml:"since"`
+
+	// SentBefore names an earlier mark for a count_pending step. The step
+	// counts the acknowledged lines sent before that mark that have not
+	// reached the receiver when the step runs, and that arrive later. For
+	// example, records that killed nodes still held on their own disks,
+	// counted just before the nodes start again.
+	SentBefore string `yaml:"sent_before"`
+
 	// Soft makes a failed expectation a note instead of a failure.
 	Soft bool `yaml:"soft"`
 }
@@ -183,6 +198,7 @@ var scenarioActions = map[string]bool{
 	"wait_log":               false,
 	"expect_no_log":          true,
 	"wait_stable":            false,
+	"count_pending":          false,
 }
 
 // nodeActionSteps are the actions that act on a node, so their `as` can
@@ -371,6 +387,9 @@ func (tc *TestCase) validateClusterScenario() error {
 
 	maxNodes := tc.Cluster.Nodes + sc.SpareNodes
 	names := map[string]bool{}
+	// marks holds the labels of the marks set so far: since and sent_before
+	// may only name a mark an earlier step sets.
+	marks := map[string]bool{}
 	for i, st := range sc.Steps {
 		where := fmt.Sprintf("case %q: cluster.scenario.steps[%d] (%s)", tc.Name, i, st.Do)
 		needsNode, known := scenarioActions[st.Do]
@@ -401,6 +420,17 @@ func (tc *TestCase) validateClusterScenario() error {
 				return fmt.Errorf("%s: %s: %w", where, field, err)
 			}
 		}
+		if st.Since != "" {
+			if st.Do != "expect_no_log" {
+				return fmt.Errorf("%s: since only applies to expect_no_log", where)
+			}
+			if !marks[st.Since] {
+				return fmt.Errorf("%s: since names mark %q, which no earlier step sets", where, st.Since)
+			}
+		}
+		if st.SentBefore != "" && st.Do != "count_pending" {
+			return fmt.Errorf("%s: sent_before only applies to count_pending", where)
+		}
 		switch st.Do {
 		case "sleep":
 			if st.For == "" {
@@ -409,6 +439,20 @@ func (tc *TestCase) validateClusterScenario() error {
 		case "mark":
 			if st.Label == "" {
 				return fmt.Errorf("%s: needs label", where)
+			}
+			marks[st.Label] = true
+		case "count_pending":
+			if !tc.HasGenerator() {
+				return fmt.Errorf("%s: counts the load's lines, and the case has no generator", where)
+			}
+			if st.SentBefore == "" {
+				return fmt.Errorf("%s: needs sent_before", where)
+			}
+			if !marks[st.SentBefore] {
+				return fmt.Errorf("%s: sent_before names mark %q, which no earlier step sets", where, st.SentBefore)
+			}
+			if st.Record == "" {
+				return fmt.Errorf("%s: needs record, the name the count is reported under", where)
 			}
 		case "start":
 			switch st.Recover {

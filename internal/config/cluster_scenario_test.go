@@ -24,6 +24,8 @@ func validScenarioCase() *TestCase {
 				{Do: "sleep", For: "5s"},
 				{Do: "mark", Label: "end"},
 				{Do: "expect_delivery_stops", Within: "60s", For: "20s", Record: "stopped"},
+				{Do: "expect_no_log", Node: "1", Log: "collecting", For: "10s", Since: "end"},
+				{Do: "count_pending", SentBefore: "end", Record: "held"},
 			},
 		}},
 	}
@@ -71,6 +73,17 @@ func TestValidateClusterScenarioRejects(t *testing.T) {
 		"as on a wait":                    {func(tc *TestCase) { tc.Cluster.Scenario.Steps[3].As = "elected" }, "acts on none"},
 		"wait naming a forgotten node":    {func(tc *TestCase) { tc.Cluster.Scenario.Steps[3].Node = "@ghost" }, "was not remembered"},
 		"wait naming a node out of range": {func(tc *TestCase) { tc.Cluster.Scenario.Steps[3].Node = "9" }, "node must be"},
+		"since on another action":         {func(tc *TestCase) { tc.Cluster.Scenario.Steps[3].Since = "end" }, "only applies to expect_no_log"},
+		"since naming no mark":            {func(tc *TestCase) { tc.Cluster.Scenario.Steps[9].Since = "ghost" }, "which no earlier step sets"},
+		"since naming a later mark": {func(tc *TestCase) {
+			steps := tc.Cluster.Scenario.Steps
+			tc.Cluster.Scenario.Steps = append([]ScenarioStep{steps[9]}, steps...)
+		}, "which no earlier step sets"},
+		"sent_before on another action":       {func(tc *TestCase) { tc.Cluster.Scenario.Steps[3].SentBefore = "end" }, "only applies to count_pending"},
+		"count_pending without sent_before":   {func(tc *TestCase) { tc.Cluster.Scenario.Steps[10].SentBefore = "" }, "needs sent_before"},
+		"count_pending naming no mark":        {func(tc *TestCase) { tc.Cluster.Scenario.Steps[10].SentBefore = "ghost" }, "which no earlier step sets"},
+		"count_pending without a record name": {func(tc *TestCase) { tc.Cluster.Scenario.Steps[10].Record = "" }, "needs record"},
+		"count_pending without a load":        {func(tc *TestCase) { tc.Generator = GeneratorConfig{} }, "has no generator"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {

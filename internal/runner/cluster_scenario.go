@@ -76,6 +76,38 @@ type scenarioMark struct {
 	At    time.Time `json:"at"`
 }
 
+// pendingCount is one count_pending step: the lines sent before a mark that
+// were still on their way when the step ran.
+type pendingCount struct {
+	Name       string    `json:"name"`
+	Mark       string    `json:"mark"`
+	SentBefore time.Time `json:"sent_before"`
+	CountedAt  time.Time `json:"counted_at"`
+	// Arrived is how many lines sent before the mark had arrived at the step.
+	Arrived int64 `json:"arrived_at_step"`
+	// ArrivedLater is how many more arrived after the step, counted after
+	// the drain: the lines that were still on their way at the step.
+	ArrivedLater int64 `json:"arrived_later"`
+}
+
+// arrivedSince is how many lines arrived between a count_pending step and
+// the end of the run, from the two counts of lines sent before its mark. The
+// receiver counts each line once, at its first arrival, so the count cannot
+// fall; a smaller second count would mean a restarted receiver, and reads 0.
+func arrivedSince(atStep, atEnd int64) int64 {
+	return max(atEnd-atStep, 0)
+}
+
+// markAt returns the time of the latest mark with the label.
+func (sr *scenarioRun) markAt(label string) (time.Time, bool) {
+	for i := len(sr.marks) - 1; i >= 0; i-- {
+		if sr.marks[i].Label == label {
+			return sr.marks[i].At, true
+		}
+	}
+	return time.Time{}, false
+}
+
 type latencyStats struct {
 	Count     int     `json:"count"`
 	P50Ms     float64 `json:"p50_ms"`
@@ -183,6 +215,7 @@ type scenarioRun struct {
 	steps    []scenarioStepReport
 	events   []scenarioEvent
 	marks    []scenarioMark
+	pending  []pendingCount
 	measures map[string]float64
 	failures []string
 	notes    []string
@@ -456,6 +489,8 @@ func describeStepArgs(st config.ScenarioStep) string {
 	add("proxy", st.Proxy)
 	add("latency", st.Latency)
 	add("log", st.Log)
+	add("since", st.Since)
+	add("sent_before", st.SentBefore)
 	if st.Nodes > 0 {
 		add("nodes", strconv.Itoa(st.Nodes))
 	}
@@ -693,6 +728,11 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		}
 		gained := prev.Acked - first.Acked
 		sr.record(st.Record, float64(maxFlat.Milliseconds()))
+		if st.Record != "" {
+			// How many lines the client got confirmed in the window: with the
+			// receiver paused, the records a node holds and still has to deliver.
+			sr.record(st.Record+"_lines_acked", float64(gained))
+		}
 		if gained <= 0 {
 			return false, fmt.Sprintf("no write was acknowledged for %s", hold), nil
 		}
@@ -719,22 +759,47 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		return sr.rollingRestart(i, st)
 
 	case "expect_no_log":
-		// The node must not log the text for the window, counted from this
-		// step: an old owner that must not collect any more, for one.
+		// The node must not log the text for the window: an old owner that
+		// must not collect any more, for one. The window starts at this step,
+		// or at the mark that since names, so that it also covers the steps
+		// in between. It ends `for` after this step starts.
 		hold := st.DurationOr("for", 30*time.Second)
 		n, err := sr.resolveNode(st.Node)
 		if err != nil {
 			return false, err.Error(), nil
 		}
 		rep.Node = n
-		from := time.Now()
+		from, fromWhat := time.Now(), "this step"
+		if st.Since != "" {
+			at, ok := sr.markAt(st.Since)
+			if !ok {
+				return false, fmt.Sprintf("no mark %q was set before this step", st.Since), nil
+			}
+			from, fromWhat = at, fmt.Sprintf("mark %q", st.Since)
+		}
+		end := time.Now().Add(hold)
 		if err := sleepCtx(sr.ctx, hold); err != nil {
 			return false, "", fmt.Errorf("interrupted: %w", err)
 		}
 		if at, found := firstLogLineSince(sr.containers[n-1], st.Log, from); found {
-			return false, fmt.Sprintf("node %d logged %q %s into the window", n, st.Log, fmtMs(at.Sub(from).Milliseconds())), nil
+			return false, fmt.Sprintf("node %d logged %q %s after %s", n, st.Log, fmtMs(at.Sub(from).Milliseconds()), fromWhat), nil
 		}
-		return true, fmt.Sprintf("node %d did not log %q for %s", n, st.Log, hold), nil
+		return true, fmt.Sprintf("node %d did not log %q from %s for %s", n, st.Log, fromWhat, fmtMs(end.Sub(from).Milliseconds())), nil
+
+	case "count_pending":
+		// Count the lines sent before the mark that have reached the receiver
+		// so far. The run counts them again after the drain: the difference
+		// is how many were still on their way at this step and arrived later.
+		before, ok := sr.markAt(st.SentBefore)
+		if !ok {
+			return false, fmt.Sprintf("no mark %q was set before this step", st.SentBefore), nil
+		}
+		ls, err := sr.receiverLatency(time.Time{}, before)
+		if err != nil {
+			return false, fmt.Sprintf("could not read the receiver's counts: %v", err), nil
+		}
+		sr.pending = append(sr.pending, pendingCount{Name: st.Record, Mark: st.SentBefore, SentBefore: before, CountedAt: time.Now(), Arrived: int64(ls.Count)})
+		return true, fmt.Sprintf("%d lines sent before mark %q had arrived; the ones still on their way are counted after the drain", ls.Count, st.SentBefore), nil
 
 	case "wait_stable":
 		// Wait until no running node has logged a sign of the cluster still
@@ -1258,13 +1323,16 @@ type scenarioReport struct {
 	Windows     map[string]latencyStats `json:"latency_windows,omitempty"`
 	// AckMaxWindows is the slowest acknowledgement the client waited for in
 	// each window between marks, in milliseconds.
-	AckMaxWindows map[string]int64     `json:"ack_latency_max_ms_windows,omitempty"`
-	Measures      map[string]float64   `json:"measures_ms"`
-	Events        []scenarioEvent      `json:"events"`
-	Steps         []scenarioStepReport `json:"steps"`
-	Leadership    leadershipStats      `json:"leadership"`
-	Generator     *generatorAck        `json:"generator,omitempty"`
-	SeqCheck      *seqCheckResult      `json:"seqcheck,omitempty"`
+	AckMaxWindows map[string]int64   `json:"ack_latency_max_ms_windows,omitempty"`
+	Measures      map[string]float64 `json:"measures_ms"`
+	// Pending holds the count_pending steps' counts: the lines sent before a
+	// mark that were still on their way when the step ran.
+	Pending    []pendingCount       `json:"pending,omitempty"`
+	Events     []scenarioEvent      `json:"events"`
+	Steps      []scenarioStepReport `json:"steps"`
+	Leadership leadershipStats      `json:"leadership"`
+	Generator  *generatorAck        `json:"generator,omitempty"`
+	SeqCheck   *seqCheckResult      `json:"seqcheck,omitempty"`
 	// DuplicateRanges groups the lines that arrived twice, with when the
 	// first copy and the second copy arrived.
 	DuplicateRanges []duplicateRange `json:"duplicate_ranges,omitempty"`
@@ -1300,6 +1368,9 @@ func (rep scenarioReport) summary() map[string]any {
 	}
 	for k, v := range rep.Measures {
 		out["ms_"+k] = v
+	}
+	for _, p := range rep.Pending {
+		out["pending_"+p.Name] = p.ArrivedLater
 	}
 	for i, ev := range rep.Events {
 		out[fmt.Sprintf("event%d_%s_gap_ms", i, strings.ReplaceAll(ev.Do, " ", "_"))] = ev.GapMs
@@ -1375,6 +1446,21 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 	}
 	fmt.Printf("  delivery: %d acknowledged, %d of them arrived, %d missing, %d duplicates, %d extra\n",
 		check.Acked, check.ReceivedAcked, check.Missing, check.Duplicates, check.Extra)
+	// The count_pending steps: count again, now that every line that will
+	// arrive has arrived. The lines that arrived after the step were still
+	// on their way when it ran.
+	for i := range sr.pending {
+		p := &sr.pending[i]
+		ls, err := sr.receiverLatency(time.Time{}, p.SentBefore)
+		if err != nil {
+			sr.notes = append(sr.notes, fmt.Sprintf("count_pending %s: could not read the receiver's counts after the drain: %v", p.Name, err))
+			continue
+		}
+		p.ArrivedLater = arrivedSince(p.Arrived, int64(ls.Count))
+		fmt.Printf("  %s: %d lines sent before mark %q were still on their way at %s and arrived after it\n",
+			p.Name, p.ArrivedLater, p.Mark, p.CountedAt.UTC().Format("15:04:05.000"))
+	}
+	rep.Pending = sr.pending
 	for conn, cc := range check.Conns {
 		if cc.Missing > 0 {
 			fmt.Printf("    conn %s: missing %d, first ranges %v\n", conn, cc.Missing, cc.MissingRanges)

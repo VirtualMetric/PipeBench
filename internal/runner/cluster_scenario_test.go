@@ -346,3 +346,33 @@ func TestProgressLineMatches(t *testing.T) {
 		t.Fatalf("progress line not parsed: %v", m)
 	}
 }
+
+func TestMarkAtTakesTheLatestMark(t *testing.T) {
+	t0 := time.Date(2026, 10, 24, 0, 0, 0, 0, time.UTC)
+	sr := &scenarioRun{marks: []scenarioMark{
+		{Label: "held", At: t0},
+		{Label: "other", At: t0.Add(time.Second)},
+		{Label: "held", At: t0.Add(2 * time.Second)},
+	}}
+	if at, ok := sr.markAt("held"); !ok || !at.Equal(t0.Add(2*time.Second)) {
+		t.Fatalf("markAt(held) = %v, %v; want the second held mark", at, ok)
+	}
+	if _, ok := sr.markAt("ghost"); ok {
+		t.Fatalf("markAt(ghost) found a mark that was never set")
+	}
+}
+
+func TestArrivedSince(t *testing.T) {
+	cases := []struct{ atStep, atEnd, want int64 }{
+		{atStep: 1000, atEnd: 3280, want: 2280},
+		{atStep: 1000, atEnd: 1000, want: 0},
+		// A receiver that restarted counts again from zero; that is not a
+		// negative number of late lines.
+		{atStep: 1000, atEnd: 400, want: 0},
+	}
+	for _, c := range cases {
+		if got := arrivedSince(c.atStep, c.atEnd); got != c.want {
+			t.Errorf("arrivedSince(%d, %d) = %d, want %d", c.atStep, c.atEnd, got, c.want)
+		}
+	}
+}
