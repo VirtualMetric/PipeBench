@@ -316,6 +316,15 @@ func (r *Runner) runClusterScenario(tc *config.TestCase, subject config.Subject)
 	}
 	sr.probe.stop()
 
+	// Keep every container's log next to the report: the evidence for a
+	// failure is in the nodes' logs, and teardown removes the containers.
+	if dir, err := r.saveScenarioLogs(tc.Name, append(append([]string{}, containers...), "bench-generator", "bench-receiver")); err == nil {
+		report.LogsDir = dir
+		fmt.Printf("  container logs → %s\n", dir)
+	} else {
+		fmt.Printf("  (could not save the container logs: %v)\n", err)
+	}
+
 	metrics, metricsCSVSrc := r.harvestResourceMetrics(orch, tmpDir)
 	sysCPUs, sysMemMB := getSystemInfo()
 
@@ -663,6 +672,40 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 			return false, fmt.Sprintf("node %d logged %q %s into the window", n, st.Log, fmtMs(at.Sub(from).Milliseconds())), nil
 		}
 		return true, fmt.Sprintf("node %d did not log %q for %s", n, st.Log, hold), nil
+
+	case "wait_stable":
+		// Wait until no running node has logged a sign of the cluster still
+		// settling (a stream or consumer moving to another Raft group, a
+		// pipeline stage starting) for `for`. A cluster reports itself
+		// healthy before every node's pipeline stages have started, and a
+		// stage that starts late changes the shared streams; a case that
+		// measures something else starts its load after this.
+		hold := st.DurationOr("for", 20*time.Second)
+		within := st.DurationOr("within", 180*time.Second)
+		started := time.Now()
+		deadline := started.Add(within)
+		for {
+			last := time.Time{}
+			for n := 1; n <= len(sr.containers); n++ {
+				if !sr.active[n] || !containerRunning(sr.containers[n-1]) {
+					continue
+				}
+				if at, found := lastLogLineSince(sr.containers[n-1], settlingMarkers, time.Now().Add(-hold)); found && at.After(last) {
+					last = at
+				}
+			}
+			if last.IsZero() {
+				ms := time.Since(started).Milliseconds()
+				sr.record(st.Record, float64(ms))
+				return true, fmt.Sprintf("no node settled anything for %s (waited %s)", hold, fmtMs(ms)), nil
+			}
+			if time.Now().After(deadline) {
+				return false, fmt.Sprintf("the cluster was still settling after %s (last change at %s)", within, last.UTC().Format("15:04:05")), nil
+			}
+			if err := sleepCtx(sr.ctx, 2*time.Second); err != nil {
+				return false, "", fmt.Errorf("interrupted: %w", err)
+			}
+		}
 
 	case "wait_log":
 		within := st.DurationOr("within", 120*time.Second)
@@ -1154,6 +1197,9 @@ type scenarioReport struct {
 	Failures      []string             `json:"failures,omitempty"`
 	Notes         []string             `json:"notes,omitempty"`
 	HealthTrail   []string             `json:"health_trail,omitempty"`
+	// LogsDir holds every container's log of the run, with docker's
+	// timestamps.
+	LogsDir string `json:"logs_dir,omitempty"`
 }
 
 // summary is the compact part of the report kept in the result row.
@@ -1455,6 +1501,29 @@ func healthTrail(rounds []healthRound) []string {
 	return out
 }
 
+// saveScenarioLogs writes each container's log, with docker's timestamps, to
+// <results>/<hardware>/scenarios/<case>-logs/<container>.log. A container
+// that does not exist (a spare node that never started) is skipped.
+func (r *Runner) saveScenarioLogs(name string, containers []string) (string, error) {
+	dir := filepath.Join(r.opts.ResultsDir, hardwareID(), "scenarios", name+"-logs")
+	if err := os.RemoveAll(dir); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	for _, c := range containers {
+		out, err := exec.Command("docker", "logs", "-t", c).CombinedOutput()
+		if err != nil && len(out) == 0 {
+			continue
+		}
+		if werr := os.WriteFile(filepath.Join(dir, c+".log"), out, 0o644); werr != nil {
+			return "", werr
+		}
+	}
+	return dir, nil
+}
+
 func (r *Runner) writeScenarioReport(name string, rep scenarioReport) (string, error) {
 	dir := filepath.Join(r.opts.ResultsDir, hardwareID(), "scenarios")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -1691,4 +1760,38 @@ func imageIdentity(ref string) (string, map[string]string) {
 	var labels map[string]string
 	_ = json.Unmarshal([]byte(labelsJSON), &labels)
 	return id, labels
+}
+
+// settlingMarkers are director log lines that mean the cluster is still
+// settling: a stream or consumer moved to a new Raft group (its replica
+// count changed), or a pipeline stage started or retried its start.
+var settlingMarkers = []string{
+	"stream remapping",
+	"consumer remapping",
+	"workqueue service started",
+	"Initialization attempt",
+}
+
+// lastLogLineSince returns the docker timestamp of the last line since t that
+// contains any of the needles.
+func lastLogLineSince(container string, needles []string, t time.Time) (time.Time, bool) {
+	out, err := exec.Command("docker", "logs", "-t", "--since", t.UTC().Format(time.RFC3339Nano), container).CombinedOutput()
+	if err != nil {
+		return time.Time{}, false
+	}
+	var last time.Time
+	found := false
+	for _, line := range strings.Split(string(out), "\n") {
+		for _, needle := range needles {
+			if !strings.Contains(line, needle) {
+				continue
+			}
+			ts, _, _ := strings.Cut(line, " ")
+			if at, perr := time.Parse(time.RFC3339Nano, ts); perr == nil && at.After(last) {
+				last, found = at, true
+			}
+			break
+		}
+	}
+	return last, found
 }

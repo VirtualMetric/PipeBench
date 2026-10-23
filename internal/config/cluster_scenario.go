@@ -180,6 +180,7 @@ var scenarioActions = map[string]bool{
 	"rolling_restart":        false,
 	"wait_log":               false,
 	"expect_no_log":          true,
+	"wait_stable":            false,
 }
 
 // ScenarioActionNeedsNode reports whether the action takes a node.
