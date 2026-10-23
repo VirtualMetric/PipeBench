@@ -68,6 +68,7 @@ func TestValidateClusterScenarioRejects(t *testing.T) {
 		"witness dir at the root":         {func(tc *TestCase) { tc.Cluster.Scenario.WitnessDir = "/" }, "absolute path"},
 		"witness dir of dots":             {func(tc *TestCase) { tc.Cluster.Scenario.WitnessDir = "/./." }, "below /"},
 		"probe interval too short":        {func(tc *TestCase) { tc.Cluster.Scenario.ProbeInterval = "100ms" }, "at least 200ms"},
+		"as on a wait":                    {func(tc *TestCase) { tc.Cluster.Scenario.Steps[3].As = "elected" }, "acts on none"},
 		"wait naming a forgotten node":    {func(tc *TestCase) { tc.Cluster.Scenario.Steps[3].Node = "@ghost" }, "was not remembered"},
 		"wait naming a node out of range": {func(tc *TestCase) { tc.Cluster.Scenario.Steps[3].Node = "9" }, "node must be"},
 	}

@@ -185,6 +185,13 @@ var scenarioActions = map[string]bool{
 	"wait_stable":            false,
 }
 
+// nodeActionSteps are the actions that act on a node, so their `as` can
+// remember it. The driver records a name only for these.
+var nodeActionSteps = map[string]bool{
+	"kill": true, "stop": true, "start": true, "restart": true,
+	"pause": true, "unpause": true, "disconnect": true, "connect": true,
+}
+
 // ScenarioActionNeedsNode reports whether the action takes a node.
 func ScenarioActionNeedsNode(do string) bool { return scenarioActions[do] }
 
@@ -378,6 +385,9 @@ func (tc *TestCase) validateClusterScenario() error {
 			}
 		}
 		if st.As != "" {
+			if !nodeActionSteps[st.Do] {
+				return fmt.Errorf("%s: as remembers the node a step acts on, and %s acts on none", where, st.Do)
+			}
 			if strings.HasPrefix(st.As, "@") {
 				return fmt.Errorf("%s: as names a node without the @", where)
 			}
