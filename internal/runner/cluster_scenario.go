@@ -116,6 +116,14 @@ type generatorAck struct {
 		AckedPerConn   map[string]int64 `json:"acked_per_conn"`
 		AckedPerTarget map[string]int64 `json:"acked_per_target"`
 		MaxAckStallMs  int64            `json:"max_ack_stall_ms"`
+		AckLatency     *struct {
+			Count int   `json:"count"`
+			P50   int64 `json:"p50"`
+			P95   int64 `json:"p95"`
+			P99   int64 `json:"p99"`
+			Max   int64 `json:"max"`
+		} `json:"ack_latency_ms"`
+		AckLatencyMaxPerSec []int64 `json:"ack_latency_max_ms_per_second"`
 	} `json:"ack"`
 }
 
@@ -1091,28 +1099,31 @@ func defaultStr(v, def string) string {
 
 // scenarioReport is the run's full record, written next to the results.
 type scenarioReport struct {
-	Case        string                  `json:"case"`
-	Image       string                  `json:"image"`
-	Nodes       int                     `json:"nodes"`
-	NodeCPU     string                  `json:"node_cpu_limit"`
-	NodeMem     string                  `json:"node_mem_limit"`
-	Acked       int64                   `json:"acked"`
-	Received    int64                   `json:"received"`
-	Unique      int64                   `json:"unique"`
-	Missing     int64                   `json:"missing"`
-	Duplicates  int64                   `json:"duplicates"`
-	Extra       int64                   `json:"extra"`
-	Latency     latencyStats            `json:"latency"`
-	Windows     map[string]latencyStats `json:"latency_windows,omitempty"`
-	Measures    map[string]float64      `json:"measures_ms"`
-	Events      []scenarioEvent         `json:"events"`
-	Steps       []scenarioStepReport    `json:"steps"`
-	Leadership  leadershipStats         `json:"leadership"`
-	Generator   *generatorAck           `json:"generator,omitempty"`
-	SeqCheck    *seqCheckResult         `json:"seqcheck,omitempty"`
-	Failures    []string                `json:"failures,omitempty"`
-	Notes       []string                `json:"notes,omitempty"`
-	HealthTrail []string                `json:"health_trail,omitempty"`
+	Case       string                  `json:"case"`
+	Image      string                  `json:"image"`
+	Nodes      int                     `json:"nodes"`
+	NodeCPU    string                  `json:"node_cpu_limit"`
+	NodeMem    string                  `json:"node_mem_limit"`
+	Acked      int64                   `json:"acked"`
+	Received   int64                   `json:"received"`
+	Unique     int64                   `json:"unique"`
+	Missing    int64                   `json:"missing"`
+	Duplicates int64                   `json:"duplicates"`
+	Extra      int64                   `json:"extra"`
+	Latency    latencyStats            `json:"latency"`
+	Windows    map[string]latencyStats `json:"latency_windows,omitempty"`
+	// AckMaxWindows is the slowest acknowledgement the client waited for in
+	// each window between marks, in milliseconds.
+	AckMaxWindows map[string]int64     `json:"ack_latency_max_ms_windows,omitempty"`
+	Measures      map[string]float64   `json:"measures_ms"`
+	Events        []scenarioEvent      `json:"events"`
+	Steps         []scenarioStepReport `json:"steps"`
+	Leadership    leadershipStats      `json:"leadership"`
+	Generator     *generatorAck        `json:"generator,omitempty"`
+	SeqCheck      *seqCheckResult      `json:"seqcheck,omitempty"`
+	Failures      []string             `json:"failures,omitempty"`
+	Notes         []string             `json:"notes,omitempty"`
+	HealthTrail   []string             `json:"health_trail,omitempty"`
 }
 
 // summary is the compact part of the report kept in the result row.
@@ -1243,6 +1254,29 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 					m.Label, ls.P50Ms, ls.P95Ms, ls.P99Ms, ls.MaxMs, ls.Count)
 			}
 		}
+		// The client's slowest confirmation per window, from the generator's
+		// per-second maxima. The generator's second 0 is the start of the
+		// load, give or take its start-up.
+		if gen != nil && gen.Ack != nil && len(gen.Ack.AckLatencyMaxPerSec) > 0 && !sr.loadStarted.IsZero() {
+			rep.AckMaxWindows = map[string]int64{}
+			for i, m := range sr.marks {
+				from := int(m.At.Sub(sr.loadStarted) / time.Second)
+				to := len(gen.Ack.AckLatencyMaxPerSec)
+				if i+1 < len(sr.marks) {
+					to = int(sr.marks[i+1].At.Sub(sr.loadStarted)/time.Second) + 1
+				}
+				var worst int64
+				for s := max(from, 0); s < min(to, len(gen.Ack.AckLatencyMaxPerSec)); s++ {
+					worst = max(worst, gen.Ack.AckLatencyMaxPerSec[s])
+				}
+				rep.AckMaxWindows[m.Label] = worst
+			}
+		}
+	}
+	if gen != nil && gen.Ack != nil && gen.Ack.AckLatency != nil {
+		a := gen.Ack.AckLatency
+		fmt.Printf("  confirmations (client post to 2xx): p50 %d ms, p95 %d ms, p99 %d ms, max %d ms over %d posts\n",
+			a.P50, a.P95, a.P99, a.Max, a.Count)
 	}
 	timeline, terr := sr.receiverTimeline()
 	for i := range sr.events {

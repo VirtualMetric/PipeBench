@@ -24,6 +24,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -46,8 +47,13 @@ type ackResult struct {
 	AckedPerConn   map[string]int64 `json:"acked_per_conn"`
 	AckedPerTarget map[string]int64 `json:"acked_per_target"`
 	MaxAckStallMs  int64            `json:"max_ack_stall_ms"`
-	FirstAckNs     int64            `json:"first_ack_ns,omitempty"`
-	LastAckNs      int64            `json:"last_ack_ns,omitempty"`
+	// AckLatency is how long the acknowledged posts took, from the request to
+	// the 2xx answer: what a client waits for a confirmation. AckLatencyMaxPerSec
+	// is the slowest acknowledged post in each second of the run.
+	AckLatency          *ackLatency `json:"ack_latency_ms,omitempty"`
+	AckLatencyMaxPerSec []int64     `json:"ack_latency_max_ms_per_second,omitempty"`
+	FirstAckNs          int64       `json:"first_ack_ns,omitempty"`
+	LastAckNs           int64       `json:"last_ack_ns,omitempty"`
 }
 
 // lastAckResult carries the http_ack summary from runHTTPAck to main, which
@@ -168,12 +174,15 @@ type ackStats struct {
 	firstAck  atomic.Int64
 	lastAck   atomic.Int64
 	maxStall  atomic.Int64
+	start     time.Time
 
 	mu        sync.Mutex
 	status    map[string]int64
 	perConn   map[string]int64
 	perTarget map[string]int64
 	lastErr   string
+	postLat   []int64 // ms, acknowledged posts
+	perSecMax []int64 // ms, slowest acknowledged post per second since start
 }
 
 func (s *ackStats) noteStatus(key string) {
@@ -245,6 +254,7 @@ func runHTTPAck(cfg config, clock *sendClock) (int64, int64, error) {
 	picker := newTargetPicker(ac.targets, ac.policy, ac.cooldown)
 
 	start := time.Now()
+	stats.start = start
 	deadline := start.Add(cfg.Duration)
 	hardStop := deadline.Add(ac.drain)
 
@@ -287,20 +297,22 @@ func runHTTPAck(cfg config, clock *sendClock) (int64, int64, error) {
 
 	stats.mu.Lock()
 	res := &ackResult{
-		Targets:        ac.targets,
-		Policy:         ac.policy,
-		Batch:          ac.batch,
-		LinesAcked:     stats.acked.Load(),
-		LinesUnacked:   stats.unacked.Load(),
-		Requests:       stats.requests.Load(),
-		Failures:       stats.failures.Load(),
-		Failovers:      stats.failovers.Load(),
-		StatusCounts:   stats.status,
-		AckedPerConn:   stats.perConn,
-		AckedPerTarget: stats.perTarget,
-		MaxAckStallMs:  stats.maxStall.Load(),
-		FirstAckNs:     stats.firstAck.Load(),
-		LastAckNs:      stats.lastAck.Load(),
+		Targets:             ac.targets,
+		Policy:              ac.policy,
+		Batch:               ac.batch,
+		LinesAcked:          stats.acked.Load(),
+		LinesUnacked:        stats.unacked.Load(),
+		Requests:            stats.requests.Load(),
+		Failures:            stats.failures.Load(),
+		Failovers:           stats.failovers.Load(),
+		StatusCounts:        stats.status,
+		AckedPerConn:        stats.perConn,
+		AckedPerTarget:      stats.perTarget,
+		MaxAckStallMs:       stats.maxStall.Load(),
+		AckLatency:          summarizeAckLatency(stats.postLat),
+		AckLatencyMaxPerSec: stats.perSecMax,
+		FirstAckNs:          stats.firstAck.Load(),
+		LastAckNs:           stats.lastAck.Load(),
 	}
 	stats.mu.Unlock()
 	lastAckResult = res
@@ -382,11 +394,13 @@ func runAckWorker(cfg config, ac ackConfig, conn int, stats *ackStats, picker *t
 			target := ac.targets[idx]
 
 			stats.requests.Add(1)
+			postStart := time.Now()
 			code, err := postBatch(client, target, ac.contentType, body)
 			switch {
 			case err == nil && code >= 200 && code < 300:
 				stats.noteStatus(strconv.Itoa(code))
 				stats.noteAck(conn, target, ac.batch, len(body), time.Now().UnixNano())
+				stats.notePostLatency(postStart, time.Since(postStart))
 				clock.RecordSend()
 				acked = true
 			case err != nil:
@@ -434,4 +448,47 @@ func postBatch(client *http.Client, target, contentType string, body []byte) (in
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	resp.Body.Close()
 	return resp.StatusCode, nil
+}
+
+// ackLatency summarizes how long acknowledged posts took, in milliseconds.
+type ackLatency struct {
+	Count int   `json:"count"`
+	P50   int64 `json:"p50"`
+	P95   int64 `json:"p95"`
+	P99   int64 `json:"p99"`
+	Max   int64 `json:"max"`
+}
+
+// notePostLatency records one acknowledged post's round trip.
+func (s *ackStats) notePostLatency(at time.Time, d time.Duration) {
+	ms := d.Milliseconds()
+	sec := int(at.Sub(s.start) / time.Second)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.postLat = append(s.postLat, ms)
+	if sec < 0 {
+		return
+	}
+	for len(s.perSecMax) <= sec {
+		s.perSecMax = append(s.perSecMax, 0)
+	}
+	if ms > s.perSecMax[sec] {
+		s.perSecMax[sec] = ms
+	}
+}
+
+func summarizeAckLatency(vals []int64) *ackLatency {
+	if len(vals) == 0 {
+		return nil
+	}
+	sorted := append([]int64(nil), vals...)
+	slices.Sort(sorted)
+	at := func(p int) int64 {
+		idx := len(sorted) * p / 100
+		if idx >= len(sorted) {
+			idx = len(sorted) - 1
+		}
+		return sorted[idx]
+	}
+	return &ackLatency{Count: len(sorted), P50: at(50), P95: at(95), P99: at(99), Max: sorted[len(sorted)-1]}
 }
