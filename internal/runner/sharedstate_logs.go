@@ -459,7 +459,8 @@ type ssSecretHit struct {
 }
 
 // scanForSecrets looks for each secret in each named text, and returns where
-// it found one. The line it returns has the secret's piece masked.
+// it found one. The line it returns has every piece of the secret masked, and
+// the hit names the longest piece found.
 func scanForSecrets(secrets []string, texts map[string]string) []ssSecretHit {
 	var hits []ssSecretHit
 	names := make([]string, 0, len(texts))
@@ -469,18 +470,37 @@ func scanForSecrets(secrets []string, texts map[string]string) []ssSecretHit {
 	sort.Strings(names)
 	for i, secret := range secrets {
 		needles := secretNeedles(i, secret)
+		// Longest first, so that a whole secret is masked before the pieces
+		// inside it are looked for. A fixed order also makes the result the
+		// same on every run.
+		order := make([]string, 0, len(needles))
+		for needle := range needles {
+			order = append(order, needle)
+		}
+		sort.Slice(order, func(a, b int) bool {
+			if len(order[a]) != len(order[b]) {
+				return len(order[a]) > len(order[b])
+			}
+			return order[a] < order[b]
+		})
 		for _, name := range names {
 			for _, line := range strings.Split(texts[name], "\n") {
-				for needle, what := range needles {
-					if strings.Contains(line, needle) {
-						masked := strings.ReplaceAll(line, needle, "[SECRET]")
-						if len(masked) > 300 {
-							masked = masked[:300] + "…"
+				what, masked := "", line
+				for _, needle := range order {
+					if strings.Contains(masked, needle) {
+						if what == "" {
+							what = needles[needle]
 						}
-						hits = append(hits, ssSecretHit{Where: name, What: what, Line: masked})
-						break
+						masked = strings.ReplaceAll(masked, needle, "[SECRET]")
 					}
 				}
+				if what == "" {
+					continue
+				}
+				if len(masked) > 300 {
+					masked = masked[:300] + "…"
+				}
+				hits = append(hits, ssSecretHit{Where: name, What: what, Line: masked})
 			}
 		}
 	}
