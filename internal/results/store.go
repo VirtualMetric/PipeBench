@@ -105,6 +105,12 @@ type RunResult struct {
 	// disabled.
 	LoadBalance map[string]any `json:"load_balance,omitempty"`
 
+	// Scenario holds a cluster scenario case's measurements: loss,
+	// duplicates, leader election and delivery times, two-leader time.
+	// The full record is in <hardware>/scenarios/<test>.json. Omitted for
+	// every other case.
+	Scenario map[string]any `json:"scenario,omitempty"`
+
 	// SharedState holds what a director_shared_state_correctness run
 	// measured: failover times, loss and duplicates per stream, store calls
 	// per second, and where its evidence lies. Omitted for other cases.
@@ -187,6 +193,7 @@ type ResultEntry struct {
 	PerReceiver map[string]int64 `json:"per_receiver,omitempty"`
 	RateWindow  map[string]any   `json:"rate_window,omitempty"`
 	LoadBalance map[string]any   `json:"load_balance,omitempty"`
+	Scenario    map[string]any   `json:"scenario,omitempty"`
 	SharedState map[string]any   `json:"shared_state,omitempty"`
 }
 
@@ -336,6 +343,7 @@ func (s *Store) Save(r RunResult, _unusedMetricsCSVSrc string) (string, error) {
 		PerReceiver:     r.PerReceiver,
 		RateWindow:      r.RateWindow,
 		LoadBalance:     r.LoadBalance,
+		Scenario:        r.Scenario,
 		SharedState:     r.SharedState,
 	}
 

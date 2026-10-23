@@ -1564,6 +1564,9 @@ type ClusterConfig struct {
 	// the node containers NET_ADMIN so the director can add it; the driver asserts
 	// the leader holds it and that it migrates to the new leader on failover.
 	IP string `yaml:"ip"`
+	// Scenario is the step list of a director_cluster_scenario_correctness
+	// case (cluster_scenario.go). Unused by director_cluster_correctness.
+	Scenario *ScenarioConfig `yaml:"scenario"`
 }
 
 // SettleOrDefault returns SettleSeconds or 45 when unset.
@@ -1577,14 +1580,20 @@ func (c *ClusterConfig) SettleOrDefault() int {
 // validateCluster checks the optional `cluster:` block and the
 // director_cluster_correctness type's structural requirements.
 func (tc *TestCase) validateCluster() error {
+	if tc.IsClusterScenarioType() {
+		return tc.validateClusterScenario()
+	}
 	if !tc.IsDirectorClusterType() {
 		if tc.Cluster != nil {
-			return fmt.Errorf("case %q: `cluster:` is only valid for type director_cluster_correctness", tc.Name)
+			return fmt.Errorf("case %q: `cluster:` is only valid for type director_cluster_correctness (or %s)", tc.Name, ClusterScenarioType)
 		}
 		return nil
 	}
 	if tc.Cluster == nil {
 		return fmt.Errorf("case %q: type director_cluster_correctness requires a `cluster:` block", tc.Name)
+	}
+	if tc.Cluster.Scenario != nil {
+		return fmt.Errorf("case %q: cluster.scenario is only valid for type %s", tc.Name, ClusterScenarioType)
 	}
 	if tc.Cluster.Nodes < 3 {
 		return fmt.Errorf("case %q: cluster.nodes must be >= 3, got %d", tc.Name, tc.Cluster.Nodes)

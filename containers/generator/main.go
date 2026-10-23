@@ -90,6 +90,9 @@ type result struct {
 	DurationMs  int64 `json:"duration_ms"`
 	FirstSentNs int64 `json:"first_sent_ns,omitempty"`
 	LastSentNs  int64 `json:"last_sent_ns,omitempty"`
+	// Ack is the http_ack mode's summary: which lines each CONN id had
+	// acknowledged, and how the posts went. Absent in every other mode.
+	Ack *ackResult `json:"ack,omitempty"`
 }
 
 // sendClock tracks the time from first successful send to last send across
@@ -165,6 +168,10 @@ func main() {
 		linesSent, bytesSent, err = runFile(cfg, &clock)
 	case "http":
 		linesSent, bytesSent, err = runHTTP(cfg, &clock)
+	case "http_ack":
+		// At-least-once HTTP with failover across a list of targets: a line
+		// counts as sent only once a post that carried it was answered 2xx.
+		linesSent, bytesSent, err = runHTTPAck(cfg, &clock)
 	case "udp":
 		// Plain newline-terminated UDP datagrams. One line per datagram.
 		// Used by topologies that want a UDP companion to TCP on the
@@ -216,6 +223,7 @@ func main() {
 		DurationMs:  sendDuration.Milliseconds(),
 		FirstSentNs: firstSent,
 		LastSentNs:  lastSent,
+		Ack:         lastAckResult,
 	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
@@ -258,6 +266,14 @@ func readinessTarget(cfg config) (string, bool) {
 	switch cfg.Mode {
 	case "tcp":
 		return cfg.Target, true
+	case "http_ack":
+		// A list of targets: wait for the first one. The harness starts this
+		// mode once the cluster is ready, so the wait is short.
+		targets := splitTargets(cfg.Target)
+		if len(targets) == 0 {
+			return "", false
+		}
+		return readinessTarget(config{Mode: "http", Target: targets[0]})
 	case "http", "s3", "azure_blob":
 		// Cloud modes carry the emulator endpoint URL in Target — TCP-dial
 		// its host:port, same as http.
