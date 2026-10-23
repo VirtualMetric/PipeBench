@@ -2,8 +2,11 @@ package runner
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/VirtualMetric/PipeBench/internal/config"
 )
 
 func TestLiveStoreMembers(t *testing.T) {
@@ -21,5 +24,25 @@ func TestLiveStoreMembers(t *testing.T) {
 	}
 	if got := liveStoreMembers(nil, "director-state", time.Second); len(got) != 0 {
 		t.Errorf("no calls: got %v", got)
+	}
+}
+
+func TestJudgeStream(t *testing.T) {
+	nothing := config.SharedStateStream{Name: "blob", ExpectNothing: true}
+	if got := judgeStream(nothing, 0, ReceiverMetrics{}); len(got) != 0 {
+		t.Errorf("a stream that expects nothing, whose sender sent nothing: %v, want no failure", got)
+	}
+	if got := judgeStream(nothing, 300, ReceiverMetrics{LinesReceived: 5}); len(got) != 1 || !strings.Contains(got[0], "5 records arrived") {
+		t.Errorf("a stream that expects nothing, with arrivals: %v, want one failure naming them", got)
+	}
+	normal := config.SharedStateStream{Name: "syslog", MaxLoss: 2, MaxDuplicatePct: 2}
+	if got := judgeStream(normal, 0, ReceiverMetrics{}); len(got) != 1 || !strings.Contains(got[0], "sent nothing") {
+		t.Errorf("a normal stream whose sender sent nothing: %v, want that failure", got)
+	}
+	if got := judgeStream(normal, 100, ReceiverMetrics{LinesReceived: 100, UniqueLines: 98, Duplicates: 1}); len(got) != 0 {
+		t.Errorf("2 lost and about 1%% repeated, within bounds: %v", got)
+	}
+	if got := judgeStream(normal, 100, ReceiverMetrics{LinesReceived: 100, UniqueLines: 97, Duplicates: 3}); len(got) != 2 {
+		t.Errorf("3 lost and about 3%% repeated: %v, want two failures", got)
 	}
 }

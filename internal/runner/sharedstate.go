@@ -1130,24 +1130,40 @@ func (run *ssRun) checkStreams() {
 		run.perReceiver[st.Receiver] = m.LinesReceived
 		fmt.Printf("  stream %s: sent %d, received %d (%d distinct, %d repeated, %.2f%%), lost %d\n",
 			st.StreamName(), sent, m.LinesReceived, m.UniqueLines, m.Duplicates, dupPct, loss)
-		if sent == 0 {
-			run.fail("stream %s: the generator sent nothing", st.StreamName())
-		}
-		if st.ExpectNothing {
-			// The stream's devices must not run at all.
-			if m.LinesReceived > 0 {
-				run.fail("stream %s: %d records arrived, and none may: its devices must not run", st.StreamName(), m.LinesReceived)
-			}
-			continue
-		}
-		if loss > st.MaxLoss {
-			run.fail("stream %s: %d records were lost, above max_loss %d", st.StreamName(), loss, st.MaxLoss)
-		}
-		if dupPct > st.MaxDuplicatePct {
-			run.fail("stream %s: %d records arrived more than once (%.2f%%), above max_duplicate_pct %.2f", st.StreamName(), m.Duplicates, dupPct, st.MaxDuplicatePct)
+		for _, why := range judgeStream(st, sent, m) {
+			run.fail("%s", why)
 		}
 	}
 	run.measures["streams"] = streams
+}
+
+// judgeStream returns why a stream fails, if it does, from what its generator
+// sent and what its receiver holds.
+func judgeStream(st config.SharedStateStream, sent int64, m ReceiverMetrics) []string {
+	// A stream whose devices must not run is judged on arrivals alone. Its
+	// generator may send nothing at all: a TCP sender whose listener never
+	// started can give up before its first write.
+	if st.ExpectNothing {
+		if m.LinesReceived > 0 {
+			return []string{fmt.Sprintf("stream %s: %d records arrived, and none may: its devices must not run", st.StreamName(), m.LinesReceived)}
+		}
+		return nil
+	}
+	if sent == 0 {
+		return []string{fmt.Sprintf("stream %s: the generator sent nothing", st.StreamName())}
+	}
+	var out []string
+	if loss := max(sent-m.UniqueLines, 0); loss > st.MaxLoss {
+		out = append(out, fmt.Sprintf("stream %s: %d records were lost, above max_loss %d", st.StreamName(), loss, st.MaxLoss))
+	}
+	dupPct := 0.0
+	if m.UniqueLines > 0 {
+		dupPct = 100 * float64(m.Duplicates) / float64(m.UniqueLines)
+	}
+	if dupPct > st.MaxDuplicatePct {
+		out = append(out, fmt.Sprintf("stream %s: %d records arrived more than once (%.2f%%), above max_duplicate_pct %.2f", st.StreamName(), m.Duplicates, dupPct, st.MaxDuplicatePct))
+	}
+	return out
 }
 
 // checkOwnershipOverlaps fails the case for every time two replicas ran the
