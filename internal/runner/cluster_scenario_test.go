@@ -1,6 +1,8 @@
 package runner
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -163,6 +165,59 @@ func TestSummarizeDuplicates(t *testing.T) {
 	}
 	if len(summarizeDuplicates(samples, 1)) != 1 {
 		t.Fatalf("the limit was not applied")
+	}
+}
+
+// TestDrainSeqCheckNeverAnswered checks that a drain in which no read of the
+// receiver succeeded says so, with the last error, instead of handing back
+// a zero check that reads as no loss.
+func TestDrainSeqCheckNeverAnswered(t *testing.T) {
+	calls := 0
+	read := func() (seqCheckResult, error) {
+		calls++
+		return seqCheckResult{}, errors.New("connection refused")
+	}
+	_, checked, err := drainSeqCheck(context.Background(), read, time.Now().Add(30*time.Millisecond), time.Minute, 5*time.Millisecond)
+	if checked {
+		t.Fatalf("no read succeeded, but the drain reports a check")
+	}
+	if err == nil || err.Error() != "connection refused" {
+		t.Fatalf("err = %v, want the last read error", err)
+	}
+	if calls < 2 {
+		t.Fatalf("the drain gave up after %d read(s), want it to retry until the deadline", calls)
+	}
+}
+
+// TestDrainSeqCheckKeepsLastAnswer checks that a drain returns the last
+// check that succeeded, even when later reads fail, and stops as soon as
+// nothing is missing.
+func TestDrainSeqCheckKeepsLastAnswer(t *testing.T) {
+	answers := []struct {
+		c   seqCheckResult
+		err error
+	}{
+		{seqCheckResult{Missing: 5, ReceivedAcked: 95}, nil},
+		{seqCheckResult{}, errors.New("timeout")},
+		{seqCheckResult{Missing: 0, ReceivedAcked: 100}, nil},
+	}
+	i := 0
+	read := func() (seqCheckResult, error) {
+		a := answers[min(i, len(answers)-1)]
+		i++
+		return a.c, a.err
+	}
+	c, checked, err := drainSeqCheck(context.Background(), read, time.Now().Add(time.Minute), time.Minute, time.Millisecond)
+	if !checked || err != nil || c.Missing != 0 || c.ReceivedAcked != 100 {
+		t.Fatalf("drain = %+v %v %v, want the final complete check", c, checked, err)
+	}
+
+	// A read that fails after a good one leaves the good one in place.
+	i = 0
+	answers = answers[:2]
+	c, checked, err = drainSeqCheck(context.Background(), read, time.Now().Add(20*time.Millisecond), time.Minute, time.Millisecond)
+	if !checked || err != nil || c.Missing != 5 {
+		t.Fatalf("drain = %+v %v %v, want the earlier good check", c, checked, err)
 	}
 }
 

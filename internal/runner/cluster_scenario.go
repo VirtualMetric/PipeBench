@@ -1344,30 +1344,15 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 	// arrives for 30 seconds, within the drain budget.
 	drain := sr.sc.DrainOrDefault()
 	fmt.Printf("  draining (up to %s)…\n", drain)
-	deadline := time.Now().Add(drain)
-	var check seqCheckResult
-	var lastReceived int64 = -1
-	quietSince := time.Now()
-	for {
-		c, err := sr.receiverSeqCheck(acked)
-		if err == nil {
-			check = c
-			if c.Missing == 0 {
-				break
-			}
-			if c.ReceivedAcked != lastReceived {
-				lastReceived = c.ReceivedAcked
-				quietSince = time.Now()
-			} else if time.Since(quietSince) > 30*time.Second {
-				break
-			}
-		}
-		if time.Now().After(deadline) {
-			break
-		}
-		if err := sleepCtx(sr.ctx, 2*time.Second); err != nil {
-			return rep, scenarioVerdict{}, fmt.Errorf("interrupted: %w", err)
-		}
+	check, checked, err := drainSeqCheck(sr.ctx, func() (seqCheckResult, error) { return sr.receiverSeqCheck(acked) },
+		time.Now().Add(drain), 30*time.Second, 2*time.Second)
+	if sr.ctx.Err() != nil {
+		return rep, scenarioVerdict{}, fmt.Errorf("interrupted: %w", sr.ctx.Err())
+	}
+	if !checked {
+		// Without one answer from the receiver the loss is unknown, and a
+		// zero count would pass max_loss on a check that never ran.
+		sr.failures = append(sr.failures, fmt.Sprintf("the receiver never answered the sequence check, so loss is unknown: %v", err))
 	}
 	rep.SeqCheck = &check
 	rep.Missing = check.Missing
@@ -1522,6 +1507,42 @@ func (sr *scenarioRun) finishWithoutLoad(rep scenarioReport) (scenarioReport, sc
 	rep.Notes = sr.notes
 	v.passed = len(v.reasons) == 0
 	return rep, v, nil
+}
+
+// drainSeqCheck reads the receiver's sequence check until every acknowledged
+// line has arrived, until the count of arrived lines has not changed for
+// quiet, or until deadline. It returns the last check that succeeded.
+// checked is false when no read succeeded at all, and err is then the last
+// error. The loss of such a run is unknown, not zero.
+func drainSeqCheck(ctx context.Context, read func() (seqCheckResult, error), deadline time.Time, quiet, poll time.Duration) (check seqCheckResult, checked bool, err error) {
+	var lastReceived int64 = -1
+	quietSince := time.Now()
+	for {
+		c, readErr := read()
+		if readErr == nil {
+			check, checked = c, true
+			if c.Missing == 0 {
+				return check, true, nil
+			}
+			if c.ReceivedAcked != lastReceived {
+				lastReceived = c.ReceivedAcked
+				quietSince = time.Now()
+			} else if time.Since(quietSince) > quiet {
+				return check, true, nil
+			}
+		} else {
+			err = readErr
+		}
+		if time.Now().After(deadline) {
+			if checked {
+				err = nil
+			}
+			return check, checked, err
+		}
+		if sleepErr := sleepCtx(ctx, poll); sleepErr != nil {
+			return check, checked, sleepErr
+		}
+	}
 }
 
 // deliveryGapAfter finds the longest stretch without a first arrival that
