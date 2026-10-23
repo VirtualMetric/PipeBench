@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"maps"
@@ -49,6 +50,11 @@ type configTemplateContext struct {
 	// case's config once per node ({{@.NodeID@}} → director.id / node.name so each
 	// node self-identifies against the cluster's nodes list). 0 for non-cluster.
 	NodeID int
+	// ClusterNodeIDs lists the nodes the rendered config names as cluster
+	// members, 1..N, so a config can build its node list with
+	// {{@ range .ClusterNodeIDs @}}. A scenario's scale_to step renders the
+	// configs again with a longer or shorter list. Empty for non-cluster.
+	ClusterNodeIDs []int
 	// T0 is the wall-clock instant the harness rendered this config, captured
 	// just before compose up — the closest proxy for "run start" a case can
 	// anchor an absolute timestamp to (see T0Plus). Containers take seconds to
@@ -152,6 +158,9 @@ networks:
 
 volumes:
   shared-data:
+{{- if .WitnessDirMount }}
+  witness-dir:
+{{- end }}
 
 services:
 
@@ -162,14 +171,24 @@ services:
     container_name: "{{ .Container }}"
     hostname: "{{ .Hostname }}"
     networks: [bench]
+{{- if .Spare }}
+    # A spare node starts only when a scale_to step adds it to the cluster.
+    profiles: ["spare"]
+{{- end }}
 {{- if $.NodesNeedNetAdmin }}
     cap_add:
       - NET_ADMIN
 {{- end }}
-{{- if $.VerifierLocalDir }}
+{{- if or $.VerifierLocalDir $.NodeDependsOn }}
     depends_on:
+{{- if $.VerifierLocalDir }}
       data-init:
         condition: service_completed_successfully
+{{- end }}
+{{- range $.NodeDependsOn }}
+      {{ .Service }}:
+        condition: {{ .Condition }}
+{{- end }}
 {{- end }}
     volumes:
       - "{{ .ConfigSrc }}:{{ $.ConfigDst }}{{ $.ConfigMountOpts }}"
@@ -180,14 +199,42 @@ services:
 {{- if $.CaseCertsHost }}
       - "{{ $.CaseCertsHost }}:/opt/vmetric/certs:ro"
 {{- end }}
+{{- if $.WitnessDirMount }}
+      - "witness-dir:{{ $.WitnessDirMount }}"
+{{- end }}
 {{- if $.SubjectUser }}
     user: "{{ $.SubjectUser }}"
 {{- end }}
+{{- if $.NodeArgsEntrypoint }}
+    # Adds /results/node-args-<n> to the command line, for one start only.
+    entrypoint: {{ $.NodeArgsEntrypoint }}
+{{- else }}
 {{- if $.SubjectEntrypoint }}
     entrypoint: {{ $.SubjectEntrypoint }}
 {{- end }}
 {{- if $.SubjectCmd }}
     command: {{ $.SubjectCmd }}
+{{- end }}
+{{- end }}
+{{- if or $.SubjectEnv $.NodeArgsEntrypoint }}
+    environment:
+{{- if $.NodeArgsEntrypoint }}
+      BENCH_NODE_ID: "{{ .ID }}"
+{{- end }}
+{{- range $k, $v := $.SubjectEnv }}
+      {{ $k }}: "{{ $v }}"
+{{- end }}
+{{- end }}
+{{- if $.HasResourceLimits }}
+    deploy:
+      resources:
+        limits:
+{{- if $.CPULimit }}
+          cpus: "{{ $.CPULimit }}"
+{{- end }}
+{{- if $.MemLimit }}
+          memory: "{{ $.MemLimit }}"
+{{- end }}
 {{- end }}
     restart: "no"
 {{- end }}
@@ -405,6 +452,10 @@ services:
     image: "{{ .GeneratorImage }}"
     container_name: "bench-generator"
     networks: [bench]
+{{- if .GenDeferred }}
+    # Started by the driver once the cluster is ready (start_load).
+    profiles: ["load"]
+{{- end }}
 {{- if and (eq .GenMode "kafka") .KafkaGSSAPIEnabled }}
     depends_on:
       kafka-init:
@@ -635,6 +686,38 @@ services:
       COLLECTOR_INTERVAL_SECS: "1"
       COLLECTOR_OUTPUT: "/results/metrics.csv"
     restart: "no"
+{{- if .WitnessDirMount }}
+
+  # One-shot: make the shared witness directory writable for the director,
+  # which runs as a non-root user, before any node starts. Reuses the subject
+  # image as root, like data-init.
+  witness-init:
+    image: "{{ .SubjectImage }}"
+    container_name: "bench-witness-init"
+    networks: [bench]
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["chmod 0777 {{ .WitnessDirMount }}"]
+    volumes:
+      - "witness-dir:{{ .WitnessDirMount }}"
+    restart: "no"
+{{- end }}
+{{- if .ToxiproxyEnabled }}
+
+  # Toxiproxy sits between the nodes and a service (the witness store, for
+  # one), so a step can add latency to the connection or cut it.
+  toxiproxy:
+    image: "{{ .ToxiproxyImage }}"
+    container_name: "bench-toxiproxy"
+    hostname: "toxiproxy"
+    networks: [bench]
+    command: ["-host=0.0.0.0", "-config=/toxiproxy/toxiproxy.json"]
+    ports:
+      - "{{ .ToxiproxyHostPort }}:8474"
+    volumes:
+      - "{{ .ToxiproxyConfigHost }}:/toxiproxy:ro"
+    restart: "no"
+{{- end }}
 {{- if .VerifierLocalDir }}
 
   # One-shot: the subject (director) runs as a non-root user, but the
@@ -1732,6 +1815,15 @@ type clusterNode struct {
 	Container string
 	Hostname  string
 	ConfigSrc string
+	// Spare nodes are rendered under the "spare" profile: they start only
+	// when a scenario's scale_to step adds them (cluster.scenario.spare_nodes).
+	Spare bool
+}
+
+// nodeDependency is one depends_on entry of every cluster node service.
+type nodeDependency struct {
+	Service   string
+	Condition string
 }
 
 type composeVars struct {
@@ -1786,6 +1878,21 @@ type composeVars struct {
 	// NodesNeedNetAdmin grants the cluster node containers NET_ADMIN so the elected
 	// director leader can add the virtual IP to its interface (cluster_ip_failover).
 	NodesNeedNetAdmin bool
+
+	// Cluster scenario topology (cluster_scenario_compose.go). NodeDependsOn
+	// orders every node after the services it needs at start (the witness
+	// store, Toxiproxy). WitnessDirMount mounts a shared witness volume there
+	// and adds witness-init. NodeArgsEntrypoint replaces each node's
+	// entrypoint with the one-start-arguments wrapper. GenDeferred keeps the
+	// generator out of the initial `up` (profile "load").
+	NodeDependsOn       []nodeDependency
+	WitnessDirMount     string
+	NodeArgsEntrypoint  string
+	GenDeferred         bool
+	ToxiproxyEnabled    bool
+	ToxiproxyImage      string
+	ToxiproxyConfigHost string
+	ToxiproxyHostPort   int
 
 	// EmitGenerator gates the singular `generator:` service. False when the
 	// case configures no generator (data is driven by the subject/endpoints),
@@ -2073,9 +2180,20 @@ func writeCompose(path string, cfg RunConfig) error {
 	// cases are unaffected (Subjects stays empty).
 	var clusterNodes []clusterNode
 	if tc.Cluster != nil && tc.Cluster.Nodes > 0 {
-		for i := 1; i <= tc.Cluster.Nodes; i++ {
+		// Spare nodes (scenario cases) render after the regular ones, with a
+		// node list that already counts them: they join a cluster that a
+		// scale_to step has grown to include them.
+		spare := 0
+		if tc.Cluster.Scenario != nil {
+			spare = tc.Cluster.Scenario.SpareNodes
+		}
+		for i := 1; i <= tc.Cluster.Nodes+spare; i++ {
+			size := tc.Cluster.Nodes
+			if i > tc.Cluster.Nodes {
+				size = i
+			}
 			nodeOut := filepath.Join(cfg.TmpDir, fmt.Sprintf("cluster-node-%d.yml", i))
-			if err := renderConfigToFile(cfg.ConfigSrcPath, nodeOut, configTemplateContext{CPUs: runtime.NumCPU(), NodeID: i, T0: t0}); err != nil {
+			if err := renderConfigToFile(cfg.ConfigSrcPath, nodeOut, configTemplateContext{CPUs: runtime.NumCPU(), NodeID: i, ClusterNodeIDs: nodeIDs(size), T0: t0}); err != nil {
 				return err
 			}
 			clusterNodes = append(clusterNodes, clusterNode{
@@ -2083,6 +2201,7 @@ func writeCompose(path string, cfg RunConfig) error {
 				Container: fmt.Sprintf("bench-subject-%s-%d", s.Name, i),
 				Hostname:  fmt.Sprintf("subject-%d", i),
 				ConfigSrc: filepath.ToSlash(nodeOut),
+				Spare:     i > tc.Cluster.Nodes,
 			})
 		}
 	}
@@ -2736,18 +2855,30 @@ func writeCompose(path string, cfg RunConfig) error {
 		vars.AgentMountsSharedData = a.MountsSharedData
 	}
 
+	// Cluster scenario topology: witness store, Toxiproxy, one-start node
+	// arguments, deferred load (cluster_scenario_compose.go).
+	if err := applyClusterScenarioTopology(&vars, cfg); err != nil {
+		return err
+	}
+
 	tmpl, err := template.New("compose").Parse(composeTemplate)
 	if err != nil {
 		return err
 	}
 
-	f, err := os.Create(path)
-	if err != nil {
+	var rendered bytes.Buffer
+	if err := tmpl.Execute(&rendered, vars); err != nil {
 		return err
 	}
-	defer f.Close()
-
-	return tmpl.Execute(f, vars)
+	out := rendered.Bytes()
+	// A scenario case caps every container that is not a director node too.
+	if tc.Cluster != nil && tc.Cluster.Scenario != nil {
+		cpu, mem := tc.Cluster.Scenario.HelperLimits()
+		if out, err = limitHelperServices(out, cpu, mem); err != nil {
+			return err
+		}
+	}
+	return os.WriteFile(path, out, 0o644)
 }
 
 // formatYAMLList formats a string slice as a YAML inline list: ["a", "b", "c"]

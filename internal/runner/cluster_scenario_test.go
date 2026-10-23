@@ -1,0 +1,135 @@
+package runner
+
+import (
+	"testing"
+	"time"
+)
+
+func h(node int, name, metaLeader string) nodeHealth {
+	return nodeHealth{Node: node, State: "running", Reachable: true, Name: name, Phase: "running", VMMQ: "ok", Clustered: true, MetaLeader: metaLeader}
+}
+
+func TestAgreedLeader(t *testing.T) {
+	r := healthRound{Nodes: []nodeHealth{h(1, "1", "2"), h(2, "2", "2"), h(3, "3", "2")}}
+	if l, ok := agreedLeader(r); !ok || l != 2 {
+		t.Fatalf("agreedLeader = %d %v, want 2", l, ok)
+	}
+
+	// A node cut off from the others still names itself; the majority names
+	// node 1. Only node 1 is agreed.
+	r = healthRound{Nodes: []nodeHealth{h(1, "1", "1"), h(2, "2", "1"), h(3, "3", "3")}}
+	if l, ok := agreedLeader(r); !ok || l != 1 {
+		t.Fatalf("partition: agreedLeader = %d %v, want 1", l, ok)
+	}
+	if c := claimedLeaders(r); len(c) != 2 {
+		t.Fatalf("partition: claimedLeaders = %v, want two", c)
+	}
+
+	// The leader is dead and nobody has been elected yet.
+	dead := nodeHealth{Node: 2, State: "exited"}
+	r = healthRound{Nodes: []nodeHealth{h(1, "1", "2"), dead, h(3, "3", "2")}}
+	if _, ok := agreedLeader(r); ok {
+		t.Fatalf("a dead leader must not be agreed")
+	}
+
+	// A director that is not in a cluster leads itself.
+	solo := nodeHealth{Node: 1, State: "running", Reachable: true, Name: "1", Phase: "running", VMMQ: "ok"}
+	if l, ok := agreedLeader(healthRound{Nodes: []nodeHealth{solo}}); !ok || l != 1 {
+		t.Fatalf("standalone director: %d %v", l, ok)
+	}
+}
+
+func TestAnalyzeLeadershipMeasuresTwoLeaderTime(t *testing.T) {
+	t0 := time.Unix(1000, 0)
+	at := func(s int) time.Time { return t0.Add(time.Duration(s) * time.Second) }
+	rounds := []healthRound{
+		{At: at(0), Nodes: []nodeHealth{h(1, "1", "3"), h(2, "2", "3"), h(3, "3", "3")}},
+		{At: at(1), Nodes: []nodeHealth{h(1, "1", "3"), h(2, "2", "3"), h(3, "3", "3")}},
+		// node 3 is cut off: the others elect node 1, node 3 still names itself
+		{At: at(2), Nodes: []nodeHealth{h(1, "1", "1"), h(2, "2", "1"), h(3, "3", "3")}},
+		{At: at(3), Nodes: []nodeHealth{h(1, "1", "1"), h(2, "2", "1"), h(3, "3", "3")}},
+		{At: at(4), Nodes: []nodeHealth{h(1, "1", "1"), h(2, "2", "1"), h(3, "3", "")}},
+	}
+	st := analyzeLeadership(rounds)
+	if st.MaxSelfClaimed != 2 {
+		t.Fatalf("MaxSelfClaimed = %d, want 2", st.MaxSelfClaimed)
+	}
+	if st.SplitBrainMs != 2000 || len(st.SplitIntervals) != 1 {
+		t.Fatalf("SplitBrainMs = %d, intervals %v; want 2000 in one stretch", st.SplitBrainMs, st.SplitIntervals)
+	}
+	if st.LeaderChanges != 1 {
+		t.Fatalf("LeaderChanges = %d, want 1", st.LeaderChanges)
+	}
+}
+
+func TestAnalyzeLeadershipStreams(t *testing.T) {
+	t0 := time.Unix(2000, 0)
+	a := h(1, "1", "1")
+	a.StreamLeaders = map[string]string{"vm-pipeline-sender": "1"}
+	b := h(2, "2", "1")
+	b.StreamLeaders = map[string]string{"vm-pipeline-sender": "2"}
+	c := h(2, "2", "1")
+	c.StreamLeaders = map[string]string{"vm-pipeline-sender": "1"}
+	st := analyzeLeadership([]healthRound{
+		{At: t0, Nodes: []nodeHealth{a, b}},
+		{At: t0.Add(time.Second), Nodes: []nodeHealth{a, c}},
+	})
+	if st.MaxStreamClaims != 2 || st.StreamSplitMs != 1000 {
+		t.Fatalf("stream split: max %d, %d ms", st.MaxStreamClaims, st.StreamSplitMs)
+	}
+}
+
+func TestDeliveryGapAfter(t *testing.T) {
+	start := time.Unix(5000, 0)
+	tl := receiverTimeline{StartNs: start.UnixNano(), BucketMs: 100}
+	// 1 s of steady arrivals, a 2.3 s gap, then arrivals again.
+	for range 10 {
+		tl.Unique = append(tl.Unique, 5)
+	}
+	for range 23 {
+		tl.Unique = append(tl.Unique, 0)
+	}
+	for range 10 {
+		tl.Unique = append(tl.Unique, 5)
+	}
+	disruption := start.Add(900 * time.Millisecond)
+	gap, resume := deliveryGapAfter(tl, disruption, 60*time.Second)
+	if gap != 2300 {
+		t.Fatalf("gap = %d ms, want 2300", gap)
+	}
+	if resume != 2400 {
+		t.Fatalf("resumed after %d ms, want 2400", resume)
+	}
+	if g, _ := deliveryGapAfter(receiverTimeline{}, disruption, time.Minute); g != 0 {
+		t.Fatalf("an empty timeline has no gap")
+	}
+}
+
+func TestParseGeneratorAck(t *testing.T) {
+	out := `{
+  "lines_sent": 30,
+  "bytes_sent": 900,
+  "duration_ms": 1000,
+  "ack": {
+    "targets": ["http://subject-1:9000/"],
+    "lines_acked": 30,
+    "acked_per_conn": {"0": 20, "1": 10}
+  }
+}
+`
+	g := parseGeneratorAck(out)
+	if g == nil || g.Ack == nil || g.Ack.LinesAcked != 30 || g.Ack.AckedPerConn["1"] != 10 {
+		t.Fatalf("parseGeneratorAck: %+v", g)
+	}
+	if parseGeneratorAck(`{"lines_sent": 5}`) != nil {
+		t.Fatalf("a result without the ack summary is not an http_ack result")
+	}
+}
+
+func TestProgressLineMatches(t *testing.T) {
+	line := `PROGRESS t_ms=1792775180000 acked=12340 unacked=0 requests=1300 failures=6 failovers=6 pending=10 last_ack_ns=1792775179999000000 last_error="x"`
+	m := progressRE.FindStringSubmatch(line)
+	if m == nil || m[2] != "12340" || m[3] != "6" || m[4] != "10" {
+		t.Fatalf("progress line not parsed: %v", m)
+	}
+}

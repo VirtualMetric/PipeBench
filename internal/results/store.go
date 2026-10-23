@@ -105,6 +105,12 @@ type RunResult struct {
 	// disabled.
 	LoadBalance map[string]any `json:"load_balance,omitempty"`
 
+	// Scenario holds a cluster scenario case's measurements: loss,
+	// duplicates, leader election and delivery times, two-leader time.
+	// The full record is in <hardware>/scenarios/<test>.json. Omitted for
+	// every other case.
+	Scenario map[string]any `json:"scenario,omitempty"`
+
 	// MetricsFile used to point at a copy of metrics.csv; with the
 	// subject-file layout we don't archive the raw CSV per run any more.
 	// Kept on the struct so old code paths compile; always empty now.
@@ -182,6 +188,7 @@ type ResultEntry struct {
 	PerReceiver map[string]int64 `json:"per_receiver,omitempty"`
 	RateWindow  map[string]any   `json:"rate_window,omitempty"`
 	LoadBalance map[string]any   `json:"load_balance,omitempty"`
+	Scenario    map[string]any   `json:"scenario,omitempty"`
 }
 
 // Store manages writing the subject-file layout.
@@ -330,6 +337,7 @@ func (s *Store) Save(r RunResult, _unusedMetricsCSVSrc string) (string, error) {
 		PerReceiver:     r.PerReceiver,
 		RateWindow:      r.RateWindow,
 		LoadBalance:     r.LoadBalance,
+		Scenario:        r.Scenario,
 	}
 
 	// Replace matching (test, config) or append.

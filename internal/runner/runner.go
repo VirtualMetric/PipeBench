@@ -336,6 +336,9 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	if tc.IsDirectorClusterType() {
 		return r.runDirectorClusterCorrectness(tc, subject)
 	}
+	if tc.IsClusterScenarioType() {
+		return r.runClusterScenario(tc, subject)
+	}
 	if tc.IsFleetAutomationType() {
 		return r.runFleetAutomationCorrectness(tc, subject)
 	}
