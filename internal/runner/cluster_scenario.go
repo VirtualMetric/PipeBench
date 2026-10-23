@@ -1523,8 +1523,12 @@ func parseGeneratorAck(stdout string) *generatorAck {
 	}
 }
 
+// receiverClient bounds every receiver query: a step may have paused the
+// receiver, and a query to a paused container would otherwise wait forever.
+var receiverClient = &http.Client{Timeout: 10 * time.Second}
+
 func (sr *scenarioRun) receiverGet(path string, out any) error {
-	resp, err := http.Get(fmt.Sprintf("http://localhost:%d%s", sr.recvPort, path)) //nolint:noctx // short local call
+	resp, err := receiverClient.Get(fmt.Sprintf("http://localhost:%d%s", sr.recvPort, path)) //nolint:noctx // short local call
 	if err != nil {
 		return err
 	}
