@@ -730,9 +730,7 @@ func handleConn(conn net.Conn, shard *connStats, val *validator, cfg config) {
 		if needsValidation {
 			val.recordLine(b, cfg)
 		}
-		if seqTrack != nil {
-			seqTrack.record(b, time.Now().UnixNano())
-		}
+		trackSeq(b)
 	}
 	// A scan error (oversized line, connection reset) silently truncates the
 	// count for this connection — surface it so a lossy-looking run is
@@ -787,7 +785,26 @@ func receiveFile(cfg config, cnt *counters, val *validator) error {
 	return nil
 }
 
+// trackSeq hands one received line to the sequence tracker, when
+// RECEIVER_TRACK_SEQ is on. Every input that counts lines calls it, so a
+// tracked line counts as arrived whichever way it came in.
+func trackSeq(line []byte) {
+	if seqTrack != nil {
+		seqTrack.record(line, time.Now().UnixNano())
+	}
+}
+
 func receiveHTTP(cfg config, cnt *counters, val *validator) error {
+	srv := &http.Server{
+		Addr:    cfg.Listen,
+		Handler: newHTTPReceiveHandler(cfg, cnt, val),
+	}
+	return srv.ListenAndServe()
+}
+
+// newHTTPReceiveHandler is the handler of the HTTP receive mode: one line per
+// body line, or the documents of an ES /_bulk body.
+func newHTTPReceiveHandler(cfg config, cnt *counters, val *validator) http.Handler {
 	// One shared shard for the HTTP server — HTTP rates are far below the
 	// per-shard ceiling so contention here doesn't matter, and a single
 	// shard keeps the per-request bookkeeping trivial.
@@ -817,6 +834,7 @@ func receiveHTTP(cfg config, cnt *counters, val *validator) error {
 				if needsValidation {
 					val.recordLine(lineBytes, cfg)
 				}
+				trackSeq(lineBytes)
 			}
 		} else {
 			httpShard.bytes.Add(int64(len(body)))
@@ -852,6 +870,7 @@ func receiveHTTP(cfg config, cnt *counters, val *validator) error {
 				if needsValidation {
 					val.recordLine(lineBytes, cfg)
 				}
+				trackSeq(lineBytes)
 			}
 		}
 		// Respond with a minimal ES-compatible bulk response
@@ -869,17 +888,21 @@ func receiveHTTP(cfg config, cnt *counters, val *validator) error {
 			genericHandler(w, r)
 		}
 	})
-
-	srv := &http.Server{
-		Addr:    cfg.Listen,
-		Handler: mux,
-	}
-	return srv.ListenAndServe()
+	return mux
 }
 
 // startHTTPDataEndpoint runs a standalone HTTP server that accepts data via
 // POST. It handles both plain line-per-request and ES /_bulk NDJSON format.
 func startHTTPDataEndpoint(port string, cnt *counters, val *validator, cfg config) error {
+	srv := &http.Server{
+		Addr:    ":" + port,
+		Handler: newHTTPDataHandler(cfg, cnt, val),
+	}
+	return srv.ListenAndServe()
+}
+
+// newHTTPDataHandler is the handler of the always-on HTTP data endpoint.
+func newHTTPDataHandler(cfg config, cnt *counters, val *validator) http.Handler {
 	httpShard := cnt.newShard()
 	needsValidation := cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.RequiredSubstring != "" || cfg.ForbiddenSubstring != ""
 	lineCallback := func(line []byte) {
@@ -887,6 +910,7 @@ func startHTTPDataEndpoint(port string, cnt *counters, val *validator, cfg confi
 		if needsValidation {
 			val.recordLine(line, cfg)
 		}
+		trackSeq(line)
 	}
 
 	mux := http.NewServeMux()
@@ -968,12 +992,7 @@ func startHTTPDataEndpoint(port string, cnt *counters, val *validator, cfg confi
 			fmt.Fprintf(w, `{"took":0,"errors":false,"items":[]}`)
 		}
 	})
-
-	srv := &http.Server{
-		Addr:    ":" + port,
-		Handler: mux,
-	}
-	return srv.ListenAndServe()
+	return mux
 }
 
 func serveMetrics(port string, cnt *counters, val *validator, cfg config) {

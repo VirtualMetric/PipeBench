@@ -2,6 +2,9 @@ package main
 
 import (
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -111,6 +114,41 @@ func TestSeqTrackerDuplicates(t *testing.T) {
 	s := d.Samples[0]
 	if s.Conn != 2 || s.Seq != 7 || s.SentNs != sent || s.FirstNs != first || s.AtNs != again {
 		t.Fatalf("sample = %+v, want conn 2 seq 7 sent %d first %d at %d", s, sent, first, again)
+	}
+}
+
+// TestHTTPInputsTrackSequences checks that lines that reach the receiver over
+// HTTP count as arrived, as lines over TCP do: through the HTTP receive mode
+// (plain and ES /_bulk bodies) and through the always-on HTTP data endpoint.
+func TestHTTPInputsTrackSequences(t *testing.T) {
+	saved := seqTrack
+	t.Cleanup(func() { seqTrack = saved })
+
+	post := func(h http.Handler, path, body string) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, strings.NewReader(body)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("POST %s answered %d", path, rec.Code)
+		}
+	}
+	ts := time.Now().UnixNano()
+	line := func(conn, seq int) string { return fmt.Sprintf("CONN=%d SEQ=%d TS=%d pad", conn, seq, ts) }
+
+	for name, h := range map[string]func() http.Handler{
+		"receive mode":  func() http.Handler { return newHTTPReceiveHandler(config{}, &counters{}, newValidator()) },
+		"data endpoint": func() http.Handler { return newHTTPDataHandler(config{}, &counters{}, newValidator()) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			seqTrack = newSeqTracker()
+			handler := h()
+			post(handler, "/", line(0, 0)+"\n"+line(0, 1)+"\n")
+			post(handler, "/logs/_bulk", `{"create":{}}`+"\n"+line(0, 2)+"\n"+`{"create":{}}`+"\n"+line(0, 3)+"\n")
+			c := seqTrack.check(map[int64]int64{0: 4}, 5)
+			if c.Missing != 0 || c.Unique != 4 {
+				t.Fatalf("after 4 tracked lines over HTTP: %+v", c)
+			}
+		})
 	}
 }
 
