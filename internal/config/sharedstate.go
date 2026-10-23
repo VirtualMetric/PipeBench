@@ -132,8 +132,9 @@ type SharedStateConfig struct {
 	// Streams say how the data of each generator must arrive at its receiver.
 	Streams []SharedStateStream `yaml:"streams"`
 
-	// OutageSeconds is how long pause_store pauses the store, and how long
-	// isolate_replica keeps the replica off the network (default 30).
+	// OutageSeconds is how long pause_store pauses the store, how long
+	// isolate_replica keeps the replica off the network, and how long
+	// scale_backlog pauses the receiver (default 30).
 	OutageSeconds int `yaml:"outage_seconds"`
 	// OutageStreams are streams that must go on arriving while the store is
 	// away: their senders feed devices that keep no shared state.

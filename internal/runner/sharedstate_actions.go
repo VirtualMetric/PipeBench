@@ -613,7 +613,8 @@ func (run *ssRun) scaleBacklog() {
 		return
 	}
 	receiver := "bench-receiver-" + st.Receiver
-	fmt.Printf("  pausing %s, so %s keeps a backlog…\n", receiver, run.replica(loaded).Service)
+	pause := time.Duration(run.ss.OutageOrDefault()) * time.Second
+	fmt.Printf("  pausing %s for %s, so %s keeps a backlog…\n", receiver, pause, run.replica(loaded).Service)
 	if err := exec.Command("docker", "pause", receiver).Run(); err != nil {
 		run.fail("docker pause %s: %v", receiver, err)
 		return
@@ -623,7 +624,7 @@ func (run *ssRun) scaleBacklog() {
 			run.fail("docker unpause %s: %v", receiver, err)
 		}
 	}()
-	if sleepCtx(run.r.ctx, 30*time.Second) != nil {
+	if sleepCtx(run.r.ctx, pause) != nil {
 		return
 	}
 	samples := map[string]ssScale{}
@@ -653,7 +654,7 @@ func (run *ssRun) scaleBacklog() {
 		fmt.Printf("    /scale %s: backlog total %d, local %d, members %d, coordination %q, pressure %d\n", name, s.Backlog.Total, s.Backlog.Local, s.Members, s.Coordination, s.Pressure)
 	}
 	if loadedLocal <= 0 {
-		run.fail("scale_backlog: %s reports no backlog of its own after its receiver was paused for 30s", run.replica(loaded).Service)
+		run.fail("scale_backlog: %s reports no backlog of its own after its receiver was paused for %s", run.replica(loaded).Service, pause)
 		return
 	}
 	want := int64(float64(loadedLocal) * run.ss.ScaleMinShareOrDefault())
