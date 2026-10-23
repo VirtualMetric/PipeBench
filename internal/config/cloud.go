@@ -252,6 +252,11 @@ type AzureConfig struct {
 	// polls that queue for BlobCreated events, which the generator's
 	// azure_blob mode synthesizes.
 	Containers []string `yaml:"containers"`
+	// Accounts are storage accounts Azurite serves beside its development
+	// account (devstoreaccount1), each with a key of its own. A case gives the
+	// subject one of them when a key must be told apart from the key of the
+	// development account, which every other container uses.
+	Accounts []AzureAccount `yaml:"accounts"`
 }
 
 // ImageOrDefault returns the Azurite image.
@@ -533,5 +538,5 @@ func (tc *TestCase) validateAzure() error {
 		}
 		seen[c] = struct{}{}
 	}
-	return nil
+	return tc.validateAzureAccounts()
 }

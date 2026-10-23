@@ -34,12 +34,13 @@ func RenderClusterNodeConfig(srcPath, outPath string, nodeID, size int) error {
 		NodeID:         nodeID,
 		ClusterNodeIDs: nodeIDs(size),
 		T0:             time.Now().UTC(),
+		Stage:          1,
 	})
 }
 
 // ClusterNodeConfigPath is where writeCompose renders node n's config.
 func ClusterNodeConfigPath(tmpDir string, n int) string {
-	return filepath.Join(tmpDir, fmt.Sprintf("cluster-node-%d.yml", n))
+	return replicaConfigPath(tmpDir, n)
 }
 
 // NodeArgsPath is the file a node's start wrapper reads its extra command
@@ -63,9 +64,8 @@ func applyClusterScenarioTopology(vars *composeVars, cfg RunConfig) error {
 	// The load starts once the cluster is ready, at the start_load step.
 	vars.GenDeferred = true
 
-	if tc.UsesAzure() {
-		vars.NodeDependsOn = append(vars.NodeDependsOn, nodeDependency{"azure-init", "service_completed_successfully"})
-	}
+	// Every cluster node already waits for azure-init when the case uses
+	// Azurite (the node block's AzureEnabled entry).
 	if tc.UsesMinio() {
 		vars.NodeDependsOn = append(vars.NodeDependsOn, nodeDependency{"minio-init", "service_completed_successfully"})
 	}

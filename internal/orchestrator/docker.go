@@ -60,6 +60,11 @@ type configTemplateContext struct {
 	// anchor an absolute timestamp to (see T0Plus). Containers take seconds to
 	// start after T0; a case must budget that latency into its offsets.
 	T0 time.Time
+	// Stage is 1 when the config is first rendered. A shared-state driver
+	// renders the replicas' configs again with Stage 2 once they all run
+	// (ComposeRunner.RenderReplicaConfigs), so a case can, for one, enable a
+	// device only after the leader has placed the first ones.
+	Stage int
 }
 
 // T0Plus returns T0 + sec seconds as RFC3339 UTC, for absolute device
@@ -171,18 +176,23 @@ services:
     container_name: "{{ .Container }}"
     hostname: "{{ .Hostname }}"
     networks: [bench]
-{{- if .Spare }}
-    # A spare node starts only when a scale_to step adds it to the cluster.
-    profiles: ["spare"]
+{{- if .Standby }}
+    # A standby replica, or a spare node of a scenario case: rendered, but
+    # started only when a scale-out action or a scale_to step names it.
+    profiles: ["standby"]
 {{- end }}
 {{- if $.NodesNeedNetAdmin }}
     cap_add:
       - NET_ADMIN
 {{- end }}
-{{- if or $.VerifierLocalDir $.NodeDependsOn }}
+{{- if or $.VerifierLocalDir $.AzureEnabled $.NodeDependsOn }}
     depends_on:
 {{- if $.VerifierLocalDir }}
       data-init:
+        condition: service_completed_successfully
+{{- end }}
+{{- if $.AzureEnabled }}
+      azure-init:
         condition: service_completed_successfully
 {{- end }}
 {{- range $.NodeDependsOn }}
@@ -444,6 +454,7 @@ services:
 {{- range $k, $v := .Env }}
       {{ $k }}: "{{ $v }}"
 {{- end }}
+{{- template "helperLimits" $ }}
     restart: "no"
 {{- end }}
 {{- else if .EmitGenerator }}
@@ -563,6 +574,7 @@ services:
 {{- range $k, $v := .GenEnv }}
       {{ $k }}: "{{ $v }}"
 {{- end }}
+{{- template "helperLimits" $ }}
     restart: "no"
 {{- end }}
 
@@ -611,6 +623,7 @@ services:
 {{- range $k, $v := .Env }}
       {{ $k }}: "{{ $v }}"
 {{- end }}
+{{- template "helperLimits" $ }}
     restart: "no"
 {{- end }}
 {{- else if not .VerifierEnabled }}
@@ -660,6 +673,7 @@ services:
 {{- range $k, $v := .RecvEnv }}
       {{ $k }}: "{{ $v }}"
 {{- end }}
+{{- template "helperLimits" $ }}
     restart: "no"
 {{- end }}
 
@@ -685,6 +699,7 @@ services:
       COLLECTOR_TARGET_CONTAINER: "{{ .CollectorTargets }}"
       COLLECTOR_INTERVAL_SECS: "1"
       COLLECTOR_OUTPUT: "/results/metrics.csv"
+{{- template "helperLimits" $ }}
     restart: "no"
 {{- if .WitnessDirMount }}
 
@@ -1218,6 +1233,11 @@ services:
     hostname: "azurite"
     networks: [bench]
     command: ["azurite", "--blobHost", "0.0.0.0", "--queueHost", "0.0.0.0", "--inMemoryPersistence", "--skipApiVersionCheck"]
+{{- if .AzuriteAccounts }}
+    environment:
+      AZURITE_ACCOUNTS: "{{ .AzuriteAccounts }}"
+{{- end }}
+{{- template "helperLimits" $ }}
     restart: "no"
 
   # One-shot: retry container/queue creation until Azurite answers, then
@@ -1233,6 +1253,7 @@ services:
       RECEIVER_MODE: "azure_init"
       AZURE_STORAGE_CONNECTION_STRING: "{{ .AzureConnString }}"
       AZURE_INIT_CONTAINERS: "{{ .AzureInitContainers }}"
+{{- template "helperLimits" $ }}
     restart: "no"
 {{- end }}
 {{- if .MinioEnabled }}
@@ -1269,6 +1290,14 @@ services:
       AWS_EC2_METADATA_DISABLED: "true"
     restart: "no"
 {{- end }}
+{{- define "helperLimits" }}{{ if .HelperCPULimit }}
+    deploy:
+      resources:
+        limits:
+          cpus: "{{ .HelperCPULimit }}"
+{{- if .HelperMemLimit }}
+          memory: "{{ .HelperMemLimit }}"
+{{- end }}{{ end }}{{ end }}
 `
 
 // RunConfig holds parameters for a single test run.
@@ -1287,7 +1316,12 @@ type RunConfig struct {
 	ExtraSubjectEnv  map[string]string
 	CPULimit         string // e.g. "1", "4" — number of cores for subject
 	MemLimit         string // e.g. "1g", "16g" — memory limit for subject
-	DockerSocketGID  string // numeric gid owning /var/run/docker.sock; passed to collector via group_add so a non-root image can still read the socket
+	// HelperCPULimit / HelperMemLimit, when set, cap every container the
+	// harness adds around the subject: generators, receivers, the collector,
+	// and Azurite with its init. Empty leaves them unlimited, as before.
+	HelperCPULimit  string
+	HelperMemLimit  string
+	DockerSocketGID string // numeric gid owning /var/run/docker.sock; passed to collector via group_add so a non-root image can still read the socket
 	// TLSCertsHost, when non-empty, is the absolute host path holding
 	// ca.crt + server.crt/key + client.crt/key for a TLS-enabled run.
 	// The harness writes the certs there before `docker compose up`; the
@@ -1337,6 +1371,37 @@ type ComposeRunner struct {
 	recvContainers []string
 	// recvHostPorts maps receiver id → host port for the /metrics endpoint.
 	recvHostPorts map[string]int
+	// renderedAt is the instant the configs were first rendered (their T0).
+	renderedAt time.Time
+}
+
+// RenderReplicaConfigs renders every cluster node's or replica's config again
+// from the case's source, with {{@.Stage@}} set to stage and the T0 of the
+// first render, over the file mounted into its container. The director reads
+// a changed config on its own, so this changes a running replica set without
+// restarting it.
+func (r *ComposeRunner) RenderReplicaConfigs(stage int) error {
+	raw, err := os.ReadFile(r.cfg.ConfigSrcPath)
+	if err != nil {
+		return err
+	}
+	tmpl, err := template.New("replica").Delims(harnessTmplLeft, harnessTmplRight).Parse(string(raw))
+	if err != nil {
+		return fmt.Errorf("parsing replica config template %s: %w", r.cfg.ConfigSrcPath, err)
+	}
+	for i := 1; i <= r.cfg.TestCase.ReplicaNodes(); i++ {
+		// Render in memory and write the file in one call: a director that
+		// reads its config while it is written must not find it empty.
+		var buf bytes.Buffer
+		ctx := configTemplateContext{CPUs: runtime.NumCPU(), NodeID: i, T0: r.renderedAt, Stage: stage}
+		if err := tmpl.Execute(&buf, ctx); err != nil {
+			return fmt.Errorf("rendering replica config %d: %w", i, err)
+		}
+		if err := os.WriteFile(replicaConfigPath(r.cfg.TmpDir, i), buf.Bytes(), 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Ensure ComposeRunner implements Orchestrator.
@@ -1406,11 +1471,12 @@ func NewComposeRunner(ctx context.Context, cfg RunConfig) (*ComposeRunner, error
 	}
 
 	composeFile := filepath.Join(cfg.TmpDir, "docker-compose.yaml")
-	if err := writeCompose(composeFile, cfg); err != nil {
+	t0 := time.Now().UTC()
+	if err := writeComposeAt(composeFile, cfg, t0); err != nil {
 		return nil, err
 	}
 
-	cr := &ComposeRunner{runCtx: ctx, cfg: cfg, composeFile: composeFile}
+	cr := &ComposeRunner{runCtx: ctx, cfg: cfg, composeFile: composeFile, renderedAt: t0}
 	cr.populateServiceNames()
 	return cr, nil
 }
@@ -1495,6 +1561,16 @@ func (r *ComposeRunner) UpServices(services ...string) error {
 func (r *ComposeRunner) RestartServices(services ...string) error {
 	resolved := r.resolveServiceAliases(services)
 	args := append([]string{"up", "-d", "--quiet-pull", "--no-deps"}, resolved...)
+	return r.compose(args...)
+}
+
+// RecreateServices replaces the named services with new containers, without
+// touching their dependencies. A container platform that replaces a replica
+// starts it on an empty disk, which `docker start` of the old container would
+// not do: whatever the replica keeps must come back from elsewhere.
+func (r *ComposeRunner) RecreateServices(services ...string) error {
+	resolved := r.resolveServiceAliases(services)
+	args := append([]string{"up", "-d", "--quiet-pull", "--no-deps", "--force-recreate"}, resolved...)
 	return r.compose(args...)
 }
 
@@ -1815,9 +1891,12 @@ type clusterNode struct {
 	Container string
 	Hostname  string
 	ConfigSrc string
-	// Spare nodes are rendered under the "spare" profile: they start only
-	// when a scenario's scale_to step adds them (cluster.scenario.spare_nodes).
-	Spare bool
+	// Standby marks a node that is rendered but not started with the others:
+	// a standby replica of a shared-state case (shared_state.standby), or a
+	// spare node of a scenario case (cluster.scenario.spare_nodes). It carries
+	// a compose profile, so `up` leaves it out until a scale-out action or a
+	// scale_to step names it.
+	Standby bool
 }
 
 // nodeDependency is one depends_on entry of every cluster node service.
@@ -1860,8 +1939,16 @@ type composeVars struct {
 	HasResourceLimits bool
 	CPULimit          string
 	MemLimit          string
-	UseSharedData     bool
-	DeferReceiver     bool
+	// HelperCPULimit / HelperMemLimit cap the harness's own containers
+	// (generators, receivers, collector, Azurite and its init) when set. Empty
+	// renders no limit, as before.
+	HelperCPULimit string
+	HelperMemLimit string
+	// AzuriteAccounts is Azurite's AZURITE_ACCOUNTS value when the case gives
+	// Azurite accounts of its own (azure.accounts), else empty.
+	AzuriteAccounts string
+	UseSharedData   bool
+	DeferReceiver   bool
 
 	// SubjectDiskPath / SubjectDiskSizeBytes render a size-limited tmpfs
 	// mount inside the singular subject service (case subject_disk block) —
@@ -2151,17 +2238,28 @@ func resolveSampleHost(caseDir, sampleFile string) (host, dst string, err error)
 }
 
 func writeCompose(path string, cfg RunConfig) error {
+	return writeComposeAt(path, cfg, time.Now().UTC())
+}
+
+// replicaConfigPath is where a cluster node's or a replica's rendered config
+// lives, bind-mounted into its container.
+func replicaConfigPath(tmpDir string, n int) string {
+	return filepath.Join(tmpDir, fmt.Sprintf("cluster-node-%d.yml", n))
+}
+
+// writeComposeAt writes the compose file, with t0 as the render instant.
+func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 	tc := cfg.TestCase
 	s := cfg.Subject
 	// One render instant shared by the subject config (T0Plus) and the
 	// LocalStack init script ($TODAY) so both anchor to the same clock.
-	t0 := time.Now().UTC()
 
 	// Render the subject config as a template (opt-in via {{@...@}}) so it can
 	// adapt to the host's CPU count or anchor timestamps to the run start.
 	renderedConfigSrc, err := renderSubjectConfig(cfg.ConfigSrcPath, cfg.TmpDir, configTemplateContext{
-		CPUs: runtime.NumCPU(),
-		T0:   t0,
+		CPUs:  runtime.NumCPU(),
+		T0:    t0,
+		Stage: 1,
 	})
 	if err != nil {
 		return err
@@ -2174,36 +2272,38 @@ func writeCompose(path string, cfg RunConfig) error {
 
 	subjectContainer := "bench-subject-" + s.Name
 
-	// Cluster cases: render the subject config once per node (NodeID 1..N injected
-	// via {{@.NodeID@}}) and emit one subject service per node. The template ranges
-	// over vars.Subjects instead of the singular subject block, so non-cluster
-	// cases are unaffected (Subjects stays empty).
+	// Cluster and shared-state cases: render the subject config once per node
+	// (NodeID 1..N injected via {{@.NodeID@}}) and emit one subject service per
+	// node. The template ranges over vars.Subjects instead of the singular
+	// subject block, so other cases are unaffected (Subjects stays empty). The
+	// replicas of a shared state run one config, so theirs carries no NodeID
+	// unless a case wants one replica to differ (a wrong key, say).
 	var clusterNodes []clusterNode
-	if tc.Cluster != nil && tc.Cluster.Nodes > 0 {
-		// Spare nodes (scenario cases) render after the regular ones, with a
-		// node list that already counts them: they join a cluster that a
-		// scale_to step has grown to include them.
-		spare := 0
-		if tc.Cluster.Scenario != nil {
-			spare = tc.Cluster.Scenario.SpareNodes
+	// A scenario case's spare nodes render after the regular ones, with a
+	// node list that already counts them: they join a cluster that a
+	// scale_to step has grown to include them. Like a standby replica, they
+	// start only when a step names them.
+	regular := tc.ReplicaNodes()
+	spare := 0
+	if tc.Cluster != nil && tc.Cluster.Scenario != nil {
+		spare = tc.Cluster.Scenario.SpareNodes
+	}
+	for i := 1; i <= regular+spare; i++ {
+		nodeOut := replicaConfigPath(cfg.TmpDir, i)
+		ctx := configTemplateContext{CPUs: runtime.NumCPU(), NodeID: i, T0: t0, Stage: 1}
+		if tc.Cluster != nil && tc.Cluster.Nodes > 0 {
+			ctx.ClusterNodeIDs = nodeIDs(max(tc.Cluster.Nodes, i))
 		}
-		for i := 1; i <= tc.Cluster.Nodes+spare; i++ {
-			size := tc.Cluster.Nodes
-			if i > tc.Cluster.Nodes {
-				size = i
-			}
-			nodeOut := filepath.Join(cfg.TmpDir, fmt.Sprintf("cluster-node-%d.yml", i))
-			if err := renderConfigToFile(cfg.ConfigSrcPath, nodeOut, configTemplateContext{CPUs: runtime.NumCPU(), NodeID: i, ClusterNodeIDs: nodeIDs(size), T0: t0}); err != nil {
-				return err
-			}
-			clusterNodes = append(clusterNodes, clusterNode{
-				ID:        i,
-				Container: fmt.Sprintf("bench-subject-%s-%d", s.Name, i),
-				Hostname:  fmt.Sprintf("subject-%d", i),
-				ConfigSrc: filepath.ToSlash(nodeOut),
-				Spare:     i > tc.Cluster.Nodes,
-			})
+		if err := renderConfigToFile(cfg.ConfigSrcPath, nodeOut, ctx); err != nil {
+			return err
 		}
+		clusterNodes = append(clusterNodes, clusterNode{
+			ID:        i,
+			Container: fmt.Sprintf("bench-subject-%s-%d", s.Name, i),
+			Hostname:  fmt.Sprintf("subject-%d", i),
+			ConfigSrc: filepath.ToSlash(nodeOut),
+			Standby:   tc.StandbyReplica(i) || i > regular,
+		})
 	}
 
 	// The collector samples targets by container name. Cluster cases have no
@@ -2420,6 +2520,8 @@ func writeCompose(path string, cfg RunConfig) error {
 		HasResourceLimits:    cfg.CPULimit != "" || cfg.MemLimit != "",
 		CPULimit:             cfg.CPULimit,
 		MemLimit:             cfg.MemLimit,
+		HelperCPULimit:       cfg.HelperCPULimit,
+		HelperMemLimit:       cfg.HelperMemLimit,
 		UseSharedData:        useSharedData,
 		SubjectDiskPath:      subjectDiskPath,
 		SubjectDiskSizeBytes: subjectDiskSizeBytes,
@@ -2750,6 +2852,7 @@ func writeCompose(path string, cfg RunConfig) error {
 		vars.AzureImage = tc.Azure.ImageOrDefault()
 		vars.AzureConnString = tc.Azure.ConnectionString()
 		vars.AzureInitContainers = strings.Join(tc.Azure.Containers, ",")
+		vars.AzuriteAccounts = tc.Azure.AzuriteAccountsEnv()
 	}
 	if tc.UsesMinio() {
 		vars.MinioEnabled = true

@@ -137,8 +137,8 @@ func TestClusterScenarioComposeRendersTopology(t *testing.T) {
 		}
 	}
 	spare := service(t, doc, "subject-4")
-	if p, _ := spare["profiles"].([]any); len(p) != 1 || p[0] != "spare" {
-		t.Fatalf("subject-4 must be a spare node: %v", spare["profiles"])
+	if p, _ := spare["profiles"].([]any); len(p) != 1 || p[0] != "standby" {
+		t.Fatalf("subject-4 must be a spare node, behind the standby profile: %v", spare["profiles"])
 	}
 	gen := service(t, doc, "generator")
 	if p, _ := gen["profiles"].([]any); len(p) != 1 || p[0] != "load" {

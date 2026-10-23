@@ -339,6 +339,11 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	if tc.IsClusterScenarioType() {
 		return r.runClusterScenario(tc, subject)
 	}
+	// Replicas of one serverless director that share their state through a
+	// store (Azurite): crashes, stops and outages, and the recovery after them.
+	if tc.IsDirectorSharedStateType() {
+		return r.runDirectorSharedStateCorrectness(tc, subject)
+	}
 	if tc.IsFleetAutomationType() {
 		return r.runFleetAutomationCorrectness(tc, subject)
 	}
