@@ -342,7 +342,7 @@ func TestParseGeneratorAck(t *testing.T) {
 func TestProgressLineMatches(t *testing.T) {
 	line := `PROGRESS t_ms=1792775180000 acked=12340 unacked=0 requests=1300 failures=6 failovers=6 pending=10 last_ack_ns=1792775179999000000 last_error="x"`
 	m := progressRE.FindStringSubmatch(line)
-	if m == nil || m[2] != "12340" || m[3] != "6" || m[4] != "10" {
+	if m == nil || m[2] != "12340" || m[3] != "6" || m[4] != "10" || m[5] != "1792775179999000000" {
 		t.Fatalf("progress line not parsed: %v", m)
 	}
 }

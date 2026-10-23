@@ -141,9 +141,11 @@ type genProgress struct {
 	Acked    int64
 	Failures int64
 	Pending  int64
+	// LastAck is when the client last got a 2xx; zero before the first one.
+	LastAck time.Time
 }
 
-var progressRE = regexp.MustCompile(`PROGRESS t_ms=(\d+) acked=(\d+) unacked=\d+ requests=\d+ failures=(\d+) failovers=\d+ pending=(\d+)`)
+var progressRE = regexp.MustCompile(`PROGRESS t_ms=(\d+) acked=(\d+) unacked=\d+ requests=\d+ failures=(\d+) failovers=\d+ pending=(\d+) last_ack_ns=(\d+)`)
 
 type scenarioRun struct {
 	r       *Runner
@@ -616,10 +618,16 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 				}
 				if time.Since(flatSince) >= hold {
 					after := last.Acked - base
-					stoppedMs := flatSince.Sub(since).Milliseconds()
+					// The writes stopped with the client's last 2xx, which can
+					// be well before this step saw the count stand still.
+					stopped := flatSince
+					if !last.LastAck.IsZero() {
+						stopped = last.LastAck
+					}
+					stoppedMs := max(stopped.Sub(since).Milliseconds(), 0)
 					sr.record(st.Record, float64(stoppedMs))
 					sr.record(st.Record+"_acked_after", float64(after))
-					return true, fmt.Sprintf("writes stopped %s after the disruption; %d lines were acknowledged %s", fmtMs(stoppedMs), after, from), nil
+					return true, fmt.Sprintf("writes stopped %s after the disruption (the client's last 2xx); %d lines were acknowledged %s", fmtMs(stoppedMs), after, from), nil
 				}
 			}
 			if time.Now().After(deadline.Add(hold)) {
@@ -1848,7 +1856,11 @@ func readGeneratorProgress() (genProgress, bool) {
 		acked, _ := strconv.ParseInt(m[2], 10, 64)
 		fails, _ := strconv.ParseInt(m[3], 10, 64)
 		pending, _ := strconv.ParseInt(m[4], 10, 64)
-		return genProgress{At: time.UnixMilli(tms), Acked: acked, Failures: fails, Pending: pending}, true
+		p := genProgress{At: time.UnixMilli(tms), Acked: acked, Failures: fails, Pending: pending}
+		if ns, _ := strconv.ParseInt(m[5], 10, 64); ns > 0 {
+			p.LastAck = time.Unix(0, ns)
+		}
+		return p, true
 	}
 	return genProgress{}, false
 }
