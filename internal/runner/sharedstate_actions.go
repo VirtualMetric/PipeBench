@@ -651,29 +651,111 @@ func (run *ssRun) storeCalls() {
 // is one of steady load: no device moves in it, and a move is written at once
 // whatever the interval.
 func (run *ssRun) checkStateWrites(calls []ssStoreCall, from, to time.Time) {
-	writer, ts := busiestWriter(segmentWrites(calls, run.ss.StoreContainerOrDefault(), from, to))
+	container := run.ss.StoreContainerOrDefault()
+	writer, ts := busiestWriter(segmentWrites(calls, container, from, to))
 	gaps := writeGaps(ts)
 	secs := make([]float64, len(gaps))
 	for i, g := range gaps {
 		secs[i] = g.Seconds()
 	}
-	run.measures["state_writes_load"] = map[string]any{"writer": writer, "writes": len(ts), "gaps_seconds": secs}
-	fmt.Printf("    state writes under load: %d by the bus's writer, %d apart (seconds): %v\n", len(ts), len(gaps), roundSeconds(secs))
+	// A stream's snapshot writes what is waiting first, whatever the interval:
+	// such a segment write comes within a second of the snapshot's own writes.
+	snaps := snapshotWrites(calls, container, from, to)
+	forced := withSnapshot(ts, snaps)
+	nForced := 0
+	for _, f := range forced {
+		if f {
+			nForced++
+		}
+	}
+	snapRounds := writeRounds(snaps, time.Second)
+	roundGaps := writeGaps(snapRounds)
+	roundSecs := make([]float64, len(roundGaps))
+	for i, g := range roundGaps {
+		roundSecs[i] = g.Seconds()
+	}
+	run.measures["state_writes_load"] = map[string]any{
+		"writer": writer, "writes": len(ts), "gaps_seconds": secs, "with_snapshot": nForced,
+		"snapshot_rounds": len(snapRounds), "snapshot_round_gaps_seconds": roundSecs,
+	}
+	fmt.Printf("    state writes under load: %d by the bus's writer (%d with a snapshot), %d apart (seconds): %v\n", len(ts), nForced, len(gaps), roundSeconds(secs))
+	fmt.Printf("    snapshot rounds under load: %d, apart (seconds): %v\n", len(snapRounds), roundSeconds(roundSecs))
 	n := run.ss.StateWriteIntervalSeconds
 	if n <= 0 {
 		return
 	}
 	want := time.Duration(n) * time.Second
 	tol := run.ss.StateWriteToleranceOrDefault()
-	if len(gaps) == 0 {
-		run.fail("the bus's writer wrote %d state segments in %s of load; checking a %s write interval needs at least two", len(ts), to.Sub(from).Round(time.Second), want)
-		return
+	problems, judged := judgeWriteGaps(ts, forced, want, tol)
+	for _, p := range problems {
+		run.fail("%s", p)
 	}
-	for i, g := range gaps {
-		if g < want-tol || g > want+tol {
-			run.fail("state write %d came %s after the one before it; the write interval is %s, give or take %s", i+2, g.Round(100*time.Millisecond), want, tol)
+	if judged == 0 {
+		run.fail("no state write in %s of load followed the %s write interval: the bus's writer wrote %d segments, %d of them with a snapshot, and the snapshot rounds came every %v seconds",
+			to.Sub(from).Round(time.Second), want, len(ts), nForced, roundSeconds(roundSecs))
+	}
+}
+
+// judgeWriteGaps judges each gap that ends at a write the interval made, and
+// returns what is wrong and how many gaps it judged. A write that a snapshot
+// asked for comes early on purpose, and the interval counts on from it.
+func judgeWriteGaps(ts []time.Time, forced []bool, want, tol time.Duration) ([]string, int) {
+	var problems []string
+	judged := 0
+	for i := 1; i < len(ts); i++ {
+		if forced[i] {
+			continue
+		}
+		judged++
+		if g := ts[i].Sub(ts[i-1]); g < want-tol || g > want+tol {
+			problems = append(problems, fmt.Sprintf("state write %d came %s after the one before it; the write interval is %s, give or take %s", i+1, g.Round(100*time.Millisecond), want, tol))
 		}
 	}
+	return problems, judged
+}
+
+// snapshotWrites returns when the store accepted a stream's snapshot or its
+// manifest in [from, to): the writes a snapshot makes.
+func snapshotWrites(calls []ssStoreCall, container string, from, to time.Time) []time.Time {
+	var out []time.Time
+	for _, c := range calls {
+		if c.At.Before(from) || !c.At.Before(to) || !c.isWrite() || c.Status >= 300 || !c.inContainer(container) {
+			continue
+		}
+		if k := c.kind(); k == "snapshots" || k == "streams" {
+			out = append(out, c.At)
+		}
+	}
+	return out
+}
+
+// withSnapshot reports, for each write, whether a snapshot write came within a
+// second of it.
+func withSnapshot(writes, snaps []time.Time) []bool {
+	out := make([]bool, len(writes))
+	for i, w := range writes {
+		for _, s := range snaps {
+			if d := s.Sub(w); d > -time.Second && d < time.Second {
+				out[i] = true
+				break
+			}
+		}
+	}
+	return out
+}
+
+// writeRounds returns the first time of each round of writes: writes less
+// than within apart belong to one round.
+func writeRounds(ts []time.Time, within time.Duration) []time.Time {
+	var rounds []time.Time
+	var last time.Time
+	for _, t := range ts {
+		if len(rounds) == 0 || t.Sub(last) >= within {
+			rounds = append(rounds, t)
+		}
+		last = t
+	}
+	return rounds
 }
 
 // roundSeconds rounds each value to a tenth, for printing.
