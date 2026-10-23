@@ -153,6 +153,15 @@ func TestClusterScenarioComposeRendersTopology(t *testing.T) {
 	if _, ok := doc["volumes"].(map[string]any)["witness-dir"]; !ok {
 		t.Fatalf("the witness-dir volume is not declared")
 	}
+	// witness-init runs as root, so the case's directory reaches its shell
+	// as data, not as part of the command.
+	wi := service(t, doc, "witness-init")
+	if env, _ := wi["environment"].(map[string]any); env["WITNESS_DIR"] != "/witness" {
+		t.Fatalf("witness-init must get the directory as WITNESS_DIR: %v", wi["environment"])
+	}
+	if cmd, _ := wi["command"].([]any); len(cmd) != 1 || strings.Contains(cmd[0].(string), "/witness") {
+		t.Fatalf("witness-init's command must not carry the directory itself: %v", wi["command"])
+	}
 	if !strings.Contains(raw, "18474:8474") {
 		t.Fatalf("Toxiproxy's API port is not published")
 	}

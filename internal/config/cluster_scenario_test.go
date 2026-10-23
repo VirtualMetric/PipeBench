@@ -57,6 +57,16 @@ func TestValidateClusterScenarioRejects(t *testing.T) {
 			tc.Cluster.Scenario.Steps = append(tc.Cluster.Scenario.Steps, ScenarioStep{Do: "proxy_latency", Proxy: "witness", Latency: "200ms"})
 		}, "not declared"},
 		"action from the other driver": {func(tc *TestCase) { tc.Cluster.Action = "restart_leader" }, "belong to director_cluster_correctness"},
+		"relative witness dir":         {func(tc *TestCase) { tc.Cluster.Scenario.WitnessDir = "witness" }, "absolute path"},
+		"witness dir with a space":     {func(tc *TestCase) { tc.Cluster.Scenario.WitnessDir = "/wit ness" }, "absolute path"},
+		"witness dir with a colon":     {func(tc *TestCase) { tc.Cluster.Scenario.WitnessDir = "/witness:rw" }, "absolute path"},
+		"witness dir with a shell command": {func(tc *TestCase) {
+			tc.Cluster.Scenario.WitnessDir = "/witness;rm -rf /"
+		}, "absolute path"},
+		"witness dir with a substitution": {func(tc *TestCase) { tc.Cluster.Scenario.WitnessDir = "/w$(id)" }, "absolute path"},
+		"witness dir climbing out":        {func(tc *TestCase) { tc.Cluster.Scenario.WitnessDir = "/witness/../etc" }, "'..'"},
+		"witness dir at the root":         {func(tc *TestCase) { tc.Cluster.Scenario.WitnessDir = "/" }, "absolute path"},
+		"witness dir of dots":             {func(tc *TestCase) { tc.Cluster.Scenario.WitnessDir = "/./." }, "below /"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {

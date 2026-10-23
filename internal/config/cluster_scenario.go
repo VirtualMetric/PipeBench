@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -260,6 +261,28 @@ func (sc *ScenarioConfig) DrainOrDefault() time.Duration {
 	return time.Duration(sc.DrainSeconds) * time.Second
 }
 
+// witnessDirPattern is the form a witness directory must take: an absolute
+// path of letters, digits, '.', '_', '-' and '/'. The path goes into every
+// node's volume entry and into witness-init, which runs as root.
+var witnessDirPattern = regexp.MustCompile(`^/[A-Za-z0-9._/-]+$`)
+
+// checkWitnessDir says what is wrong with a cluster.scenario.witness_dir, or
+// returns nil.
+func checkWitnessDir(dir string) error {
+	if !witnessDirPattern.MatchString(dir) {
+		return fmt.Errorf("must be an absolute path made only of letters, digits, '.', '_', '-' and '/', with no spaces, ':' or shell characters")
+	}
+	for _, part := range strings.Split(dir, "/") {
+		if part == ".." {
+			return fmt.Errorf("must not contain '..'")
+		}
+	}
+	if strings.Trim(dir, "/.") == "" {
+		return fmt.Errorf("must name a directory below /")
+	}
+	return nil
+}
+
 // validateClusterScenario checks a director_cluster_scenario_correctness case.
 func (tc *TestCase) validateClusterScenario() error {
 	if tc.Cluster == nil {
@@ -298,6 +321,11 @@ func (tc *TestCase) validateClusterScenario() error {
 	case "", "dir", "azure", "s3":
 	default:
 		return fmt.Errorf("case %q: cluster.scenario.witness must be dir, azure or s3, got %q", tc.Name, sc.Witness)
+	}
+	if sc.WitnessDir != "" {
+		if err := checkWitnessDir(sc.WitnessDir); err != nil {
+			return fmt.Errorf("case %q: cluster.scenario.witness_dir %q %v", tc.Name, sc.WitnessDir, err)
+		}
 	}
 	if sc.Witness == "azure" && !tc.UsesAzure() {
 		return fmt.Errorf("case %q: cluster.scenario.witness azure needs the case's `azure:` block", tc.Name)

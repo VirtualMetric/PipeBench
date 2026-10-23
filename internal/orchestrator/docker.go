@@ -711,8 +711,14 @@ services:
     container_name: "bench-witness-init"
     networks: [bench]
     user: "0:0"
+    # The directory comes from the case, so it reaches the root shell as an
+    # environment variable and is quoted there, like data-init's ($$ -> $
+    # after compose interpolation). The case check makes it an absolute path,
+    # so it cannot read as an option.
     entrypoint: ["/bin/sh", "-c"]
-    command: ["chmod 0777 {{ .WitnessDirMount }}"]
+    command: ["chmod 0777 \"$${WITNESS_DIR}\""]
+    environment:
+      WITNESS_DIR: "{{ .WitnessDirMount }}"
     volumes:
       - "witness-dir:{{ .WitnessDirMount }}"
     restart: "no"
