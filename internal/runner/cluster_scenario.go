@@ -1572,6 +1572,14 @@ func deliveryGapAfter(tl receiverTimeline, at time.Time, window time.Duration) (
 	first := min(bucketAtOrAfter(tl, at), len(tl.Unique))
 	last := min(bucketAtOrAfter(tl, at.Add(window)), len(tl.Unique))
 	i := first
+	// A gap already under way at the first bucket started before at, so it
+	// belongs to an earlier disruption: skip it, and look for gaps that
+	// start after it.
+	if i > 0 && i < len(tl.Unique) && tl.Unique[i-1] == 0 {
+		for i < len(tl.Unique) && tl.Unique[i] == 0 {
+			i++
+		}
+	}
 	bestLen, bestEnd := 0, -1
 	for i < last {
 		if tl.Unique[i] != 0 {

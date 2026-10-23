@@ -169,6 +169,41 @@ func TestDeliveryGapAfterBoundaryBetweenBuckets(t *testing.T) {
 	}
 }
 
+// TestDeliveryGapAfterTwoDisruptionsInOneGap checks that a gap is counted
+// once, for the disruption it started after. A second disruption that comes
+// while the gap is under way skips it and takes only the gaps that start
+// later.
+func TestDeliveryGapAfterTwoDisruptionsInOneGap(t *testing.T) {
+	start := time.Unix(5000, 0)
+	tl := receiverTimeline{StartNs: start.UnixNano(), BucketMs: 100}
+	add := func(n int, v int32) {
+		for range n {
+			tl.Unique = append(tl.Unique, v)
+		}
+	}
+	add(10, 5) // 0-1 s
+	add(20, 0) // 1-3 s: one gap
+	add(10, 5) // 3-4 s
+	add(5, 0)  // 4-4.5 s: a later gap
+	add(10, 5)
+
+	gap, resume := deliveryGapAfter(tl, start.Add(950*time.Millisecond), 1050*time.Millisecond)
+	if gap != 2000 || resume != 2050 {
+		t.Fatalf("first disruption: gap %d ms, resumed after %d ms; want 2000, 2050", gap, resume)
+	}
+	// The second disruption at 2 s falls inside the first gap: it must not
+	// report the rest of that gap, only the later one.
+	gap, resume = deliveryGapAfter(tl, start.Add(2*time.Second), time.Minute)
+	if gap != 500 || resume != 2500 {
+		t.Fatalf("second disruption: gap %d ms, resumed after %d ms; want 500, 2500", gap, resume)
+	}
+	// With no later gap, it reports none.
+	gap, _ = deliveryGapAfter(tl, start.Add(2*time.Second), 1500*time.Millisecond)
+	if gap != 0 {
+		t.Fatalf("second disruption with a short window: gap %d ms, want 0", gap)
+	}
+}
+
 func TestArrivalsAfter(t *testing.T) {
 	start := time.Unix(5000, 0)
 	tl := receiverTimeline{StartNs: start.UnixNano(), BucketMs: 100}
