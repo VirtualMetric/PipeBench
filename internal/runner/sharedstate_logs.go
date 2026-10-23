@@ -30,27 +30,41 @@ type ssLogBook struct {
 	mu    sync.Mutex
 	lines map[string][]ssLine
 	last  map[string]time.Time
+	// read returns what the container wrote after since (all of it when
+	// since is zero), as `docker logs -t` prints it. Tests replace it.
+	read func(container string, since time.Time) ([]byte, error)
 }
 
 func newSSLogBook() *ssLogBook {
-	return &ssLogBook{lines: map[string][]ssLine{}, last: map[string]time.Time{}}
+	return &ssLogBook{lines: map[string][]ssLine{}, last: map[string]time.Time{}, read: dockerLogs}
 }
 
-// refresh reads the lines the container wrote since the last refresh. A read
-// that fails leaves the book as it was, and the next refresh reads the lines
-// it missed. So only the final checks need to act on the error.
-func (b *ssLogBook) refresh(container string) error {
-	b.mu.Lock()
-	since := b.last[container]
-	b.mu.Unlock()
-
+// dockerLogs reads a container's log with Docker's own timestamps.
+func dockerLogs(container string, since time.Time) ([]byte, error) {
 	args := []string{"logs", "-t"}
 	if !since.IsZero() {
 		args = append(args, "--since", since.Add(time.Nanosecond).Format(time.RFC3339Nano))
 	}
 	out, err := exec.Command("docker", append(args, container)...).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("docker logs %s: %w", container, err)
+		return nil, fmt.Errorf("docker logs %s: %w", container, err)
+	}
+	return out, nil
+}
+
+// refresh reads the lines the container wrote since the last refresh. A read
+// that fails leaves the book as it was, and the next refresh reads the lines
+// it missed. So only the last read of a container must act on the error: the
+// read after the harness ends its process, because a container that is
+// replaced takes its log with it, and the final checks' read.
+func (b *ssLogBook) refresh(container string) error {
+	b.mu.Lock()
+	since := b.last[container]
+	b.mu.Unlock()
+
+	out, err := b.read(container, since)
+	if err != nil {
+		return err
 	}
 	fresh := parseDockerLogLines(string(out))
 

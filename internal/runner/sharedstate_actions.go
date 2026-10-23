@@ -420,7 +420,7 @@ func (run *ssRun) scaleOutIn() {
 		run.fail("starting %s: %v", rep.Service, err)
 		return
 	}
-	run.running[n] = true
+	run.markStarted(n)
 	since := containerStartedAt(rep.Container, time.Now())
 	readyAt, ok := run.waitReady(n, since, earliest(time.Now().Add(run.replicaWarmup()), run.deadline))
 	if !ok {
@@ -452,12 +452,7 @@ func (run *ssRun) scaleOutIn() {
 		return
 	}
 	took := time.Since(issued)
-	endedAt := containerFinishedAt(rep.Container, time.Now())
-	if err := run.book.refresh(rep.Container); err != nil {
-		run.fail("reading %s's log after the scale-in: %v", rep.Service, err)
-	}
-	run.running[n] = false
-	run.ended = append(run.ended, ssEvent{At: endedAt, Container: rep.Container, Kind: ssProcessEnd, Text: "harness: scale-in"})
+	run.endReplica(n, containerFinishedAt(rep.Container, time.Now()), "scale-in")
 	run.measures["scale_in_exit_seconds"] = took.Seconds()
 	fmt.Printf("    %s exited %.1fs after the stop began\n", rep.Service, took.Seconds())
 	if got := run.waitStoreMembers(run.ss.Replicas, 30*time.Second); got != run.ss.Replicas {
@@ -540,13 +535,7 @@ func (run *ssRun) coldRestart() {
 		}
 	}
 	for _, rep := range running {
-		// The new containers take the old ones' logs with them, so this is
-		// the last read of what the replicas logged before the restart.
-		if err := run.book.refresh(rep.Container); err != nil {
-			run.fail("reading %s's log before replacing it: %v", rep.Service, err)
-		}
-		run.running[rep.N] = false
-		run.ended = append(run.ended, ssEvent{At: containerFinishedAt(rep.Container, time.Now()), Container: rep.Container, Kind: ssProcessEnd, Text: "harness: cold restart"})
+		run.endReplica(rep.N, containerFinishedAt(rep.Container, time.Now()), "cold restart")
 	}
 	fmt.Printf("    all stopped after %.1fs; starting new containers…\n", time.Since(stopped).Seconds())
 	var services []string
@@ -559,7 +548,7 @@ func (run *ssRun) coldRestart() {
 		return
 	}
 	for _, rep := range running {
-		run.running[rep.N] = true
+		run.markStarted(rep.N)
 	}
 	ready := map[string]float64{}
 	for _, rep := range running {
@@ -998,34 +987,29 @@ func (run *ssRun) moveThenKill() {
 	if within := run.ss.MoveKillWithinOrDefault(); lag > within {
 		run.fail("the kill came %.2fs after the device moved, later than move_kill_within_ms %d", lag.Seconds(), within.Milliseconds())
 	}
-	if err := run.book.refresh(target.Container); err != nil {
-		run.fail("reading %s's log after the kill: %v", target.Service, err)
-	}
-	run.running[target.N] = false
-	run.ended = append(run.ended, ssEvent{At: killedAt, Container: target.Container, Kind: ssProcessEnd, Text: "harness: docker kill"})
+	run.endReplica(target.N, killedAt, "docker kill")
 
 	if err := <-stopped; err != nil {
 		run.fail("docker stop %s: %v", orep.Service, err)
 	}
-	if err := run.book.refresh(orep.Container); err != nil {
-		run.fail("reading %s's log after its stop: %v", orep.Service, err)
-	}
-	run.running[owner] = false
-	run.ended = append(run.ended, ssEvent{At: containerFinishedAt(orep.Container, time.Now()), Container: orep.Container, Kind: ssProcessEnd, Text: "harness: docker stop"})
+	run.endReplica(owner, containerFinishedAt(orep.Container, time.Now()), "docker stop")
 
 	// The replica set must settle on what is left before the platform brings
 	// the two back.
 	if !run.checkSettled("after the kill", earliest(time.Now().Add(time.Duration(run.ss.SettleOrDefault())*time.Second), run.deadline)) {
 		return
 	}
-	run.replaceAll([]int{owner, target.N})
+	if !run.replaceAll([]int{owner, target.N}) {
+		return
+	}
 	run.checkSettled("after", earliest(time.Now().Add(60*time.Second), run.deadline))
 	run.checkHealthAll("after")
 }
 
 // replaceAll replaces lost replicas with new containers on empty disks, as the
-// platform does, and waits for each to rejoin.
-func (run *ssRun) replaceAll(ns []int) {
+// platform does, and waits for each to rejoin. It reports whether every one
+// of them rejoined.
+func (run *ssRun) replaceAll(ns []int) bool {
 	var services []string
 	for _, n := range ns {
 		services = append(services, run.replica(n).Service)
@@ -1034,11 +1018,12 @@ func (run *ssRun) replaceAll(ns []int) {
 	started := time.Now()
 	if err := run.orch.RecreateServices(services...); err != nil {
 		run.fail("replacing %s: %v", strings.Join(services, ", "), err)
-		return
+		return false
 	}
 	for _, n := range ns {
-		run.running[n] = true
+		run.markStarted(n)
 	}
+	rejoined := true
 	for _, n := range ns {
 		rep := run.replica(n)
 		since := containerStartedAt(rep.Container, started)
@@ -1046,14 +1031,18 @@ func (run *ssRun) replaceAll(ns []int) {
 			fmt.Printf("    %s rejoined after %.1fs\n", rep.Service, at.Sub(since).Seconds())
 		} else {
 			run.fail("%s did not rejoin after it was replaced: %s", rep.Service, run.readiness(n, since))
+			rejoined = false
 		}
 	}
+	return rejoined
 }
 
 // rollingRestart stops each replica in turn, gracefully, and replaces it with
 // a new container on an empty disk, as a new revision of a container app does:
 // the followers first, the leader last. Before it stops the next replica, the
-// new one must have rejoined and the replica set must have settled.
+// new one must have rejoined and the replica set must have settled. When one
+// has not, the restart ends there: stopping another replica of a set that is
+// already short would test something else.
 func (run *ssRun) rollingRestart() {
 	run.refreshAll()
 	leaders := run.leaders(current())
@@ -1066,58 +1055,105 @@ func (run *ssRun) rollingRestart() {
 	order = append(order, leaders...)
 	exits := map[string]float64{}
 	run.measures["rolling_restart_exit_seconds"] = exits
-	for _, n := range order {
-		rep := run.replica(n)
-		fmt.Printf("  restarting %s…\n", rep.Service)
-		issued := time.Now()
-		if err := exec.Command("docker", "stop", "-t", "30", rep.Container).Run(); err != nil {
-			run.fail("docker stop %s: %v", rep.Service, err)
-			return
-		}
-		exits[rep.Service] = time.Since(issued).Seconds()
-		fmt.Printf("    %s exited %.1fs after the stop began\n", rep.Service, exits[rep.Service])
-		endedAt := containerFinishedAt(rep.Container, time.Now())
-		// The new container takes the old one's log with it.
-		if err := run.book.refresh(rep.Container); err != nil {
-			run.fail("reading %s's log before replacing it: %v", rep.Service, err)
-		}
-		run.running[n] = false
-		run.ended = append(run.ended, ssEvent{At: endedAt, Container: rep.Container, Kind: ssProcessEnd, Text: "harness: rolling restart"})
-		run.replaceAll([]int{n})
-		if !run.checkSettled("after restarting "+rep.Service, earliest(time.Now().Add(time.Duration(run.ss.SettleOrDefault())*time.Second), run.deadline)) {
-			return
-		}
+	if !inTurn(order, func(n int) bool { return run.restartOne(n, exits) }) {
+		return
 	}
 	run.checkHealthAll("after")
 }
 
+// inTurn calls step for each replica in order, and stops at the first step
+// that fails. It reports whether every step succeeded.
+func inTurn(order []int, step func(n int) bool) bool {
+	for _, n := range order {
+		if !step(n) {
+			return false
+		}
+	}
+	return true
+}
+
+// restartOne stops replica n gracefully, replaces it with a new container,
+// and waits for the replica set to settle. It reports whether all of that
+// happened.
+func (run *ssRun) restartOne(n int, exits map[string]float64) bool {
+	rep := run.replica(n)
+	fmt.Printf("  restarting %s…\n", rep.Service)
+	issued := time.Now()
+	if err := exec.Command("docker", "stop", "-t", "30", rep.Container).Run(); err != nil {
+		run.fail("docker stop %s: %v", rep.Service, err)
+		return false
+	}
+	exits[rep.Service] = time.Since(issued).Seconds()
+	fmt.Printf("    %s exited %.1fs after the stop began\n", rep.Service, exits[rep.Service])
+	// The new container takes the old one's log with it.
+	if !run.endReplica(n, containerFinishedAt(rep.Container, time.Now()), "rolling restart") {
+		return false
+	}
+	if !run.replaceAll([]int{n}) {
+		return false
+	}
+	return run.checkSettled("after restarting "+rep.Service, earliest(time.Now().Add(time.Duration(run.ss.SettleOrDefault())*time.Second), run.deadline))
+}
+
 // checkLogOnce fails the case for a replica that did not log a line of
-// expect_log_once exactly once for every time its director started.
+// expect_log_once exactly once in each run of its director.
 func (run *ssRun) checkLogOnce() {
 	for _, want := range run.ss.ExpectLogOnce {
 		for _, rep := range run.replicas {
-			lines := run.book.all(rep.Container)
-			if len(lines) == 0 {
+			if !run.ran[rep.N] {
 				continue // a standby that never ran
 			}
-			starts, seen := countStartsAndLines(lines, want)
-			if seen != starts {
-				run.fail("%s logged %q %d times over %d starts of its director; want it once a start", rep.Service, want, seen, starts)
+			for _, p := range logOnceProblems(run.book.all(rep.Container), want) {
+				run.fail("%s %s", rep.Service, p)
 			}
 		}
 	}
 }
 
-// countStartsAndLines counts the starts of a director in a replica's log, and
-// the lines that contain want.
-func countStartsAndLines(lines []ssLine, want string) (starts, seen int) {
+// ssDirectorStart is in the first line the director logs when it starts.
+const ssDirectorStart = "vmetric-director started"
+
+// logOnceProblems splits a replica's log into the runs of its director, each
+// from one start line to the next, and says where want is not logged exactly
+// once in a run. A count over the whole log would pass a run that logged the
+// line twice beside a run that never logged it.
+func logOnceProblems(lines []ssLine, want string) []string {
+	var runs []int // the lines that contain want, in each run
+	before := 0    // and before the first start
 	for _, l := range lines {
-		if strings.Contains(l.Text, "vmetric-director started") {
-			starts++
+		start := strings.Contains(l.Text, ssDirectorStart)
+		if start && strings.Contains(l.Text, want) {
+			// The line would be found once in every run whatever the
+			// director did, so the check would prove nothing.
+			return []string{fmt.Sprintf("logged %q in the line that starts the director, so the check cannot tell one run from the next", want)}
 		}
-		if strings.Contains(l.Text, want) {
-			seen++
+		switch {
+		case start:
+			runs = append(runs, 0)
+		case !strings.Contains(l.Text, want):
+		case len(runs) == 0:
+			before++
+		default:
+			runs[len(runs)-1]++
 		}
 	}
-	return starts, seen
+	if len(runs) == 0 {
+		return []string{fmt.Sprintf("never logged %q, so the harness cannot tell the runs of its director apart", ssDirectorStart)}
+	}
+	var problems []string
+	switch {
+	case before == 1:
+		problems = append(problems, fmt.Sprintf("logged %q once before its director first started", want))
+	case before > 1:
+		problems = append(problems, fmt.Sprintf("logged %q %d times before its director first started", want, before))
+	}
+	for i, n := range runs {
+		switch {
+		case n == 0:
+			problems = append(problems, fmt.Sprintf("did not log %q in run %d of its director (of %d); want it once in each run", want, i+1, len(runs)))
+		case n > 1:
+			problems = append(problems, fmt.Sprintf("logged %q %d times in run %d of its director (of %d); want it once in each run", want, n, i+1, len(runs)))
+		}
+	}
+	return problems
 }

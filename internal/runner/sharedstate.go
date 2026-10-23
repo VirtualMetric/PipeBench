@@ -195,6 +195,9 @@ type ssRun struct {
 
 	replicas []ssReplica
 	running  map[int]bool
+	// ran are the replicas whose containers ran at some time in the run. The
+	// final checks read every one of their logs, whatever they hold by then.
+	ran map[int]bool
 	// bad is the replica whose store credentials are wrong
 	// (wrong_credentials), or 0.
 	bad int
@@ -217,6 +220,7 @@ func newSSRun(r *Runner, tc *config.TestCase, subject config.Subject, orch *orch
 		r: r, tc: tc, ss: tc.SharedState, subject: subject, orch: orch,
 		book:        newSSLogBook(),
 		running:     map[int]bool{},
+		ran:         map[int]bool{},
 		health:      map[string]string{},
 		measures:    map[string]any{},
 		perReceiver: map[string]int64{},
@@ -237,6 +241,29 @@ func newSSRun(r *Runner, tc *config.TestCase, subject config.Subject, orch *orch
 }
 
 func (run *ssRun) replica(n int) ssReplica { return run.replicas[n-1] }
+
+// markStarted records that replica n's container runs.
+func (run *ssRun) markStarted(n int) {
+	run.running[n] = true
+	run.ran[n] = true
+}
+
+// endReplica records that the harness ended replica n's process at `at`,
+// and how. It first reads the lines the replica wrote last: a container that
+// is replaced takes its log with it, and a stopped one that is left alone is
+// only read again by the final checks. A read that fails here fails the run,
+// because the checks would then pass on part of the evidence; endReplica
+// reports whether the read succeeded.
+func (run *ssRun) endReplica(n int, at time.Time, how string) bool {
+	rep := run.replica(n)
+	err := run.book.refresh(rep.Container)
+	if err != nil {
+		run.fail("reading the last lines of %s's log after the %s: %v", rep.Service, how, err)
+	}
+	run.running[n] = false
+	run.ended = append(run.ended, ssEvent{At: at, Container: rep.Container, Kind: ssProcessEnd, Text: "harness: " + how})
+	return err == nil
+}
 
 // fail records why the case fails.
 func (run *ssRun) fail(format string, args ...any) {
@@ -347,7 +374,7 @@ func (run *ssRun) startReplicas() bool {
 			return false
 		}
 		for _, n := range group {
-			run.running[n] = true
+			run.markStarted(n)
 		}
 		deadline := earliest(time.Now().Add(run.replicaWarmup()), run.deadline)
 		for _, n := range group {
@@ -547,7 +574,7 @@ func (run *ssRun) events(container string) []ssEvent {
 func (run *ssRun) refreshAll() []error {
 	var errs []error
 	for _, rep := range run.replicas {
-		if run.running[rep.N] || len(run.book.all(rep.Container)) > 0 {
+		if run.ran[rep.N] {
 			if err := run.book.refresh(rep.Container); err != nil {
 				errs = append(errs, err)
 			}
@@ -899,7 +926,9 @@ func (run *ssRun) disruptAndReplace(n int, how string, replace bool) {
 	fmt.Printf("  %s %s (%s, runs devices %v)…\n", map[string]string{"kill": "killing", "stop": "stopping"}[how], rep.Service, role, owned)
 	run.measures["victim"] = map[string]any{"replica": rep.Service, "leader": wasLeader, "devices": owned, "how": how}
 
-	run.book.refresh(rep.Container)
+	// A read that fails here loses nothing: endReplica reads every line
+	// since the last one read.
+	_ = run.book.refresh(rep.Container)
 	issued := time.Now()
 	var err error
 	if how == "kill" {
@@ -914,9 +943,7 @@ func (run *ssRun) disruptAndReplace(n int, how string, replace bool) {
 	took := time.Since(issued)
 	// The daemon's own time of the end is on the clock the log lines carry.
 	endedAt := containerFinishedAt(rep.Container, time.Now())
-	run.book.refresh(rep.Container)
-	run.running[n] = false
-	run.ended = append(run.ended, ssEvent{At: endedAt, Container: rep.Container, Kind: ssProcessEnd, Text: "harness: docker " + how})
+	run.endReplica(n, endedAt, "docker "+how)
 	// A kill ends the process at once. A stop starts the handover when the
 	// signal is sent: the end, less the time the stop took, on the same clock.
 	from := endedAt
@@ -997,7 +1024,7 @@ func (run *ssRun) disruptAndReplace(n int, how string, replace bool) {
 		run.fail("replacing %s: %v", rep.Service, err)
 		return
 	}
-	run.running[n] = true
+	run.markStarted(n)
 	replacedAt := containerStartedAt(rep.Container, time.Now())
 	if readyAt, ok := run.waitReady(n, replacedAt, earliest(time.Now().Add(run.replicaWarmup()), run.deadline)); ok {
 		run.measures["rejoin_seconds"] = readyAt.Sub(replacedAt).Seconds()

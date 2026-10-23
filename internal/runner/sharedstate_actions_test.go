@@ -1,6 +1,8 @@
 package runner
 
 import (
+	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -78,17 +80,51 @@ func TestOutageBaseline(t *testing.T) {
 	}
 }
 
-func TestCountStartsAndLines(t *testing.T) {
-	lines := parseDockerLogLines(`2026-10-24T08:00:00.000Z [2026-10-24 08:00:00] [Information] [director] vmetric-director started; reason recorded as unknown.
-2026-10-24T08:00:01.000Z [2026-10-24 08:00:01] [Warning] [director] This director runs in crash-resistant mode, so it ignores shared_state.write_interval. In this mode the director confirms each write only once the write is in the store.
-2026-10-24T08:05:00.000Z [2026-10-24 08:05:00] [Information] [director] vmetric-director started; reason recorded as unknown.
-2026-10-24T08:05:01.000Z [2026-10-24 08:05:01] [Warning] [director] This director runs in crash-resistant mode, so it ignores shared_state.write_interval. In this mode the director confirms each write only once the write is in the store.`)
-	starts, seen := countStartsAndLines(lines, "so it ignores shared_state.write_interval")
-	if starts != 2 || seen != 2 {
-		t.Errorf("starts = %d, seen = %d; want 2 and 2: once for each start of the director", starts, seen)
+func TestLogOncePerRun(t *testing.T) {
+	const (
+		start  = "2026-10-24T08:0%d:00.000Z [2026-10-24 08:00:00] [Information] [director] vmetric-director started; reason recorded as unknown."
+		notice = "2026-10-24T08:0%d:01.000Z [2026-10-24 08:00:01] [Warning] [director] This director runs in crash-resistant mode, so it ignores shared_state.write_interval. In this mode the director confirms each write only once the write is in the store."
+		other  = "2026-10-24T08:0%d:02.000Z [2026-10-24 08:00:02] [Information] [director] The state bus is ready"
+		want   = "so it ignores shared_state.write_interval"
+	)
+	log := func(lines ...string) []ssLine {
+		var text []string
+		for i, l := range lines {
+			text = append(text, fmt.Sprintf(l, i))
+		}
+		return parseDockerLogLines(strings.Join(text, "\n"))
 	}
-	if _, seen := countStartsAndLines(lines, "a line nobody logs"); seen != 0 {
-		t.Errorf("a line nobody logs was seen %d times", seen)
+	for name, tc := range map[string]struct {
+		lines []ssLine
+		bad   []string // a part of each problem, in order
+	}{
+		"once in each run": {log(start, notice, other, start, notice), nil},
+		// The whole log holds the line once per start, so a count over the
+		// whole log passed it.
+		"twice in the first run and never in the second": {
+			log(start, notice, notice, start, other),
+			[]string{"2 times in run 1 of its director (of 2)", "did not log \"" + want + "\" in run 2 of its director (of 2)"},
+		},
+		"never":                    {log(start, other), []string{"did not log \"" + want + "\" in run 1"}},
+		"before the director runs": {log(notice, start, notice), []string{"once before its director first started"}},
+		"no start line":            {log(other, notice), []string{"never logged \"vmetric-director started\""}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := logOnceProblems(tc.lines, want)
+			if len(got) != len(tc.bad) {
+				t.Fatalf("problems = %q, want %d of them", got, len(tc.bad))
+			}
+			for i, part := range tc.bad {
+				if !strings.Contains(got[i], part) {
+					t.Errorf("problem %d = %q, want it to say %q", i, got[i], part)
+				}
+			}
+		})
+	}
+	// A line that only the start line holds would be found once a run
+	// whatever the director did.
+	if got := logOnceProblems(log(start, other, start), "reason recorded as unknown"); len(got) != 1 || !strings.Contains(got[0], "cannot tell one run from the next") {
+		t.Errorf("a want that the start line holds: problems = %q", got)
 	}
 }
 
@@ -121,5 +157,72 @@ func TestStateWritesBesideSnapshots(t *testing.T) {
 	writes = []time.Time{at(0), at(5)}
 	if problems, _ := judgeWriteGaps(writes, []bool{false, false}, 10*time.Second, 2*time.Second); len(problems) != 1 {
 		t.Errorf("a write 5 s after the last with a 10 s interval: %v, want one problem", problems)
+	}
+}
+
+// TestRollingRestartStopsAtAFailedStep: a replica that did not rejoin, or a
+// replica set that did not settle, ends the rolling restart before the next
+// replica is stopped.
+func TestRollingRestartStopsAtAFailedStep(t *testing.T) {
+	var called []int
+	if inTurn([]int{2, 3, 1}, func(n int) bool { called = append(called, n); return n != 3 }) {
+		t.Error("inTurn reported success although a step failed")
+	}
+	if !reflect.DeepEqual(called, []int{2, 3}) {
+		t.Errorf("steps called = %v, want [2 3]: the leader, 1, must not be stopped while 3 is missing", called)
+	}
+	called = nil
+	if !inTurn([]int{2, 3, 1}, func(n int) bool { called = append(called, n); return true }) || !reflect.DeepEqual(called, []int{2, 3, 1}) {
+		t.Errorf("steps called = %v, want every replica in order", called)
+	}
+}
+
+// TestEndReplicaFailsOnAFailedRead: the read after the harness ends a
+// replica is the last one of that container, so a failed read fails the run,
+// and the final checks still read every replica that ran, whatever its book
+// holds.
+func TestEndReplicaFailsOnAFailedRead(t *testing.T) {
+	reads := map[string]int{}
+	fail := true
+	book := newSSLogBook()
+	book.read = func(container string, _ time.Time) ([]byte, error) {
+		reads[container]++
+		if fail {
+			return nil, errors.New("no such container")
+		}
+		return []byte("2026-10-24T08:00:00.000Z [2026-10-24 08:00:00] [Information] [director] vmetric-director started; reason recorded as unknown.\n"), nil
+	}
+	run := &ssRun{
+		book:    book,
+		running: map[int]bool{1: true},
+		ran:     map[int]bool{1: true},
+		replicas: []ssReplica{
+			{N: 1, Service: "subject-1", Container: "bench-subject-vmetric-1"},
+			{N: 2, Service: "subject-2", Container: "bench-subject-vmetric-2"},
+		},
+	}
+	if run.endReplica(1, time.Now(), "docker stop") {
+		t.Error("endReplica reported a failed read as a success")
+	}
+	if len(run.errs) != 1 || !strings.Contains(run.errs[0], "reading the last lines of subject-1's log after the docker stop") {
+		t.Errorf("errs = %q, want the failed read", run.errs)
+	}
+	if run.running[1] || len(run.ended) != 1 || run.ended[0].Text != "harness: docker stop" {
+		t.Errorf("the replica must count as ended: running %v, ended %v", run.running[1], run.ended)
+	}
+	// subject-1's book is empty and it no longer runs, but it ran: the final
+	// checks must read it, and report that they could not. subject-2 never ran.
+	if errs := run.refreshAll(); len(errs) != 1 {
+		t.Errorf("refreshAll reported %d failed reads, want subject-1's", len(errs))
+	}
+	if reads["bench-subject-vmetric-2"] != 0 {
+		t.Errorf("refreshAll read subject-2, which never ran")
+	}
+
+	fail = false
+	run.errs = nil
+	run.markStarted(2)
+	if !run.endReplica(2, time.Now(), "docker kill") || len(run.errs) != 0 || len(run.book.all("bench-subject-vmetric-2")) != 1 {
+		t.Errorf("a read that works: errs %q, lines %d", run.errs, len(run.book.all("bench-subject-vmetric-2")))
 	}
 }
