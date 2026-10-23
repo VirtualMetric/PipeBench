@@ -106,7 +106,8 @@ type ScenarioStep struct {
 	Do string `yaml:"do"`
 
 	// Node selects the node: "leader" (the current leader), "follower" (the
-	// lowest-numbered running node that is not the leader), a number, or
+	// lowest-numbered running node that is not the leader), "owner" (the node
+	// the leader last placed a placement-managed device on), a number, or
 	// "@name" for a node an earlier step remembered with As.
 	Node string `yaml:"node"`
 	// As remembers the node this step acted on, for a later "@name".
@@ -178,6 +179,7 @@ var scenarioActions = map[string]bool{
 	"scale_to":               false,
 	"rolling_restart":        false,
 	"wait_log":               false,
+	"expect_no_log":          true,
 }
 
 // ScenarioActionNeedsNode reports whether the action takes a node.
@@ -271,16 +273,23 @@ func (tc *TestCase) validateClusterScenario() error {
 	if sc == nil || len(sc.Steps) == 0 {
 		return fmt.Errorf("case %q: type %s requires cluster.scenario.steps", tc.Name, ClusterScenarioType)
 	}
-	if tc.Generator.Mode != "http_ack" {
+	switch {
+	case !tc.HasGenerator():
+		// A case whose data comes from a device the cluster collects itself
+		// (a database poller, for example) runs without the http_ack load.
+		// It has no acknowledged lines, so it cannot judge loss.
+		if sc.Expect.MaxLoss != nil || sc.Expect.MinAcked > 0 {
+			return fmt.Errorf("case %q: expect.max_loss and expect.min_acked need the http_ack generator", tc.Name)
+		}
+	case tc.Generator.Mode != "http_ack":
 		return fmt.Errorf("case %q: a scenario case counts acknowledged lines, so its generator must use mode http_ack (got %q)", tc.Name, tc.Generator.Mode)
-	}
 	// The rate is per worker, and an unset worker count means three per CPU
 	// (resolveGeneratorConnections), so a scenario case states both and stays
 	// at a load a shared machine can carry.
-	if tc.Generator.Connections < 1 || tc.Generator.Rate < 1 {
+	case tc.Generator.Connections < 1 || tc.Generator.Rate < 1:
 		return fmt.Errorf("case %q: a scenario case sets generator.connections and generator.rate explicitly", tc.Name)
 	}
-	if total := tc.Generator.Connections * tc.Generator.Rate; total > MaxScenarioRate {
+	if total := tc.Generator.Connections * tc.Generator.Rate; tc.HasGenerator() && total > MaxScenarioRate {
 		return fmt.Errorf("case %q: generator.connections × generator.rate is %d lines a second, more than the %d a scenario case may send", tc.Name, total, MaxScenarioRate)
 	}
 	switch sc.Witness {
@@ -370,7 +379,7 @@ func (tc *TestCase) validateClusterScenario() error {
 			if st.Nodes < 1 || st.Nodes > maxNodes {
 				return fmt.Errorf("%s: nodes must be between 1 and %d (cluster.nodes + spare_nodes), got %d", where, maxNodes, st.Nodes)
 			}
-		case "wait_log":
+		case "wait_log", "expect_no_log":
 			if st.Log == "" {
 				return fmt.Errorf("%s: needs log", where)
 			}
@@ -381,7 +390,7 @@ func (tc *TestCase) validateClusterScenario() error {
 
 func validateNodeSelector(sel string, maxNodes int, names map[string]bool) error {
 	switch {
-	case sel == "leader" || sel == "follower":
+	case sel == "leader" || sel == "follower" || sel == "owner":
 		return nil
 	case strings.HasPrefix(sel, "@"):
 		if !names[sel[1:]] {
@@ -393,7 +402,7 @@ func validateNodeSelector(sel string, maxNodes int, names map[string]bool) error
 	}
 	n, err := strconv.Atoi(sel)
 	if err != nil || n < 1 || n > maxNodes {
-		return fmt.Errorf("node must be leader, follower, @name or 1..%d, got %q", maxNodes, sel)
+		return fmt.Errorf("node must be leader, follower, owner, @name or 1..%d, got %q", maxNodes, sel)
 	}
 	return nil
 }

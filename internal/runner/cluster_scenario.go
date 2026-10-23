@@ -627,6 +627,24 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 	case "rolling_restart":
 		return sr.rollingRestart(i, st)
 
+	case "expect_no_log":
+		// The node must not log the text for the window, counted from this
+		// step: an old owner that must not collect any more, for one.
+		hold := st.DurationOr("for", 30*time.Second)
+		n, err := sr.resolveNode(st.Node)
+		if err != nil {
+			return false, err.Error(), nil
+		}
+		rep.Node = n
+		from := time.Now()
+		if err := sleepCtx(sr.ctx, hold); err != nil {
+			return false, "", fmt.Errorf("interrupted: %w", err)
+		}
+		if at, found := firstLogLineSince(sr.containers[n-1], st.Log, from); found {
+			return false, fmt.Sprintf("node %d logged %q %s into the window", n, st.Log, fmtMs(at.Sub(from).Milliseconds())), nil
+		}
+		return true, fmt.Sprintf("node %d did not log %q for %s", n, st.Log, hold), nil
+
 	case "wait_log":
 		within := st.DurationOr("within", 120*time.Second)
 		since := sr.lastDisruption
@@ -645,6 +663,11 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		deadline := time.Now().Add(within)
 		for {
 			for _, n := range nodes {
+				// Without a node, only running nodes count: the last lines of a
+				// node a step just killed must not satisfy the wait.
+				if st.Node == "" && !containerRunning(sr.containers[n-1]) {
+					continue
+				}
 				if at, found := firstLogLineSince(sr.containers[n-1], st.Log, since); found {
 					ms := at.Sub(since).Milliseconds()
 					sr.record(st.Record, float64(ms))
@@ -786,6 +809,15 @@ func (sr *scenarioRun) resolveNode(sel string) (int, error) {
 			return 0, fmt.Errorf("no node was remembered as %q", sel[1:])
 		}
 		return n, nil
+	case sel == "owner":
+		// The node the leader last placed a placement-managed device on, from
+		// its "Assigned new device" / "Reassigned device" log lines.
+		owner := agentlessDeviceOwner(sr.containers)
+		n, err := strconv.Atoi(owner)
+		if err != nil || n < 1 || n > len(sr.containers) {
+			return 0, fmt.Errorf("no device placement found in the logs (owner %q)", owner)
+		}
+		return n, nil
 	case sel == "leader" || sel == "follower":
 		// Wait briefly for a round with an agreed leader.
 		var leader int
@@ -869,6 +901,10 @@ func (sr *scenarioRun) waitRound(within time.Duration, ok func(healthRound) bool
 
 func (sr *scenarioRun) startLoad() error {
 	if !sr.loadStarted.IsZero() {
+		return nil
+	}
+	if !sr.tc.HasGenerator() {
+		sr.loadStarted = time.Now()
 		return nil
 	}
 	fmt.Println("  starting the load (http_ack generator)…")
@@ -1116,6 +1152,10 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 		Notes:    sr.notes,
 	}
 
+	if !sr.tc.HasGenerator() {
+		return sr.finishWithoutLoad(rep)
+	}
+
 	// The load ends after its duration plus the generator's drain timeout,
 	// in which it retries any batch not yet acknowledged.
 	genBudget := sr.tc.DurationOrDefault(2*time.Minute) + 3*time.Minute
@@ -1239,6 +1279,39 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 	if ex.MaxLoss != nil && rep.Missing > *ex.MaxLoss {
 		v.reasons = append(v.reasons, fmt.Sprintf("%d acknowledged lines never arrived (max_loss %d)", rep.Missing, *ex.MaxLoss))
 	}
+	if ex.MaxDuplicates != nil && rep.Duplicates > *ex.MaxDuplicates {
+		v.reasons = append(v.reasons, fmt.Sprintf("%d lines arrived more than once (max_duplicates %d)", rep.Duplicates, *ex.MaxDuplicates))
+	}
+	if ex.MaxSplitBrainMs != nil && rep.Leadership.SplitBrainMs > *ex.MaxSplitBrainMs {
+		v.reasons = append(v.reasons, fmt.Sprintf("two nodes named themselves the leader for %s (max_split_brain_ms %d)",
+			fmtMs(rep.Leadership.SplitBrainMs), *ex.MaxSplitBrainMs))
+	}
+	rep.Failures = v.reasons
+	rep.Notes = sr.notes
+	v.passed = len(v.reasons) == 0
+	return rep, v, nil
+}
+
+// finishWithoutLoad ends a scenario whose data came from a device the
+// cluster collected itself: there are no acknowledged lines, so the receiver's
+// own counts (and its hash-based duplicate check, when the case turns it on)
+// are reported as they are.
+func (sr *scenarioRun) finishWithoutLoad(rep scenarioReport) (scenarioReport, scenarioVerdict, error) {
+	if m, err := sr.r.queryReceiverMetrics(sr.recvPort, 10*time.Second); err == nil {
+		rep.Received = m.LinesReceived
+		rep.Unique = m.UniqueLines
+		rep.Duplicates = m.Duplicates
+		fmt.Printf("  delivery: %d lines received, %d distinct, %d duplicates\n", m.LinesReceived, m.UniqueLines, m.Duplicates)
+	}
+	rep.Events = sr.events
+	rep.Steps = sr.steps
+	rounds := sr.probe.all()
+	rep.Leadership = analyzeLeadership(rounds)
+	rep.HealthTrail = healthTrail(rounds)
+	fmt.Printf("  leadership: %d rounds read, %d leader changes, most self-named leaders at once %d, two-leader time %s\n",
+		rep.Leadership.Rounds, rep.Leadership.LeaderChanges, rep.Leadership.MaxSelfClaimed, fmtMs(rep.Leadership.SplitBrainMs))
+	v := scenarioVerdict{reasons: append([]string(nil), sr.failures...)}
+	ex := sr.sc.Expect
 	if ex.MaxDuplicates != nil && rep.Duplicates > *ex.MaxDuplicates {
 		v.reasons = append(v.reasons, fmt.Sprintf("%d lines arrived more than once (max_duplicates %d)", rep.Duplicates, *ex.MaxDuplicates))
 	}
