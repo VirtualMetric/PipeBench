@@ -241,7 +241,9 @@ func sortSSEvents(events []ssEvent) {
 // ssLeadingAt reports, from one container's events in time order, whether
 // the container leads at time t. A process that ends, a process that starts
 // and a state bus that starts again all end a leadership: the director
-// manager that led is gone, and a new one logs its own.
+// manager that led is gone, and a new one logs its own. So does a bus that
+// stops writing its streams: it disables JetStream, and a replica without
+// JetStream cannot lead, whether or not its manager says so.
 func ssLeadingAt(events []ssEvent, t time.Time) bool {
 	leading := false
 	for _, e := range events {
@@ -251,7 +253,7 @@ func ssLeadingAt(events []ssEvent, t time.Time) bool {
 		switch e.Kind {
 		case ssLeaderUp:
 			leading = true
-		case ssLeaderDown, ssProcessStart, ssProcessEnd, ssBusStarted, ssBusStopped:
+		case ssLeaderDown, ssProcessStart, ssProcessEnd, ssBusStarted, ssBusStopped, ssFenced:
 			leading = false
 		}
 	}
