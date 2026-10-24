@@ -447,7 +447,9 @@ func (tc *TestCase) validateClusterScenario() error {
 		if st.SentBefore != "" && st.Do != "count_pending" {
 			return fmt.Errorf("%s: sent_before only applies to count_pending", where)
 		}
-		if len(st.Logs) > 0 && st.Do != "wait_log" && st.Do != "expect_no_log" {
+		// A logs key that is present counts, even as an empty list: logs: []
+		// is a mistake to report, not a field to ignore.
+		if st.Logs != nil && st.Do != "wait_log" && st.Do != "expect_no_log" {
 			return fmt.Errorf("%s: logs only applies to wait_log and expect_no_log", where)
 		}
 		switch st.Do {
@@ -495,8 +497,11 @@ func (tc *TestCase) validateClusterScenario() error {
 				return fmt.Errorf("%s: nodes must be between 1 and %d (cluster.nodes + spare_nodes), got %d", where, maxNodes, st.Nodes)
 			}
 		case "wait_log", "expect_no_log":
-			if st.Log != "" && len(st.Logs) > 0 {
+			if st.Log != "" && st.Logs != nil {
 				return fmt.Errorf("%s: names log and logs; name one of them", where)
+			}
+			if st.Logs != nil && len(st.Logs) == 0 {
+				return fmt.Errorf("%s: logs is empty; name at least one line", where)
 			}
 			if st.Log == "" && len(st.Logs) == 0 {
 				return fmt.Errorf("%s: needs log", where)

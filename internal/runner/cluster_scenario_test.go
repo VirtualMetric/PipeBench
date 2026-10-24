@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -383,14 +384,14 @@ func TestFirstMatchingLine(t *testing.T) {
 		"2026-10-24T01:30:25.732000000Z Device pg-bench placement has been changed to 2. Stopping the collector...\n" +
 		"2026-10-24T01:30:26.000000000Z Ownership lease for device 1 (pg-bench) lost on node 1\n"
 	needles := []string{"lost on node", "placement has been changed to"}
-	at, line, ok := firstMatchingLine(out, needles)
+	at, line, ok := firstMatchingLine(out, needles, time.Time{})
 	if !ok || line != "placement has been changed to" {
 		t.Fatalf("firstMatchingLine = %v, %q, %v; want the placement line, the first with a timestamp", at, line, ok)
 	}
 	if want := time.Date(2026, 10, 24, 1, 30, 25, 732000000, time.UTC); !at.Equal(want) {
 		t.Fatalf("at = %v, want %v", at, want)
 	}
-	if _, _, ok := firstMatchingLine(out, []string{"never logged"}); ok {
+	if _, _, ok := firstMatchingLine(out, []string{"never logged"}, time.Time{}); ok {
 		t.Fatalf("firstMatchingLine found a line that is not there")
 	}
 }
@@ -401,5 +402,63 @@ func TestQuoteLines(t *testing.T) {
 	}
 	if got := quoteLines([]string{"a", "b"}); got != `"a" or "b"` {
 		t.Fatalf("quoteLines(a, b) = %s", got)
+	}
+}
+
+func TestFirstMatchingLineStopsAtTheWindowEnd(t *testing.T) {
+	out := "2026-10-24T01:30:25.000000000Z still inside: Starting event collection of x\n" +
+		"2026-10-24T01:30:41.000000000Z after the end: Starting event collection of x\n"
+	needles := []string{"Starting event collection of"}
+	end := time.Date(2026, 10, 24, 1, 30, 40, 0, time.UTC)
+	if _, _, ok := firstMatchingLine(out[strings.Index(out, "\n")+1:], needles, end); ok {
+		t.Fatalf("a line stamped after the window's end counted")
+	}
+	if at, _, ok := firstMatchingLine(out, needles, end); !ok || !at.Equal(time.Date(2026, 10, 24, 1, 30, 25, 0, time.UTC)) {
+		t.Fatalf("firstMatchingLine = %v, %v; want the line inside the window", at, ok)
+	}
+}
+
+func TestEarliestLogMatchAcrossNodes(t *testing.T) {
+	t0 := time.Date(2026, 10, 24, 1, 0, 0, 0, time.UTC)
+	found := map[int]time.Time{1: t0.Add(8 * time.Second), 2: t0.Add(3 * time.Second)}
+	n, at, line, ok := earliestLogMatch([]int{1, 2, 3}, func(n int) (time.Time, string, bool) {
+		at, ok := found[n]
+		return at, "lost on node", ok
+	})
+	if !ok || n != 2 || !at.Equal(t0.Add(3*time.Second)) || line != "lost on node" {
+		t.Fatalf("earliestLogMatch = node %d at %v (%q, %v); want node 2, the earlier line", n, at, line, ok)
+	}
+	if _, _, _, ok := earliestLogMatch([]int{1, 2}, func(int) (time.Time, string, bool) { return time.Time{}, "", false }); ok {
+		t.Fatalf("earliestLogMatch found a match no node had")
+	}
+}
+
+func TestReadProgressBaselineRetries(t *testing.T) {
+	calls := 0
+	read := func() (genProgress, bool) {
+		calls++
+		return genProgress{Acked: 500}, calls == 3
+	}
+	if p, ok := readProgressBaseline(context.Background(), read, 5, time.Millisecond); !ok || p.Acked != 500 || calls != 3 {
+		t.Fatalf("readProgressBaseline = %+v, %v after %d reads; want the third read", p, ok, calls)
+	}
+	never := func() (genProgress, bool) { return genProgress{}, false }
+	if _, ok := readProgressBaseline(context.Background(), never, 3, time.Millisecond); ok {
+		t.Fatalf("readProgressBaseline reported a baseline no read returned")
+	}
+}
+
+func TestSummaryLeavesOutAnUnfinishedPendingCount(t *testing.T) {
+	later := int64(820)
+	rep := scenarioReport{Pending: []pendingCount{
+		{Name: "held_by_killed_nodes", ArrivedLater: &later},
+		{Name: "not_counted"},
+	}}
+	sum := rep.summary()
+	if sum["pending_held_by_killed_nodes"] != int64(820) {
+		t.Fatalf("summary pending_held_by_killed_nodes = %v, want 820", sum["pending_held_by_killed_nodes"])
+	}
+	if _, ok := sum["pending_not_counted"]; ok {
+		t.Fatalf("summary reports a count that was never finished")
 	}
 }

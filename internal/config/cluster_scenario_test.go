@@ -3,6 +3,8 @@ package config
 import (
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func validScenarioCase() *TestCase {
@@ -92,6 +94,16 @@ func TestValidateClusterScenarioRejects(t *testing.T) {
 			tc.Cluster.Scenario.Steps[9].Logs = []string{"stopping collector", ""}
 		}, "empty line"},
 		"logs on another action": {func(tc *TestCase) { tc.Cluster.Scenario.Steps[3].Logs = []string{"x"} }, "only applies to wait_log and expect_no_log"},
+		"an empty logs list on another action": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Steps[3].Logs = []string{}
+		}, "only applies to wait_log and expect_no_log"},
+		"an empty logs list beside log": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Steps[9].Logs = []string{}
+		}, "name one of them"},
+		"an empty logs list alone": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Steps[9].Log = ""
+			tc.Cluster.Scenario.Steps[9].Logs = []string{}
+		}, "logs is empty"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -144,5 +156,24 @@ func TestValidateClusterScenarioAcceptsLogs(t *testing.T) {
 	}
 	if got := (ScenarioStep{}).LogLines(); got != nil {
 		t.Fatalf("LogLines() of a step with neither = %q", got)
+	}
+}
+
+// An empty logs list in a case file must reach the validator as present, so
+// that it is refused instead of read as no logs key at all.
+func TestEmptyLogsListDecodesAsPresent(t *testing.T) {
+	var st ScenarioStep
+	if err := yaml.Unmarshal([]byte("do: wait_log\nlog: ready\nlogs: []\n"), &st); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if st.Logs == nil {
+		t.Fatalf("logs: [] decoded as absent; the validator could not refuse it")
+	}
+	var absent ScenarioStep
+	if err := yaml.Unmarshal([]byte("do: wait_log\nlog: ready\n"), &absent); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if absent.Logs != nil {
+		t.Fatalf("a step without logs decoded with a logs list")
 	}
 }

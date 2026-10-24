@@ -86,8 +86,9 @@ type pendingCount struct {
 	// Arrived is how many lines sent before the mark had arrived at the step.
 	Arrived int64 `json:"arrived_at_step"`
 	// ArrivedLater is how many more arrived after the step, counted after
-	// the drain: the lines that were still on their way at the step.
-	ArrivedLater int64 `json:"arrived_later"`
+	// the drain: the lines that were still on their way at the step. It is
+	// nil when the count after the drain could not be read.
+	ArrivedLater *int64 `json:"arrived_later,omitempty"`
 }
 
 // arrivedSince is how many lines arrived between a count_pending step and
@@ -709,7 +710,15 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 
 	case "expect_writes_continue":
 		hold := st.DurationOr("for", 20*time.Second)
-		first, _ := readGeneratorProgress()
+		// The window counts from a progress line read at its start. Without
+		// one, the count would include every line confirmed before the window.
+		first, ok := readProgressBaseline(sr.ctx, readGeneratorProgress, 5, 500*time.Millisecond)
+		if !ok {
+			if sr.ctx.Err() != nil {
+				return false, "", fmt.Errorf("interrupted: %w", sr.ctx.Err())
+			}
+			return false, "could not read the client's progress at the start of the window", nil
+		}
 		maxFlat := time.Duration(0)
 		lastChange := time.Now()
 		prev := first
@@ -782,7 +791,9 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		if err := sleepCtx(sr.ctx, hold); err != nil {
 			return false, "", fmt.Errorf("interrupted: %w", err)
 		}
-		if at, line, found := firstLogLineSinceAny(sr.containers[n-1], st.LogLines(), from); found {
+		// The read stops at the window's end: a line logged between the end
+		// and the read is outside the window.
+		if at, line, found := firstLogLineInWindow(sr.containers[n-1], st.LogLines(), from, end); found {
 			return false, fmt.Sprintf("node %d logged %q %s after %s", n, line, fmtMs(at.Sub(from).Milliseconds()), fromWhat), nil
 		}
 		return true, fmt.Sprintf("node %d did not log %s from %s for %s", n, quoteLines(st.LogLines()), fromWhat, fmtMs(end.Sub(from).Milliseconds())), nil
@@ -853,18 +864,21 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		}
 		deadline := time.Now().Add(within)
 		for {
-			for _, n := range nodes {
+			// Every node is read, and the first line in time wins, so the
+			// measure and the report name the first node to log it.
+			n, at, line, found := earliestLogMatch(nodes, func(n int) (time.Time, string, bool) {
 				// Without a node, only running nodes count: the last lines of a
 				// node a step just killed must not satisfy the wait.
 				if st.Node == "" && !containerRunning(sr.containers[n-1]) {
-					continue
+					return time.Time{}, "", false
 				}
-				if at, line, found := firstLogLineSinceAny(sr.containers[n-1], st.LogLines(), since); found {
-					ms := at.Sub(since).Milliseconds()
-					sr.record(st.Record, float64(ms))
-					rep.Node = n
-					return true, fmt.Sprintf("node %d logged %q %s after the disruption", n, line, fmtMs(ms)), nil
-				}
+				return firstLogLineInWindow(sr.containers[n-1], st.LogLines(), since, time.Time{})
+			})
+			if found {
+				ms := at.Sub(since).Milliseconds()
+				sr.record(st.Record, float64(ms))
+				rep.Node = n
+				return true, fmt.Sprintf("node %d logged %q %s after the disruption", n, line, fmtMs(ms)), nil
 			}
 			if time.Now().After(deadline) {
 				return false, fmt.Sprintf("no node logged %s within %s", quoteLines(st.LogLines()), within), nil
@@ -1371,7 +1385,10 @@ func (rep scenarioReport) summary() map[string]any {
 		out["ms_"+k] = v
 	}
 	for _, p := range rep.Pending {
-		out["pending_"+p.Name] = p.ArrivedLater
+		// A count that could not be finished is left out, not reported as 0.
+		if p.ArrivedLater != nil {
+			out["pending_"+p.Name] = *p.ArrivedLater
+		}
 	}
 	for i, ev := range rep.Events {
 		out[fmt.Sprintf("event%d_%s_gap_ms", i, strings.ReplaceAll(ev.Do, " ", "_"))] = ev.GapMs
@@ -1454,12 +1471,21 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 		p := &sr.pending[i]
 		ls, err := sr.receiverLatency(time.Time{}, p.SentBefore)
 		if err != nil {
-			sr.notes = append(sr.notes, fmt.Sprintf("count_pending %s: could not read the receiver's counts after the drain: %v", p.Name, err))
+			sr.notes = append(sr.notes, fmt.Sprintf("count_pending %s: could not read the receiver's counts after the drain, so it has no count: %v", p.Name, err))
+			fmt.Printf("  %s: could not be counted after the drain (%v)\n", p.Name, err)
 			continue
 		}
-		p.ArrivedLater = arrivedSince(p.Arrived, int64(ls.Count))
+		later := arrivedSince(p.Arrived, int64(ls.Count))
+		p.ArrivedLater = &later
 		fmt.Printf("  %s: %d lines sent before mark %q were still on their way at %s and arrived after it\n",
-			p.Name, p.ArrivedLater, p.Mark, p.CountedAt.UTC().Format("15:04:05.000"))
+			p.Name, later, p.Mark, p.CountedAt.UTC().Format("15:04:05.000"))
+	}
+	// The receiver counts lines by when they were sent, whether or not the
+	// client had them confirmed. The client retries a batch until it is
+	// confirmed, so only lines still unconfirmed at the end of the run can be
+	// counted without a confirmation. Say so when there are any.
+	if len(sr.pending) > 0 && gen != nil && gen.Ack != nil && gen.Ack.LinesUnacked > 0 {
+		sr.notes = append(sr.notes, fmt.Sprintf("the client left %d lines unconfirmed; a count_pending count can include those of them sent before its mark", gen.Ack.LinesUnacked))
 	}
 	rep.Pending = sr.pending
 	for conn, cc := range check.Conns {
@@ -1911,35 +1937,76 @@ func containerNetwork(container string) string {
 // firstLogLineSince returns the docker timestamp of the first line since t
 // that contains needle.
 func firstLogLineSince(container, needle string, t time.Time) (time.Time, bool) {
-	at, _, found := firstLogLineSinceAny(container, []string{needle}, t)
+	at, _, found := firstLogLineInWindow(container, []string{needle}, t, time.Time{})
 	return at, found
 }
 
-// firstLogLineSinceAny returns the docker timestamp of the first line since t
-// that contains any of the needles, and the needle it contains.
-func firstLogLineSinceAny(container string, needles []string, t time.Time) (time.Time, string, bool) {
-	out, err := exec.Command("docker", "logs", "-t", "--since", t.UTC().Format(time.RFC3339Nano), container).CombinedOutput()
+// firstLogLineInWindow returns the docker timestamp of the first line from
+// since up to until that contains any of the needles, and the needle it
+// contains. A zero until leaves the window open: up to the moment of the read.
+func firstLogLineInWindow(container string, needles []string, since, until time.Time) (time.Time, string, bool) {
+	args := []string{"logs", "-t", "--since", since.UTC().Format(time.RFC3339Nano)}
+	if !until.IsZero() {
+		args = append(args, "--until", until.UTC().Format(time.RFC3339Nano))
+	}
+	out, err := exec.Command("docker", append(args, container)...).CombinedOutput()
 	if err != nil {
 		return time.Time{}, "", false
 	}
-	return firstMatchingLine(string(out), needles)
+	return firstMatchingLine(string(out), needles, until)
 }
 
 // firstMatchingLine finds the first line of `docker logs -t` output that
-// contains any of the needles, and returns its timestamp and that needle.
-func firstMatchingLine(out string, needles []string) (time.Time, string, bool) {
+// contains any of the needles, and returns its timestamp and that needle. A
+// line stamped after a non-zero until is outside the window and does not count.
+func firstMatchingLine(out string, needles []string, until time.Time) (time.Time, string, bool) {
 	for _, line := range strings.Split(out, "\n") {
 		for _, needle := range needles {
 			if !strings.Contains(line, needle) {
 				continue
 			}
 			ts, _, _ := strings.Cut(line, " ")
-			if at, perr := time.Parse(time.RFC3339Nano, ts); perr == nil {
-				return at, needle, true
+			at, perr := time.Parse(time.RFC3339Nano, ts)
+			if perr != nil || (!until.IsZero() && at.After(until)) {
+				continue
 			}
+			return at, needle, true
 		}
 	}
 	return time.Time{}, "", false
+}
+
+// readProgressBaseline reads the client's progress, trying up to tries times,
+// wait apart. It reports false when no read succeeded or the run stopped.
+func readProgressBaseline(ctx context.Context, read func() (genProgress, bool), tries int, wait time.Duration) (genProgress, bool) {
+	for i := 0; i < tries; i++ {
+		if p, ok := read(); ok {
+			return p, true
+		}
+		if i+1 < tries {
+			if err := sleepCtx(ctx, wait); err != nil {
+				return genProgress{}, false
+			}
+		}
+	}
+	return genProgress{}, false
+}
+
+// earliestLogMatch asks each node for its first matching line and returns the
+// node whose line came first, its time and the text it matched. find reports
+// a node's first match, or false when it has none.
+func earliestLogMatch(nodes []int, find func(n int) (time.Time, string, bool)) (int, time.Time, string, bool) {
+	bestNode, bestAt, bestLine := 0, time.Time{}, ""
+	for _, n := range nodes {
+		at, line, found := find(n)
+		if !found {
+			continue
+		}
+		if bestNode == 0 || at.Before(bestAt) {
+			bestNode, bestAt, bestLine = n, at, line
+		}
+	}
+	return bestNode, bestAt, bestLine, bestNode != 0
 }
 
 // quoteLines names the texts a log step looks for: one quoted text, or the
