@@ -3,6 +3,8 @@ package config
 import (
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func validScenarioCase() *TestCase {
@@ -24,6 +26,8 @@ func validScenarioCase() *TestCase {
 				{Do: "sleep", For: "5s"},
 				{Do: "mark", Label: "end"},
 				{Do: "expect_delivery_stops", Within: "60s", For: "20s", Record: "stopped"},
+				{Do: "expect_no_log", Node: "1", Log: "collecting", For: "10s", Since: "end"},
+				{Do: "count_pending", SentBefore: "end", Record: "held"},
 			},
 		}},
 	}
@@ -71,6 +75,35 @@ func TestValidateClusterScenarioRejects(t *testing.T) {
 		"as on a wait":                    {func(tc *TestCase) { tc.Cluster.Scenario.Steps[3].As = "elected" }, "acts on none"},
 		"wait naming a forgotten node":    {func(tc *TestCase) { tc.Cluster.Scenario.Steps[3].Node = "@ghost" }, "was not remembered"},
 		"wait naming a node out of range": {func(tc *TestCase) { tc.Cluster.Scenario.Steps[3].Node = "9" }, "node must be"},
+		"since on another action":         {func(tc *TestCase) { tc.Cluster.Scenario.Steps[3].Since = "end" }, "only applies to expect_no_log"},
+		"since naming no mark":            {func(tc *TestCase) { tc.Cluster.Scenario.Steps[9].Since = "ghost" }, "which no earlier step sets"},
+		"since naming a later mark": {func(tc *TestCase) {
+			steps := tc.Cluster.Scenario.Steps
+			tc.Cluster.Scenario.Steps = append([]ScenarioStep{steps[9]}, steps...)
+		}, "which no earlier step sets"},
+		"sent_before on another action":       {func(tc *TestCase) { tc.Cluster.Scenario.Steps[3].SentBefore = "end" }, "only applies to count_pending"},
+		"count_pending without sent_before":   {func(tc *TestCase) { tc.Cluster.Scenario.Steps[10].SentBefore = "" }, "needs sent_before"},
+		"count_pending naming no mark":        {func(tc *TestCase) { tc.Cluster.Scenario.Steps[10].SentBefore = "ghost" }, "which no earlier step sets"},
+		"count_pending without a record name": {func(tc *TestCase) { tc.Cluster.Scenario.Steps[10].Record = "" }, "needs record"},
+		"count_pending without a load":        {func(tc *TestCase) { tc.Generator = GeneratorConfig{} }, "has no generator"},
+		"log and logs together": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Steps[9].Logs = []string{"stopping collector"}
+		}, "name one of them"},
+		"an empty line in logs": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Steps[9].Log = ""
+			tc.Cluster.Scenario.Steps[9].Logs = []string{"stopping collector", ""}
+		}, "empty line"},
+		"logs on another action": {func(tc *TestCase) { tc.Cluster.Scenario.Steps[3].Logs = []string{"x"} }, "only applies to wait_log and expect_no_log"},
+		"an empty logs list on another action": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Steps[3].Logs = []string{}
+		}, "only applies to wait_log and expect_no_log"},
+		"an empty logs list beside log": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Steps[9].Logs = []string{}
+		}, "name one of them"},
+		"an empty logs list alone": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Steps[9].Log = ""
+			tc.Cluster.Scenario.Steps[9].Logs = []string{}
+		}, "logs is empty"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -104,5 +137,43 @@ func TestScenarioDefaults(t *testing.T) {
 	}
 	if !strings.Contains(sc.ToxiproxyImageOrDefault(), ":2.") {
 		t.Fatalf("the Toxiproxy image must be pinned to a release")
+	}
+}
+
+func TestValidateClusterScenarioAcceptsLogs(t *testing.T) {
+	tc := validScenarioCase()
+	st := &tc.Cluster.Scenario.Steps[9]
+	st.Log = ""
+	st.Logs = []string{"lost on node", "placement has been changed to"}
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if got := st.LogLines(); len(got) != 2 || got[1] != "placement has been changed to" {
+		t.Fatalf("LogLines() = %q", got)
+	}
+	if got := (ScenarioStep{Log: "one"}).LogLines(); len(got) != 1 || got[0] != "one" {
+		t.Fatalf("LogLines() of a step with log = %q", got)
+	}
+	if got := (ScenarioStep{}).LogLines(); got != nil {
+		t.Fatalf("LogLines() of a step with neither = %q", got)
+	}
+}
+
+// An empty logs list in a case file must reach the validator as present, so
+// that it is refused instead of read as no logs key at all.
+func TestEmptyLogsListDecodesAsPresent(t *testing.T) {
+	var st ScenarioStep
+	if err := yaml.Unmarshal([]byte("do: wait_log\nlog: ready\nlogs: []\n"), &st); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if st.Logs == nil {
+		t.Fatalf("logs: [] decoded as absent; the validator could not refuse it")
+	}
+	var absent ScenarioStep
+	if err := yaml.Unmarshal([]byte("do: wait_log\nlog: ready\n"), &absent); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if absent.Logs != nil {
+		t.Fatalf("a step without logs decoded with a logs list")
 	}
 }

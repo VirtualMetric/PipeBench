@@ -76,6 +76,39 @@ type scenarioMark struct {
 	At    time.Time `json:"at"`
 }
 
+// pendingCount is one count_pending step: the lines sent before a mark that
+// were still on their way when the step ran.
+type pendingCount struct {
+	Name       string    `json:"name"`
+	Mark       string    `json:"mark"`
+	SentBefore time.Time `json:"sent_before"`
+	CountedAt  time.Time `json:"counted_at"`
+	// Arrived is how many lines sent before the mark had arrived at the step.
+	Arrived int64 `json:"arrived_at_step"`
+	// ArrivedLater is how many more arrived after the step, counted after
+	// the drain: the lines that were still on their way at the step. It is
+	// nil when the count after the drain could not be read.
+	ArrivedLater *int64 `json:"arrived_later,omitempty"`
+}
+
+// arrivedSince is how many lines arrived between a count_pending step and
+// the end of the run, from the two counts of lines sent before its mark. The
+// receiver counts each line once, at its first arrival, so the count cannot
+// fall; a smaller second count would mean a restarted receiver, and reads 0.
+func arrivedSince(atStep, atEnd int64) int64 {
+	return max(atEnd-atStep, 0)
+}
+
+// markAt returns the time of the latest mark with the label.
+func (sr *scenarioRun) markAt(label string) (time.Time, bool) {
+	for i := len(sr.marks) - 1; i >= 0; i-- {
+		if sr.marks[i].Label == label {
+			return sr.marks[i].At, true
+		}
+	}
+	return time.Time{}, false
+}
+
 type latencyStats struct {
 	Count     int     `json:"count"`
 	P50Ms     float64 `json:"p50_ms"`
@@ -183,7 +216,9 @@ type scenarioRun struct {
 	steps    []scenarioStepReport
 	events   []scenarioEvent
 	marks    []scenarioMark
+	pending  []pendingCount
 	measures map[string]float64
+	counts   map[string]int64
 	failures []string
 	notes    []string
 
@@ -290,7 +325,7 @@ func (r *Runner) runClusterScenario(tc *config.TestCase, subject config.Subject)
 		containers: containers, active: map[int]bool{}, size: tc.Cluster.Nodes,
 		tmpDir: tmpDir, configSrc: srcCfg, recvPort: r.opts.ReceiverHostPort,
 		names: map[string]int{}, disconnected: map[int]bool{}, down: map[int]bool{}, measures: map[string]float64{},
-		imageID: imageID, imageLabels: imageLabels,
+		counts: map[string]int64{}, imageID: imageID, imageLabels: imageLabels,
 	}
 	for i := 1; i <= tc.Cluster.Nodes; i++ {
 		sr.active[i] = true
@@ -456,6 +491,9 @@ func describeStepArgs(st config.ScenarioStep) string {
 	add("proxy", st.Proxy)
 	add("latency", st.Latency)
 	add("log", st.Log)
+	add("logs", strings.Join(st.Logs, " | "))
+	add("since", st.Since)
+	add("sent_before", st.SentBefore)
 	if st.Nodes > 0 {
 		add("nodes", strconv.Itoa(st.Nodes))
 	}
@@ -626,12 +664,12 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 					}
 					stoppedMs := max(stopped.Sub(since).Milliseconds(), 0)
 					sr.record(st.Record, float64(stoppedMs))
-					sr.record(st.Record+"_acked_after", float64(after))
+					sr.recordCount(st.Record, "_acked_after", after)
 					return true, fmt.Sprintf("writes stopped %s after the disruption (the client's last 2xx); %d lines were acknowledged %s", fmtMs(stoppedMs), after, from), nil
 				}
 			}
 			if time.Now().After(deadline.Add(hold)) {
-				sr.record(st.Record+"_acked_after", float64(last.Acked-base))
+				sr.recordCount(st.Record, "_acked_after", last.Acked-base)
 				return false, fmt.Sprintf("the cluster kept acknowledging writes: %d lines %s", last.Acked-base, from), nil
 			}
 			if err := sleepCtx(sr.ctx, 500*time.Millisecond); err != nil {
@@ -658,12 +696,12 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 				if time.Since(last) >= hold {
 					stoppedMs := max(last.Sub(since).Milliseconds(), 0)
 					sr.record(st.Record, float64(stoppedMs))
-					sr.record(st.Record+"_lines_after", float64(after))
+					sr.recordCount(st.Record, "_lines_after", after)
 					return true, fmt.Sprintf("deliveries stopped %s after the disruption; %d lines arrived after it", fmtMs(stoppedMs), after), nil
 				}
 			}
 			if time.Now().After(deadline) {
-				sr.record(st.Record+"_lines_after", float64(after))
+				sr.recordCount(st.Record, "_lines_after", after)
 				return false, fmt.Sprintf("lines kept arriving: %d since the disruption, the last %s ago", after, fmtMs(time.Since(last).Milliseconds())), nil
 			}
 			if err := sleepCtx(sr.ctx, time.Second); err != nil {
@@ -673,7 +711,15 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 
 	case "expect_writes_continue":
 		hold := st.DurationOr("for", 20*time.Second)
-		first, _ := readGeneratorProgress()
+		// The window counts from a progress line read at its start. Without
+		// one, the count would include every line confirmed before the window.
+		first, ok := readProgressBaseline(sr.ctx, readGeneratorProgress, 5, 500*time.Millisecond)
+		if !ok {
+			if sr.ctx.Err() != nil {
+				return false, "", fmt.Errorf("interrupted: %w", sr.ctx.Err())
+			}
+			return false, "could not read the client's progress at the start of the window", nil
+		}
 		maxFlat := time.Duration(0)
 		lastChange := time.Now()
 		prev := first
@@ -693,6 +739,9 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		}
 		gained := prev.Acked - first.Acked
 		sr.record(st.Record, float64(maxFlat.Milliseconds()))
+		// How many lines the client got confirmed in the window: with the
+		// receiver paused, the records a node holds and still has to deliver.
+		sr.recordCount(st.Record, "_lines_acked", gained)
 		if gained <= 0 {
 			return false, fmt.Sprintf("no write was acknowledged for %s", hold), nil
 		}
@@ -719,22 +768,49 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		return sr.rollingRestart(i, st)
 
 	case "expect_no_log":
-		// The node must not log the text for the window, counted from this
-		// step: an old owner that must not collect any more, for one.
+		// The node must not log the text for the window: an old owner that
+		// must not collect any more, for one. The window starts at this step,
+		// or at the mark that since names, so that it also covers the steps
+		// in between. It ends `for` after this step starts.
 		hold := st.DurationOr("for", 30*time.Second)
 		n, err := sr.resolveNode(st.Node)
 		if err != nil {
 			return false, err.Error(), nil
 		}
 		rep.Node = n
-		from := time.Now()
+		from, fromWhat := time.Now(), "this step"
+		if st.Since != "" {
+			at, ok := sr.markAt(st.Since)
+			if !ok {
+				return false, fmt.Sprintf("no mark %q was set before this step", st.Since), nil
+			}
+			from, fromWhat = at, fmt.Sprintf("mark %q", st.Since)
+		}
+		end := time.Now().Add(hold)
 		if err := sleepCtx(sr.ctx, hold); err != nil {
 			return false, "", fmt.Errorf("interrupted: %w", err)
 		}
-		if at, found := firstLogLineSince(sr.containers[n-1], st.Log, from); found {
-			return false, fmt.Sprintf("node %d logged %q %s into the window", n, st.Log, fmtMs(at.Sub(from).Milliseconds())), nil
+		// The read stops at the window's end: a line logged between the end
+		// and the read is outside the window.
+		if at, line, found := firstLogLineInWindow(sr.containers[n-1], st.LogLines(), from, end); found {
+			return false, fmt.Sprintf("node %d logged %q %s after %s", n, line, fmtMs(at.Sub(from).Milliseconds()), fromWhat), nil
 		}
-		return true, fmt.Sprintf("node %d did not log %q for %s", n, st.Log, hold), nil
+		return true, fmt.Sprintf("node %d did not log %s from %s for %s", n, quoteLines(st.LogLines()), fromWhat, fmtMs(end.Sub(from).Milliseconds())), nil
+
+	case "count_pending":
+		// Count the lines sent before the mark that have reached the receiver
+		// so far. The run counts them again after the drain: the difference
+		// is how many were still on their way at this step and arrived later.
+		before, ok := sr.markAt(st.SentBefore)
+		if !ok {
+			return false, fmt.Sprintf("no mark %q was set before this step", st.SentBefore), nil
+		}
+		ls, err := sr.receiverLatency(time.Time{}, before)
+		if err != nil {
+			return false, fmt.Sprintf("could not read the receiver's counts: %v", err), nil
+		}
+		sr.pending = append(sr.pending, pendingCount{Name: st.Record, Mark: st.SentBefore, SentBefore: before, CountedAt: time.Now(), Arrived: int64(ls.Count)})
+		return true, fmt.Sprintf("%d lines sent before mark %q had arrived; the ones still on their way are counted after the drain", ls.Count, st.SentBefore), nil
 
 	case "wait_stable":
 		// Wait until no running node has logged a sign of the cluster still
@@ -787,21 +863,24 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		}
 		deadline := time.Now().Add(within)
 		for {
-			for _, n := range nodes {
+			// Every node is read, and the first line in time wins, so the
+			// measure and the report name the first node to log it.
+			n, at, line, found := earliestLogMatch(nodes, func(n int) (time.Time, string, bool) {
 				// Without a node, only running nodes count: the last lines of a
 				// node a step just killed must not satisfy the wait.
 				if st.Node == "" && !containerRunning(sr.containers[n-1]) {
-					continue
+					return time.Time{}, "", false
 				}
-				if at, found := firstLogLineSince(sr.containers[n-1], st.Log, since); found {
-					ms := at.Sub(since).Milliseconds()
-					sr.record(st.Record, float64(ms))
-					rep.Node = n
-					return true, fmt.Sprintf("node %d logged %q %s after the disruption", n, st.Log, fmtMs(ms)), nil
-				}
+				return firstLogLineInWindow(sr.containers[n-1], st.LogLines(), since, time.Time{})
+			})
+			if found {
+				ms := at.Sub(since).Milliseconds()
+				sr.record(st.Record, float64(ms))
+				rep.Node = n
+				return true, fmt.Sprintf("node %d logged %q %s after the disruption", n, line, fmtMs(ms)), nil
 			}
 			if time.Now().After(deadline) {
-				return false, fmt.Sprintf("no node logged %q within %s", st.Log, within), nil
+				return false, fmt.Sprintf("no node logged %s within %s", quoteLines(st.LogLines()), within), nil
 			}
 			if err := sleepCtx(sr.ctx, time.Second); err != nil {
 				return false, "", fmt.Errorf("interrupted: %w", err)
@@ -814,6 +893,16 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 func (sr *scenarioRun) record(name string, v float64) {
 	if name != "" {
 		sr.measures[name] = v
+	}
+}
+
+// recordCount stores a number of lines that a step counted beside its time,
+// under the step's record name with suffix added. The report keeps counts
+// apart from the measures, which are times in milliseconds. A step with no
+// record name stores no count.
+func (sr *scenarioRun) recordCount(record, suffix string, n int64) {
+	if record != "" {
+		sr.counts[record+suffix] = n
 	}
 }
 
@@ -1258,13 +1347,19 @@ type scenarioReport struct {
 	Windows     map[string]latencyStats `json:"latency_windows,omitempty"`
 	// AckMaxWindows is the slowest acknowledgement the client waited for in
 	// each window between marks, in milliseconds.
-	AckMaxWindows map[string]int64     `json:"ack_latency_max_ms_windows,omitempty"`
-	Measures      map[string]float64   `json:"measures_ms"`
-	Events        []scenarioEvent      `json:"events"`
-	Steps         []scenarioStepReport `json:"steps"`
-	Leadership    leadershipStats      `json:"leadership"`
-	Generator     *generatorAck        `json:"generator,omitempty"`
-	SeqCheck      *seqCheckResult      `json:"seqcheck,omitempty"`
+	AckMaxWindows map[string]int64   `json:"ack_latency_max_ms_windows,omitempty"`
+	Measures      map[string]float64 `json:"measures_ms"`
+	// Counts holds the numbers of lines that steps counted beside their
+	// times, such as <record>_lines_acked. They are lines, not milliseconds.
+	Counts map[string]int64 `json:"counts,omitempty"`
+	// Pending holds the count_pending steps' counts: the lines sent before a
+	// mark that were still on their way when the step ran.
+	Pending    []pendingCount       `json:"pending,omitempty"`
+	Events     []scenarioEvent      `json:"events"`
+	Steps      []scenarioStepReport `json:"steps"`
+	Leadership leadershipStats      `json:"leadership"`
+	Generator  *generatorAck        `json:"generator,omitempty"`
+	SeqCheck   *seqCheckResult      `json:"seqcheck,omitempty"`
 	// DuplicateRanges groups the lines that arrived twice, with when the
 	// first copy and the second copy arrived.
 	DuplicateRanges []duplicateRange `json:"duplicate_ranges,omitempty"`
@@ -1301,6 +1396,15 @@ func (rep scenarioReport) summary() map[string]any {
 	for k, v := range rep.Measures {
 		out["ms_"+k] = v
 	}
+	for k, v := range rep.Counts {
+		out["count_"+k] = v
+	}
+	for _, p := range rep.Pending {
+		// A count that could not be finished is left out, not reported as 0.
+		if p.ArrivedLater != nil {
+			out["pending_"+p.Name] = *p.ArrivedLater
+		}
+	}
 	for i, ev := range rep.Events {
 		out[fmt.Sprintf("event%d_%s_gap_ms", i, strings.ReplaceAll(ev.Do, " ", "_"))] = ev.GapMs
 	}
@@ -1322,6 +1426,7 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 		NodeCPU:     sr.r.runCPULimit,
 		NodeMem:     sr.r.runMemLimit,
 		Measures:    sr.measures,
+		Counts:      sr.counts,
 		Notes:       sr.notes,
 	}
 
@@ -1375,6 +1480,30 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 	}
 	fmt.Printf("  delivery: %d acknowledged, %d of them arrived, %d missing, %d duplicates, %d extra\n",
 		check.Acked, check.ReceivedAcked, check.Missing, check.Duplicates, check.Extra)
+	// The count_pending steps: count again, now that every line that will
+	// arrive has arrived. The lines that arrived after the step were still
+	// on their way when it ran.
+	for i := range sr.pending {
+		p := &sr.pending[i]
+		ls, err := sr.receiverLatency(time.Time{}, p.SentBefore)
+		if err != nil {
+			sr.notes = append(sr.notes, fmt.Sprintf("count_pending %s: could not read the receiver's counts after the drain, so it has no count: %v", p.Name, err))
+			fmt.Printf("  %s: could not be counted after the drain (%v)\n", p.Name, err)
+			continue
+		}
+		later := arrivedSince(p.Arrived, int64(ls.Count))
+		p.ArrivedLater = &later
+		fmt.Printf("  %s: %d lines sent before mark %q were still on their way at %s and arrived after it\n",
+			p.Name, later, p.Mark, p.CountedAt.UTC().Format("15:04:05.000"))
+	}
+	// The receiver counts lines by when they were sent, whether or not the
+	// client had them confirmed. The client retries a batch until it is
+	// confirmed, so only lines still unconfirmed at the end of the run can be
+	// counted without a confirmation. Say so when there are any.
+	if len(sr.pending) > 0 && gen != nil && gen.Ack != nil && gen.Ack.LinesUnacked > 0 {
+		sr.notes = append(sr.notes, fmt.Sprintf("the client left %d lines unconfirmed; a count_pending count can include those of them sent before its mark", gen.Ack.LinesUnacked))
+	}
+	rep.Pending = sr.pending
 	for conn, cc := range check.Conns {
 		if cc.Missing > 0 {
 			fmt.Printf("    conn %s: missing %d, first ranges %v\n", conn, cc.Missing, cc.MissingRanges)
@@ -1824,20 +1953,86 @@ func containerNetwork(container string) string {
 // firstLogLineSince returns the docker timestamp of the first line since t
 // that contains needle.
 func firstLogLineSince(container, needle string, t time.Time) (time.Time, bool) {
-	out, err := exec.Command("docker", "logs", "-t", "--since", t.UTC().Format(time.RFC3339Nano), container).CombinedOutput()
-	if err != nil {
-		return time.Time{}, false
+	at, _, found := firstLogLineInWindow(container, []string{needle}, t, time.Time{})
+	return at, found
+}
+
+// firstLogLineInWindow returns the docker timestamp of the first line from
+// since up to until that contains any of the needles, and the needle it
+// contains. A zero until leaves the window open: up to the moment of the read.
+func firstLogLineInWindow(container string, needles []string, since, until time.Time) (time.Time, string, bool) {
+	args := []string{"logs", "-t", "--since", since.UTC().Format(time.RFC3339Nano)}
+	if !until.IsZero() {
+		args = append(args, "--until", until.UTC().Format(time.RFC3339Nano))
 	}
-	for _, line := range strings.Split(string(out), "\n") {
-		if !strings.Contains(line, needle) {
+	out, err := exec.Command("docker", append(args, container)...).CombinedOutput()
+	if err != nil {
+		return time.Time{}, "", false
+	}
+	return firstMatchingLine(string(out), needles, until)
+}
+
+// firstMatchingLine finds the first line of `docker logs -t` output that
+// contains any of the needles, and returns its timestamp and that needle. A
+// line stamped after a non-zero until is outside the window and does not count.
+func firstMatchingLine(out string, needles []string, until time.Time) (time.Time, string, bool) {
+	for _, line := range strings.Split(out, "\n") {
+		for _, needle := range needles {
+			if !strings.Contains(line, needle) {
+				continue
+			}
+			ts, _, _ := strings.Cut(line, " ")
+			at, perr := time.Parse(time.RFC3339Nano, ts)
+			if perr != nil || (!until.IsZero() && at.After(until)) {
+				continue
+			}
+			return at, needle, true
+		}
+	}
+	return time.Time{}, "", false
+}
+
+// readProgressBaseline reads the client's progress, trying up to tries times,
+// wait apart. It reports false when no read succeeded or the run stopped.
+func readProgressBaseline(ctx context.Context, read func() (genProgress, bool), tries int, wait time.Duration) (genProgress, bool) {
+	for i := 0; i < tries; i++ {
+		if p, ok := read(); ok {
+			return p, true
+		}
+		if i+1 < tries {
+			if err := sleepCtx(ctx, wait); err != nil {
+				return genProgress{}, false
+			}
+		}
+	}
+	return genProgress{}, false
+}
+
+// earliestLogMatch asks each node for its first matching line and returns the
+// node whose line came first, its time and the text it matched. find reports
+// a node's first match, or false when it has none.
+func earliestLogMatch(nodes []int, find func(n int) (time.Time, string, bool)) (int, time.Time, string, bool) {
+	bestNode, bestAt, bestLine := 0, time.Time{}, ""
+	for _, n := range nodes {
+		at, line, found := find(n)
+		if !found {
 			continue
 		}
-		ts, _, _ := strings.Cut(line, " ")
-		if at, perr := time.Parse(time.RFC3339Nano, ts); perr == nil {
-			return at, true
+		if bestNode == 0 || at.Before(bestAt) {
+			bestNode, bestAt, bestLine = n, at, line
 		}
 	}
-	return time.Time{}, false
+	return bestNode, bestAt, bestLine, bestNode != 0
+}
+
+// quoteLines names the texts a log step looks for: one quoted text, or the
+// quoted texts joined with "or".
+func quoteLines(lines []string) string {
+	quoted := make([]string, len(lines))
+	for i, l := range lines {
+		quoted[i] = strconv.Quote(l)
+	}
+	return strings.Join(quoted, " or ")
 }
 
 // readGeneratorProgress returns the generator's last PROGRESS line.
