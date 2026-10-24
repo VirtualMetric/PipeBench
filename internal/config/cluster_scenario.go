@@ -153,8 +153,11 @@ type ScenarioProxy struct {
 // do not judge".
 type ScenarioExpect struct {
 	// MaxLoss is how many acknowledged lines may be missing at the receiver.
+	// A case with several receivers (`receivers:`) needs every acknowledged
+	// line at each of them, so the limit applies to each receiver.
 	MaxLoss *int64 `yaml:"max_loss"`
-	// MaxDuplicates is how many lines may arrive more than once.
+	// MaxDuplicates is how many lines may arrive more than once, at each
+	// receiver when there are several.
 	MaxDuplicates *int64 `yaml:"max_duplicates"`
 	// MaxSplitBrainMs is how long two nodes may both name themselves the
 	// cluster's leader in the same round of /health reads.
@@ -180,7 +183,8 @@ type ScenarioStep struct {
 	// Node selects the node: "leader" (the current leader), "follower" (the
 	// lowest-numbered running node that is not the leader), "owner" (the node
 	// the leader last placed a placement-managed device on), a number, or
-	// "@name" for a node an earlier step remembered with As.
+	// "@name" for a node an earlier step remembered with As. An
+	// expect_no_log step may also name "all": no node may log the text.
 	Node string `yaml:"node"`
 	// As remembers the node this step acted on, for a later "@name".
 	As string `yaml:"as"`
@@ -218,6 +222,11 @@ type ScenarioStep struct {
 	Proxy   string `yaml:"proxy"`
 	Latency string `yaml:"latency"`
 	Jitter  string `yaml:"jitter"`
+
+	// Receiver names, by its id, the receiver a receiver_pause or
+	// receiver_unpause step acts on. A case with several receivers
+	// (`receivers:`) names one; a case with one receiver names none.
+	Receiver string `yaml:"receiver"`
 
 	// Nodes is the cluster size a scale_to step moves to.
 	Nodes int `yaml:"nodes"`
@@ -511,6 +520,11 @@ func (tc *TestCase) validateClusterScenario() error {
 	if total := tc.Generator.Connections * tc.Generator.Rate; tc.HasGenerator() && total > MaxScenarioRate {
 		return fmt.Errorf("case %q: generator.connections × generator.rate is %d lines a second, more than the %d a scenario case may send", tc.Name, total, MaxScenarioRate)
 	}
+	// With several receivers, the driver checks the load's acknowledged lines
+	// at each of them. Without the load there is nothing to check them by.
+	if tc.MultiReceiver() && !tc.HasGenerator() {
+		return fmt.Errorf("case %q: a scenario case with several receivers checks the load's lines at each of them, so it needs the http_ack generator", tc.Name)
+	}
 	switch sc.Witness {
 	case "", "dir", "azure", "s3":
 	default:
@@ -568,8 +582,10 @@ func (tc *TestCase) validateClusterScenario() error {
 		}
 		// A step that acts on a node must name it. A wait that may name one
 		// (wait_leader, wait_log) must name it the same way when it does. A
-		// link step checks its own node, which may be "all".
-		if (needsNode || st.Node != "") && !linkSteps[st.Do] {
+		// link step checks its own node, which may be "all", and so may an
+		// expect_no_log step.
+		allNodes := st.Do == "expect_no_log" && st.Node == "all"
+		if (needsNode || st.Node != "") && !linkSteps[st.Do] && !allNodes {
 			if err := validateNodeSelector(st.Node, maxNodes, names); err != nil {
 				return fmt.Errorf("%s: %w", where, err)
 			}
@@ -697,6 +713,10 @@ func (tc *TestCase) validateClusterScenario() error {
 			if st.Nodes < 1 || st.Nodes > maxNodes {
 				return fmt.Errorf("%s: nodes must be between 1 and %d (cluster.nodes + spare_nodes), got %d", where, maxNodes, st.Nodes)
 			}
+		case "receiver_pause", "receiver_unpause":
+			if err := tc.validateScenarioReceiver(st.Receiver); err != nil {
+				return fmt.Errorf("%s: %w", where, err)
+			}
 		case "wait_log", "expect_no_log":
 			if st.Log != "" && st.Logs != nil {
 				return fmt.Errorf("%s: names log and logs; name one of them", where)
@@ -715,6 +735,27 @@ func (tc *TestCase) validateClusterScenario() error {
 		}
 	}
 	return nil
+}
+
+// validateScenarioReceiver checks the receiver a receiver_pause or
+// receiver_unpause step names: one of the case's receivers when it has
+// several, and none when it has one.
+func (tc *TestCase) validateScenarioReceiver(id string) error {
+	if !tc.MultiReceiver() {
+		if id != "" {
+			return fmt.Errorf("names receiver %q, but the case has one receiver; receiver names one of several", id)
+		}
+		return nil
+	}
+	if id == "" {
+		return fmt.Errorf("needs receiver: the case has several receivers, so the step names the one it acts on")
+	}
+	for _, r := range tc.Receivers {
+		if r.ID == id {
+			return nil
+		}
+	}
+	return fmt.Errorf("receiver %q is not one of the case's receivers", id)
 }
 
 func validateNodeSelector(sel string, maxNodes int, names map[string]bool) error {
@@ -751,6 +792,7 @@ var stepFieldOwners = []struct {
 	{"empty_disk", func(s ScenarioStep) bool { return s.EmptyDisk }, map[string]bool{"start": true}},
 	{"leave", func(s ScenarioStep) bool { return s.Leave != "" }, map[string]bool{"fill_disk": true}},
 	{"gap", func(s ScenarioStep) bool { return s.Gap != "" }, map[string]bool{"expect_delivery_continues": true, "expect_writes_continue": true}},
+	{"receiver", func(s ScenarioStep) bool { return s.Receiver != "" }, map[string]bool{"receiver_pause": true, "receiver_unpause": true}},
 }
 
 func checkStepFieldOwners(st ScenarioStep) error {
