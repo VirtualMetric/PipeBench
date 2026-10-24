@@ -314,3 +314,99 @@ func TestWatchWritesSteady(t *testing.T) {
 		t.Fatal("a window with no confirmation passed")
 	}
 }
+
+// The gap's boundary: the first confirmation, or the first line, comes after
+// the gap has passed but before the next poll (must fail), or before the gap
+// (must pass). The poll that sees it measures the pause before it resets it.
+func TestTheGapBoundary(t *testing.T) {
+	const gap, poll, hold = 200 * time.Millisecond, 150 * time.Millisecond, 600 * time.Millisecond
+	for _, c := range []struct {
+		name  string
+		first time.Duration // when the first confirmation or line comes
+		pass  bool
+	}{
+		{"just before the gap", 100 * time.Millisecond, true},
+		{"just after the gap", 250 * time.Millisecond, false},
+	} {
+		start := time.Now()
+		since := func() time.Duration { return time.Since(start) }
+		var acked int64
+		read := func() (genProgress, bool) {
+			if since() >= c.first {
+				acked += 10
+			}
+			return genProgress{Acked: acked}, true
+		}
+		gained, longest, err := watchWrites(context.Background(), genProgress{}, hold, poll, read)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok, detail, _ := judgeWrites(gained, longest, hold, gap); ok != c.pass {
+			t.Errorf("writes, %s: pass %v (%s, longest %s), want %v", c.name, ok, detail, longest, c.pass)
+		}
+
+		start = time.Now()
+		var n int64
+		count := func() (int64, error) {
+			if since() >= c.first {
+				n += 10
+			}
+			return n, nil
+		}
+		w, err := watchDelivery(context.Background(), start, hold, gap, poll, count)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w.ok != c.pass {
+			t.Errorf("delivery, %s: pass %v (%s, longest %s), want %v", c.name, w.ok, w.detail, w.longest, c.pass)
+		}
+	}
+}
+
+// The window's boundary: a confirmation or a line that comes just before the
+// window ends counts, and one that comes just after it does not. With no gap,
+// a window whose only confirmation came after it fails.
+func TestTheWindowBoundary(t *testing.T) {
+	const hold, poll = 300 * time.Millisecond, 100 * time.Millisecond
+	for _, c := range []struct {
+		name  string
+		first time.Duration
+		pass  bool
+	}{
+		{"just before the end", 150 * time.Millisecond, true},
+		{"just after the end", 320 * time.Millisecond, false},
+	} {
+		start := time.Now()
+		since := func() time.Duration { return time.Since(start) }
+		read := func() (genProgress, bool) {
+			if since() >= c.first {
+				return genProgress{Acked: 10}, true
+			}
+			return genProgress{}, true
+		}
+		gained, longest, err := watchWrites(context.Background(), genProgress{}, hold, poll, read)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok, detail, _ := judgeWrites(gained, longest, hold, 0); ok != c.pass {
+			t.Errorf("writes, %s: pass %v (%s, %d lines), want %v", c.name, ok, detail, gained, c.pass)
+		}
+
+		// Delivery with a gap as long as the window: only whether the line
+		// came inside the window decides.
+		start = time.Now()
+		count := func() (int64, error) {
+			if since() >= c.first {
+				return 100, nil
+			}
+			return 0, nil
+		}
+		w, err := watchDelivery(context.Background(), start, hold, 290*time.Millisecond, poll, count)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w.ok != c.pass || (w.lines > 0) != c.pass {
+			t.Errorf("delivery, %s: pass %v with %d lines (%s), want %v", c.name, w.ok, w.lines, w.detail, c.pass)
+		}
+	}
+}

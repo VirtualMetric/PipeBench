@@ -490,34 +490,52 @@ func watchDelivery(ctx context.Context, start time.Time, hold, gap, poll time.Du
 	lastGrowth := start
 	var lastErr error
 	end := start.Add(hold)
+	// stalled judges a stall that ended (or was measured) at the given time.
+	stalled := func(stall time.Duration) bool {
+		if stall > w.longest {
+			w.longest = stall
+		}
+		if stall <= gap {
+			return false
+		}
+		w.detail = fmt.Sprintf("no line sent in the window arrived for %s, more than the gap of %s; %d had arrived",
+			fmtMs(stall.Milliseconds()), gap, w.lines)
+		if lastErr != nil {
+			w.detail += "; the receiver's count could not be read: " + lastErr.Error()
+		}
+		return true
+	}
 	for {
+		n, err := count()
 		now := time.Now()
-		if n, err := count(); err != nil {
+		if !now.Before(end) {
+			// A count read after the window may hold lines that arrived after
+			// it, so it does not count. The last stall runs to the window's end.
+			if stalled(end.Sub(lastGrowth)) {
+				return w, nil
+			}
+			w.ok = true
+			return w, nil
+		}
+		grew := false
+		if err != nil {
 			lastErr = err
 		} else {
 			lastErr = nil
 			if n > w.lines {
 				w.lines = n
-				lastGrowth = now
+				grew = true
 			}
 		}
-		stall := now.Sub(lastGrowth)
-		if stall > w.longest {
-			w.longest = stall
-		}
-		if stall > gap {
-			w.detail = fmt.Sprintf("no line sent in the window arrived for %s, more than the gap of %s; %d had arrived",
-				fmtMs(stall.Milliseconds()), gap, w.lines)
-			if lastErr != nil {
-				w.detail += "; the receiver's count could not be read: " + lastErr.Error()
-			}
+		// The stall is measured before a growth ends it: growth seen just after
+		// the gap still means the gap passed.
+		if stalled(now.Sub(lastGrowth)) {
 			return w, nil
 		}
-		if !now.Before(end) {
-			w.ok = true
-			return w, nil
+		if grew {
+			lastGrowth = now
 		}
-		if err := sleepCtx(ctx, poll); err != nil {
+		if err := sleepCtx(ctx, min(poll, time.Until(end))); err != nil {
 			return w, fmt.Errorf("interrupted: %w", err)
 		}
 	}
@@ -532,18 +550,30 @@ func watchWrites(ctx context.Context, first genProgress, hold, poll time.Duratio
 	lastChange := time.Now()
 	prev := first
 	end := lastChange.Add(hold)
-	for time.Now().Before(end) {
-		if err := sleepCtx(ctx, poll); err != nil {
+	for {
+		if err := sleepCtx(ctx, min(poll, time.Until(end))); err != nil {
 			return prev.Acked - first.Acked, longest, err
 		}
-		if p, ok := read(); ok && p.Acked != prev.Acked {
-			lastChange = time.Now()
-			prev = p
-		} else if f := time.Since(lastChange); f > longest {
+		p, ok := read()
+		now := time.Now()
+		if !now.Before(end) {
+			// A read after the window may show confirmations from after it, so
+			// it does not count. The last pause runs to the window's end.
+			if f := end.Sub(lastChange); f > longest {
+				longest = f
+			}
+			return prev.Acked - first.Acked, longest, nil
+		}
+		// The pause is measured before a confirmation ends it: one seen just
+		// after the gap still means the gap passed.
+		if f := now.Sub(lastChange); f > longest {
 			longest = f
 		}
+		if ok && p.Acked != prev.Acked {
+			lastChange = now
+			prev = p
+		}
 	}
-	return prev.Acked - first.Acked, longest, nil
 }
 
 // judgeWrites judges an expect_writes_continue window. With a gap, the client
