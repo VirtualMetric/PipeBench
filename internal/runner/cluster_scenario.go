@@ -871,7 +871,9 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 				if st.Node == "" && !containerRunning(sr.containers[n-1]) {
 					return time.Time{}, "", false
 				}
-				return firstLogLineInWindow(sr.containers[n-1], st.LogLines(), since, time.Time{})
+				// The read stops at the deadline: a line logged after it is
+				// too late, even when the read happens to see it.
+				return firstLogLineInWindow(sr.containers[n-1], st.LogLines(), since, deadline)
 			})
 			if found {
 				ms := at.Sub(since).Milliseconds()
