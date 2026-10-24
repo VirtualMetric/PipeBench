@@ -811,6 +811,29 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		}
 		return true, fmt.Sprintf("%d lines acknowledged in %s (longest pause %s)", gained, hold, fmtMs(maxFlat.Milliseconds())), nil
 
+	case "expect_delivery_continues":
+		// Lines sent in the window must keep arriving: the count of lines
+		// sent after the window began (and deliveryMargin, so lines already
+		// on their way do not count) that reached the receiver must grow at
+		// least once every gap. wait_delivery is satisfied by one handful of
+		// lines; this shows that delivery went on.
+		hold := st.DurationOr("for", 30*time.Second)
+		gap := st.DurationOr("gap", 10*time.Second)
+		start := time.Now()
+		res, err := watchDelivery(sr.ctx, start, hold, gap, 250*time.Millisecond, func() (int64, error) {
+			ls, err := sr.receiverLatency(start.Add(deliveryMargin), time.Time{})
+			return int64(ls.Count), err
+		})
+		if err != nil {
+			return false, "", err
+		}
+		sr.record(st.Record, float64(res.longest.Milliseconds()))
+		sr.recordCount(st.Record, "_lines", res.lines)
+		if !res.ok {
+			return false, res.detail, nil
+		}
+		return true, fmt.Sprintf("%d lines sent in the window arrived in %s (longest stall %s)", res.lines, hold, fmtMs(res.longest.Milliseconds())), nil
+
 	case "witness_down", "witness_up":
 		return sr.witnessAction(i, st)
 

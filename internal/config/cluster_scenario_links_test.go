@@ -218,3 +218,32 @@ func TestValidateWaitLeaderGroups(t *testing.T) {
 		t.Fatalf("groups on a kill: Validate = %v", err)
 	}
 }
+
+func TestValidateExpectDeliveryContinues(t *testing.T) {
+	withStep := func(st ScenarioStep) *TestCase {
+		tc := linkScenarioCase()
+		tc.Cluster.Scenario.Steps = append(tc.Cluster.Scenario.Steps, st)
+		return tc
+	}
+	if err := withStep(ScenarioStep{Do: "expect_delivery_continues", For: "60s", Gap: "10s"}).Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if err := withStep(ScenarioStep{Do: "expect_delivery_continues"}).Validate(); err != nil {
+		t.Fatalf("Validate with the defaults: %v", err)
+	}
+	bad := map[string]struct {
+		st   ScenarioStep
+		want string
+	}{
+		"gap too short":  {ScenarioStep{Do: "expect_delivery_continues", Gap: "1s"}, "gap must be at least 2s"},
+		"for within gap": {ScenarioStep{Do: "expect_delivery_continues", For: "5s", Gap: "10s"}, "for must be longer than gap"},
+		"gap not a time": {ScenarioStep{Do: "expect_delivery_continues", Gap: "soon"}, "gap"},
+		"gap on another": {ScenarioStep{Do: "wait_delivery", Gap: "10s"}, "gap only applies to expect_delivery_continues"},
+	}
+	for name, c := range bad {
+		err := withStep(c.st).Validate()
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: Validate = %v, want an error with %q", name, err, c.want)
+		}
+	}
+}

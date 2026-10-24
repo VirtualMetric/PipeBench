@@ -202,6 +202,9 @@ type ScenarioStep struct {
 	Signal string `yaml:"signal"`
 	// Grace is the stop timeout for stop and restart (default 30s).
 	Grace string `yaml:"grace"`
+	// Gap is the longest expect_delivery_continues allows between two
+	// arrivals of lines sent in its window (default 10s).
+	Gap string `yaml:"gap"`
 
 	// Recover passes -recover=<value> to a start (accept-loss or reset).
 	// Needs scenario.node_args.
@@ -293,38 +296,39 @@ func LossPercent(s string) (float64, error) {
 
 // scenarioActions lists every step action and whether it needs Node.
 var scenarioActions = map[string]bool{
-	"wait_ready":             false,
-	"start_load":             false,
-	"sleep":                  false,
-	"mark":                   false,
-	"kill":                   true,
-	"stop":                   true,
-	"start":                  true,
-	"restart":                true,
-	"pause":                  true,
-	"unpause":                true,
-	"disconnect":             true,
-	"connect":                true,
-	"wait_leader":            false,
-	"expect_no_leader":       false,
-	"wait_delivery":          false,
-	"expect_writes_stop":     false,
-	"expect_writes_continue": false,
-	"expect_delivery_stops":  false,
-	"wait_healthy":           false,
-	"witness_down":           false,
-	"witness_up":             false,
-	"proxy_latency":          false,
-	"proxy_down":             false,
-	"proxy_up":               false,
-	"receiver_pause":         false,
-	"receiver_unpause":       false,
-	"scale_to":               false,
-	"rolling_restart":        false,
-	"wait_log":               false,
-	"expect_no_log":          true,
-	"wait_stable":            false,
-	"count_pending":          false,
+	"wait_ready":                false,
+	"start_load":                false,
+	"sleep":                     false,
+	"mark":                      false,
+	"kill":                      true,
+	"stop":                      true,
+	"start":                     true,
+	"restart":                   true,
+	"pause":                     true,
+	"unpause":                   true,
+	"disconnect":                true,
+	"connect":                   true,
+	"wait_leader":               false,
+	"expect_no_leader":          false,
+	"wait_delivery":             false,
+	"expect_writes_stop":        false,
+	"expect_writes_continue":    false,
+	"expect_delivery_stops":     false,
+	"expect_delivery_continues": false,
+	"wait_healthy":              false,
+	"witness_down":              false,
+	"witness_up":                false,
+	"proxy_latency":             false,
+	"proxy_down":                false,
+	"proxy_up":                  false,
+	"receiver_pause":            false,
+	"receiver_unpause":          false,
+	"scale_to":                  false,
+	"rolling_restart":           false,
+	"wait_log":                  false,
+	"expect_no_log":             true,
+	"wait_stable":               false,
+	"count_pending":             false,
 	// The link steps check their node themselves: it may be "all".
 	"cut_link":     false,
 	"shape_link":   false,
@@ -375,6 +379,8 @@ func (s ScenarioStep) DurationOr(field string, def time.Duration) time.Duration 
 		v = s.For
 	} else if field == "grace" {
 		v = s.Grace
+	} else if field == "gap" {
+		v = s.Gap
 	}
 	if v == "" {
 		return def
@@ -573,12 +579,21 @@ func (tc *TestCase) validateClusterScenario() error {
 			}
 			names[st.As] = true
 		}
-		for field, v := range map[string]string{"within": st.Within, "for": st.For, "grace": st.Grace, "latency": st.Latency, "jitter": st.Jitter} {
+		for field, v := range map[string]string{"within": st.Within, "for": st.For, "grace": st.Grace, "gap": st.Gap, "latency": st.Latency, "jitter": st.Jitter} {
 			if v == "" {
 				continue
 			}
 			if _, err := time.ParseDuration(v); err != nil {
 				return fmt.Errorf("%s: %s: %w", where, field, err)
+			}
+		}
+		if st.Do == "expect_delivery_continues" {
+			gap := st.DurationOr("gap", 10*time.Second)
+			if gap < 2*time.Second {
+				return fmt.Errorf("%s: gap must be at least 2s: a line sent in the window needs time to arrive", where)
+			}
+			if st.DurationOr("for", 30*time.Second) <= gap {
+				return fmt.Errorf("%s: for must be longer than gap", where)
 			}
 		}
 		if st.Since != "" {
@@ -723,6 +738,7 @@ var stepFieldOwners = []struct {
 	{"groups", func(s ScenarioStep) bool { return s.Groups != nil }, map[string]bool{"split": true, "wait_leader": true}},
 	{"empty_disk", func(s ScenarioStep) bool { return s.EmptyDisk }, map[string]bool{"start": true}},
 	{"leave", func(s ScenarioStep) bool { return s.Leave != "" }, map[string]bool{"fill_disk": true}},
+	{"gap", func(s ScenarioStep) bool { return s.Gap != "" }, map[string]bool{"expect_delivery_continues": true}},
 }
 
 func checkStepFieldOwners(st ScenarioStep) error {

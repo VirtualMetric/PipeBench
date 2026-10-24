@@ -472,3 +472,53 @@ func (sr *scenarioRun) queryRows(query string) ([]string, error) {
 	}
 	return rows, nil
 }
+
+// deliveryWatch is what watchDelivery saw.
+type deliveryWatch struct {
+	ok      bool
+	lines   int64
+	longest time.Duration
+	detail  string
+}
+
+// watchDelivery polls count until hold has passed since start. count returns
+// how many lines sent in the window have arrived so far. The window fails as
+// soon as the count has not grown for longer than gap, the wait for its first
+// growth included. A count that cannot be read does not grow.
+func watchDelivery(ctx context.Context, start time.Time, hold, gap, poll time.Duration, count func() (int64, error)) (deliveryWatch, error) {
+	var w deliveryWatch
+	lastGrowth := start
+	var lastErr error
+	end := start.Add(hold)
+	for {
+		now := time.Now()
+		if n, err := count(); err != nil {
+			lastErr = err
+		} else {
+			lastErr = nil
+			if n > w.lines {
+				w.lines = n
+				lastGrowth = now
+			}
+		}
+		stall := now.Sub(lastGrowth)
+		if stall > w.longest {
+			w.longest = stall
+		}
+		if stall > gap {
+			w.detail = fmt.Sprintf("no line sent in the window arrived for %s, more than the gap of %s; %d had arrived",
+				fmtMs(stall.Milliseconds()), gap, w.lines)
+			if lastErr != nil {
+				w.detail += "; the receiver's count could not be read: " + lastErr.Error()
+			}
+			return w, nil
+		}
+		if !now.Before(end) {
+			w.ok = true
+			return w, nil
+		}
+		if err := sleepCtx(ctx, poll); err != nil {
+			return w, fmt.Errorf("interrupted: %w", err)
+		}
+	}
+}

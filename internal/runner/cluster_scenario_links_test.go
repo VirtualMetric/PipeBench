@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -200,5 +201,40 @@ func TestOneSideLeader(t *testing.T) {
 	r = healthRound{Nodes: []nodeHealth{h(1, "n1", ""), h(2, "n2", ""), h(3, "n3", ""), h(4, "n4", "")}}
 	if _, _, ok := oneSideLeader(r, sides); ok {
 		t.Fatal("no side has a leader, and the round passed")
+	}
+}
+
+// expect_delivery_continues: lines sent in the window must keep arriving.
+func TestWatchDelivery(t *testing.T) {
+	ctx := context.Background()
+	start := time.Now()
+	var n int64
+	steady := func() (int64, error) { n++; return n, nil }
+	w, err := watchDelivery(ctx, start, 300*time.Millisecond, 100*time.Millisecond, 10*time.Millisecond, steady)
+	if err != nil || !w.ok || w.lines == 0 {
+		t.Fatalf("steady delivery: %+v, %v; want a pass", w, err)
+	}
+
+	// Delivery that stops after a few lines fails once the gap has passed.
+	start, n = time.Now(), 0
+	stops := func() (int64, error) {
+		if n < 3 {
+			n++
+		}
+		return n, nil
+	}
+	w, err = watchDelivery(ctx, start, time.Second, 100*time.Millisecond, 10*time.Millisecond, stops)
+	if err != nil || w.ok || !strings.Contains(w.detail, "more than the gap") || w.lines != 3 {
+		t.Fatalf("stopped delivery: %+v, %v; want a failure after 3 lines", w, err)
+	}
+	if time.Since(start) > 700*time.Millisecond {
+		t.Errorf("the stall was judged only after %s, not once the gap passed", time.Since(start))
+	}
+
+	// A count that cannot be read does not count as delivery.
+	broken := func() (int64, error) { return 0, errors.New("receiver down") }
+	w, err = watchDelivery(ctx, time.Now(), time.Second, 100*time.Millisecond, 10*time.Millisecond, broken)
+	if err != nil || w.ok || !strings.Contains(w.detail, "receiver down") {
+		t.Fatalf("unreadable count: %+v, %v; want a failure naming the error", w, err)
 	}
 }
