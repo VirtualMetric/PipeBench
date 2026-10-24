@@ -177,3 +177,28 @@ func TestAgreedLeaderAmongASide(t *testing.T) {
 		t.Fatalf("a side split between two leaders agreed on node %d", l)
 	}
 }
+
+// Only one side may lead. A side that still follows the old leader while the
+// other side elected its own is two leaders, and the round does not count.
+func TestOneSideLeader(t *testing.T) {
+	sides := [][]int{{1, 2}, {3, 4}}
+	r := healthRound{Nodes: []nodeHealth{h(1, "n1", "n1"), h(2, "n2", "n1"), h(3, "n3", ""), h(4, "n4", "n1")}}
+	if l, side, ok := oneSideLeader(r, sides); !ok || l != 1 || side[0] != 1 {
+		t.Fatalf("oneSideLeader = %d, %v, %v; want node 1 leading [1 2]", l, side, ok)
+	}
+	// Both sides agree on a leader of their own.
+	r = healthRound{Nodes: []nodeHealth{h(1, "n1", "n1"), h(2, "n2", "n1"), h(3, "n3", "n3"), h(4, "n4", "n3")}}
+	if l, _, ok := oneSideLeader(r, sides); ok {
+		t.Fatalf("two sides with a leader each passed, on node %d", l)
+	}
+	// One side agrees, and a node of the other side names itself.
+	r = healthRound{Nodes: []nodeHealth{h(1, "n1", "n1"), h(2, "n2", "n1"), h(3, "n3", "n3"), h(4, "n4", "")}}
+	if l, _, ok := oneSideLeader(r, sides); ok {
+		t.Fatalf("a claimant outside the leading side passed, on node %d", l)
+	}
+	// No side has a leader.
+	r = healthRound{Nodes: []nodeHealth{h(1, "n1", ""), h(2, "n2", ""), h(3, "n3", ""), h(4, "n4", "")}}
+	if _, _, ok := oneSideLeader(r, sides); ok {
+		t.Fatal("no side has a leader, and the round passed")
+	}
+}

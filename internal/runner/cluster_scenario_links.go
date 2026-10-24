@@ -71,7 +71,9 @@ func (sr *scenarioRun) linkAction(i int, st config.ScenarioStep, rep *scenarioSt
 		if err != nil {
 			return false, err.Error(), nil
 		}
-		var pairs int
+		// links counts each link once: node all with peers all names every
+		// link from both of its ends.
+		links := map[[2]string]bool{}
 		for _, from := range froms {
 			for _, sel := range st.PeerList() {
 				peers, _, err := sr.linkEnds(sel, from)
@@ -79,6 +81,11 @@ func (sr *scenarioRun) linkAction(i int, st config.ScenarioStep, rep *scenarioSt
 					return false, err.Error(), nil
 				}
 				for _, peer := range peers {
+					link := [2]string{from, peer}
+					if !st.OneWay && peer < from {
+						link = [2]string{peer, from}
+					}
+					links[link] = true
 					keys := []linkKey{{from, peer}}
 					if !st.OneWay {
 						keys = append(keys, linkKey{peer, from})
@@ -98,10 +105,10 @@ func (sr *scenarioRun) linkAction(i int, st config.ScenarioStep, rep *scenarioSt
 						}
 						changes[k] = f
 					}
-					pairs++
 				}
 			}
 		}
+		pairs := len(links)
 		if pairs == 0 {
 			return false, "the step names no link: no peer is running", nil
 		}

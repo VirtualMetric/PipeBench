@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -170,6 +171,35 @@ func agreedLeaderAmong(r healthRound, nodes []int) (int, bool) {
 		}
 	}
 	return agreedLeader(side)
+}
+
+// oneSideLeader returns the leader of a split's sides: the leader that one
+// group agrees on, when exactly one group has one and no node outside that
+// group names itself the leader. Right after a split, the side of the old
+// leader still follows it while the other side may elect its own. That is two
+// leaders, not one side leading, so the round does not count.
+func oneSideLeader(r healthRound, groups [][]int) (int, []int, bool) {
+	var side []int
+	leader := 0
+	for _, g := range groups {
+		l, ok := agreedLeaderAmong(r, g)
+		if !ok {
+			continue
+		}
+		if side != nil {
+			return 0, nil, false
+		}
+		side, leader = g, l
+	}
+	if side == nil {
+		return 0, nil, false
+	}
+	for _, h := range r.Nodes {
+		if h.selfLeader() && !slices.Contains(side, h.Node) {
+			return 0, nil, false
+		}
+	}
+	return leader, side, true
 }
 
 // splitInterval is a stretch of rounds in which two or more nodes named

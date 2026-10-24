@@ -74,7 +74,7 @@ func TestValidateRejectsBadLinkAndDiskSteps(t *testing.T) {
 		"leave on free_disk":        {func(tc *TestCase) { step(tc, -2).Leave = "1m" }, "leave only applies to fill_disk"},
 		"fill without a disk":       {func(tc *TestCase) { tc.Cluster.Scenario.NodeDisk = nil }, "needs cluster.scenario.node_disk"},
 		"fill on a node without":    {func(tc *TestCase) { step(tc, fill).Node = "2" }, "node 2 has no disk of its own"},
-		"bad leave":                 {func(tc *TestCase) { step(tc, fill).Leave = "lots" }, "leave"},
+		"bad leave":                 {func(tc *TestCase) { step(tc, fill).Leave = "lots" }, `leave "lots"`},
 		"disk path not absolute":    {func(tc *TestCase) { tc.Cluster.Scenario.NodeDisk.Path = "storage" }, "node_disk.path"},
 		"disk too small":            {func(tc *TestCase) { tc.Cluster.Scenario.NodeDisk.Size = "16m" }, "at least 64m"},
 		"disk on a node that isn't": {func(tc *TestCase) { tc.Cluster.Scenario.NodeDisk.Nodes = []int{7} }, "7 is not a node"},

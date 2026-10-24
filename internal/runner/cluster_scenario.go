@@ -612,12 +612,7 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 				l, ok := agreedLeader(r)
 				return l, nil, ok
 			}
-			for _, g := range groups {
-				if l, ok := agreedLeaderAmong(r, g); ok {
-					return l, g, true
-				}
-			}
-			return 0, nil, false
+			return oneSideLeader(r, groups)
 		}
 		round, ok, err := sr.waitRound(within, func(r healthRound) bool {
 			l, _, ok := leaderOf(r)
@@ -628,7 +623,7 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		}
 		if !ok {
 			if len(groups) > 0 {
-				return false, fmt.Sprintf("no group %s agreed on a leader within %s: %s", describeSides(groups), within, describeRound(round)), nil
+				return false, fmt.Sprintf("not exactly one of the groups %s agreed on a leader within %s: %s", describeSides(groups), within, describeRound(round)), nil
 			}
 			return false, fmt.Sprintf("no agreed leader within %s: %s", within, describeRound(round)), nil
 		}
@@ -1722,6 +1717,12 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 	if ex.MaxSplitBrainMs != nil && rep.Leadership.SplitBrainMs > *ex.MaxSplitBrainMs {
 		v.reasons = append(v.reasons, fmt.Sprintf("two nodes named themselves the leader for %s (max_split_brain_ms %d)",
 			fmtMs(rep.Leadership.SplitBrainMs), *ex.MaxSplitBrainMs))
+	}
+	// Validation keeps rows to cases without a generator, so a run with load
+	// has none. Were that to change, a judged rows check that never ran fails
+	// here instead of passing unseen.
+	if reason, _ := judgeRows(rep.Rows, ex.MaxMissingRows); reason != "" {
+		v.reasons = append(v.reasons, reason)
 	}
 	rep.Failures = v.reasons
 	rep.Notes = sr.notes
