@@ -3,19 +3,24 @@ package runner
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/url"
 	"os/exec"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/VirtualMetric/PipeBench/internal/config"
+	"github.com/VirtualMetric/PipeBench/internal/orchestrator"
 )
 
 // The actions of a shared-state case that disturb the store, the network or
 // the size of the replica set, rather than one replica.
 
-// pauseStore pauses Azurite for the outage, so no replica can reach the
-// store, then lets it go on. It measures when the leader stops leading and
+// pauseStore takes the store away for the outage, so no replica can reach it,
+// then gives it back: it pauses Azurite, MinIO or Redis, or makes the share
+// refuse every access. It measures when the leader stops leading and
 // when the replicas stop their placed devices, samples /health and the
 // outage streams while the store is away, and measures how long the replica
 // set takes to lead and run every placed device again once it is back.
@@ -32,12 +37,27 @@ func (run *ssRun) pauseStore() {
 			return
 		}
 	}
-	fmt.Printf("  pausing Azurite for %s…\n", outage)
-	paused := time.Now()
-	if err := exec.Command("docker", "pause", "bench-azurite").Run(); err != nil {
-		run.fail("docker pause bench-azurite: %v (the outage did not happen)", err)
+	if run.ss.StoreOrDefault() == config.SharedStateStoreShare {
+		what := fmt.Sprintf("The share refuses access for %d s (chmod 000). This fails fast, unlike a network share that stops answering.", run.ss.OutageOrDefault())
+		run.measures["outage_kind"] = what
+		fmt.Printf("  %s\n", what)
+	} else {
+		fmt.Printf("  pausing %s for %s…\n", run.ss.StoreName(), outage)
+	}
+	if err := run.takeStore(true); err != nil {
+		run.fail("%v (the outage did not happen)", err)
 		return
 	}
+	if run.ss.StoreOrDefault() == config.SharedStateStoreShare {
+		if err := run.confirmShareRefused(); err != nil {
+			run.fail("%v", err)
+			if back := run.takeStore(false); back != nil {
+				run.fail("%v", back)
+			}
+			return
+		}
+	}
+	paused := time.Now()
 	run.measures["outage_from"] = paused.UTC()
 
 	// While the store is away: /health on every replica, and the streams.
@@ -62,8 +82,8 @@ func (run *ssRun) pauseStore() {
 	}
 	during := run.streamCounts()
 	held := run.holdOthers(leader, hold)
-	if err := exec.Command("docker", "unpause", "bench-azurite").Run(); err != nil {
-		run.fail("docker unpause bench-azurite: %v", err)
+	if err := run.takeStore(false); err != nil {
+		run.fail("%v", err)
 		run.thaw(held)
 		return
 	}
@@ -95,6 +115,77 @@ func (run *ssRun) pauseStore() {
 			fmt.Printf("    %s, which led before the outage, led again after it\n", run.replica(leader).Service)
 		}
 	}
+}
+
+// takeStore takes the store away (away) or gives it back.
+func (run *ssRun) takeStore(away bool) error {
+	via := ""
+	if run.ss.StoreOrDefault() == config.SharedStateStoreShare {
+		via = run.replicas[0].Container
+	}
+	args := storeOutageArgs(run.ss, away, via, run.subject.ImageRef())
+	if out, err := exec.Command("docker", args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("docker %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// confirmShareRefused checks, inside every running replica and as the
+// replica's own user, that the share now refuses access. chmod 000 does not
+// stop a process that runs as root, so an outage the replicas could ignore
+// fails the run, instead of passing as one they survived.
+func (run *ssRun) confirmShareRefused() error {
+	checked := 0
+	for _, rep := range run.replicas {
+		if !run.running[rep.N] {
+			continue
+		}
+		checked++
+		opens, err := shareOpens(rep.Container, run.ss.SharePath)
+		if err != nil {
+			return fmt.Errorf("checking that the share refuses %s: %v", rep.Service, err)
+		}
+		if opens {
+			return fmt.Errorf("the share at %s still opens for %s's user after chmod 000, so the outage did not happen: a process that runs as root ignores the mode", run.ss.SharePath, rep.Service)
+		}
+	}
+	if checked == 0 {
+		return fmt.Errorf("no replica runs, so nothing confirms that the share at %s refuses access", run.ss.SharePath)
+	}
+	return nil
+}
+
+// shareOpens reports whether a container's own user can open the directory:
+// docker exec runs as the user the container runs as. Tests replace it.
+var shareOpens = func(container, dir string) (bool, error) {
+	out, err := exec.Command("docker", "exec", container, "sh", "-c", `cd "$1"`, "sh", dir).CombinedOutput()
+	if err == nil {
+		return true, nil
+	}
+	if strings.Contains(string(out), "ermission denied") {
+		return false, nil
+	}
+	return false, fmt.Errorf("docker exec %s: %v: %s", container, err, strings.TrimSpace(string(out)))
+}
+
+// storeOutageArgs returns the docker arguments that take the store away, or
+// give it back. A paused container stops answering. A share that is chmod 000
+// refuses every access at once: a short container of the subject's image,
+// with the volumes of replica via (running, paused or stopped), changes the
+// mode as root, so the replicas' own user can no longer reach the share.
+func storeOutageArgs(ss *config.SharedStateConfig, away bool, via, image string) []string {
+	if ss.StoreOrDefault() == config.SharedStateStoreShare {
+		mode := "0777"
+		if away {
+			mode = "000"
+		}
+		return []string{"run", "--rm", "--volumes-from", via, "--user", "0:0", "--network", "none",
+			"--cpus", "0.5", "--memory", "64m", "--entrypoint", "chmod", image, mode, ss.SharePath}
+	}
+	if away {
+		return []string{"pause", "bench-" + ss.StoreService()}
+	}
+	return []string{"unpause", "bench-" + ss.StoreService()}
 }
 
 // holdOthers freezes every running replica but keep, when hold is set, so
@@ -327,10 +418,50 @@ func (run *ssRun) judgeOutageStreams(base *outageBaseline, during map[string]int
 	run.measures["outage_stream_window_seconds"] = window.Seconds()
 	fmt.Printf("    records that arrived in the last %s of the outage: %v\n", window.Round(time.Second), growth)
 	for _, name := range run.ss.OutageStreams {
-		if growth[name] <= 0 {
-			run.fail("stream %s stopped during the outage: no record arrived in its last %s", name, window.Round(time.Second))
+		if why := outageShortfall(name, growth[name], window, run.streamPace(name)); why != "" {
+			run.fail("%s", why)
 		}
 	}
+}
+
+// outageShortfall says why an outage stream's arrivals in the window fall
+// short, or "". A record or two would only show that something arrived, so
+// the stream must keep at least half the pace its generator sends at.
+func outageShortfall(name string, growth int64, window time.Duration, perSec float64) string {
+	if growth <= 0 {
+		return fmt.Sprintf("stream %s stopped during the outage: no record arrived in its last %s", name, window.Round(time.Second))
+	}
+	paced := perSec * window.Seconds()
+	if perSec > 0 && float64(growth) < paced/2 {
+		return fmt.Sprintf("stream %s slowed during the outage: in its last %s, %s arrived of the %.0f its generator sends in that time; at least half must arrive", name, window.Round(time.Second), countOf(growth, "record"), paced)
+	}
+	return ""
+}
+
+// countOf says n of a thing: "1 record", "2 records".
+func countOf(n int64, thing string) string {
+	if n == 1 {
+		return "1 " + thing
+	}
+	return strconv.FormatInt(n, 10) + " " + thing + "s"
+}
+
+// streamPace is how many records a second the generator of the named stream
+// sends: its rate on each of its connections, counted as the compose file
+// counts them, so a generator that leaves connections unset gets the host's
+// default. It is 0 for a stream whose generator has no rate limit.
+func (run *ssRun) streamPace(name string) float64 {
+	for _, st := range run.ss.Streams {
+		if st.StreamName() != name {
+			continue
+		}
+		for _, g := range run.tc.AllGenerators() {
+			if g.ID == st.Generator {
+				return float64(g.Rate) * float64(orchestrator.ResolveGeneratorConnections(g.Connections))
+			}
+		}
+	}
+	return 0
 }
 
 // outageBaselineDelay is how far into an outage the driver counts the outage
@@ -420,7 +551,7 @@ func (run *ssRun) scaleOutIn() {
 		run.fail("starting %s: %v", rep.Service, err)
 		return
 	}
-	run.running[n] = true
+	run.markStarted(n)
 	since := containerStartedAt(rep.Container, time.Now())
 	readyAt, ok := run.waitReady(n, since, earliest(time.Now().Add(run.replicaWarmup()), run.deadline))
 	if !ok {
@@ -452,12 +583,7 @@ func (run *ssRun) scaleOutIn() {
 		return
 	}
 	took := time.Since(issued)
-	endedAt := containerFinishedAt(rep.Container, time.Now())
-	if err := run.book.refresh(rep.Container); err != nil {
-		run.fail("reading %s's log after the scale-in: %v", rep.Service, err)
-	}
-	run.running[n] = false
-	run.ended = append(run.ended, ssEvent{At: endedAt, Container: rep.Container, Kind: ssProcessEnd, Text: "harness: scale-in"})
+	run.endReplica(n, containerFinishedAt(rep.Container, time.Now()), "scale-in", true)
 	run.measures["scale_in_exit_seconds"] = took.Seconds()
 	fmt.Printf("    %s exited %.1fs after the stop began\n", rep.Service, took.Seconds())
 	if got := run.waitStoreMembers(run.ss.Replicas, 30*time.Second); got != run.ss.Replicas {
@@ -540,13 +666,7 @@ func (run *ssRun) coldRestart() {
 		}
 	}
 	for _, rep := range running {
-		// The new containers take the old ones' logs with them, so this is
-		// the last read of what the replicas logged before the restart.
-		if err := run.book.refresh(rep.Container); err != nil {
-			run.fail("reading %s's log before replacing it: %v", rep.Service, err)
-		}
-		run.running[rep.N] = false
-		run.ended = append(run.ended, ssEvent{At: containerFinishedAt(rep.Container, time.Now()), Container: rep.Container, Kind: ssProcessEnd, Text: "harness: cold restart"})
+		run.endReplica(rep.N, containerFinishedAt(rep.Container, time.Now()), "cold restart", true)
 	}
 	fmt.Printf("    all stopped after %.1fs; starting new containers…\n", time.Since(stopped).Seconds())
 	var services []string
@@ -559,7 +679,7 @@ func (run *ssRun) coldRestart() {
 		return
 	}
 	for _, rep := range running {
-		run.running[rep.N] = true
+		run.markStarted(rep.N)
 	}
 	ready := map[string]float64{}
 	for _, rep := range running {
@@ -613,6 +733,7 @@ func (run *ssRun) measureIdle() {
 	rates := storeCallRates(parseAzuriteCalls(run.book.all("bench-azurite")), run.ss.StoreContainerOrDefault(), from.Add(skew), time.Now().Add(skew))
 	run.measures["store_calls_idle"] = rates
 	fmt.Printf("    idle: %.2f writes/s, %.2f reads and lists/s\n", rates.WritesPerSec, rates.ReadsPerSec)
+	printCallKinds(rates)
 }
 
 // storeCalls counts the store calls under load, and judges them against the
@@ -629,14 +750,250 @@ func (run *ssRun) storeCalls() {
 		return
 	}
 	skew := run.daemonSkew()
-	rates := storeCallRates(parseAzuriteCalls(run.book.all("bench-azurite")), run.ss.StoreContainerOrDefault(), from.Add(skew), time.Now().Add(skew))
+	to := time.Now()
+	calls := parseAzuriteCalls(run.book.all("bench-azurite"))
+	rates := storeCallRates(calls, run.ss.StoreContainerOrDefault(), from.Add(skew), to.Add(skew))
 	run.measures["store_calls_load"] = rates
 	fmt.Printf("    under load: %.2f writes/s, %.2f reads and lists/s (%d failed)\n", rates.WritesPerSec, rates.ReadsPerSec, rates.FailedRequests)
+	printCallKinds(rates)
 	if limit := run.ss.MaxStoreWritesPerSec; limit > 0 && rates.WritesPerSec > limit {
 		run.fail("under load the replicas wrote to the store %.2f times a second, above max_store_writes_per_sec %.2f", rates.WritesPerSec, limit)
 	}
 	if limit := run.ss.MaxStoreReadsPerSec; limit > 0 && rates.ReadsPerSec > limit {
 		run.fail("under load the replicas read or listed the store %.2f times a second, above max_store_reads_per_sec %.2f", rates.ReadsPerSec, limit)
+	}
+	// The window must be steady. A replica that stopped leading, a device
+	// that moved, a bus that started again or a store that stood still all
+	// make the replicas write at once, whatever the interval, so the window
+	// would say nothing about the interval.
+	run.refreshAll()
+	var events []ssEvent
+	for _, rep := range run.replicas {
+		events = append(events, run.events(rep.Container)...)
+	}
+	disturbed := windowDisturbances(events, calls, run.ss.StoreContainerOrDefault(), from.Add(skew), to.Add(skew))
+	run.measures["store_calls_load_disturbances"] = disturbed
+	for _, d := range disturbed {
+		run.fail("the load window was not steady, so its store calls are no evidence: %s", d)
+	}
+	run.checkStateWrites(calls, from.Add(skew), to.Add(skew), len(disturbed) == 0)
+}
+
+// ssStoreStall is how long Azurite may serve no request at all before the
+// driver calls it a stall. Every replica renews its member record every two
+// seconds, so a store that is quiet this long stood still, or the machine
+// did.
+const ssStoreStall = 5 * time.Second
+
+// windowDisturbances lists what happened in [from, to) that a steady window
+// does not hold: a replica that started or stopped leading, a device that
+// started, stopped or was placed, a bus or process that started or stopped,
+// the state bus writing as more than one writer, and Azurite serving no
+// request for ssStoreStall or longer.
+func windowDisturbances(events []ssEvent, calls []ssStoreCall, container string, from, to time.Time) []string {
+	var out []string
+	sorted := slices.Clone(events)
+	sortSSEvents(sorted)
+	for _, e := range sorted {
+		if e.At.Before(from) || !e.At.Before(to) {
+			continue
+		}
+		if what := disturbanceOf(e); what != "" {
+			out = append(out, fmt.Sprintf("%s %s at %s", e.Container, what, e.At.UTC().Format("15:04:05.000")))
+		}
+	}
+	writers := slices.Sorted(maps.Keys(segmentWrites(calls, container, from, to)))
+	if len(writers) > 1 {
+		out = append(out, fmt.Sprintf("the state bus wrote its segments as %d writers (%s): it moved or started again", len(writers), strings.Join(writers, ", ")))
+	}
+	last := from
+	for _, c := range calls {
+		if c.At.Before(from) || !c.At.Before(to) {
+			continue
+		}
+		if gap := c.At.Sub(last); gap >= ssStoreStall {
+			out = append(out, fmt.Sprintf("Azurite served no request for %.1fs from %s", gap.Seconds(), last.UTC().Format("15:04:05.000")))
+		}
+		last = c.At
+	}
+	if gap := to.Sub(last); gap >= ssStoreStall {
+		out = append(out, fmt.Sprintf("Azurite served no request for %.1fs from %s", gap.Seconds(), last.UTC().Format("15:04:05.000")))
+	}
+	return out
+}
+
+// disturbanceOf says what an event changed, or "" for an event a steady
+// replica set also logs.
+func disturbanceOf(e ssEvent) string {
+	switch e.Kind {
+	case ssProcessStart:
+		return "started its director"
+	case ssProcessEnd:
+		return "ended its process"
+	case ssBusStarted:
+		return "started its state bus"
+	case ssBusStopped:
+		return "stopped its state bus"
+	case ssFenced:
+		return "could no longer write its bus's streams"
+	case ssLeaderUp:
+		return "became the leader"
+	case ssLeaderDown:
+		return "stopped leading"
+	case ssLeaseAcquired:
+		return fmt.Sprintf("started device %d", e.Device)
+	case ssLeaseEnded:
+		return fmt.Sprintf("stopped device %d", e.Device)
+	case ssPlaced:
+		return fmt.Sprintf("placed device %d on %s", e.Device, e.Member)
+	}
+	return ""
+}
+
+// checkStateWrites reports when the replica that runs the shared bus wrote
+// the state's segments in a window, and when the snapshot rounds came. When
+// judge is set and the case names the director's write interval, it checks
+// each gap between two writes against it. The window must be one of steady
+// load (windowDisturbances): a move is written at once whatever the interval.
+func (run *ssRun) checkStateWrites(calls []ssStoreCall, from, to time.Time, judge bool) {
+	container := run.ss.StoreContainerOrDefault()
+	writer, ts := busiestWriter(segmentWrites(calls, container, from, to))
+	gaps := writeGaps(ts)
+	secs := make([]float64, len(gaps))
+	for i, g := range gaps {
+		secs[i] = g.Seconds()
+	}
+	// A stream's snapshot writes what is waiting first, whatever the interval:
+	// such a segment write comes within a second of the snapshot's own writes.
+	snaps := snapshotWrites(calls, container, from, to)
+	forced := withSnapshot(ts, snaps)
+	nForced := 0
+	for _, f := range forced {
+		if f {
+			nForced++
+		}
+	}
+	snapRounds := writeRounds(snaps, time.Second)
+	roundGaps := writeGaps(snapRounds)
+	roundSecs := make([]float64, len(roundGaps))
+	for i, g := range roundGaps {
+		roundSecs[i] = g.Seconds()
+	}
+	writeTimes := make([]string, len(ts))
+	for i, t := range ts {
+		writeTimes[i] = t.UTC().Format("15:04:05.000")
+	}
+	roundTimes := make([]string, len(snapRounds))
+	for i, t := range snapRounds {
+		roundTimes[i] = t.UTC().Format("15:04:05.000")
+	}
+	run.measures["state_writes_load"] = map[string]any{
+		"writer": writer, "writes": len(ts), "write_times": writeTimes, "gaps_seconds": secs, "with_snapshot": nForced,
+		"snapshot_rounds": len(snapRounds), "snapshot_round_times": roundTimes, "snapshot_round_gaps_seconds": roundSecs,
+	}
+	fmt.Printf("    state writes under load: %d by the bus's writer (%d with a snapshot), at %v, %d apart (seconds): %v\n", len(ts), nForced, writeTimes, len(gaps), roundSeconds(secs))
+	fmt.Printf("    snapshot rounds under load: %d, at %v, apart (seconds): %v\n", len(snapRounds), roundTimes, roundSeconds(roundSecs))
+	n := run.ss.StateWriteIntervalSeconds
+	if n <= 0 {
+		return
+	}
+	if !judge {
+		fmt.Printf("    the write interval is not judged: the window was not steady\n")
+		return
+	}
+	want := time.Duration(n) * time.Second
+	tol := run.ss.StateWriteToleranceOrDefault()
+	problems, judged := judgeWriteGaps(ts, forced, want, tol)
+	for _, p := range problems {
+		run.fail("%s", p)
+	}
+	if judged == 0 {
+		run.fail("no state write in %s of load followed the %s write interval: the bus's writer wrote %d segments, %d of them with a snapshot, and the snapshot rounds came every %v seconds",
+			to.Sub(from).Round(time.Second), want, len(ts), nForced, roundSeconds(roundSecs))
+	}
+}
+
+// judgeWriteGaps judges each gap that ends at a write the interval made, and
+// returns what is wrong and how many gaps it judged. A write that a snapshot
+// asked for comes early on purpose, and the interval counts on from it.
+func judgeWriteGaps(ts []time.Time, forced []bool, want, tol time.Duration) ([]string, int) {
+	var problems []string
+	judged := 0
+	for i := 1; i < len(ts); i++ {
+		if forced[i] {
+			continue
+		}
+		judged++
+		if g := ts[i].Sub(ts[i-1]); g < want-tol || g > want+tol {
+			problems = append(problems, fmt.Sprintf("state write %d came %s after the one before it; the write interval is %s, give or take %s", i+1, g.Round(100*time.Millisecond), want, tol))
+		}
+	}
+	return problems, judged
+}
+
+// snapshotWrites returns when the store accepted a stream's snapshot or its
+// manifest in [from, to): the writes a snapshot makes.
+func snapshotWrites(calls []ssStoreCall, container string, from, to time.Time) []time.Time {
+	var out []time.Time
+	for _, c := range calls {
+		if c.At.Before(from) || !c.At.Before(to) || !c.isWrite() || c.Status >= 300 || !c.inContainer(container) {
+			continue
+		}
+		if k := c.kind(); k == "snapshots" || k == "streams" {
+			out = append(out, c.At)
+		}
+	}
+	return out
+}
+
+// withSnapshot reports, for each write, whether a snapshot write came within a
+// second of it.
+func withSnapshot(writes, snaps []time.Time) []bool {
+	out := make([]bool, len(writes))
+	for i, w := range writes {
+		for _, s := range snaps {
+			if d := s.Sub(w); d > -time.Second && d < time.Second {
+				out[i] = true
+				break
+			}
+		}
+	}
+	return out
+}
+
+// writeRounds returns the first time of each round of writes: writes less
+// than within apart belong to one round.
+func writeRounds(ts []time.Time, within time.Duration) []time.Time {
+	var rounds []time.Time
+	var last time.Time
+	for _, t := range ts {
+		if len(rounds) == 0 || t.Sub(last) >= within {
+			rounds = append(rounds, t)
+		}
+		last = t
+	}
+	return rounds
+}
+
+// roundSeconds rounds each value to a tenth, for printing.
+func roundSeconds(secs []float64) []float64 {
+	out := make([]float64, len(secs))
+	for i, s := range secs {
+		out[i] = float64(int(s*10+0.5)) / 10
+	}
+	return out
+}
+
+// printCallKinds prints the write and read rates of each kind of store call.
+func printCallKinds(rates ssCallRates) {
+	kinds := make([]string, 0, len(rates.ByKind))
+	for k := range rates.ByKind {
+		kinds = append(kinds, k)
+	}
+	slices.Sort(kinds)
+	for _, k := range kinds {
+		c := rates.ByKind[k]
+		fmt.Printf("      %-9s %.2f writes/s, %.2f reads and lists/s\n", k, c.WritesPerSec, c.ReadsPerSec)
 	}
 }
 
@@ -772,4 +1129,259 @@ func (run *ssRun) scaleOf(n int) (ssScale, error) {
 		return ssScale{}, fmt.Errorf("unreadable answer: %s", strings.TrimSpace(string(out)))
 	}
 	return s, nil
+}
+
+// moveThenKill stops, gracefully, a replica that runs placed devices and does
+// not lead, so the leader moves its devices at once. As soon as one of them
+// has a new owner, it kills the replica that runs the shared bus with
+// SIGKILL. A device's change of owner must reach the store when it happens,
+// whatever the director's write interval: a new bus that read an older owner
+// from the store would hand the device to a third replica while its new
+// owner still runs it. The overlap check at the end of the case catches that.
+func (run *ssRun) moveThenKill() {
+	owner, ok := run.ownerNotLeading()
+	if !ok {
+		return
+	}
+	run.refreshAll()
+	var moving []int64
+	for _, d := range run.ss.PlacedDevices {
+		if slices.Contains(run.owners(d, current()), owner) {
+			moving = append(moving, d)
+		}
+	}
+	orep := run.replica(owner)
+	fmt.Printf("  stopping %s (runs devices %v), and killing the bus's replica once a device has moved…\n", orep.Service, moving)
+	run.measures["victim"] = map[string]any{"replica": orep.Service, "devices": moving, "how": "move_then_kill"}
+
+	skew := run.daemonSkew()
+	issued := time.Now()
+	stopped := make(chan error, 1)
+	go func() { stopped <- exec.Command("docker", "stop", "-t", "30", orep.Container).Run() }()
+
+	// Watch the other replicas for the first new owner of a moved device.
+	since := issued.Add(skew)
+	deadline := earliest(time.Now().Add(60*time.Second), run.deadline)
+	var newOwner int
+	var device int64
+	var tookAt time.Time
+	for newOwner == 0 && time.Now().Before(deadline) {
+		for _, rep := range run.replicas {
+			if rep.N == owner || !run.running[rep.N] {
+				continue
+			}
+			_ = run.book.refresh(rep.Container)
+			for _, e := range run.events(rep.Container) {
+				if e.Kind == ssLeaseAcquired && e.At.After(since) && slices.Contains(moving, e.Device) {
+					newOwner, device, tookAt = rep.N, e.Device, e.At
+					break
+				}
+			}
+			if newOwner != 0 {
+				break
+			}
+		}
+		if newOwner == 0 && sleepCtx(run.r.ctx, 100*time.Millisecond) != nil {
+			break
+		}
+	}
+	if newOwner == 0 {
+		run.fail("no replica took over a device of %s within 60s of its stop", orep.Service)
+		<-stopped
+		return
+	}
+
+	// The replica that runs the bus is the one that leads now. When the new
+	// owner leads, it is the one killed.
+	leaders := run.leaders(current())
+	if len(leaders) != 1 {
+		run.fail("%d replicas lead (%s) when the device moved; the kill needs one", len(leaders), run.names(leaders))
+		<-stopped
+		return
+	}
+	target := run.replica(leaders[0])
+	if err := exec.Command("docker", "kill", "-s", "KILL", target.Container).Run(); err != nil {
+		run.fail("docker kill %s: %v (the kill did not happen)", target.Service, err)
+		<-stopped
+		return
+	}
+	killedAt := containerFinishedAt(target.Container, time.Now())
+	lag := killedAt.Sub(tookAt)
+	fmt.Printf("    %s took device %d; %s, which runs the bus, was killed %.2fs later\n", run.replica(newOwner).Service, device, target.Service, lag.Seconds())
+	run.measures["move_then_kill"] = map[string]any{
+		"stopped": orep.Service, "device": device, "new_owner": run.replica(newOwner).Service,
+		"killed": target.Service, "new_owner_was_killed": newOwner == leaders[0], "kill_lag_seconds": lag.Seconds(),
+	}
+	if within := run.ss.MoveKillWithinOrDefault(); lag > within {
+		run.fail("the kill came %.2fs after the device moved, later than move_kill_within_ms %d", lag.Seconds(), within.Milliseconds())
+	}
+	run.endReplica(target.N, killedAt, "docker kill", false)
+
+	if err := <-stopped; err != nil {
+		run.fail("docker stop %s: %v", orep.Service, err)
+	}
+	run.endReplica(owner, containerFinishedAt(orep.Container, time.Now()), "docker stop", true)
+
+	// The replica set must settle on what is left before the platform brings
+	// the two back.
+	if !run.checkSettled("after the kill", earliest(time.Now().Add(time.Duration(run.ss.SettleOrDefault())*time.Second), run.deadline)) {
+		return
+	}
+	if !run.replaceAll([]int{owner, target.N}) {
+		return
+	}
+	run.checkSettled("after", earliest(time.Now().Add(60*time.Second), run.deadline))
+	run.checkHealthAll("after")
+}
+
+// replaceAll replaces lost replicas with new containers on empty disks, as the
+// platform does, and waits for each to rejoin. It reports whether every one
+// of them rejoined.
+func (run *ssRun) replaceAll(ns []int) bool {
+	var services []string
+	for _, n := range ns {
+		services = append(services, run.replica(n).Service)
+	}
+	fmt.Printf("  replacing %s with new containers…\n", strings.Join(services, ", "))
+	started := time.Now()
+	if err := run.orch.RecreateServices(services...); err != nil {
+		run.fail("replacing %s: %v", strings.Join(services, ", "), err)
+		return false
+	}
+	for _, n := range ns {
+		run.markStarted(n)
+	}
+	rejoined := true
+	for _, n := range ns {
+		rep := run.replica(n)
+		since := containerStartedAt(rep.Container, started)
+		if at, ok := run.waitReady(n, since, earliest(time.Now().Add(run.replicaWarmup()), run.deadline)); ok {
+			fmt.Printf("    %s rejoined after %.1fs\n", rep.Service, at.Sub(since).Seconds())
+		} else {
+			run.fail("%s did not rejoin after it was replaced: %s", rep.Service, run.readiness(n, since))
+			rejoined = false
+		}
+	}
+	return rejoined
+}
+
+// rollingRestart stops each replica in turn, gracefully, and replaces it with
+// a new container on an empty disk, as a new revision of a container app does:
+// the followers first, the leader last. Before it stops the next replica, the
+// new one must have rejoined and the replica set must have settled. When one
+// has not, the restart ends there: stopping another replica of a set that is
+// already short would test something else.
+func (run *ssRun) rollingRestart() {
+	run.refreshAll()
+	leaders := run.leaders(current())
+	var order []int
+	for _, rep := range run.replicas {
+		if run.running[rep.N] && !slices.Contains(leaders, rep.N) {
+			order = append(order, rep.N)
+		}
+	}
+	order = append(order, leaders...)
+	exits := map[string]float64{}
+	run.measures["rolling_restart_exit_seconds"] = exits
+	if !inTurn(order, func(n int) bool { return run.restartOne(n, exits) }) {
+		return
+	}
+	run.checkHealthAll("after")
+}
+
+// inTurn calls step for each replica in order, and stops at the first step
+// that fails. It reports whether every step succeeded.
+func inTurn(order []int, step func(n int) bool) bool {
+	for _, n := range order {
+		if !step(n) {
+			return false
+		}
+	}
+	return true
+}
+
+// restartOne stops replica n gracefully, replaces it with a new container,
+// and waits for the replica set to settle. It reports whether all of that
+// happened.
+func (run *ssRun) restartOne(n int, exits map[string]float64) bool {
+	rep := run.replica(n)
+	fmt.Printf("  restarting %s…\n", rep.Service)
+	issued := time.Now()
+	if err := exec.Command("docker", "stop", "-t", "30", rep.Container).Run(); err != nil {
+		run.fail("docker stop %s: %v", rep.Service, err)
+		return false
+	}
+	exits[rep.Service] = time.Since(issued).Seconds()
+	fmt.Printf("    %s exited %.1fs after the stop began\n", rep.Service, exits[rep.Service])
+	// The new container takes the old one's log with it.
+	if !run.endReplica(n, containerFinishedAt(rep.Container, time.Now()), "rolling restart", true) {
+		return false
+	}
+	if !run.replaceAll([]int{n}) {
+		return false
+	}
+	return run.checkSettled("after restarting "+rep.Service, earliest(time.Now().Add(time.Duration(run.ss.SettleOrDefault())*time.Second), run.deadline))
+}
+
+// checkLogOnce fails the case for a replica that did not log a line of
+// expect_log_once exactly once in each run of its director.
+func (run *ssRun) checkLogOnce() {
+	for _, want := range run.ss.ExpectLogOnce {
+		for _, rep := range run.replicas {
+			if !run.ran[rep.N] {
+				continue // a standby that never ran
+			}
+			for _, p := range logOnceProblems(run.book.all(rep.Container), want) {
+				run.fail("%s %s", rep.Service, p)
+			}
+		}
+	}
+}
+
+// ssDirectorStart is in the first line the director logs when it starts.
+const ssDirectorStart = "vmetric-director started"
+
+// logOnceProblems splits a replica's log into the runs of its director, each
+// from one start line to the next, and says where want is not logged exactly
+// once in a run. A count over the whole log would pass a run that logged the
+// line twice beside a run that never logged it.
+func logOnceProblems(lines []ssLine, want string) []string {
+	var runs []int // the lines that contain want, in each run
+	before := 0    // and before the first start
+	for _, l := range lines {
+		start := strings.Contains(l.Text, ssDirectorStart)
+		if start && strings.Contains(l.Text, want) {
+			// The line would be found once in every run whatever the
+			// director did, so the check would prove nothing.
+			return []string{fmt.Sprintf("logged %q in the line that starts the director, so the check cannot tell one run from the next", want)}
+		}
+		switch {
+		case start:
+			runs = append(runs, 0)
+		case !strings.Contains(l.Text, want):
+		case len(runs) == 0:
+			before++
+		default:
+			runs[len(runs)-1]++
+		}
+	}
+	if len(runs) == 0 {
+		return []string{fmt.Sprintf("never logged %q, so the harness cannot tell the runs of its director apart", ssDirectorStart)}
+	}
+	var problems []string
+	switch {
+	case before == 1:
+		problems = append(problems, fmt.Sprintf("logged %q once before its director first started", want))
+	case before > 1:
+		problems = append(problems, fmt.Sprintf("logged %q %d times before its director first started", want, before))
+	}
+	for i, n := range runs {
+		switch {
+		case n == 0:
+			problems = append(problems, fmt.Sprintf("did not log %q in run %d of its director (of %d); want it once in each run", want, i+1, len(runs)))
+		case n > 1:
+			problems = append(problems, fmt.Sprintf("logged %q %d times in run %d of its director (of %d); want it once in each run", want, n, i+1, len(runs)))
+		}
+	}
+	return problems
 }

@@ -63,6 +63,33 @@ func TestSharedStateValidates(t *testing.T) {
 	}
 }
 
+// TestSharedStateStores: each store names the service pause_store takes
+// away, and only Azurite lets the driver count the store calls.
+func TestSharedStateStores(t *testing.T) {
+	for store, want := range map[string]struct {
+		service, name string
+		counts        bool
+		set           func(tc *TestCase)
+	}{
+		"":                        {"azurite", "Azurite", true, func(*TestCase) {}},
+		SharedStateStoreS3:        {"minio", "MinIO", false, func(tc *TestCase) { tc.Minio = &MinioConfig{Buckets: []string{"director-state"}} }},
+		SharedStateStoreRedis:     {"redis", "Redis", false, func(tc *TestCase) { tc.Endpoints = []Endpoint{{Name: "redis", Image: "redis:7-alpine"}} }},
+		SharedStateStoreShare:     {"", "the share", false, func(tc *TestCase) { tc.SharedState.SharePath = "/mnt/vm-state" }},
+		SharedStateStoreAzureBlob: {"azurite", "Azurite", true, func(*TestCase) {}},
+	} {
+		tc := sharedStateCase()
+		tc.SharedState.Store = store
+		want.set(tc)
+		if err := tc.Validate(); err != nil {
+			t.Errorf("store %q: %v", store, err)
+		}
+		ss := tc.SharedState
+		if ss.StoreService() != want.service || ss.StoreName() != want.name || ss.CountsStoreCalls() != want.counts {
+			t.Errorf("store %q: service %q, name %q, counts %v; want %q, %q, %v", store, ss.StoreService(), ss.StoreName(), ss.CountsStoreCalls(), want.service, want.name, want.counts)
+		}
+	}
+}
+
 // The driver counts loss from unique lines, so a shared-state case tracks
 // them even when its file does not turn on dedup validation. Without them,
 // every line sent would count as lost.
@@ -133,6 +160,54 @@ func TestSharedStateRefusals(t *testing.T) {
 			tc.SharedState.Action = SharedStateActionPauseStore
 			tc.SharedState.OutageHoldOthersSeconds = 15
 		}, "must be 1 to 12"},
+		"negative max_duplicates": {func(tc *TestCase) {
+			n := int64(-1)
+			tc.SharedState.Streams[0].MaxDuplicates = &n
+		}, "must not be negative"},
+		"both duplicate bounds": {func(tc *TestCase) {
+			n := int64(10)
+			tc.SharedState.Streams[0].MaxDuplicates = &n
+			tc.SharedState.Streams[0].MaxDuplicatePct = 5
+		}, "set one"},
+		"interval, other action": {func(tc *TestCase) { tc.SharedState.StateWriteIntervalSeconds = 60 }, "only judged by the store_calls action"},
+		"negative interval": {func(tc *TestCase) {
+			tc.SharedState.Action = SharedStateActionStoreCalls
+			tc.SharedState.StateWriteIntervalSeconds = -60
+		}, "must not be negative"},
+		"move then kill, no devices": {func(tc *TestCase) {
+			tc.SharedState.Action = SharedStateActionMoveThenKill
+			tc.SharedState.PlacedDevices = nil
+		}, "move_then_kill needs shared_state.placed_devices"},
+		"stop owner, no devices": {func(tc *TestCase) {
+			tc.SharedState.Action = SharedStateActionStopOwner
+			tc.SharedState.PlacedDevices = nil
+		}, "stop_owner needs shared_state.placed_devices"},
+		"negative action delay": {func(tc *TestCase) { tc.SharedState.ActionDelaySeconds = -1 }, "must not be negative"},
+		"short expected line":   {func(tc *TestCase) { tc.SharedState.ExpectLogOnce = []string{"ignores"} }, "expect_log_once[0] is shorter than 8"},
+		"unknown store":         {func(tc *TestCase) { tc.SharedState.Store = "nfs" }, "store must be azure_blob, s3, redis or share"},
+		"s3 without minio":      {func(tc *TestCase) { tc.SharedState.Store = SharedStateStoreS3 }, "needs a `minio:` block"},
+		"redis without redis":   {func(tc *TestCase) { tc.SharedState.Store = SharedStateStoreRedis }, "needs an endpoint named redis"},
+		"share without a path":  {func(tc *TestCase) { tc.SharedState.Store = SharedStateStoreShare }, "needs shared_state.share_path"},
+		"share at the root": {func(tc *TestCase) {
+			tc.SharedState.Store = SharedStateStoreShare
+			tc.SharedState.SharePath = "/"
+		}, "needs shared_state.share_path"},
+		"share path, other store": {func(tc *TestCase) { tc.SharedState.SharePath = "/mnt/vm-state" }, "only used by shared_state.store share"},
+		"store calls on s3": {func(tc *TestCase) {
+			tc.Minio = &MinioConfig{Buckets: []string{"director-state"}}
+			tc.SharedState.Store = SharedStateStoreS3
+			tc.SharedState.Action = SharedStateActionStoreCalls
+		}, "store_calls counts store calls in Azurite's access log"},
+		"scale out on redis": {func(tc *TestCase) {
+			tc.Endpoints = []Endpoint{{Name: "redis", Image: "redis:7-alpine"}}
+			tc.SharedState.Store = SharedStateStoreRedis
+			tc.SharedState.Action = SharedStateActionScaleOutIn
+		}, "scale_out_in counts store calls in Azurite's access log"},
+		"isolate on a share": {func(tc *TestCase) {
+			tc.SharedState.Store = SharedStateStoreShare
+			tc.SharedState.SharePath = "/mnt/vm-state"
+			tc.SharedState.Action = SharedStateActionIsolateReplica
+		}, "a share is a local mount"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {

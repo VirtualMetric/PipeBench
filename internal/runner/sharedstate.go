@@ -3,7 +3,9 @@ package runner
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"maps"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -195,6 +197,9 @@ type ssRun struct {
 
 	replicas []ssReplica
 	running  map[int]bool
+	// ran are the replicas whose containers ran at some time in the run. The
+	// final checks read every one of their logs, whatever they hold by then.
+	ran map[int]bool
 	// bad is the replica whose store credentials are wrong
 	// (wrong_credentials), or 0.
 	bad int
@@ -217,6 +222,7 @@ func newSSRun(r *Runner, tc *config.TestCase, subject config.Subject, orch *orch
 		r: r, tc: tc, ss: tc.SharedState, subject: subject, orch: orch,
 		book:        newSSLogBook(),
 		running:     map[int]bool{},
+		ran:         map[int]bool{},
 		health:      map[string]string{},
 		measures:    map[string]any{},
 		perReceiver: map[string]int64{},
@@ -237,6 +243,70 @@ func newSSRun(r *Runner, tc *config.TestCase, subject config.Subject, orch *orch
 }
 
 func (run *ssRun) replica(n int) ssReplica { return run.replicas[n-1] }
+
+// markStarted records that replica n's container runs.
+func (run *ssRun) markStarted(n int) {
+	run.running[n] = true
+	run.ran[n] = true
+}
+
+// endReplica records that the harness ended replica n's process at `at`,
+// and how. It first reads the lines the replica wrote last: a container that
+// is replaced takes its log with it, and a stopped one that is left alone is
+// only read again by the final checks. A read that fails here fails the run,
+// because the checks would then pass on part of the evidence; endReplica
+// reports whether the read succeeded.
+//
+// stopped says the harness asked the process to stop (docker stop: SIGTERM,
+// then SIGKILL 30 seconds later). Such a process must have exited by itself:
+// one that Docker had to kill did not stop gracefully, whatever else the
+// case then measures.
+func (run *ssRun) endReplica(n int, at time.Time, how string, stopped bool) bool {
+	rep := run.replica(n)
+	err := run.book.refresh(rep.Container)
+	if err != nil {
+		run.fail("reading the last lines of %s's log after the %s: %v", rep.Service, how, err)
+	}
+	run.running[n] = false
+	run.ended = append(run.ended, ssEvent{At: at, Container: rep.Container, Kind: ssProcessEnd, Text: "harness: " + how})
+	if stopped {
+		run.checkGracefulExit(rep, how)
+	}
+	return err == nil
+}
+
+// containerExit reads how a container's process ended: its exit code, and
+// whether the kernel killed it for memory. Tests replace it.
+var containerExit = func(container string) (code int, oomKilled bool, err error) {
+	out, err := exec.Command("docker", "inspect", "-f", "{{.State.ExitCode}} {{.State.OOMKilled}}", container).Output()
+	if err != nil {
+		return 0, false, fmt.Errorf("docker inspect %s: %w", container, err)
+	}
+	_, err = fmt.Sscanf(strings.TrimSpace(string(out)), "%d %t", &code, &oomKilled)
+	return code, oomKilled, err
+}
+
+// checkGracefulExit fails the run when a replica the harness stopped did not
+// exit by itself, and keeps its exit code.
+func (run *ssRun) checkGracefulExit(rep ssReplica, how string) {
+	code, oom, err := containerExit(rep.Container)
+	if err != nil {
+		run.fail("reading how %s's process ended after the %s: %v", rep.Service, how, err)
+		return
+	}
+	codes, _ := run.measures["stop_exit_codes"].(map[string][]int)
+	if codes == nil {
+		codes = map[string][]int{}
+		run.measures["stop_exit_codes"] = codes
+	}
+	codes[rep.Service] = append(codes[rep.Service], code)
+	switch {
+	case oom:
+		run.fail("%s ran out of memory in the %s, so its process did not stop by itself", rep.Service, how)
+	case code == 137:
+		run.fail("%s did not exit within 30s of the SIGTERM of the %s, so Docker killed it (exit code 137): the stop was not graceful", rep.Service, how)
+	}
+}
 
 // fail records why the case fails.
 func (run *ssRun) fail(format string, args ...any) {
@@ -288,6 +358,12 @@ func (run *ssRun) drive() bool {
 	if !run.waitBaseline() {
 		return false
 	}
+	if d := time.Duration(run.ss.ActionDelaySeconds) * time.Second; d > 0 {
+		fmt.Printf("  waiting %s before the action…\n", d)
+		if sleepCtx(run.r.ctx, d) != nil {
+			return false
+		}
+	}
 
 	run.act()
 
@@ -296,31 +372,82 @@ func (run *ssRun) drive() bool {
 	return len(run.errs) == 0
 }
 
-// startInfrastructure starts Azurite and its init, the receivers and the
-// collector, and waits for the init to finish.
+// startInfrastructure starts what the replicas need before they start:
+// Azurite and its init, the store when it is another (MinIO and its init, an
+// endpoint such as Redis, or the share's init), the receivers and the
+// collector. It waits for every init to finish and for every endpoint with a
+// healthcheck to be healthy.
 func (run *ssRun) startInfrastructure() bool {
-	services := []string{"azurite", "azure-init", "receiver", "collector"}
-	fmt.Println("  starting Azurite, the receivers and the collector…")
+	services, inits, names := []string{"azurite", "azure-init"}, []string{"azure-init"}, []string{"Azurite"}
+	if run.tc.UsesMinio() {
+		services, inits, names = append(services, "minio", "minio-init"), append(inits, "minio-init"), append(names, "MinIO")
+	}
+	if run.ss.StoreOrDefault() == config.SharedStateStoreShare {
+		services, inits = append(services, "witness-init"), append(inits, "witness-init")
+	}
+	var healthy []string
+	for _, e := range run.tc.Endpoints {
+		services, names = append(services, e.Name), append(names, e.Name)
+		if e.Healthcheck != nil {
+			healthy = append(healthy, e.Name)
+		}
+	}
+	services = append(services, "receiver", "collector")
+	fmt.Printf("  starting %s, the receivers and the collector…\n", strings.Join(names, ", "))
 	if err := run.orch.UpServices(services...); err != nil {
 		run.fail("starting the infrastructure: %v", err)
 		return false
 	}
 	deadline := time.Now().Add(2 * time.Minute)
-	for time.Now().Before(deadline) {
-		out, _ := exec.Command("docker", "inspect", "-f", "{{.State.Status}} {{.State.ExitCode}}", "bench-azure-init").Output()
-		switch state := strings.TrimSpace(string(out)); {
-		case state == "exited 0":
-			return true
-		case strings.HasPrefix(state, "exited"):
-			run.fail("azure-init failed (%s): %s", state, run.orch.Logs("bench-azure-init", 20))
-			return false
-		}
-		if sleepCtx(run.r.ctx, time.Second) != nil {
+	for _, one := range inits {
+		if !run.waitContainer("bench-"+one, "{{.State.Status}} {{.State.ExitCode}}", "exited 0", deadline) {
 			return false
 		}
 	}
-	run.fail("azure-init did not finish within 2 minutes")
+	for _, name := range healthy {
+		if !run.waitContainer("bench-"+name, "{{.State.Health.Status}}", "healthy", deadline) {
+			return false
+		}
+	}
+	return true
+}
+
+// waitContainer waits until docker inspect's format says want for the
+// container, and fails the run when it never does. A container that has
+// exited fails it at once, with its last log lines: a health status, for one,
+// keeps its last value after the container is gone.
+func (run *ssRun) waitContainer(container, format, want string, deadline time.Time) bool {
+	name := strings.TrimPrefix(container, "bench-")
+	var state string
+	for {
+		out, _ := containerInspect(container, "{{.State.Status}}|"+format)
+		status, value, _ := strings.Cut(strings.TrimSpace(out), "|")
+		state = value
+		if value == want {
+			return true
+		}
+		if status == "exited" || status == "dead" {
+			run.fail("%s has %s (%s): %s", name, status, value, containerTail(container))
+			return false
+		}
+		if time.Now().After(deadline) || sleepCtx(run.r.ctx, time.Second) != nil {
+			break
+		}
+	}
+	run.fail("%s was not %s within 2 minutes (%s)", name, want, state)
 	return false
+}
+
+// containerInspect runs docker inspect with a format. Tests replace it.
+var containerInspect = func(container, format string) (string, error) {
+	out, err := exec.Command("docker", "inspect", "-f", format, container).Output()
+	return string(out), err
+}
+
+// containerTail returns a container's last 20 log lines. Tests replace it.
+var containerTail = func(container string) string {
+	out, _ := exec.Command("docker", "logs", "--tail", "20", container).CombinedOutput()
+	return strings.TrimSpace(string(out))
 }
 
 // startReplicas starts the replicas group by group, and waits for each group
@@ -341,7 +468,7 @@ func (run *ssRun) startReplicas() bool {
 			return false
 		}
 		for _, n := range group {
-			run.running[n] = true
+			run.markStarted(n)
 		}
 		deadline := earliest(time.Now().Add(run.replicaWarmup()), run.deadline)
 		for _, n := range group {
@@ -541,7 +668,7 @@ func (run *ssRun) events(container string) []ssEvent {
 func (run *ssRun) refreshAll() []error {
 	var errs []error
 	for _, rep := range run.replicas {
-		if run.running[rep.N] || len(run.book.all(rep.Container)) > 0 {
+		if run.ran[rep.N] {
 			if err := run.book.refresh(rep.Container); err != nil {
 				errs = append(errs, err)
 			}
@@ -783,6 +910,14 @@ func (run *ssRun) act() {
 		run.storeCalls()
 	case config.SharedStateActionScaleBacklog:
 		run.scaleBacklog()
+	case config.SharedStateActionMoveThenKill:
+		run.moveThenKill()
+	case config.SharedStateActionStopOwner:
+		if owner, ok := run.ownerNotLeading(); ok {
+			run.disruptAndReplace(owner, "stop", false)
+		}
+	case config.SharedStateActionRollingRestart:
+		run.rollingRestart()
 	}
 }
 
@@ -860,6 +995,14 @@ func (run *ssRun) watchPlacement(d time.Duration) {
 // devices it ran, and then replaces it with a new container, as a container
 // platform would, and measures how long that takes to rejoin.
 func (run *ssRun) disrupt(n int, how string) {
+	run.disruptAndReplace(n, how, true)
+}
+
+// disruptAndReplace kills or stops replica n, measures the takeover and, when
+// replace is set, replaces the replica as the platform does. Without it, the
+// replica set must settle on the replicas that are left, as after a
+// scale-in.
+func (run *ssRun) disruptAndReplace(n int, how string, replace bool) {
 	rep := run.replica(n)
 	run.refreshAll()
 	now := current()
@@ -877,7 +1020,9 @@ func (run *ssRun) disrupt(n int, how string) {
 	fmt.Printf("  %s %s (%s, runs devices %v)…\n", map[string]string{"kill": "killing", "stop": "stopping"}[how], rep.Service, role, owned)
 	run.measures["victim"] = map[string]any{"replica": rep.Service, "leader": wasLeader, "devices": owned, "how": how}
 
-	run.book.refresh(rep.Container)
+	// A read that fails here loses nothing: endReplica reads every line
+	// since the last one read.
+	_ = run.book.refresh(rep.Container)
 	issued := time.Now()
 	var err error
 	if how == "kill" {
@@ -892,9 +1037,7 @@ func (run *ssRun) disrupt(n int, how string) {
 	took := time.Since(issued)
 	// The daemon's own time of the end is on the clock the log lines carry.
 	endedAt := containerFinishedAt(rep.Container, time.Now())
-	run.book.refresh(rep.Container)
-	run.running[n] = false
-	run.ended = append(run.ended, ssEvent{At: endedAt, Container: rep.Container, Kind: ssProcessEnd, Text: "harness: docker " + how})
+	run.endReplica(n, endedAt, "docker "+how, how == "stop")
 	// A kill ends the process at once. A stop starts the handover when the
 	// signal is sent: the end, less the time the stop took, on the same clock.
 	from := endedAt
@@ -957,6 +1100,12 @@ func (run *ssRun) disrupt(n int, how string) {
 		}
 	}
 
+	if !replace {
+		run.checkSettled("after", earliest(time.Now().Add(60*time.Second), run.deadline))
+		run.checkHealthAll("after")
+		return
+	}
+
 	// The platform replaces the lost replica with a new one, on an empty disk.
 	fmt.Printf("  replacing %s with a new container…\n", rep.Service)
 	// The replacement takes the container's log with it, so this is the last
@@ -969,7 +1118,7 @@ func (run *ssRun) disrupt(n int, how string) {
 		run.fail("replacing %s: %v", rep.Service, err)
 		return
 	}
-	run.running[n] = true
+	run.markStarted(n)
 	replacedAt := containerStartedAt(rep.Container, time.Now())
 	if readyAt, ok := run.waitReady(n, replacedAt, earliest(time.Now().Add(run.replicaWarmup()), run.deadline)); ok {
 		run.measures["rejoin_seconds"] = readyAt.Sub(replacedAt).Seconds()
@@ -1100,10 +1249,12 @@ func (run *ssRun) analyse() {
 	run.checkOwnershipOverlaps()
 	run.countStoreCalls()
 	run.checkSecrets()
+	run.checkLogOnce()
 }
 
 // checkStreams compares what each generator sent with what its receiver
-// holds.
+// holds. It counts records by the sequence numbers the generator put in
+// them, so a line that arrived cut or garbled is not taken for a record.
 func (run *ssRun) checkStreams() {
 	ports := run.orch.ReceiverMetricsPorts()
 	streams := map[string]any{}
@@ -1115,37 +1266,73 @@ func (run *ssRun) checkStreams() {
 			run.fail("stream %s: the receiver did not answer: %v", st.StreamName(), err)
 			continue
 		}
-		loss := max(sent-m.UniqueLines, 0)
-		dupPct := 0.0
-		if m.UniqueLines > 0 {
-			dupPct = 100 * float64(m.Duplicates) / float64(m.UniqueLines)
+		seq, err := receiverSeqCounts(ports[st.Receiver])
+		if err != nil {
+			run.fail("stream %s: the receiver did not count the records' sequence numbers (%v); these cases need the receiver of PipeBench v0.4.7 or later", st.StreamName(), err)
+			continue
 		}
+		got := ssStreamCounts{Received: m.LinesReceived, Unique: seq.Unique, Duplicates: seq.Duplicates, Unparsed: seq.Unparsed}
+		loss := max(sent-got.Unique, 0)
+		dupPct := got.duplicatePct()
 		streams[st.StreamName()] = map[string]any{
-			"sent": sent, "received": m.LinesReceived, "unique": m.UniqueLines,
-			"duplicates": m.Duplicates, "duplicate_pct": dupPct, "lost": loss,
+			"sent": sent, "received": got.Received, "unique": got.Unique,
+			"duplicates": got.Duplicates, "duplicate_pct": dupPct, "lost": loss,
+			"unnumbered": got.Unparsed,
 		}
 		run.linesIn += sent
-		run.linesOut += m.LinesReceived
-		run.uniqueOut += m.UniqueLines
-		run.perReceiver[st.Receiver] = m.LinesReceived
-		fmt.Printf("  stream %s: sent %d, received %d (%d distinct, %d repeated, %.2f%%), lost %d\n",
-			st.StreamName(), sent, m.LinesReceived, m.UniqueLines, m.Duplicates, dupPct, loss)
-		for _, why := range judgeStream(st, sent, m) {
+		run.linesOut += got.Received
+		run.uniqueOut += got.Unique
+		run.perReceiver[st.Receiver] = got.Received
+		fmt.Printf("  stream %s: sent %d, received %d (%d distinct, %d repeated, %.2f%%, %d without a number), lost %d\n",
+			st.StreamName(), sent, got.Received, got.Unique, got.Duplicates, dupPct, got.Unparsed, loss)
+		for _, why := range judgeStream(st, sent, got) {
 			run.fail("%s", why)
 		}
 	}
 	run.measures["streams"] = streams
 }
 
+// ssStreamCounts is what a receiver holds of one stream: every line that
+// arrived, the distinct records among them by their sequence numbers, the
+// copies of records that arrived before, and the lines that carry no number.
+type ssStreamCounts struct {
+	Received, Unique, Duplicates, Unparsed int64
+}
+
+func (c ssStreamCounts) duplicatePct() float64 {
+	if c.Unique == 0 {
+		return 0
+	}
+	return 100 * float64(c.Duplicates) / float64(c.Unique)
+}
+
+// receiverSeqCounts reads what a receiver's sequence tracking counted.
+func receiverSeqCounts(port int) (seqCheckResult, error) {
+	var out seqCheckResult
+	resp, err := receiverClient.Get(fmt.Sprintf("http://localhost:%d/seqcheck?acked=", port)) //nolint:noctx // short local call
+	if err != nil {
+		return out, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return out, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return out, fmt.Errorf("/seqcheck: %s", resp.Status)
+	}
+	return out, json.Unmarshal(body, &out)
+}
+
 // judgeStream returns why a stream fails, if it does, from what its generator
 // sent and what its receiver holds.
-func judgeStream(st config.SharedStateStream, sent int64, m ReceiverMetrics) []string {
+func judgeStream(st config.SharedStateStream, sent int64, got ssStreamCounts) []string {
 	// A stream whose devices must not run is judged on arrivals alone. Its
 	// generator may send nothing at all: a TCP sender whose listener never
 	// started can give up before its first write.
 	if st.ExpectNothing {
-		if m.LinesReceived > 0 {
-			return []string{fmt.Sprintf("stream %s: %d records arrived, and none may: its devices must not run", st.StreamName(), m.LinesReceived)}
+		if got.Received > 0 {
+			return []string{fmt.Sprintf("stream %s: %d records arrived, and none may: its devices must not run", st.StreamName(), got.Received)}
 		}
 		return nil
 	}
@@ -1153,15 +1340,23 @@ func judgeStream(st config.SharedStateStream, sent int64, m ReceiverMetrics) []s
 		return []string{fmt.Sprintf("stream %s: the generator sent nothing", st.StreamName())}
 	}
 	var out []string
-	if loss := max(sent-m.UniqueLines, 0); loss > st.MaxLoss {
+	if got.Unparsed > 0 {
+		out = append(out, fmt.Sprintf("stream %s: %d lines arrived without a record's sequence number, so they arrived cut or garbled", st.StreamName(), got.Unparsed))
+	}
+	if got.Unique > sent {
+		out = append(out, fmt.Sprintf("stream %s: %d distinct records arrived, %d more than the generator sent", st.StreamName(), got.Unique, got.Unique-sent))
+	}
+	if loss := max(sent-got.Unique, 0); loss > st.MaxLoss {
 		out = append(out, fmt.Sprintf("stream %s: %d records were lost, above max_loss %d", st.StreamName(), loss, st.MaxLoss))
 	}
-	dupPct := 0.0
-	if m.UniqueLines > 0 {
-		dupPct = 100 * float64(m.Duplicates) / float64(m.UniqueLines)
-	}
-	if dupPct > st.MaxDuplicatePct {
-		out = append(out, fmt.Sprintf("stream %s: %d records arrived more than once (%.2f%%), above max_duplicate_pct %.2f", st.StreamName(), m.Duplicates, dupPct, st.MaxDuplicatePct))
+	dupPct := got.duplicatePct()
+	switch {
+	case st.MaxDuplicates != nil:
+		if got.Duplicates > *st.MaxDuplicates {
+			out = append(out, fmt.Sprintf("stream %s: %d records arrived more than once, above max_duplicates %d", st.StreamName(), got.Duplicates, *st.MaxDuplicates))
+		}
+	case dupPct > st.MaxDuplicatePct:
+		out = append(out, fmt.Sprintf("stream %s: %d records arrived more than once (%.2f%%), above max_duplicate_pct %.2f", st.StreamName(), got.Duplicates, dupPct, st.MaxDuplicatePct))
 	}
 	return out
 }
@@ -1174,22 +1369,54 @@ func (run *ssRun) checkOwnershipOverlaps() {
 	for _, rep := range run.replicas {
 		intervals = append(intervals, ssOwnership(rep.Container, run.events(rep.Container), until)...)
 	}
-	overlaps := ssOverlaps(intervals, time.Second)
+	overlaps := ssOverlaps(intervals, 0)
 	var report []map[string]any
 	for _, o := range overlaps {
 		report = append(report, map[string]any{
 			"device": o.Device, "a": o.A, "b": o.B,
-			"from": o.From.UTC(), "seconds": o.Seconds(),
+			"from": o.From.UTC(), "seconds": o.Seconds(), "judged": o.To.Sub(o.From) > ssOverlapTolerance,
 		})
-		run.fail("device %d ran on %s and %s at once for %.1fs, from %s", o.Device, o.A, o.B, o.Seconds(), o.From.UTC().Format("15:04:05.000"))
+	}
+	fails, notes := judgeOverlaps(overlaps)
+	for _, f := range fails {
+		run.fail("%s", f)
+	}
+	for _, n := range notes {
+		run.note("%s", n)
 	}
 	run.measures["ownership_overlaps"] = report
 	run.measures["ownership_intervals"] = len(intervals)
 }
 
+// ssOverlapTolerance is how long two replicas may seem to run one device at
+// once before the case fails. Docker stamps each line as it reads it from its
+// container, so the lines of two containers can come out a few milliseconds
+// out of order. A double run of a tenth of a second is no such jitter.
+const ssOverlapTolerance = 100 * time.Millisecond
+
+// judgeOverlaps fails every overlap longer than ssOverlapTolerance, and
+// reports the shorter ones as notes, so that none goes unseen.
+func judgeOverlaps(overlaps []ssOverlap) (fails, notes []string) {
+	for _, o := range overlaps {
+		what := fmt.Sprintf("device %d ran on %s and %s at once for %.3fs, from %s", o.Device, o.A, o.B, o.Seconds(), o.From.UTC().Format("15:04:05.000"))
+		if o.To.Sub(o.From) > ssOverlapTolerance {
+			fails = append(fails, what)
+		} else {
+			notes = append(notes, what+fmt.Sprintf(": within the %s the log stamps of two containers can be apart, so it is reported, not judged", ssOverlapTolerance))
+		}
+	}
+	return fails, notes
+}
+
 // countStoreCalls counts the replicas' calls to the shared state's container,
 // over the run and under load.
 func (run *ssRun) countStoreCalls() {
+	if !run.ss.CountsStoreCalls() {
+		why := fmt.Sprintf("not counted: the shared state is in %s, and the harness counts store calls only from Azurite's access log", run.ss.StoreName())
+		run.measures["store_calls"] = why
+		fmt.Printf("  store calls %s\n", why)
+		return
+	}
 	if err := run.book.refresh("bench-azurite"); err != nil {
 		run.fail("reading Azurite's access log to count the store calls: %v", err)
 	}
@@ -1214,8 +1441,10 @@ func (run *ssRun) countStoreCalls() {
 	run.measures["store_calls"] = rates
 	fmt.Printf("  store calls to %q: %.2f writes/s, %.2f reads and lists/s over the run (%d failed)\n",
 		container, whole.WritesPerSec, whole.ReadsPerSec, whole.FailedRequests)
+	printCallKinds(whole)
 	if l, ok := rates["under_load"].(ssCallRates); ok {
 		fmt.Printf("  store calls under load: %.2f writes/s, %.2f reads and lists/s over %.0fs\n", l.WritesPerSec, l.ReadsPerSec, l.Seconds)
+		printCallKinds(l)
 	}
 }
 
@@ -1276,6 +1505,10 @@ func (run *ssRun) saveEvidence() {
 		}
 	}
 	write("azurite.log", run.book.text("bench-azurite"))
+	if service := run.ss.StoreService(); service != "" && service != "azurite" {
+		out, _ := exec.Command("docker", "logs", "-t", "bench-"+service).CombinedOutput()
+		write(service+".log", string(out))
+	}
 	for label, body := range run.health {
 		write("health-"+label+".json", body)
 	}

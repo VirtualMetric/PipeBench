@@ -17,7 +17,7 @@ import (
 	"github.com/VirtualMetric/PipeBench/internal/config"
 )
 
-// resolveGeneratorConnections picks the generator's parallel-connection
+// ResolveGeneratorConnections picks the generator's parallel-connection
 // count. An explicit non-zero value in case.yaml always wins. When unset
 // (0), scale with the host's CPU count at 3× cores — enough parallelism
 // to drive the subject's worker pools past their per-worker steady state
@@ -29,7 +29,7 @@ import (
 // the bench's subjects (vmetric/vector/etc.) typically run their own
 // per-listener worker pools sized to NumCPU, so feeding them ~3× more
 // connections than cores keeps those pools saturated rather than starved.
-func resolveGeneratorConnections(explicit int) int {
+func ResolveGeneratorConnections(explicit int) int {
 	if explicit > 0 {
 		return explicit
 	}
@@ -2574,7 +2574,7 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 	if tc.MultiGenerator() {
 		offset := 0
 		for _, g := range tc.Generators {
-			conns := resolveGeneratorConnections(g.Connections)
+			conns := ResolveGeneratorConnections(g.Connections)
 			lineSize := g.LineSize
 			if lineSize == 0 {
 				lineSize = 256
@@ -2634,7 +2634,7 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 		vars.GenRate = g.Rate
 		vars.GenLineSize = genLineSize
 		vars.GenFormat = genFormat
-		vars.GenConnections = resolveGeneratorConnections(g.Connections)
+		vars.GenConnections = ResolveGeneratorConnections(g.Connections)
 		vars.GenReconnect = g.Reconnect
 		vars.GenTotalLines = g.TotalLines
 		vars.GenEnv = mergeEnv(cloudEnvForMode(g.Mode, awsEnv, minioEnv, azureEnv), g.Env)
@@ -2970,6 +2970,11 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 	if err := applyClusterScenarioTopology(&vars, cfg); err != nil {
 		return err
 	}
+	// Shared-state topology: sequence tracking on every receiver
+	// (sharedstate_compose.go).
+	if err := applySharedStateTopology(&vars, cfg); err != nil {
+		return err
+	}
 
 	tmpl, err := template.New("compose").Parse(composeTemplate)
 	if err != nil {
@@ -2985,6 +2990,14 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 	if tc.Cluster != nil && tc.Cluster.Scenario != nil {
 		cpu, mem := tc.Cluster.Scenario.HelperLimits()
 		if out, err = limitHelperServices(out, cpu, mem); err != nil {
+			return err
+		}
+	}
+	// So does a shared-state case. The template caps the helpers it knows,
+	// and this caps the rest: MinIO and its init, an endpoint such as Redis,
+	// and the share's init.
+	if tc.IsDirectorSharedStateType() && cfg.HelperCPULimit != "" && cfg.HelperMemLimit != "" {
+		if out, err = limitHelperServices(out, cfg.HelperCPULimit, cfg.HelperMemLimit); err != nil {
 			return err
 		}
 	}

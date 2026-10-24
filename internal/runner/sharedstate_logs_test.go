@@ -149,7 +149,7 @@ func TestOverlaps(t *testing.T) {
 		iv("b", 11, 100, 200), // a clean handover: no overlap
 		iv("c", 11, 150, 160), // b and c both run device 11 for 10 seconds
 		iv("a", 12, 0, 100),   // another device: never compared with 11
-		iv("b", 12, 99, 150),  // one second of jitter at the handover is tolerated
+		iv("b", 12, 100, 150), // a handover on the second: no overlap
 		iv("b", 11, 300, 400), // the same container twice: never an overlap
 		iv("b", 11, 350, 360),
 	}
@@ -191,6 +191,45 @@ func TestStoreCallRates(t *testing.T) {
 	}
 }
 
+func TestStoreCallKinds(t *testing.T) {
+	cases := map[string]string{
+		"/statestore/director-state/bench%2F7001%2Fstate%2Fo%2Fsegments%2Fsubject-1-ab-cd-e7baf38d%2F00000000000000000015":    "segments",
+		"/statestore/director-state/bench/7001/state/o/snapshots/$G/KV_devices/subject-1-ab-cd-e7baf38d-9":                    "snapshots",
+		"/statestore/director-state/bench/7001/state/r/streams/$G/KV_persistent":                                              "streams",
+		"/statestore/director-state/bench/7001/state/r/shared/members/subject-2-47d4":                                         "members",
+		"/statestore/director-state/bench%2F7001%2Fstate%2Fr%2Fshared%2Factive":                                               "lease",
+		"/statestore/director-state?comp=list&prefix=bench%2F7001%2Fstate%2Fo%2Fsegments%2Fsubject-1-ab%2F&restype=container": "segments",
+		"/statestore/director-state?restype=container":                                                                        "other",
+	}
+	for path, want := range cases {
+		if got := (ssStoreCall{Path: path}).kind(); got != want {
+			t.Errorf("kind(%q) = %q, want %q", path, got, want)
+		}
+	}
+	base := time.Date(2026, 10, 23, 18, 0, 0, 0, time.UTC)
+	calls := []ssStoreCall{
+		{At: base, Method: "PUT", Status: 201, Path: "/statestore/director-state/bench%2Fo%2Fsegments%2Fold-writer%2F00000000000000000001"},
+		{At: base.Add(60 * time.Second), Method: "PUT", Status: 201, Path: "/statestore/director-state/bench/o/segments/w%2F00000000000000000001"},
+		{At: base.Add(61 * time.Second), Method: "PUT", Status: 201, Path: "/statestore/director-state/bench/r/shared/members/m1"},
+		{At: base.Add(120 * time.Second), Method: "PUT", Status: 201, Path: "/statestore/director-state/bench/o/segments/w%2F00000000000000000002"},
+		{At: base.Add(121 * time.Second), Method: "PUT", Status: 409, Path: "/statestore/director-state/bench/o/segments/w%2F00000000000000000002"},
+		{At: base.Add(181 * time.Second), Method: "PUT", Status: 201, Path: "/statestore/director-state/bench/o/segments/w%2F00000000000000000003"},
+		{At: base.Add(182 * time.Second), Method: "GET", Status: 200, Path: "/statestore/director-state/bench/o/segments/w%2F00000000000000000003"},
+	}
+	r := storeCallRates(calls, "director-state", base, base.Add(200*time.Second))
+	if r.ByKind["segments"].Writes != 5 || r.ByKind["members"].Writes != 1 || r.ByKind["segments"].ReadsAndLists != 1 {
+		t.Errorf("by kind = %+v, want 5 segment writes, 1 segment read and 1 member write", r.ByKind)
+	}
+	writer, ts := busiestWriter(segmentWrites(calls, "director-state", base, base.Add(200*time.Second)))
+	if writer != "w" || len(ts) != 3 {
+		t.Fatalf("busiest writer = %q with %d writes, want w with 3: a refused write is not a write", writer, len(ts))
+	}
+	gaps := writeGaps(ts)
+	if len(gaps) != 2 || gaps[0] != 60*time.Second || gaps[1] != 61*time.Second {
+		t.Errorf("gaps = %v, want 1m0s and 1m1s", gaps)
+	}
+}
+
 func TestScanForSecrets(t *testing.T) {
 	key := "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
 	texts := map[string]string{
@@ -229,5 +268,32 @@ func TestSSLogBookRefreshReportsALogItCannotRead(t *testing.T) {
 	}
 	if lines := book.all("pipebench-test-no-such-container"); len(lines) != 0 {
 		t.Fatalf("the book holds %d lines of a container it could not read", len(lines))
+	}
+}
+
+// TestOverlapUnderASecond: the lines of a pause_store run against a dev build.
+// Once the store was back, subject-1 took the three pollers' leases again.
+// subject-2, the new leader, took them over a second later, because
+// subject-1's member record had lapsed during the outage, and subject-1 found
+// out a second after that. Both ran the pollers for 0.949 seconds. The old
+// one-second tolerance passed the run.
+func TestOverlapUnderASecond(t *testing.T) {
+	s1 := parseDockerLogLines(`2026-10-23T20:30:35.762000000Z [2026-10-23 20:30:35] [Information] [director] [azblob-12] Acquired ownership lease for device 12 (blob-1) on node 7001 (epoch 1)
+2026-10-23T20:30:37.763000000Z [2026-10-23 20:30:37] [Debug] [director] Ownership lease for device 12 (blob-1) was not released by node subject-1-8dae988b-b667-4da3-a493-6de981d7b8f6: devicekv: revision mismatch`)
+	s2 := parseDockerLogLines(`2026-10-23T20:30:36.814000000Z [2026-10-23 20:30:36] [Information] [director] Taking over the ownership lease of device 12 from node subject-1-8dae988b-b667-4da3-a493-6de981d7b8f6, which is no longer a live member (lease valid for another 16s); epoch 2 on node subject-2-77344d38-320d-4401-9c61-cb9159653e41
+2026-10-23T20:30:36.814000000Z [2026-10-23 20:30:36] [Information] [director] [azblob-12] Acquired ownership lease for device 12 (blob-1) on node 7001 (epoch 2)`)
+	until := at(t, "2026-10-23T20:31:00Z")
+	intervals := append(ssOwnership("subject-1", ssEventsOf("subject-1", s1), until), ssOwnership("subject-2", ssEventsOf("subject-2", s2), until)...)
+	if old := ssOverlaps(intervals, time.Second); len(old) != 0 {
+		t.Fatalf("the old tolerance found %v; the run passed", old)
+	}
+	fails, notes := judgeOverlaps(ssOverlaps(intervals, 0))
+	if len(fails) != 1 || !strings.Contains(fails[0], "device 12 ran on subject-1 and subject-2 at once for 0.949s, from 20:30:36.814") || len(notes) != 0 {
+		t.Errorf("fails %q, notes %q; want the 0.949s double run", fails, notes)
+	}
+	// Two containers' stamps a few milliseconds apart are reported, not judged.
+	jitter := []ssOverlap{{Device: 11, A: "subject-1", B: "subject-2", From: until, To: until.Add(40 * time.Millisecond)}}
+	if fails, notes := judgeOverlaps(jitter); len(fails) != 0 || len(notes) != 1 || !strings.Contains(notes[0], "reported, not judged") {
+		t.Errorf("40ms: fails %q, notes %q", fails, notes)
 	}
 }
