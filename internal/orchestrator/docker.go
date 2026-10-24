@@ -17,7 +17,7 @@ import (
 	"github.com/VirtualMetric/PipeBench/internal/config"
 )
 
-// resolveGeneratorConnections picks the generator's parallel-connection
+// ResolveGeneratorConnections picks the generator's parallel-connection
 // count. An explicit non-zero value in case.yaml always wins. When unset
 // (0), scale with the host's CPU count at 3× cores — enough parallelism
 // to drive the subject's worker pools past their per-worker steady state
@@ -29,7 +29,7 @@ import (
 // the bench's subjects (vmetric/vector/etc.) typically run their own
 // per-listener worker pools sized to NumCPU, so feeding them ~3× more
 // connections than cores keeps those pools saturated rather than starved.
-func resolveGeneratorConnections(explicit int) int {
+func ResolveGeneratorConnections(explicit int) int {
 	if explicit > 0 {
 		return explicit
 	}
@@ -2574,7 +2574,7 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 	if tc.MultiGenerator() {
 		offset := 0
 		for _, g := range tc.Generators {
-			conns := resolveGeneratorConnections(g.Connections)
+			conns := ResolveGeneratorConnections(g.Connections)
 			lineSize := g.LineSize
 			if lineSize == 0 {
 				lineSize = 256
@@ -2634,7 +2634,7 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 		vars.GenRate = g.Rate
 		vars.GenLineSize = genLineSize
 		vars.GenFormat = genFormat
-		vars.GenConnections = resolveGeneratorConnections(g.Connections)
+		vars.GenConnections = ResolveGeneratorConnections(g.Connections)
 		vars.GenReconnect = g.Reconnect
 		vars.GenTotalLines = g.TotalLines
 		vars.GenEnv = mergeEnv(cloudEnvForMode(g.Mode, awsEnv, minioEnv, azureEnv), g.Env)

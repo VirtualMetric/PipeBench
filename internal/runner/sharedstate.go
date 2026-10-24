@@ -413,25 +413,41 @@ func (run *ssRun) startInfrastructure() bool {
 }
 
 // waitContainer waits until docker inspect's format says want for the
-// container, and fails the run when it never does or the container exits.
+// container, and fails the run when it never does. A container that has
+// exited fails it at once, with its last log lines: a health status, for one,
+// keeps its last value after the container is gone.
 func (run *ssRun) waitContainer(container, format, want string, deadline time.Time) bool {
+	name := strings.TrimPrefix(container, "bench-")
 	var state string
 	for {
-		out, _ := exec.Command("docker", "inspect", "-f", format, container).Output()
-		state = strings.TrimSpace(string(out))
-		if state == want {
+		out, _ := containerInspect(container, "{{.State.Status}}|"+format)
+		status, value, _ := strings.Cut(strings.TrimSpace(out), "|")
+		state = value
+		if value == want {
 			return true
 		}
-		if strings.HasPrefix(state, "exited") {
-			run.fail("%s failed (%s): %s", strings.TrimPrefix(container, "bench-"), state, run.orch.Logs(container, 20))
+		if status == "exited" || status == "dead" {
+			run.fail("%s has %s (%s): %s", name, status, value, containerTail(container))
 			return false
 		}
 		if time.Now().After(deadline) || sleepCtx(run.r.ctx, time.Second) != nil {
 			break
 		}
 	}
-	run.fail("%s was not %s within 2 minutes (%s)", strings.TrimPrefix(container, "bench-"), want, state)
+	run.fail("%s was not %s within 2 minutes (%s)", name, want, state)
 	return false
+}
+
+// containerInspect runs docker inspect with a format. Tests replace it.
+var containerInspect = func(container, format string) (string, error) {
+	out, err := exec.Command("docker", "inspect", "-f", format, container).Output()
+	return string(out), err
+}
+
+// containerTail returns a container's last 20 log lines. Tests replace it.
+var containerTail = func(container string) string {
+	out, _ := exec.Command("docker", "logs", "--tail", "20", container).CombinedOutput()
+	return strings.TrimSpace(string(out))
 }
 
 // startReplicas starts the replicas group by group, and waits for each group

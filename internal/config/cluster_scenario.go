@@ -320,7 +320,7 @@ func (tc *TestCase) validateClusterScenario() error {
 	case tc.Generator.Mode != "http_ack":
 		return fmt.Errorf("case %q: a scenario case counts acknowledged lines, so its generator must use mode http_ack (got %q)", tc.Name, tc.Generator.Mode)
 	// The rate is per worker, and an unset worker count means three per CPU
-	// (resolveGeneratorConnections), so a scenario case states both and stays
+	// (ResolveGeneratorConnections), so a scenario case states both and stays
 	// at a load a shared machine can carry.
 	case tc.Generator.Connections < 1 || tc.Generator.Rate < 1:
 		return fmt.Errorf("case %q: a scenario case sets generator.connections and generator.rate explicitly", tc.Name)

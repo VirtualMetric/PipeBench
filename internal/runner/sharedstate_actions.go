@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/VirtualMetric/PipeBench/internal/config"
+	"github.com/VirtualMetric/PipeBench/internal/orchestrator"
 )
 
 // The actions of a shared-state case that disturb the store, the network or
@@ -46,6 +47,15 @@ func (run *ssRun) pauseStore() {
 	if err := run.takeStore(true); err != nil {
 		run.fail("%v (the outage did not happen)", err)
 		return
+	}
+	if run.ss.StoreOrDefault() == config.SharedStateStoreShare {
+		if err := run.confirmShareRefused(); err != nil {
+			run.fail("%v", err)
+			if back := run.takeStore(false); back != nil {
+				run.fail("%v", back)
+			}
+			return
+		}
 	}
 	paused := time.Now()
 	run.measures["outage_from"] = paused.UTC()
@@ -118,6 +128,44 @@ func (run *ssRun) takeStore(away bool) error {
 		return fmt.Errorf("docker %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// confirmShareRefused checks, inside every running replica and as the
+// replica's own user, that the share now refuses access. chmod 000 does not
+// stop a process that runs as root, so an outage the replicas could ignore
+// fails the run, instead of passing as one they survived.
+func (run *ssRun) confirmShareRefused() error {
+	checked := 0
+	for _, rep := range run.replicas {
+		if !run.running[rep.N] {
+			continue
+		}
+		checked++
+		opens, err := shareOpens(rep.Container, run.ss.SharePath)
+		if err != nil {
+			return fmt.Errorf("checking that the share refuses %s: %v", rep.Service, err)
+		}
+		if opens {
+			return fmt.Errorf("the share at %s still opens for %s's user after chmod 000, so the outage did not happen: a process that runs as root ignores the mode", run.ss.SharePath, rep.Service)
+		}
+	}
+	if checked == 0 {
+		return fmt.Errorf("no replica runs, so nothing confirms that the share at %s refuses access", run.ss.SharePath)
+	}
+	return nil
+}
+
+// shareOpens reports whether a container's own user can open the directory:
+// docker exec runs as the user the container runs as. Tests replace it.
+var shareOpens = func(container, dir string) (bool, error) {
+	out, err := exec.Command("docker", "exec", container, "sh", "-c", `cd "$1"`, "sh", dir).CombinedOutput()
+	if err == nil {
+		return true, nil
+	}
+	if strings.Contains(string(out), "ermission denied") {
+		return false, nil
+	}
+	return false, fmt.Errorf("docker exec %s: %v: %s", container, err, strings.TrimSpace(string(out)))
 }
 
 // storeOutageArgs returns the docker arguments that take the store away, or
@@ -399,8 +447,9 @@ func countOf(n int64, thing string) string {
 }
 
 // streamPace is how many records a second the generator of the named stream
-// sends: its rate on each of its connections. It is 0 for a stream whose
-// generator has no rate limit.
+// sends: its rate on each of its connections, counted as the compose file
+// counts them, so a generator that leaves connections unset gets the host's
+// default. It is 0 for a stream whose generator has no rate limit.
 func (run *ssRun) streamPace(name string) float64 {
 	for _, st := range run.ss.Streams {
 		if st.StreamName() != name {
@@ -408,7 +457,7 @@ func (run *ssRun) streamPace(name string) float64 {
 		}
 		for _, g := range run.tc.AllGenerators() {
 			if g.ID == st.Generator {
-				return float64(g.Rate) * float64(max(g.Connections, 1))
+				return float64(g.Rate) * float64(orchestrator.ResolveGeneratorConnections(g.Connections))
 			}
 		}
 	}

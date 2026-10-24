@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"reflect"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/VirtualMetric/PipeBench/internal/config"
+	"github.com/VirtualMetric/PipeBench/internal/orchestrator"
 )
 
 func TestLiveStoreMembers(t *testing.T) {
@@ -421,5 +423,99 @@ func TestStoreCallsNotCountedOutsideAzurite(t *testing.T) {
 	run.countStoreCalls()
 	if got, _ := run.measures["store_calls"].(string); !strings.Contains(got, "not counted: the shared state is in Redis") {
 		t.Errorf("store_calls = %v", run.measures["store_calls"])
+	}
+}
+
+// TestShareOutageMustRefuseTheReplicas: chmod 000 does not stop a process
+// that runs as root. Such a replica keeps its store through the outage, and
+// the case used to count the outage as survived. It now fails the run.
+func TestShareOutageMustRefuseTheReplicas(t *testing.T) {
+	saved := shareOpens
+	t.Cleanup(func() { shareOpens = saved })
+	run := &ssRun{
+		ss:      &config.SharedStateConfig{Store: config.SharedStateStoreShare, SharePath: "/mnt/vm-state"},
+		running: map[int]bool{1: true, 2: true},
+		replicas: []ssReplica{
+			{N: 1, Service: "subject-1", Container: "bench-subject-vmetric-1"},
+			{N: 2, Service: "subject-2", Container: "bench-subject-vmetric-2"},
+			{N: 3, Service: "subject-3", Container: "bench-subject-vmetric-3"},
+		},
+	}
+	// subject-2 runs as root: the share still opens for it.
+	shareOpens = func(container, _ string) (bool, error) { return container == "bench-subject-vmetric-2", nil }
+	if err := run.confirmShareRefused(); err == nil || !strings.Contains(err.Error(), "still opens for subject-2's user") {
+		t.Errorf("a root replica: %v, want the outage refused", err)
+	}
+	var asked []string
+	shareOpens = func(container, _ string) (bool, error) { asked = append(asked, container); return false, nil }
+	if err := run.confirmShareRefused(); err != nil {
+		t.Errorf("every replica refused: %v", err)
+	}
+	if !reflect.DeepEqual(asked, []string{"bench-subject-vmetric-1", "bench-subject-vmetric-2"}) {
+		t.Errorf("asked %v, want the two running replicas", asked)
+	}
+	run.running = map[int]bool{}
+	if err := run.confirmShareRefused(); err == nil {
+		t.Error("with no replica running, nothing confirmed the outage")
+	}
+}
+
+// TestStreamPaceCountsTheDefaultConnections: a generator that leaves
+// connections unset gets the host's default count from the compose file. The
+// pace used to count it as one connection, so a stream that slowed to a
+// fraction of its real pace passed the outage check.
+func TestStreamPaceCountsTheDefaultConnections(t *testing.T) {
+	conns := orchestrator.ResolveGeneratorConnections(0)
+	if conns < 2 {
+		t.Skipf("the host's default is %d connection; the case needs more than one", conns)
+	}
+	run := &ssRun{
+		tc: &config.TestCase{Generators: []config.GeneratorConfig{{ID: "syslog", Rate: 10}}},
+		ss: &config.SharedStateConfig{Streams: []config.SharedStateStream{{Name: "syslog", Generator: "syslog", Receiver: "syslog"}}},
+	}
+	pace := run.streamPace("syslog")
+	if pace != float64(10*conns) {
+		t.Fatalf("pace = %v, want %d: 10 a second on each of %d connections", pace, 10*conns, conns)
+	}
+	// The bad run: 150 records in 15 seconds, while the generator sent 10 a
+	// second on every connection. At one connection the floor was 75.
+	window := 15 * time.Second
+	if why := outageShortfall("syslog", 150, window, 10); why != "" {
+		t.Fatalf("the old pace should have passed this run: %q", why)
+	}
+	if why := outageShortfall("syslog", 150, window, pace); !strings.Contains(why, "slowed during the outage") {
+		t.Errorf("at the real pace: %q, want the stream to fail", why)
+	}
+}
+
+// TestWaitContainerFailsAtOnceOnAnExitedEndpoint: an endpoint that crashes
+// keeps its last health status, so the wait used to run to its deadline and
+// fail without the endpoint's logs. It now fails as soon as the container has
+// exited, with its last lines.
+func TestWaitContainerFailsAtOnceOnAnExitedEndpoint(t *testing.T) {
+	savedInspect, savedTail := containerInspect, containerTail
+	t.Cleanup(func() { containerInspect, containerTail = savedInspect, savedTail })
+	containerInspect = func(string, string) (string, error) { return "exited|starting\n", nil }
+	containerTail = func(string) string { return "redis: bad password config" }
+	run := &ssRun{r: &Runner{ctx: context.Background()}}
+	start := time.Now()
+	if run.waitContainer("bench-redis", "{{.State.Health.Status}}", "healthy", time.Now().Add(time.Minute)) {
+		t.Fatal("an exited endpoint counted as healthy")
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Errorf("the wait took %s; it should end at once", took)
+	}
+	if len(run.errs) != 1 || !strings.Contains(run.errs[0], "redis has exited (starting): redis: bad password config") {
+		t.Errorf("errs = %q", run.errs)
+	}
+
+	// An init that finished is ready, and one that failed fails.
+	containerInspect = func(string, string) (string, error) { return "exited|exited 0", nil }
+	if !run.waitContainer("bench-minio-init", "{{.State.Status}} {{.State.ExitCode}}", "exited 0", time.Now().Add(time.Minute)) {
+		t.Error("an init that exited 0 did not count as done")
+	}
+	containerInspect = func(string, string) (string, error) { return "exited|exited 1", nil }
+	if run.waitContainer("bench-minio-init", "{{.State.Status}} {{.State.ExitCode}}", "exited 0", time.Now().Add(time.Minute)) {
+		t.Error("an init that exited 1 counted as done")
 	}
 }
