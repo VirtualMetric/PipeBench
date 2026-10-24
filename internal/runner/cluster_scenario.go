@@ -803,6 +803,14 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		}
 		gained := prev.Acked - first.Acked
 		sr.record(st.Record, float64(maxFlat.Milliseconds()))
+		// With gap set, the client must get a confirmation at least once every
+		// gap, not one somewhere in the window.
+		if st.Gap != "" {
+			if gap := st.DurationOr("gap", 10*time.Second); maxFlat > gap {
+				sr.recordCount(st.Record, "_lines_acked", gained)
+				return false, fmt.Sprintf("writes paused for %s, more than the gap of %s (%d lines acknowledged in %s)", fmtMs(maxFlat.Milliseconds()), gap, gained, hold), nil
+			}
+		}
 		// How many lines the client got confirmed in the window: with the
 		// receiver paused, the records a node holds and still has to deliver.
 		sr.recordCount(st.Record, "_lines_acked", gained)
@@ -1744,7 +1752,7 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 	// Validation keeps rows to cases without a generator, so a run with load
 	// has none. Were that to change, a judged rows check that never ran fails
 	// here instead of passing unseen.
-	if reason, _ := judgeRows(rep.Rows, ex.MaxMissingRows); reason != "" {
+	if reason, _ := judgeRows(rep.Rows, ex.MaxMissingRows, ex.MaxRowsTwice); reason != "" {
 		v.reasons = append(v.reasons, reason)
 	}
 	rep.Failures = v.reasons
@@ -1757,14 +1765,16 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 // (cluster.scenario.rows; config validation allows it only without a
 // generator). It returns a reason the run fails, or a note when the case does
 // not judge its rows, or neither.
-func judgeRows(rows *rowsCheck, maxMissing *int64) (reason, note string) {
+func judgeRows(rows *rowsCheck, maxMissing, maxTwice *int64) (reason, note string) {
+	// Either limit makes the comparison one the run depends on.
+	judge := maxMissing != nil || maxTwice != nil
 	if rows == nil {
-		if maxMissing != nil {
+		if judge {
 			return "the database rows were not compared with what arrived", ""
 		}
 		return "", ""
 	}
-	judge := maxMissing != nil
+	var reasons []string
 	switch {
 	case rows.Error != "" && judge:
 		// An unknown count is not zero.
@@ -1773,11 +1783,16 @@ func judgeRows(rows *rowsCheck, maxMissing *int64) (reason, note string) {
 		return "", "the database rows could not be compared with what arrived: " + rows.Error
 	case judge && rows.Written == 0:
 		return "the rows query returned no rows, so nothing was compared", ""
-	case judge && rows.Missing > *maxMissing:
-		return fmt.Sprintf("%d of %d database rows never arrived (max_missing_rows %d); the first: %s",
-			rows.Missing, rows.Written, *maxMissing, strings.Join(rows.MissingKeys, ", ")), ""
 	}
-	return "", ""
+	if maxMissing != nil && rows.Missing > *maxMissing {
+		reasons = append(reasons, fmt.Sprintf("%d of %d database rows never arrived (max_missing_rows %d); the first: %s",
+			rows.Missing, rows.Written, *maxMissing, strings.Join(rows.MissingKeys, ", ")))
+	}
+	if maxTwice != nil && rows.ArrivedTwice > *maxTwice {
+		reasons = append(reasons, fmt.Sprintf("%d of %d database rows arrived more than once (max_rows_twice %d); the first: %s",
+			rows.ArrivedTwice, rows.Written, *maxTwice, strings.Join(rows.TwiceKeys, ", ")))
+	}
+	return strings.Join(reasons, "; "), ""
 }
 
 // finishWithoutLoad ends a scenario whose data came from a device the
@@ -1841,13 +1856,9 @@ func withoutLoadVerdict(rep scenarioReport, ex config.ScenarioExpect, dedup bool
 	// The rows are judged here, in the only verdict a case with rows reaches.
 	// A proof run found them reported and never judged: a row was missing, and
 	// the case passed.
-	reason, note := judgeRows(rep.Rows, ex.MaxMissingRows)
+	reason, note := judgeRows(rep.Rows, ex.MaxMissingRows, ex.MaxRowsTwice)
 	if reason != "" {
 		reasons = append(reasons, reason)
-	}
-	if r := rep.Rows; r != nil && r.Error == "" && ex.MaxRowsTwice != nil && r.ArrivedTwice > *ex.MaxRowsTwice {
-		reasons = append(reasons, fmt.Sprintf("%d of %d database rows arrived more than once (max_rows_twice %d); the first: %s",
-			r.ArrivedTwice, r.Written, *ex.MaxRowsTwice, strings.Join(r.TwiceKeys, ", ")))
 	}
 	if note != "" {
 		notes = append(notes, note)

@@ -55,7 +55,7 @@ func TestJudgeRows(t *testing.T) {
 		{"judged rows that were never read fail", nil, &zero, true, false, "not compared"},
 	}
 	for _, c := range cases {
-		reason, note := judgeRows(c.rows, c.max)
+		reason, note := judgeRows(c.rows, c.max, nil)
 		if (reason != "") != c.fails {
 			t.Errorf("%s: reason %q, want a failure: %v", c.name, reason, c.fails)
 		}
@@ -102,6 +102,34 @@ func TestWithoutLoadVerdict(t *testing.T) {
 		}
 		if !strings.Contains(got, c.reasonPart) {
 			t.Errorf("%s: reasons %q, want one that mentions %q", c.name, got, c.reasonPart)
+		}
+	}
+}
+
+// max_rows_twice alone makes the rows comparison one the run depends on.
+func TestJudgeRowsTwiceOnly(t *testing.T) {
+	zero := int64(0)
+	cases := []struct {
+		name       string
+		rows       *rowsCheck
+		reasonPart string
+	}{
+		{"a failed comparison", &rowsCheck{Error: "psql: connection refused"}, "connection refused"},
+		{"no rows", &rowsCheck{}, "no rows"},
+		{"never read", nil, "not compared"},
+		{"rows twice", &rowsCheck{Written: 10, Arrived: 10, ArrivedTwice: 3, TwiceKeys: []string{"evt-1"}}, "3 of 10 database rows arrived more than once"},
+		{"a missing row is not judged", &rowsCheck{Written: 10, Arrived: 9, Missing: 1}, ""},
+	}
+	for _, c := range cases {
+		reason, _ := judgeRows(c.rows, nil, &zero)
+		if c.reasonPart == "" {
+			if reason != "" {
+				t.Errorf("%s: failed with %q, want a pass", c.name, reason)
+			}
+			continue
+		}
+		if !strings.Contains(reason, c.reasonPart) {
+			t.Errorf("%s: reason %q, want one that mentions %q", c.name, reason, c.reasonPart)
 		}
 	}
 }

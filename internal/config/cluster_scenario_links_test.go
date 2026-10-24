@@ -162,7 +162,7 @@ func TestLossPercent(t *testing.T) {
 			t.Errorf("LossPercent(%q) = %v, %v; want %v", in, got, err, want)
 		}
 	}
-	for _, in := range []string{"20", "0%", "-5%", "101%", "x%"} {
+	for _, in := range []string{"20", "0%", "-5%", "101%", "x%", "NaN%", "nan%"} {
 		if _, err := LossPercent(in); err == nil {
 			t.Errorf("LossPercent(%q) accepted it", in)
 		}
@@ -231,14 +231,25 @@ func TestValidateExpectDeliveryContinues(t *testing.T) {
 	if err := withStep(ScenarioStep{Do: "expect_delivery_continues"}).Validate(); err != nil {
 		t.Fatalf("Validate with the defaults: %v", err)
 	}
+	if err := withStep(ScenarioStep{Do: "expect_writes_continue", For: "30s", Gap: "10s"}).Validate(); err != nil {
+		t.Fatalf("Validate expect_writes_continue with a gap: %v", err)
+	}
+	// The step counts the load's lines: a case without a generator has none.
+	noLoad := rowsScenarioCase()
+	noLoad.Cluster.Scenario.Steps = append(noLoad.Cluster.Scenario.Steps, ScenarioStep{Do: "expect_delivery_continues"})
+	if err := noLoad.validateClusterScenario(); err == nil || !strings.Contains(err.Error(), "has no generator") {
+		t.Errorf("Validate without a generator = %v, want the generator error", err)
+	}
 	bad := map[string]struct {
 		st   ScenarioStep
 		want string
 	}{
-		"gap too short":  {ScenarioStep{Do: "expect_delivery_continues", Gap: "1s"}, "gap must be at least 2s"},
-		"for within gap": {ScenarioStep{Do: "expect_delivery_continues", For: "5s", Gap: "10s"}, "for must be longer than gap"},
-		"gap not a time": {ScenarioStep{Do: "expect_delivery_continues", Gap: "soon"}, "gap"},
-		"gap on another": {ScenarioStep{Do: "wait_delivery", Gap: "10s"}, "gap only applies to expect_delivery_continues"},
+		"gap too short":    {ScenarioStep{Do: "expect_delivery_continues", Gap: "1s"}, "gap must be at least 2s"},
+		"for within gap":   {ScenarioStep{Do: "expect_delivery_continues", For: "5s", Gap: "10s"}, "for must be longer than gap"},
+		"gap not a time":   {ScenarioStep{Do: "expect_delivery_continues", Gap: "soon"}, "gap"},
+		"gap on another":   {ScenarioStep{Do: "wait_delivery", Gap: "10s"}, "gap only applies to expect_delivery_continues, expect_writes_continue"},
+		"writes gap short": {ScenarioStep{Do: "expect_writes_continue", For: "30s", Gap: "1s"}, "gap must be at least 2s"},
+		"writes gap long":  {ScenarioStep{Do: "expect_writes_continue", Gap: "25s"}, "for must be longer than gap"},
 	}
 	for name, c := range bad {
 		err := withStep(c.st).Validate()

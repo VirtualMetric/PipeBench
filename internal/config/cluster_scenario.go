@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
 	"strconv"
@@ -203,7 +204,9 @@ type ScenarioStep struct {
 	// Grace is the stop timeout for stop and restart (default 30s).
 	Grace string `yaml:"grace"`
 	// Gap is the longest expect_delivery_continues allows between two
-	// arrivals of lines sent in its window (default 10s).
+	// arrivals of lines sent in its window (default 10s), and the longest
+	// pause between two acknowledgements expect_writes_continue allows (not
+	// judged when unset).
 	Gap string `yaml:"gap"`
 
 	// Recover passes -recover=<value> to a start (accept-loss or reset).
@@ -288,7 +291,8 @@ func LossPercent(s string) (float64, error) {
 		return 0, fmt.Errorf("loss %q must be a percentage such as 20%%", s)
 	}
 	p, err := strconv.ParseFloat(strings.TrimSpace(num), 64)
-	if err != nil || p <= 0 || p > 100 {
+	// ParseFloat reads "NaN", and NaN fails every comparison.
+	if err != nil || math.IsNaN(p) || p <= 0 || p > 100 {
 		return 0, fmt.Errorf("loss %q must be a percentage above 0%% and at most 100%%", s)
 	}
 	return p, nil
@@ -587,12 +591,20 @@ func (tc *TestCase) validateClusterScenario() error {
 				return fmt.Errorf("%s: %s: %w", where, field, err)
 			}
 		}
-		if st.Do == "expect_delivery_continues" {
+		if st.Do == "expect_delivery_continues" && !tc.HasGenerator() {
+			return fmt.Errorf("%s: counts the load's lines, and the case has no generator", where)
+		}
+		if st.Do == "expect_delivery_continues" || (st.Do == "expect_writes_continue" && st.Gap != "") {
+			// The windows default to 30s and 20s, as the driver runs them.
+			window := 30 * time.Second
+			if st.Do == "expect_writes_continue" {
+				window = 20 * time.Second
+			}
 			gap := st.DurationOr("gap", 10*time.Second)
 			if gap < 2*time.Second {
-				return fmt.Errorf("%s: gap must be at least 2s: a line sent in the window needs time to arrive", where)
+				return fmt.Errorf("%s: gap must be at least 2s: a line or a confirmation needs time to come", where)
 			}
-			if st.DurationOr("for", 30*time.Second) <= gap {
+			if st.DurationOr("for", window) <= gap {
 				return fmt.Errorf("%s: for must be longer than gap", where)
 			}
 		}
@@ -738,7 +750,7 @@ var stepFieldOwners = []struct {
 	{"groups", func(s ScenarioStep) bool { return s.Groups != nil }, map[string]bool{"split": true, "wait_leader": true}},
 	{"empty_disk", func(s ScenarioStep) bool { return s.EmptyDisk }, map[string]bool{"start": true}},
 	{"leave", func(s ScenarioStep) bool { return s.Leave != "" }, map[string]bool{"fill_disk": true}},
-	{"gap", func(s ScenarioStep) bool { return s.Gap != "" }, map[string]bool{"expect_delivery_continues": true}},
+	{"gap", func(s ScenarioStep) bool { return s.Gap != "" }, map[string]bool{"expect_delivery_continues": true, "expect_writes_continue": true}},
 }
 
 func checkStepFieldOwners(st ScenarioStep) error {
