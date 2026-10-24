@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -460,5 +461,46 @@ func TestSummaryLeavesOutAnUnfinishedPendingCount(t *testing.T) {
 	}
 	if _, ok := sum["pending_not_counted"]; ok {
 		t.Fatalf("summary reports a count that was never finished")
+	}
+}
+
+func TestLineCountsStayApartFromTimes(t *testing.T) {
+	sr := &scenarioRun{measures: map[string]float64{}, counts: map[string]int64{}}
+	sr.record("held_writes", 1500)
+	sr.recordCount("held_writes", "_lines_acked", 820)
+	sr.recordCount("", "_lines_after", 7)
+
+	if _, ok := sr.measures["held_writes_lines_acked"]; ok {
+		t.Fatalf("a line count was stored with the times: %v", sr.measures)
+	}
+	if len(sr.counts) != 1 || sr.counts["held_writes_lines_acked"] != 820 {
+		t.Fatalf("counts = %v, want only held_writes_lines_acked = 820", sr.counts)
+	}
+
+	rep := scenarioReport{Measures: sr.measures, Counts: sr.counts}
+	sum := rep.summary()
+	if sum["ms_held_writes"] != float64(1500) {
+		t.Fatalf("summary ms_held_writes = %v, want 1500", sum["ms_held_writes"])
+	}
+	if sum["count_held_writes_lines_acked"] != int64(820) {
+		t.Fatalf("summary count_held_writes_lines_acked = %v, want 820", sum["count_held_writes_lines_acked"])
+	}
+	if _, ok := sum["ms_held_writes_lines_acked"]; ok {
+		t.Fatalf("summary exports a line count as milliseconds")
+	}
+
+	raw, err := json.Marshal(rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Measures map[string]float64 `json:"measures_ms"`
+		Counts   map[string]int64   `json:"counts"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := doc.Measures["held_writes_lines_acked"]; ok || doc.Counts["held_writes_lines_acked"] != 820 {
+		t.Fatalf("report measures_ms = %v, counts = %v; want the count under counts only", doc.Measures, doc.Counts)
 	}
 }

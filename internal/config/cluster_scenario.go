@@ -120,7 +120,10 @@ type ScenarioStep struct {
 	For    string `yaml:"for"`
 
 	// Record names the measurement a wait stores: the time from the last
-	// disruption to the moment the wait was satisfied.
+	// disruption to the moment the wait was satisfied. expect_writes_stop,
+	// expect_delivery_stops and expect_writes_continue also count lines.
+	// The report lists those counts apart from the times, under the same
+	// name with _acked_after, _lines_after or _lines_acked added.
 	Record string `yaml:"record"`
 	// Label names a mark.
 	Label string `yaml:"label"`

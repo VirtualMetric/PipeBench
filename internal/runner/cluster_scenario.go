@@ -218,6 +218,7 @@ type scenarioRun struct {
 	marks    []scenarioMark
 	pending  []pendingCount
 	measures map[string]float64
+	counts   map[string]int64
 	failures []string
 	notes    []string
 
@@ -324,7 +325,7 @@ func (r *Runner) runClusterScenario(tc *config.TestCase, subject config.Subject)
 		containers: containers, active: map[int]bool{}, size: tc.Cluster.Nodes,
 		tmpDir: tmpDir, configSrc: srcCfg, recvPort: r.opts.ReceiverHostPort,
 		names: map[string]int{}, disconnected: map[int]bool{}, down: map[int]bool{}, measures: map[string]float64{},
-		imageID: imageID, imageLabels: imageLabels,
+		counts: map[string]int64{}, imageID: imageID, imageLabels: imageLabels,
 	}
 	for i := 1; i <= tc.Cluster.Nodes; i++ {
 		sr.active[i] = true
@@ -663,12 +664,12 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 					}
 					stoppedMs := max(stopped.Sub(since).Milliseconds(), 0)
 					sr.record(st.Record, float64(stoppedMs))
-					sr.record(st.Record+"_acked_after", float64(after))
+					sr.recordCount(st.Record, "_acked_after", after)
 					return true, fmt.Sprintf("writes stopped %s after the disruption (the client's last 2xx); %d lines were acknowledged %s", fmtMs(stoppedMs), after, from), nil
 				}
 			}
 			if time.Now().After(deadline.Add(hold)) {
-				sr.record(st.Record+"_acked_after", float64(last.Acked-base))
+				sr.recordCount(st.Record, "_acked_after", last.Acked-base)
 				return false, fmt.Sprintf("the cluster kept acknowledging writes: %d lines %s", last.Acked-base, from), nil
 			}
 			if err := sleepCtx(sr.ctx, 500*time.Millisecond); err != nil {
@@ -695,12 +696,12 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 				if time.Since(last) >= hold {
 					stoppedMs := max(last.Sub(since).Milliseconds(), 0)
 					sr.record(st.Record, float64(stoppedMs))
-					sr.record(st.Record+"_lines_after", float64(after))
+					sr.recordCount(st.Record, "_lines_after", after)
 					return true, fmt.Sprintf("deliveries stopped %s after the disruption; %d lines arrived after it", fmtMs(stoppedMs), after), nil
 				}
 			}
 			if time.Now().After(deadline) {
-				sr.record(st.Record+"_lines_after", float64(after))
+				sr.recordCount(st.Record, "_lines_after", after)
 				return false, fmt.Sprintf("lines kept arriving: %d since the disruption, the last %s ago", after, fmtMs(time.Since(last).Milliseconds())), nil
 			}
 			if err := sleepCtx(sr.ctx, time.Second); err != nil {
@@ -738,11 +739,9 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		}
 		gained := prev.Acked - first.Acked
 		sr.record(st.Record, float64(maxFlat.Milliseconds()))
-		if st.Record != "" {
-			// How many lines the client got confirmed in the window: with the
-			// receiver paused, the records a node holds and still has to deliver.
-			sr.record(st.Record+"_lines_acked", float64(gained))
-		}
+		// How many lines the client got confirmed in the window: with the
+		// receiver paused, the records a node holds and still has to deliver.
+		sr.recordCount(st.Record, "_lines_acked", gained)
 		if gained <= 0 {
 			return false, fmt.Sprintf("no write was acknowledged for %s", hold), nil
 		}
@@ -894,6 +893,16 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 func (sr *scenarioRun) record(name string, v float64) {
 	if name != "" {
 		sr.measures[name] = v
+	}
+}
+
+// recordCount stores a number of lines that a step counted beside its time,
+// under the step's record name with suffix added. The report keeps counts
+// apart from the measures, which are times in milliseconds. A step with no
+// record name stores no count.
+func (sr *scenarioRun) recordCount(record, suffix string, n int64) {
+	if record != "" {
+		sr.counts[record+suffix] = n
 	}
 }
 
@@ -1340,6 +1349,9 @@ type scenarioReport struct {
 	// each window between marks, in milliseconds.
 	AckMaxWindows map[string]int64   `json:"ack_latency_max_ms_windows,omitempty"`
 	Measures      map[string]float64 `json:"measures_ms"`
+	// Counts holds the numbers of lines that steps counted beside their
+	// times, such as <record>_lines_acked. They are lines, not milliseconds.
+	Counts map[string]int64 `json:"counts,omitempty"`
 	// Pending holds the count_pending steps' counts: the lines sent before a
 	// mark that were still on their way when the step ran.
 	Pending    []pendingCount       `json:"pending,omitempty"`
@@ -1384,6 +1396,9 @@ func (rep scenarioReport) summary() map[string]any {
 	for k, v := range rep.Measures {
 		out["ms_"+k] = v
 	}
+	for k, v := range rep.Counts {
+		out["count_"+k] = v
+	}
 	for _, p := range rep.Pending {
 		// A count that could not be finished is left out, not reported as 0.
 		if p.ArrivedLater != nil {
@@ -1411,6 +1426,7 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 		NodeCPU:     sr.r.runCPULimit,
 		NodeMem:     sr.r.runMemLimit,
 		Measures:    sr.measures,
+		Counts:      sr.counts,
 		Notes:       sr.notes,
 	}
 
