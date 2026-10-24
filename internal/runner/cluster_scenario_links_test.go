@@ -266,3 +266,51 @@ func TestWatchDelivery(t *testing.T) {
 		t.Fatalf("unreadable count: %+v, %v; want a failure naming the error", w, err)
 	}
 }
+
+// expect_writes_continue with a gap: one confirmation followed by progress the
+// step cannot read must fail once the stretch passes the gap.
+func TestWatchWritesUnreadableProgress(t *testing.T) {
+	ctx := context.Background()
+	first := genProgress{Acked: 1000}
+	calls := 0
+	read := func() (genProgress, bool) {
+		calls++
+		if calls == 1 {
+			return genProgress{Acked: 1010}, true
+		}
+		return genProgress{}, false
+	}
+	gained, longest, err := watchWrites(ctx, first, 400*time.Millisecond, 10*time.Millisecond, read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gained != 10 {
+		t.Fatalf("gained = %d, want the one confirmation of 10 lines", gained)
+	}
+	if longest < 300*time.Millisecond {
+		t.Fatalf("longest = %s; the unreadable stretch after the first read did not count", longest)
+	}
+	ok, detail, _ := judgeWrites(gained, longest, 400*time.Millisecond, 100*time.Millisecond)
+	if ok || !strings.Contains(detail, "more than the gap") {
+		t.Fatalf("judgeWrites = %v, %q; want a failure on the gap", ok, detail)
+	}
+	// Without a gap, the step judges only that something was confirmed.
+	if ok, _, _ := judgeWrites(gained, longest, 400*time.Millisecond, 0); !ok {
+		t.Fatal("without a gap, one confirmation failed the step")
+	}
+}
+
+func TestWatchWritesSteady(t *testing.T) {
+	var acked int64
+	read := func() (genProgress, bool) { acked += 10; return genProgress{Acked: acked}, true }
+	gained, longest, err := watchWrites(context.Background(), genProgress{}, 200*time.Millisecond, 10*time.Millisecond, read)
+	if err != nil || gained == 0 || longest > 50*time.Millisecond {
+		t.Fatalf("steady writes: gained %d, longest %s, err %v", gained, longest, err)
+	}
+	if ok, detail, _ := judgeWrites(gained, longest, 200*time.Millisecond, 100*time.Millisecond); !ok {
+		t.Fatalf("steady writes failed: %s", detail)
+	}
+	if ok, _, _ := judgeWrites(0, 0, 200*time.Millisecond, 0); ok {
+		t.Fatal("a window with no confirmation passed")
+	}
+}

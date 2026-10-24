@@ -784,40 +784,19 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 			}
 			return false, "could not read the client's progress at the start of the window", nil
 		}
-		maxFlat := time.Duration(0)
-		lastChange := time.Now()
-		prev := first
-		end := time.Now().Add(hold)
-		for time.Now().Before(end) {
-			if err := sleepCtx(sr.ctx, 500*time.Millisecond); err != nil {
-				return false, "", fmt.Errorf("interrupted: %w", err)
-			}
-			// A read that fails shows no progress, so it counts as a pause:
-			// a confirmation the step cannot see does not keep the gap open.
-			if p, ok := readGeneratorProgress(); ok && p.Acked != prev.Acked {
-				lastChange = time.Now()
-				prev = p
-			} else if f := time.Since(lastChange); f > maxFlat {
-				maxFlat = f
-			}
+		gained, maxFlat, err := watchWrites(sr.ctx, first, hold, 500*time.Millisecond, readGeneratorProgress)
+		if err != nil {
+			return false, "", fmt.Errorf("interrupted: %w", err)
 		}
-		gained := prev.Acked - first.Acked
 		sr.record(st.Record, float64(maxFlat.Milliseconds()))
-		// With gap set, the client must get a confirmation at least once every
-		// gap, not one somewhere in the window.
-		if st.Gap != "" {
-			if gap := st.DurationOr("gap", 10*time.Second); maxFlat > gap {
-				sr.recordCount(st.Record, "_lines_acked", gained)
-				return false, fmt.Sprintf("writes paused for %s, more than the gap of %s (%d lines acknowledged in %s)", fmtMs(maxFlat.Milliseconds()), gap, gained, hold), nil
-			}
-		}
 		// How many lines the client got confirmed in the window: with the
 		// receiver paused, the records a node holds and still has to deliver.
 		sr.recordCount(st.Record, "_lines_acked", gained)
-		if gained <= 0 {
-			return false, fmt.Sprintf("no write was acknowledged for %s", hold), nil
+		var gap time.Duration
+		if st.Gap != "" {
+			gap = st.DurationOr("gap", 10*time.Second)
 		}
-		return true, fmt.Sprintf("%d lines acknowledged in %s (longest pause %s)", gained, hold, fmtMs(maxFlat.Milliseconds())), nil
+		return judgeWrites(gained, maxFlat, hold, gap)
 
 	case "expect_delivery_continues":
 		// Lines sent in the window must keep arriving: the count of lines

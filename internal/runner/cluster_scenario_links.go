@@ -522,3 +522,39 @@ func watchDelivery(ctx context.Context, start time.Time, hold, gap, poll time.Du
 		}
 	}
 }
+
+// watchWrites polls read every poll until hold has passed. read returns the
+// client's progress, and false when it could not be read. It returns how many
+// lines the client got confirmed since first, and the longest stretch without
+// a new confirmation. A read that fails shows no progress, so it counts as part
+// of a stretch: a confirmation the step cannot see does not keep a gap open.
+func watchWrites(ctx context.Context, first genProgress, hold, poll time.Duration, read func() (genProgress, bool)) (gained int64, longest time.Duration, err error) {
+	lastChange := time.Now()
+	prev := first
+	end := lastChange.Add(hold)
+	for time.Now().Before(end) {
+		if err := sleepCtx(ctx, poll); err != nil {
+			return prev.Acked - first.Acked, longest, err
+		}
+		if p, ok := read(); ok && p.Acked != prev.Acked {
+			lastChange = time.Now()
+			prev = p
+		} else if f := time.Since(lastChange); f > longest {
+			longest = f
+		}
+	}
+	return prev.Acked - first.Acked, longest, nil
+}
+
+// judgeWrites judges an expect_writes_continue window. With a gap, the client
+// must have got a confirmation at least once every gap, not one somewhere in
+// the window. A zero gap judges only that some write was confirmed.
+func judgeWrites(gained int64, longest, hold, gap time.Duration) (bool, string, error) {
+	if gap > 0 && longest > gap {
+		return false, fmt.Sprintf("writes paused for %s, more than the gap of %s (%d lines acknowledged in %s)", fmtMs(longest.Milliseconds()), gap, gained, hold), nil
+	}
+	if gained <= 0 {
+		return false, fmt.Sprintf("no write was acknowledged for %s", hold), nil
+	}
+	return true, fmt.Sprintf("%d lines acknowledged in %s (longest pause %s)", gained, hold, fmtMs(longest.Milliseconds())), nil
+}
