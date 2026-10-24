@@ -198,6 +198,11 @@ type scenarioRun struct {
 
 	probe *clusterProbe
 
+	// links holds the link faults the steps have put in force, and filled
+	// the nodes whose disk a fill_disk step filled.
+	links  *linkFaults
+	filled map[int]bool
+
 	names        map[string]int
 	disconnected map[int]bool
 	// down holds the members a step took out of service on purpose (killed,
@@ -325,7 +330,7 @@ func (r *Runner) runClusterScenario(tc *config.TestCase, subject config.Subject)
 		containers: containers, active: map[int]bool{}, size: tc.Cluster.Nodes,
 		tmpDir: tmpDir, configSrc: srcCfg, recvPort: r.opts.ReceiverHostPort,
 		names: map[string]int{}, disconnected: map[int]bool{}, down: map[int]bool{}, measures: map[string]float64{},
-		counts: map[string]int64{}, imageID: imageID, imageLabels: imageLabels,
+		counts: map[string]int64{}, imageID: imageID, imageLabels: imageLabels, filled: map[int]bool{},
 	}
 	for i := 1; i <= tc.Cluster.Nodes; i++ {
 		sr.active[i] = true
@@ -339,6 +344,14 @@ func (r *Runner) runClusterScenario(tc *config.TestCase, subject config.Subject)
 	sr.upAt = time.Now()
 	sr.lastDisruption = sr.upAt
 	sr.network = containerNetwork(containers[0])
+	sr.links = newLinkFaults(r.opts.NettoolImage, sr.network)
+	// Whatever happens, no link fault or full disk outlives the run: with
+	// --no-cleanup the containers stay, and so would their rules.
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		sr.restoreAtEnd(ctx)
+	}()
 
 	sr.probe = newClusterProbe(containers, sc.ProbeIntervalOrDefault())
 	sr.probe.start(r.ctx)
@@ -352,6 +365,7 @@ func (r *Runner) runClusterScenario(tc *config.TestCase, subject config.Subject)
 			return results.RunResult{}, err
 		}
 	}
+	sr.restoreAtEnd(r.ctx)
 	if sr.loadStarted.IsZero() {
 		sr.notes = append(sr.notes, "no step started the load, so it ran from the end of the steps")
 		if err := sr.startLoad(); err != nil {
@@ -494,6 +508,23 @@ func describeStepArgs(st config.ScenarioStep) string {
 	add("logs", strings.Join(st.Logs, " | "))
 	add("since", st.Since)
 	add("sent_before", st.SentBefore)
+	add("peers", strings.Join(st.PeerList(), ","))
+	add("loss", st.Loss)
+	add("jitter", st.Jitter)
+	add("leave", st.Leave)
+	if st.OneWay {
+		add("one_way", "true")
+	}
+	if st.EmptyDisk {
+		add("empty_disk", "true")
+	}
+	if len(st.Groups) > 0 {
+		parts := make([]string, len(st.Groups))
+		for i, g := range st.Groups {
+			parts[i] = strings.Join(g, ",")
+		}
+		add("groups", strings.Join(parts, " | "))
+	}
 	if st.Nodes > 0 {
 		add("nodes", strconv.Itoa(st.Nodes))
 	}
@@ -545,6 +576,12 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 	case "kill", "stop", "start", "restart", "pause", "unpause", "disconnect", "connect":
 		return sr.nodeAction(i, st, rep)
 
+	case "cut_link", "shape_link", "restore_link", "split":
+		return sr.linkAction(i, st, rep)
+
+	case "fill_disk", "free_disk":
+		return sr.diskAction(i, st, rep)
+
 	case "wait_leader":
 		within := st.DurationOr("within", 90*time.Second)
 		since := sr.lastDisruption
@@ -556,20 +593,52 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 			}
 			exclude = n
 		}
+		// With groups, a leader agreed within one group is enough: the sides of
+		// a split cannot vote for each other.
+		var groups [][]int
+		for _, g := range st.Groups {
+			var ns []int
+			for _, sel := range g {
+				n, err := sr.resolveNode(sel)
+				if err != nil {
+					return false, err.Error(), nil
+				}
+				ns = append(ns, n)
+			}
+			groups = append(groups, ns)
+		}
+		leaderOf := func(r healthRound) (int, []int, bool) {
+			if len(groups) == 0 {
+				l, ok := agreedLeader(r)
+				return l, nil, ok
+			}
+			for _, g := range groups {
+				if l, ok := agreedLeaderAmong(r, g); ok {
+					return l, g, true
+				}
+			}
+			return 0, nil, false
+		}
 		round, ok, err := sr.waitRound(within, func(r healthRound) bool {
-			l, ok := agreedLeader(r)
+			l, _, ok := leaderOf(r)
 			return ok && l != exclude && !sr.disconnected[l]
 		})
 		if err != nil {
 			return false, "", err
 		}
 		if !ok {
+			if len(groups) > 0 {
+				return false, fmt.Sprintf("no group %s agreed on a leader within %s: %s", describeSides(groups), within, describeRound(round)), nil
+			}
 			return false, fmt.Sprintf("no agreed leader within %s: %s", within, describeRound(round)), nil
 		}
 		ms := round.At.Sub(since).Milliseconds()
-		leader, _ := agreedLeader(round)
+		leader, side, _ := leaderOf(round)
 		sr.record(st.Record, float64(ms))
 		detail := fmt.Sprintf("node %d leads, first seen %s after the disruption", leader, fmtMs(ms))
+		if side != nil {
+			detail = fmt.Sprintf("node %d leads the side %v, first seen %s after the disruption", leader, side, fmtMs(ms))
+		}
 		if at, found := firstLogLineSince(sr.containers[leader-1], "became leader on", since); found {
 			logMs := at.Sub(since).Milliseconds()
 			sr.record(st.Record+"_log", float64(logMs))
@@ -969,6 +1038,7 @@ func (sr *scenarioRun) nodeAction(i int, st config.ScenarioStep, rep *scenarioSt
 		if err := dockerCmd(sr.ctx, grace+60*time.Second, "restart", "-t", graceSecs, c); err != nil {
 			return false, fmt.Sprintf("docker restart %s: %v", c, err), nil
 		}
+		sr.relink(n)
 		return true, fmt.Sprintf("restarted node %d in %s", n, fmtMs(time.Since(start).Milliseconds())), nil
 	case "start":
 		argsFile := orchestrator.NodeArgsPath(sr.tmpDir, n)
@@ -979,11 +1049,20 @@ func (sr *scenarioRun) nodeAction(i int, st config.ScenarioStep, rep *scenarioSt
 		}
 		sr.disrupt(i, "start", n)
 		delete(sr.down, n)
-		if err := dockerCmd(sr.ctx, 60*time.Second, "start", c); err != nil {
+		if st.EmptyDisk {
+			// A new container from the same service starts on an empty disk, as
+			// a node whose disk was replaced does.
+			_ = dockerCmd(sr.ctx, 60*time.Second, "rm", "-f", c)
+			if err := sr.orch.RestartServices(fmt.Sprintf("subject-%d", n)); err != nil {
+				_ = os.Remove(argsFile)
+				return false, fmt.Sprintf("starting a new container for node %d: %v", n, err), nil
+			}
+		} else if err := dockerCmd(sr.ctx, 60*time.Second, "start", c); err != nil {
 			_ = os.Remove(argsFile)
 			return false, fmt.Sprintf("docker start %s: %v", c, err), nil
 		}
 		sr.active[n] = true
+		sr.relink(n)
 		if st.Recover != "" {
 			// The wrapper reads the file when the container starts. Remove it
 			// once the node said it took it, so the next start is a plain one.
@@ -1002,6 +1081,9 @@ func (sr *scenarioRun) nodeAction(i int, st config.ScenarioStep, rep *scenarioSt
 				return false, fmt.Sprintf("node %d did not report starting with -recover=%s", n, st.Recover), nil
 			}
 			return true, fmt.Sprintf("started node %d once with -recover=%s", n, st.Recover), nil
+		}
+		if st.EmptyDisk {
+			return true, fmt.Sprintf("started node %d on an empty disk", n), nil
 		}
 		return true, fmt.Sprintf("started node %d", n), nil
 	case "pause", "unpause":
@@ -1032,6 +1114,8 @@ func (sr *scenarioRun) nodeAction(i int, st config.ScenarioStep, rep *scenarioSt
 			return false, fmt.Sprintf("docker network connect %s %s: %v", sr.network, c, err), nil
 		}
 		delete(sr.disconnected, n)
+		// The node has a new interface, and maybe a new address.
+		sr.relink(n)
 		return true, fmt.Sprintf("put node %d back on the network", n), nil
 	}
 	return false, "unknown node action", nil
@@ -1266,6 +1350,9 @@ func (sr *scenarioRun) scaleTo(i int, st config.ScenarioStep) (bool, string, err
 		if err := sr.orch.RestartServices(services...); err != nil {
 			return false, fmt.Sprintf("starting %v: %v", services, err), nil
 		}
+		for _, n := range started {
+			sr.relink(n)
+		}
 	} else {
 		for n := target + 1; n <= sr.size; n++ {
 			if err := dockerCmd(sr.ctx, 60*time.Second, "stop", "-t", "30", sr.containers[n-1]); err != nil {
@@ -1305,6 +1392,7 @@ func (sr *scenarioRun) rollingRestart(i int, st config.ScenarioStep) (bool, stri
 		if err := dockerCmd(sr.ctx, grace+60*time.Second, "restart", "-t", strconv.Itoa(int(grace.Seconds())), sr.containers[n-1]); err != nil {
 			return false, fmt.Sprintf("restarting node %d: %v", n, err), nil
 		}
+		sr.relink(n)
 		round, ok, err := sr.waitRound(within, func(r healthRound) bool { return sr.healthy(r) })
 		if err != nil {
 			return false, "", err
@@ -1354,6 +1442,9 @@ type scenarioReport struct {
 	// Counts holds the numbers of lines that steps counted beside their
 	// times, such as <record>_lines_acked. They are lines, not milliseconds.
 	Counts map[string]int64 `json:"counts,omitempty"`
+	// Rows compares a database's rows with the rows that arrived
+	// (cluster.scenario.rows).
+	Rows *rowsCheck `json:"rows,omitempty"`
 	// Pending holds the count_pending steps' counts: the lines sent before a
 	// mark that were still on their way when the step ran.
 	Pending    []pendingCount       `json:"pending,omitempty"`
@@ -1400,6 +1491,10 @@ func (rep scenarioReport) summary() map[string]any {
 	}
 	for k, v := range rep.Counts {
 		out["count_"+k] = v
+	}
+	if rep.Rows != nil && rep.Rows.Error == "" {
+		out["rows_written"] = rep.Rows.Written
+		out["rows_missing"] = rep.Rows.Missing
 	}
 	for _, p := range rep.Pending {
 		// A count that could not be finished is left out, not reported as 0.
@@ -1621,6 +1716,21 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 		v.reasons = append(v.reasons, fmt.Sprintf("two nodes named themselves the leader for %s (max_split_brain_ms %d)",
 			fmtMs(rep.Leadership.SplitBrainMs), *ex.MaxSplitBrainMs))
 	}
+	if rows := rep.Rows; rows != nil {
+		judge := ex.MaxMissingRows != nil
+		switch {
+		case rows.Error != "" && judge:
+			// An unknown count is not zero.
+			v.reasons = append(v.reasons, "the database rows could not be compared with what arrived: "+rows.Error)
+		case rows.Error != "":
+			sr.notes = append(sr.notes, "the database rows could not be compared with what arrived: "+rows.Error)
+		case judge && rows.Written == 0:
+			v.reasons = append(v.reasons, "the rows query returned no rows, so nothing was compared")
+		case judge && rows.Missing > *ex.MaxMissingRows:
+			v.reasons = append(v.reasons, fmt.Sprintf("%d of %d database rows never arrived (max_missing_rows %d); the first: %s",
+				rows.Missing, rows.Written, *ex.MaxMissingRows, strings.Join(rows.MissingKeys, ", ")))
+		}
+	}
 	rep.Failures = v.reasons
 	rep.Notes = sr.notes
 	v.passed = len(v.reasons) == 0
@@ -1632,6 +1742,10 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 // own counts (and its hash-based duplicate check, when the case turns it on)
 // are reported as they are.
 func (sr *scenarioRun) finishWithoutLoad(rep scenarioReport) (scenarioReport, scenarioVerdict, error) {
+	if sr.sc.Rows != nil {
+		rows := sr.checkRows()
+		rep.Rows = &rows
+	}
 	if m, err := sr.r.queryReceiverMetrics(sr.recvPort, 10*time.Second); err == nil {
 		rep.Received = m.LinesReceived
 		rep.Unique = m.UniqueLines

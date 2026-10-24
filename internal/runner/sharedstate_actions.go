@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -1384,4 +1385,138 @@ func logOnceProblems(lines []ssLine, want string) []string {
 		}
 	}
 	return problems
+}
+
+// moveAcrossCutLink cuts the link between the replica that runs move_device,
+// which does not lead, and another replica that does not lead. Both keep the
+// store and the leader. Then it renders the config's third stage, in which
+// {{@.MoveTarget@}} is the second replica's member name: the case allows the
+// device only there, so the leader moves it across the cut link at once. The
+// device must start on the second replica. The run's ownership check fails it
+// if the device ever runs on both. The link stays cut for hold_seconds after
+// the move, and is then restored.
+func (run *ssRun) moveAcrossCutLink() {
+	d := run.ss.MoveDevice
+	run.refreshAll()
+	now := current()
+	leaders := run.leaders(now)
+	if len(leaders) != 1 {
+		run.fail("the move needs one leader, and %d replicas lead (%s)", len(leaders), run.names(leaders))
+		return
+	}
+	leader := leaders[0]
+	owners := run.owners(d, now)
+	if len(owners) != 1 {
+		run.fail("device %d runs on %d replicas (%s); the move needs one owner", d, len(owners), run.names(owners))
+		return
+	}
+	from := owners[0]
+	if from == leader {
+		run.fail("device %d runs on the leader %s; the move needs an owner that does not lead", d, run.replica(from).Service)
+		return
+	}
+	to := 0
+	for _, rep := range run.replicas {
+		if run.running[rep.N] && rep.N != from && rep.N != leader {
+			to = rep.N
+			break
+		}
+	}
+	if to == 0 {
+		run.fail("no third replica runs, to move device %d to", d)
+		return
+	}
+	frep, trep := run.replica(from), run.replica(to)
+	member := run.memberOf(to)
+	if member == "" {
+		run.fail("%s has not logged its member name, so the config cannot name it", trep.Service)
+		return
+	}
+
+	links := newLinkFaults(run.r.opts.NettoolImage, containerNetwork(frep.Container))
+	restored := false
+	restore := func() {
+		if restored {
+			return
+		}
+		restored = true
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if err := links.restoreAll(ctx); err != nil {
+			run.fail("restoring the link between %s and %s: %v", frep.Service, trep.Service, err)
+		}
+	}
+	defer restore()
+
+	fmt.Printf("  cutting the link between %s (runs device %d) and %s; both keep the store and the leader %s…\n",
+		frep.Service, d, trep.Service, run.replica(leader).Service)
+	cut := map[linkKey]linkFault{
+		{frep.Container, trep.Container}: {Cut: true},
+		{trep.Container, frep.Container}: {Cut: true},
+	}
+	if err := links.set(run.r.ctx, cut); err != nil {
+		run.fail("cutting the link between %s and %s: %v", frep.Service, trep.Service, err)
+		return
+	}
+	cutAt := time.Now()
+	if sleepCtx(run.r.ctx, time.Duration(run.ss.CutHoldOrDefault())*time.Second) != nil {
+		return
+	}
+
+	skew := run.daemonSkew()
+	issued := time.Now()
+	if err := run.orch.RenderReplicaConfigsMoving(3, member); err != nil {
+		run.fail("rendering the config's third stage: %v", err)
+		return
+	}
+	fmt.Printf("  rendered the third stage: device %d may run only on %s (%s)\n", d, trep.Service, member)
+
+	since := issued.Add(skew)
+	deadline := earliest(time.Now().Add(time.Duration(run.ss.SettleOrDefault())*time.Second), run.deadline)
+	var tookAt time.Time
+	for tookAt.IsZero() && time.Now().Before(deadline) {
+		_ = run.book.refresh(trep.Container)
+		for _, e := range run.events(trep.Container) {
+			if e.Kind == ssLeaseAcquired && e.Device == d && e.At.After(since) {
+				tookAt = e.At
+				break
+			}
+		}
+		if tookAt.IsZero() && sleepCtx(run.r.ctx, 200*time.Millisecond) != nil {
+			return
+		}
+	}
+	if tookAt.IsZero() {
+		run.fail("device %d did not start on %s within %ds of the third stage", d, trep.Service, run.ss.SettleOrDefault())
+		return
+	}
+	moved := tookAt.Sub(since)
+	fmt.Printf("    %s took device %d %.2fs after the third stage; the link stays cut for %ds more\n",
+		trep.Service, d, moved.Seconds(), run.ss.HoldOrDefault())
+	run.measures["move_across_cut_link"] = map[string]any{
+		"device": d, "from": frep.Service, "to": trep.Service, "leader": run.replica(leader).Service,
+		"cut_before_move_seconds": issued.Sub(cutAt).Seconds(), "moved_seconds": moved.Seconds(),
+	}
+
+	// An old owner that does not let go shows it while the link is still cut.
+	if sleepCtx(run.r.ctx, time.Duration(run.ss.HoldOrDefault())*time.Second) != nil {
+		return
+	}
+	restore()
+	run.checkSettled("after the move", earliest(time.Now().Add(time.Duration(run.ss.SettleOrDefault())*time.Second), run.deadline))
+	run.checkHealthAll("after")
+}
+
+// memberOf returns the member name replica n's director last logged: the
+// name the leader places devices on.
+func (run *ssRun) memberOf(n int) string {
+	rep := run.replica(n)
+	_ = run.book.refresh(rep.Container)
+	member := ""
+	for _, e := range run.events(rep.Container) {
+		if (e.Kind == ssManagerShared || e.Kind == ssBusStarted) && e.Member != "" {
+			member = e.Member
+		}
+	}
+	return member
 }

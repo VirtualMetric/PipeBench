@@ -154,6 +154,24 @@ func streamSelfClaims(r healthRound) map[string][]int {
 	return out
 }
 
+// agreedLeaderAmong is agreedLeader within a set of nodes: a node of the set
+// that names itself the leader and that more than half of the set's reachable
+// nodes name too. A split's side uses it, because the other side cannot vote
+// there.
+func agreedLeaderAmong(r healthRound, nodes []int) (int, bool) {
+	in := map[int]bool{}
+	for _, n := range nodes {
+		in[n] = true
+	}
+	side := healthRound{At: r.At}
+	for _, h := range r.Nodes {
+		if in[h.Node] {
+			side.Nodes = append(side.Nodes, h)
+		}
+	}
+	return agreedLeader(side)
+}
+
 // splitInterval is a stretch of rounds in which two or more nodes named
 // themselves the leader.
 type splitInterval struct {

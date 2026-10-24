@@ -310,3 +310,40 @@ func TestLimitHelperServicesAppliesEachLimitAlone(t *testing.T) {
 		t.Errorf("no limits must leave the file as it was, got:\n%s", out)
 	}
 }
+
+// TestClusterScenarioComposeNodeDiskAndKeys covers node_disk, a tmpfs on the
+// chosen nodes only, and rows, which has the receiver note each line's key.
+func TestClusterScenarioComposeNodeDiskAndKeys(t *testing.T) {
+	steps := []config.ScenarioStep{{Do: "wait_ready"}}
+	src := "director:\n  id: {{@.NodeID@}}\n"
+	tc := scenarioCase(&config.ScenarioConfig{
+		Steps:    steps,
+		NodeDisk: &config.ScenarioNodeDisk{Path: "/opt/vmetric/storage", Size: "1g", Nodes: []int{3}},
+		Rows:     &config.ScenarioRows{Query: "SELECT message FROM events", Key: "evt-[0-9]+"},
+	})
+	doc, _, _ := renderScenario(t, tc, src)
+
+	tmpfsOn := func(name string) map[string]any {
+		vols, _ := service(t, doc, name)["volumes"].([]any)
+		for _, v := range vols {
+			if m, ok := v.(map[string]any); ok && m["type"] == "tmpfs" {
+				return m
+			}
+		}
+		return nil
+	}
+	if m := tmpfsOn("subject-1"); m != nil {
+		t.Fatalf("subject-1 got a disk of its own: %v", m)
+	}
+	m := tmpfsOn("subject-3")
+	if m == nil {
+		t.Fatalf("subject-3 has no tmpfs: %v", service(t, doc, "subject-3")["volumes"])
+	}
+	opts, _ := m["tmpfs"].(map[string]any)
+	if m["target"] != "/opt/vmetric/storage" || opts["size"] != 1<<30 {
+		t.Fatalf("subject-3's disk = %v, want 1g at /opt/vmetric/storage", m)
+	}
+	if env, _ := service(t, doc, "receiver")["environment"].(map[string]any); env["RECEIVER_TRACK_KEYS"] != "evt-[0-9]+" {
+		t.Fatalf("the receiver must note each line's key: %v", env)
+	}
+}

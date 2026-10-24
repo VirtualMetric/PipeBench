@@ -558,6 +558,14 @@ func main() {
 	if cfg.TrackSeq {
 		seqTrack = newSeqTracker()
 	}
+	if expr := os.Getenv("RECEIVER_TRACK_KEYS"); expr != "" {
+		kt, err := newKeyTracker(expr)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "receiver:", err)
+			os.Exit(2)
+		}
+		keyTrack = kt
+	}
 
 	// Start metrics HTTP server on a separate port
 	go serveMetrics(cfg.MetricsPort, cnt, val, cfg)
@@ -786,11 +794,15 @@ func receiveFile(cfg config, cnt *counters, val *validator) error {
 }
 
 // trackSeq hands one received line to the sequence tracker, when
-// RECEIVER_TRACK_SEQ is on. Every input that counts lines calls it, so a
-// tracked line counts as arrived whichever way it came in.
+// RECEIVER_TRACK_SEQ is on, and to the key tracker, when RECEIVER_TRACK_KEYS
+// is set. Every input that counts lines calls it, so a tracked line counts as
+// arrived whichever way it came in.
 func trackSeq(line []byte) {
 	if seqTrack != nil {
 		seqTrack.record(line, time.Now().UnixNano())
+	}
+	if keyTrack != nil {
+		keyTrack.record(line)
 	}
 }
 
@@ -1068,6 +1080,9 @@ func serveMetrics(port string, cnt *counters, val *validator, cfg config) {
 	})
 	if seqTrack != nil {
 		registerSeqHandlers(mux, seqTrack)
+	}
+	if keyTrack != nil {
+		registerKeyHandler(mux, keyTrack)
 	}
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {

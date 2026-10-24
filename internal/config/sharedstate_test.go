@@ -244,3 +244,38 @@ func TestOutageStreamsNeedAnOutageToJudge(t *testing.T) {
 		}
 	}
 }
+
+func TestMoveAcrossCutLinkValidation(t *testing.T) {
+	valid := func() *TestCase {
+		tc := sharedStateCase()
+		tc.SharedState.Action = SharedStateActionMoveAcrossCutLink
+		tc.SharedState.MoveDevice = 12
+		return tc
+	}
+	if err := valid().Validate(); err != nil {
+		t.Fatalf("a valid case was refused: %v", err)
+	}
+	cases := map[string]struct {
+		edit func(tc *TestCase)
+		want string
+	}{
+		"two replicas":      {func(tc *TestCase) { tc.SharedState.Replicas = 2 }, "needs three replicas"},
+		"no device":         {func(tc *TestCase) { tc.SharedState.MoveDevice = 0 }, "needs shared_state.move_device"},
+		"device not placed": {func(tc *TestCase) { tc.SharedState.MoveDevice = 99 }, "one of placed_devices"},
+		"device, no move":   {func(tc *TestCase) { tc.SharedState.Action = SharedStateActionKillLeader }, "only used by the move_across_cut_link"},
+		"negative cut hold": {func(tc *TestCase) { tc.SharedState.CutHoldSeconds = -1 }, "cut_hold_seconds"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			tc := valid()
+			c.edit(tc)
+			err := tc.Validate()
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("Validate = %v, want an error about %q", err, c.want)
+			}
+		})
+	}
+	if got := (&SharedStateConfig{}).CutHoldOrDefault(); got != 10 {
+		t.Fatalf("CutHoldOrDefault = %d, want 10", got)
+	}
+}

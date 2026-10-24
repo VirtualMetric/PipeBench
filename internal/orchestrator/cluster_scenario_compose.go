@@ -68,6 +68,11 @@ func applyClusterScenarioTopology(vars *composeVars, cfg RunConfig) error {
 	// sequence tracking (/seqcheck). Without it the loss of the run is
 	// unknown, so it is on for every receiver of a scenario case.
 	trackSeq := map[string]string{"RECEIVER_TRACK_SEQ": "true"}
+	// A case that compares a database's rows with what arrived has the
+	// receiver note the key of every line it gets (cluster.scenario.rows).
+	if sc.Rows != nil {
+		trackSeq["RECEIVER_TRACK_KEYS"] = sc.Rows.Key
+	}
 	vars.RecvEnv = mergeEnv(vars.RecvEnv, trackSeq)
 	for i := range vars.Receivers {
 		vars.Receivers[i].Env = mergeEnv(vars.Receivers[i].Env, trackSeq)
