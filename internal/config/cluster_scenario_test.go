@@ -177,3 +177,89 @@ func TestEmptyLogsListDecodesAsPresent(t *testing.T) {
 		t.Fatalf("a step without logs decoded with a logs list")
 	}
 }
+
+// twoReceiverScenarioCase is a valid scenario case with two receivers, the
+// second of which a step pauses and unpauses.
+func twoReceiverScenarioCase() *TestCase {
+	tc := validScenarioCase()
+	tc.Receiver = ReceiverConfig{}
+	tc.Receivers = []ReceiverConfig{
+		{ID: "a", Mode: "tcp", Listen: ":9001"},
+		{ID: "b", Mode: "tcp", Listen: ":9001"},
+	}
+	tc.Cluster.Scenario.Steps = append(tc.Cluster.Scenario.Steps,
+		ScenarioStep{Do: "receiver_pause", Receiver: "b"},
+		ScenarioStep{Do: "sleep", For: "20s"},
+		ScenarioStep{Do: "receiver_unpause", Receiver: "b"},
+	)
+	return tc
+}
+
+func TestValidateClusterScenarioAcceptsTwoReceivers(t *testing.T) {
+	if err := twoReceiverScenarioCase().Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+}
+
+func TestValidateClusterScenarioReceiverSteps(t *testing.T) {
+	last := func(tc *TestCase) *ScenarioStep {
+		return &tc.Cluster.Scenario.Steps[len(tc.Cluster.Scenario.Steps)-1]
+	}
+	cases := map[string]struct {
+		build func() *TestCase
+		edit  func(tc *TestCase)
+		want  string
+	}{
+		"a pause without a receiver": {twoReceiverScenarioCase, func(tc *TestCase) {
+			tc.Cluster.Scenario.Steps[len(tc.Cluster.Scenario.Steps)-3].Receiver = ""
+		}, "needs receiver"},
+		"an unpause naming no receiver of the case": {twoReceiverScenarioCase, func(tc *TestCase) { last(tc).Receiver = "c" }, `receiver "c" is not one of the case's receivers`},
+		"a receiver named with one receiver": {validScenarioCase, func(tc *TestCase) {
+			tc.Cluster.Scenario.Steps = append(tc.Cluster.Scenario.Steps, ScenarioStep{Do: "receiver_pause", Receiver: "a"})
+		}, "the case has one receiver"},
+		"a receiver on another action": {twoReceiverScenarioCase, func(tc *TestCase) {
+			tc.Cluster.Scenario.Steps[6].Receiver = "a"
+		}, "receiver only applies to receiver_pause, receiver_unpause"},
+		"several receivers without the load": {twoReceiverScenarioCase, func(tc *TestCase) { tc.Generator = GeneratorConfig{} }, "needs the http_ack generator"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			tc := c.build()
+			c.edit(tc)
+			err := tc.Validate()
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("Validate() = %v, want an error containing %q", err, c.want)
+			}
+		})
+	}
+}
+
+// A case with one receiver pauses it without naming it, as before.
+func TestValidateClusterScenarioPausesItsOneReceiver(t *testing.T) {
+	tc := validScenarioCase()
+	tc.Cluster.Scenario.Steps = append(tc.Cluster.Scenario.Steps,
+		ScenarioStep{Do: "receiver_pause"}, ScenarioStep{Do: "receiver_unpause"})
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+}
+
+func TestValidateClusterScenarioExpectNoLogOnEveryNode(t *testing.T) {
+	tc := validScenarioCase()
+	tc.Cluster.Scenario.Steps[9].Node = "all"
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("Validate with node all: %v", err)
+	}
+	// Only expect_no_log reads every node this way: a kill still needs one.
+	tc = validScenarioCase()
+	tc.Cluster.Scenario.Steps[2].Node = "all"
+	if err := tc.Validate(); err == nil || !strings.Contains(err.Error(), "node must be") {
+		t.Fatalf("Validate() of a kill on all = %v, want a node error", err)
+	}
+	// And expect_no_log still needs a node.
+	tc = validScenarioCase()
+	tc.Cluster.Scenario.Steps[9].Node = ""
+	if err := tc.Validate(); err == nil || !strings.Contains(err.Error(), "needs node") {
+		t.Fatalf("Validate() of expect_no_log without a node = %v, want needs node", err)
+	}
+}

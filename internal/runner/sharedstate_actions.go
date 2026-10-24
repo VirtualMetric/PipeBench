@@ -295,6 +295,32 @@ func (run *ssRun) isolateReplica() {
 	run.judgeOutageStreams(base, during, back)
 
 	run.recoverAfterOutage(cut, back, rep.Container)
+	takeovers, _ := run.measures["outage_takeover_seconds"].(map[string]float64)
+	for _, p := range isolateTakeoverProblems(owned, takeovers, back.Sub(cut), run.ss.MaxFailoverSeconds) {
+		run.fail("%s", p)
+	}
+}
+
+// isolateTakeoverProblems judges how soon another replica ran each device the
+// cut-off replica ran, counted from the cut, against max_failover_seconds. A
+// device that no other replica ran during the cut was too slow when the cut
+// lasted longer than the limit. With a shorter cut it is not judged: it may
+// have run again on the replica that came back.
+func isolateTakeoverProblems(owned []int64, takeovers map[string]float64, cut time.Duration, limit float64) []string {
+	if limit <= 0 {
+		return nil
+	}
+	var problems []string
+	for _, d := range owned {
+		secs, ok := takeovers[strconv.FormatInt(d, 10)]
+		switch {
+		case ok && secs > limit:
+			problems = append(problems, fmt.Sprintf("device %d of the cut-off replica ran on another replica %.1fs after the cut, above max_failover_seconds %.0f", d, secs, limit))
+		case !ok && cut.Seconds() > limit:
+			problems = append(problems, fmt.Sprintf("device %d of the cut-off replica did not run on another replica within max_failover_seconds %.0f of the cut, which lasted %.0fs", d, limit, cut.Seconds()))
+		}
+	}
+	return problems
 }
 
 // recoverAfterOutage measures the outage's effect from the logs, and waits for
@@ -1029,7 +1055,7 @@ func (run *ssRun) checkStateWrites(calls []ssStoreCall, from, to time.Time, judg
 	}
 	want := time.Duration(n) * time.Second
 	tol := run.ss.StateWriteToleranceOrDefault()
-	problems, judged := judgeWriteGaps(ts, forced, want, tol)
+	problems, judged := judgeWriteGaps(ts, want, tol)
 	for _, p := range problems {
 		run.fail("%s", p)
 	}
@@ -1039,22 +1065,23 @@ func (run *ssRun) checkStateWrites(calls []ssStoreCall, from, to time.Time, judg
 	}
 }
 
-// judgeWriteGaps judges each gap that ends at a write the interval made, and
-// returns what is wrong and how many gaps it judged. A write that a snapshot
-// asked for comes early on purpose, and the interval counts on from it.
-func judgeWriteGaps(ts []time.Time, forced []bool, want, tol time.Duration) ([]string, int) {
+// judgeWriteGaps judges the gap before each round of state writes, and
+// returns what is wrong and how many gaps it judged. A round is the writes
+// that came within a second of each other, or within a tenth of the interval
+// when that is shorter: a snapshot round writes a segment for each stream it
+// takes a snapshot of, a few milliseconds apart. A write that comes with a
+// snapshot counts as an interval write. A bus takes its snapshots with its
+// interval writes, so a snapshot that comes between two of them adds a store
+// call of its own, and its gap is judged like any other.
+func judgeWriteGaps(ts []time.Time, want, tol time.Duration) ([]string, int) {
+	rounds := writeRounds(ts, min(time.Second, want/10))
 	var problems []string
-	judged := 0
-	for i := 1; i < len(ts); i++ {
-		if forced[i] {
-			continue
-		}
-		judged++
-		if g := ts[i].Sub(ts[i-1]); g < want-tol || g > want+tol {
-			problems = append(problems, fmt.Sprintf("state write %d came %s after the one before it; the write interval is %s, give or take %s", i+1, g.Round(100*time.Millisecond), want, tol))
+	for i := 1; i < len(rounds); i++ {
+		if g := rounds[i].Sub(rounds[i-1]); g < want-tol || g > want+tol {
+			problems = append(problems, fmt.Sprintf("state write round %d came %s after the one before it; the write interval is %s, give or take %s", i+1, g.Round(100*time.Millisecond), want, tol))
 		}
 	}
-	return problems, judged
+	return problems, max(len(rounds)-1, 0)
 }
 
 // snapshotWrites returns when the store accepted a stream's snapshot or its
