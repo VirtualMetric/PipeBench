@@ -82,7 +82,7 @@ func TestLiveStoreMembersRenewedEveryTwoSeconds(t *testing.T) {
 	log.WriteString(azuriteLine(t0.Add(durSecs(19.6)), "PUT", "/devstoreaccount1/bench-in/shared%2Fmembers%2Fnot-a-member", 201))
 	calls := parseAzuriteCalls(slices.SortedFunc(slices.Values(parseDockerLogLines(log.String())), func(a, b ssLine) int { return a.At.Compare(b.At) }))
 
-	if got := memberRecordWindow(memberRecords(calls, "director-state")); got != 6*time.Second {
+	if got := memberRecordWindow(memberRecords(calls, "director-state"), storeSilences(calls, "director-state")); got != 6*time.Second {
 		t.Errorf("window = %v, want 6s for records renewed every 2 seconds", got)
 	}
 	got := liveStoreMembers(calls, "director-state")
@@ -108,7 +108,7 @@ func TestLiveStoreMembersWrittenEveryThirtySeconds(t *testing.T) {
 
 	t.Run("before any record is written twice", func(t *testing.T) {
 		calls := inOrder(recordWrites(t0, "subject-1-195f", 0.0), recordWrites(t0, "subject-2-af09", 0.1), recordWrites(t0, "subject-3-ef0e", 0.2), leaseReads(t0, 0, 20))
-		if got := memberRecordWindow(memberRecords(calls, "director-state")); got != 45*time.Second {
+		if got := memberRecordWindow(memberRecords(calls, "director-state"), storeSilences(calls, "director-state")); got != 45*time.Second {
 			t.Errorf("window = %v, want 45s: with no record written twice yet, the interval is taken as 30 seconds", got)
 		}
 		want := []string{"subject-1-195f", "subject-2-af09", "subject-3-ef0e"}
@@ -121,7 +121,7 @@ func TestLiveStoreMembersWrittenEveryThirtySeconds(t *testing.T) {
 		// A fourth replica starts 80 s in. At 90 s, the others last wrote
 		// their records 26 to 28 seconds ago.
 		calls := inOrder(slices.Concat(replicas...), recordWrites(t0, "subject-4-77aa", 80), leaseReads(t0, 0, 90))
-		window := memberRecordWindow(memberRecords(calls, "director-state"))
+		window := memberRecordWindow(memberRecords(calls, "director-state"), storeSilences(calls, "director-state"))
 		if window < 45*time.Second || window > 50*time.Second {
 			t.Errorf("window = %v, want about 1.5 times the 31 s between two writes", window)
 		}
@@ -150,6 +150,61 @@ func TestLiveStoreMembersWrittenEveryThirtySeconds(t *testing.T) {
 			t.Errorf("after a kill: live members = %v, want %v", got, want)
 		}
 	})
+}
+
+// A director writes its record a second time soon after it starts, once it
+// knows its route address. That first gap of a second is not the interval
+// the director writes at, and does not make the replicas look gone a few
+// seconds later.
+func TestLiveStoreMembersRecordWrittenAgainAtTheStart(t *testing.T) {
+	t0 := time.Date(2026, 10, 24, 15, 2, 7, 0, time.UTC)
+	calls := inOrder(
+		recordWrites(t0, "subject-1-0b3c", 0.0, 1.0),
+		recordWrites(t0, "subject-2-5e71", 0.1, 1.1),
+		recordWrites(t0, "subject-3-c2a8", 0.2, 1.2),
+		leaseReads(t0, 0, 20))
+	if got := memberRecordWindow(memberRecords(calls, "director-state"), storeSilences(calls, "director-state")); got != 45*time.Second {
+		t.Errorf("window = %v, want 45s: the second write right after the start does not count", got)
+	}
+	want := []string{"subject-1-0b3c", "subject-2-5e71", "subject-3-c2a8"}
+	if got := liveStoreMembers(calls, "director-state"); !reflect.DeepEqual(got, want) {
+		t.Errorf("20 s after the start: live members = %v, want %v", got, want)
+	}
+}
+
+// While the store is down, no replica can write its record, so the gap
+// across an outage is not the interval the replicas write at. Counted, it
+// would keep a replica that was killed during the outage live for minutes
+// after it.
+func TestLiveStoreMembersAfterAStoreOutage(t *testing.T) {
+	t0 := time.Date(2026, 10, 24, 15, 9, 41, 0, time.UTC)
+	// The store answers nothing from 20 s to 200 s. subject-1 and subject-2
+	// write their records again when it is back. subject-3 was killed during
+	// the outage: it last wrote its record at 1.2 s.
+	calls := inOrder(
+		recordWrites(t0, "subject-1-0b3c", 0.0, 1.0, 201.0),
+		recordWrites(t0, "subject-2-5e71", 0.1, 1.1, 201.1),
+		recordWrites(t0, "subject-3-c2a8", 0.2, 1.2),
+		leaseReads(t0, 0, 20),
+		leaseReads(t0, 200, 212))
+	silences := storeSilences(calls, "director-state")
+	if len(silences) != 1 || !silences[0].from.Equal(t0.Add(20*time.Second)) || !silences[0].to.Equal(t0.Add(200*time.Second)) {
+		t.Fatalf("silences = %v, want one from 20 s to 200 s", silences)
+	}
+	if got := memberRecordWindow(memberRecords(calls, "director-state"), silences); got != 45*time.Second {
+		t.Errorf("window = %v, want 45s: the gaps across the outage do not count", got)
+	}
+	want := []string{"subject-1-0b3c", "subject-2-5e71"}
+	if got := liveStoreMembers(calls, "director-state"); !reflect.DeepEqual(got, want) {
+		t.Errorf("12 s after the outage: live members = %v, want %v", got, want)
+	}
+
+	// A call the store answered with an error of its own does not show that
+	// it was up.
+	failing := inOrder(calls, []ssStoreCall{{At: t0.Add(durSecs(100)), Method: "GET", Path: storeLease, Status: 503}})
+	if got := storeSilences(failing, "director-state"); len(got) != 1 {
+		t.Errorf("with a 503 inside the outage: silences = %v, want one", got)
+	}
 }
 
 func TestJudgeStream(t *testing.T) {

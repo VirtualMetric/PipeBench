@@ -612,11 +612,22 @@ func (run *ssRun) waitStoreMembers(want int, d time.Duration) int {
 }
 
 // ssMemberRecordInterval is how often a replica writes its member record, used
-// until the store's log shows a record written twice. A newer director writes
-// a replica's record when it starts and then every 30 seconds: the replicas
-// check on each other over their own connections, not through the store.
-// An older director renews the record every 2 seconds.
+// until the store's log shows a gap that tells. A newer director writes a
+// replica's record when it starts, again as soon as it knows its route
+// address, and then every 30 seconds: the replicas check on each other over
+// their own connections, not through the store. An older director renews the
+// record every 2 seconds.
 const ssMemberRecordInterval = 30 * time.Second
+
+// ssStoreSilence is how long the state container can go without a call that
+// the store answered before the bench takes it for a store outage. Every
+// replica reads its lease every 2 seconds, so a store that is up answers a
+// call at least that often.
+const ssStoreSilence = 10 * time.Second
+
+// ssSilence is a stretch of the store's log in which the store answered no
+// call to the state container.
+type ssSilence struct{ from, to time.Time }
 
 // ssMemberRecord is what the store's log shows of one member record: when a
 // replica wrote it, and when it was last deleted.
@@ -636,7 +647,7 @@ func liveStoreMembers(calls []ssStoreCall, container string) []string {
 	}
 	last := calls[len(calls)-1].At
 	records := memberRecords(calls, container)
-	window := memberRecordWindow(records)
+	window := memberRecordWindow(records, storeSilences(calls, container))
 	var members []string
 	for member, r := range records {
 		if len(r.writes) == 0 {
@@ -696,11 +707,24 @@ func memberRecords(calls []ssStoreCall, container string) map[string]*ssMemberRe
 // seconds gets 6 seconds, as before. A director that writes it every
 // 30 seconds gets about 45 seconds. That is close to the 45 seconds such a
 // director itself trusts a record for: the record interval plus 15 seconds.
-func memberRecordWindow(records map[string]*ssMemberRecord) time.Duration {
+//
+// Two kinds of gap do not count. The first gap of each record does not: a
+// newer director writes its record again soon after it starts, once it knows
+// its route address, and a gap of a second would make the window a few
+// seconds long. A gap in which the store was silent does not count either:
+// the replicas could not write their records then, so such a gap says
+// nothing about how often they write them. Counted, the gaps of a long store
+// outage would make the window minutes long, and a replica killed during the
+// outage would still count as live after it.
+func memberRecordWindow(records map[string]*ssMemberRecord, silences []ssSilence) time.Duration {
 	var gaps []time.Duration
 	for _, r := range records {
-		for i := 1; i < len(r.writes); i++ {
-			gaps = append(gaps, r.writes[i].Sub(r.writes[i-1]))
+		for i := 2; i < len(r.writes); i++ {
+			from, to := r.writes[i-1], r.writes[i]
+			if silentBetween(silences, from, to) {
+				continue
+			}
+			gaps = append(gaps, to.Sub(from))
 		}
 	}
 	interval := ssMemberRecordInterval
@@ -709,6 +733,36 @@ func memberRecordWindow(records map[string]*ssMemberRecord) time.Duration {
 		interval = gaps[len(gaps)/2]
 	}
 	return max(interval*3/2, interval+4*time.Second)
+}
+
+// storeSilences returns the stretches in which the store answered no call to
+// the container for longer than ssStoreSilence: it was paused, unreachable or
+// failing. A call that the store answered with a status below 500 counts, so a
+// refused write or a missing record shows that the store was up.
+func storeSilences(calls []ssStoreCall, container string) []ssSilence {
+	var silences []ssSilence
+	var answered time.Time
+	for _, c := range calls {
+		if c.Status >= 500 || !c.inContainer(container) {
+			continue
+		}
+		if !answered.IsZero() && c.At.Sub(answered) > ssStoreSilence {
+			silences = append(silences, ssSilence{from: answered, to: c.At})
+		}
+		answered = c.At
+	}
+	return silences
+}
+
+// silentBetween reports whether the store was silent at some point between
+// from and to.
+func silentBetween(silences []ssSilence, from, to time.Time) bool {
+	for _, s := range silences {
+		if s.from.Before(to) && s.to.After(from) {
+			return true
+		}
+	}
+	return false
 }
 
 // coldRestart stops every replica at once, gracefully, and starts a new
