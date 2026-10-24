@@ -285,19 +285,28 @@ func (a *AzureConfig) ConnectionString() string {
 // the s3 generator/receiver modes and the s3_sink/s3_source capabilities
 // apply unchanged; only the endpoint and credentials differ from LocalStack.
 type MinioConfig struct {
-	// Image is the MinIO container image (default below). Pinned to a
-	// release tag, never :latest.
+	// Image is the MinIO container image (DefaultMinioImage when empty).
+	// Pin it by digest or by a release tag, never :latest.
 	Image string `yaml:"image"`
 	// Buckets are S3 buckets created by minio-init before the subject starts.
 	Buckets []string `yaml:"buckets"`
 }
+
+// DefaultMinioImage is the MinIO a case gets when its `minio:` block names no
+// image. Docker Hub withdrew minio/minio, and quay.io no longer serves it
+// without a login, so this is Chainguard's build of MinIO. Its entrypoint is
+// the minio binary, so the service's `server /data` command is unchanged.
+// Chainguard publishes only a `latest` tag for free, so the image is pinned
+// by digest: the tag would change under the bench. Chainguard can delete an
+// old digest at any time, so this image should move to a registry we control.
+const DefaultMinioImage = "cgr.dev/chainguard/minio@sha256:ad134b2dd572ae0d989d6807c3e45516cc75a34883a8021db2ff04be5d1d496a"
 
 // ImageOrDefault returns the MinIO image.
 func (m *MinioConfig) ImageOrDefault() string {
 	if m != nil && m.Image != "" {
 		return m.Image
 	}
-	return "minio/minio:RELEASE.2025-04-22T22-12-26Z"
+	return DefaultMinioImage
 }
 
 // EndpointURL is the MinIO S3 endpoint as seen from the bench network.

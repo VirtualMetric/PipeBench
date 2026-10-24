@@ -308,11 +308,30 @@ func TestValidateAWSSeedObjects(t *testing.T) {
 
 func TestMinioConfigDefaults(t *testing.T) {
 	m := &MinioConfig{Buckets: []string{"bench-out"}}
-	if got, want := m.ImageOrDefault(), "minio/minio:RELEASE.2025-04-22T22-12-26Z"; got != want {
+	if got, want := m.ImageOrDefault(), DefaultMinioImage; got != want {
 		t.Errorf("ImageOrDefault() = %q, want %q", got, want)
+	}
+	if got := (&MinioConfig{Image: "example/minio:1"}).ImageOrDefault(); got != "example/minio:1" {
+		t.Errorf("a case's own image: ImageOrDefault() = %q", got)
 	}
 	if got, want := m.EndpointURL(), "http://minio:9000"; got != want {
 		t.Errorf("EndpointURL() = %q, want %q", got, want)
+	}
+}
+
+// TestMinioDefaultImageIsPinnedByDigest: the default MinIO image is pinned by
+// digest, with no tag. A tag can change or vanish under the bench, as
+// minio/minio's release tag did when Docker Hub withdrew the repository.
+func TestMinioDefaultImageIsPinnedByDigest(t *testing.T) {
+	name, digest, ok := strings.Cut(DefaultMinioImage, "@sha256:")
+	if !ok {
+		t.Fatalf("DefaultMinioImage %q is not pinned by digest", DefaultMinioImage)
+	}
+	if len(digest) != 64 || strings.Trim(digest, "0123456789abcdef") != "" {
+		t.Errorf("DefaultMinioImage digest %q is not 64 lowercase hex digits", digest)
+	}
+	if last := name[strings.LastIndex(name, "/")+1:]; strings.Contains(last, ":") {
+		t.Errorf("DefaultMinioImage %q names a tag beside its digest; the digest alone decides the image", DefaultMinioImage)
 	}
 }
 
