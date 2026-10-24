@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -14,22 +15,141 @@ import (
 	"github.com/VirtualMetric/PipeBench/internal/orchestrator"
 )
 
-func TestLiveStoreMembers(t *testing.T) {
-	lines := parseDockerLogLines(`2026-10-23T16:40:40.000Z 172.20.0.9 - - [23/Oct/2026:16:40:40 +0000] "PUT /statestore/director-state/bench%2F7001%2Fstate%2Fr%2Fshared%2Fmembers%2Fsubject-4-old HTTP/1.1" 201 -
-2026-10-23T16:40:47.000Z 172.20.0.5 - - [23/Oct/2026:16:40:47 +0000] "PUT /statestore/director-state/bench%2F7001%2Fstate%2Fr%2Fshared%2Fmembers%2Fsubject-1-b29e HTTP/1.1" 201 -
-2026-10-23T16:40:48.000Z 172.20.0.6 - - [23/Oct/2026:16:40:48 +0000] "PUT /statestore/director-state/bench%2F7001%2Fstate%2Fr%2Fshared%2Fmembers%2Fsubject-2-3a9f HTTP/1.1" 201 -
-2026-10-23T16:40:48.500Z 172.20.0.6 - - [23/Oct/2026:16:40:48 +0000] "GET /statestore/director-state/bench%2F7001%2Fstate%2Fr%2Fshared%2Fmembers%2Fsubject-3-f4d7 HTTP/1.1" 200 302
-2026-10-23T16:40:49.000Z 172.20.0.5 - - [23/Oct/2026:16:40:49 +0000] "PUT /statestore/director-state/bench%2F7001%2Fstate%2Fr%2Fshared%2Fmembers%2Fsubject-1-b29e HTTP/1.1" 201 -
-2026-10-23T16:40:49.500Z 172.20.0.8 - - [23/Oct/2026:16:40:49 +0000] "PUT /devstoreaccount1/bench-in/shared%2Fmembers%2Fnot-a-member HTTP/1.1" 201 -
-`)
-	got := liveStoreMembers(parseAzuriteCalls(lines), "director-state", 6*time.Second)
+// storeMembers is where the member records are in the state container, as
+// Azurite's access log shows the path.
+const storeMembers = "/statestore/director-state/bench%2F7001%2Fstate%2Fr%2Fshared%2Fmembers%2F"
+
+// storeLease is the path of the lease, which every replica reads every 2
+// seconds, so the log goes on while no record is written.
+const storeLease = "/statestore/director-state/bench%2F7001%2Fstate%2Fr%2Fshared%2Factive"
+
+// azuriteLine is a line of Azurite's access log, as `docker logs -t` prints
+// it, for a call at at.
+func azuriteLine(at time.Time, method, path string, status int) string {
+	return fmt.Sprintf("%s 172.20.0.5 - - [%s] \"%s %s HTTP/1.1\" %d -\n",
+		at.UTC().Format(time.RFC3339Nano), at.UTC().Format("02/Jan/2006:15:04:05 -0700"), method, path, status)
+}
+
+// durSecs is a number of seconds as a duration.
+func durSecs(s float64) time.Duration { return time.Duration(s * float64(time.Second)) }
+
+// leaseReads returns the lease reads of one replica every 2 seconds, from
+// from to to.
+func leaseReads(t0 time.Time, from, to float64) []ssStoreCall {
+	var calls []ssStoreCall
+	for s := from; s <= to; s += 2 {
+		calls = append(calls, ssStoreCall{At: t0.Add(durSecs(s)), Method: "GET", Path: storeLease, Status: 200})
+	}
+	return calls
+}
+
+// recordWrites returns the writes of a member record at the given seconds
+// after t0.
+func recordWrites(t0 time.Time, member string, at ...float64) []ssStoreCall {
+	var calls []ssStoreCall
+	for _, s := range at {
+		calls = append(calls, ssStoreCall{At: t0.Add(durSecs(s)), Method: "PUT", Path: storeMembers + member, Status: 201})
+	}
+	return calls
+}
+
+// inOrder sorts calls by time, as the log has them.
+func inOrder(calls ...[]ssStoreCall) []ssStoreCall {
+	all := slices.Concat(calls...)
+	slices.SortStableFunc(all, func(a, b ssStoreCall) int { return a.At.Compare(b.At) })
+	return all
+}
+
+// An older director renews its member record every 2 seconds, so
+// a record that has not been written for more than 6 seconds is gone.
+func TestLiveStoreMembersRenewedEveryTwoSeconds(t *testing.T) {
+	t0 := time.Date(2026, 10, 23, 16, 40, 30, 0, time.UTC)
+	var log strings.Builder
+	for s := 0.0; s <= 20; s += 2 {
+		log.WriteString(azuriteLine(t0.Add(durSecs(s)), "PUT", storeMembers+"subject-1-b29e", 201))
+		log.WriteString(azuriteLine(t0.Add(durSecs(s+0.5)), "PUT", storeMembers+"subject-2-3a9f", 201))
+		if s <= 12 {
+			// subject-4 was killed: its record is still there, but nobody
+			// renews it.
+			log.WriteString(azuriteLine(t0.Add(durSecs(s+1)), "PUT", storeMembers+"subject-4-old", 201))
+		}
+	}
+	// A replica reads subject-3's record, which nobody writes.
+	log.WriteString(azuriteLine(t0.Add(durSecs(18.6)), "GET", storeMembers+"subject-3-f4d7", 200))
+	// The store refuses a write of subject-5's record.
+	log.WriteString(azuriteLine(t0.Add(durSecs(19.1)), "PUT", storeMembers+"subject-5-c1d2", 412))
+	// A write to another container is not a member record.
+	log.WriteString(azuriteLine(t0.Add(durSecs(19.6)), "PUT", "/devstoreaccount1/bench-in/shared%2Fmembers%2Fnot-a-member", 201))
+	calls := parseAzuriteCalls(slices.SortedFunc(slices.Values(parseDockerLogLines(log.String())), func(a, b ssLine) int { return a.At.Compare(b.At) }))
+
+	if got := memberRecordWindow(memberRecords(calls, "director-state")); got != 6*time.Second {
+		t.Errorf("window = %v, want 6s for records renewed every 2 seconds", got)
+	}
+	got := liveStoreMembers(calls, "director-state")
 	want := []string{"subject-1-b29e", "subject-2-3a9f"}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("live members = %v, want %v: a record renewed long ago, a read, and a write to another container do not count", got, want)
+		t.Errorf("live members = %v, want %v: a record not renewed for 7.5 seconds, a read, a refused write and a write to another container do not count", got, want)
 	}
-	if got := liveStoreMembers(nil, "director-state", time.Second); len(got) != 0 {
+	if got := liveStoreMembers(nil, "director-state"); len(got) != 0 {
 		t.Errorf("no calls: got %v", got)
 	}
+}
+
+// A newer director writes its member record when it starts and then
+// every 30 seconds, and deletes it when it stops cleanly. A record is live
+// for about 45 seconds after its last write, and gone at once when deleted.
+func TestLiveStoreMembersWrittenEveryThirtySeconds(t *testing.T) {
+	t0 := time.Date(2026, 10, 24, 11, 9, 22, 0, time.UTC)
+	replicas := [][]ssStoreCall{
+		recordWrites(t0, "subject-1-195f", 0.0, 31.8, 63.6),
+		recordWrites(t0, "subject-2-af09", 0.1, 31.0, 62.2),
+		recordWrites(t0, "subject-3-ef0e", 0.2, 31.9, 63.9),
+	}
+
+	t.Run("before any record is written twice", func(t *testing.T) {
+		calls := inOrder(recordWrites(t0, "subject-1-195f", 0.0), recordWrites(t0, "subject-2-af09", 0.1), recordWrites(t0, "subject-3-ef0e", 0.2), leaseReads(t0, 0, 20))
+		if got := memberRecordWindow(memberRecords(calls, "director-state")); got != 45*time.Second {
+			t.Errorf("window = %v, want 45s: with no record written twice yet, the interval is taken as 30 seconds", got)
+		}
+		want := []string{"subject-1-195f", "subject-2-af09", "subject-3-ef0e"}
+		if got := liveStoreMembers(calls, "director-state"); !reflect.DeepEqual(got, want) {
+			t.Errorf("20 s after the start: live members = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("scale-out", func(t *testing.T) {
+		// A fourth replica starts 80 s in. At 90 s, the others last wrote
+		// their records 26 to 28 seconds ago.
+		calls := inOrder(slices.Concat(replicas...), recordWrites(t0, "subject-4-77aa", 80), leaseReads(t0, 0, 90))
+		window := memberRecordWindow(memberRecords(calls, "director-state"))
+		if window < 45*time.Second || window > 50*time.Second {
+			t.Errorf("window = %v, want about 1.5 times the 31 s between two writes", window)
+		}
+		want := []string{"subject-1-195f", "subject-2-af09", "subject-3-ef0e", "subject-4-77aa"}
+		if got := liveStoreMembers(calls, "director-state"); !reflect.DeepEqual(got, want) {
+			t.Errorf("after the scale-out: live members = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("scale-in", func(t *testing.T) {
+		// The fourth replica stops cleanly at 95 s and deletes its record.
+		deleted := []ssStoreCall{{At: t0.Add(durSecs(95)), Method: "DELETE", Path: storeMembers + "subject-4-77aa", Status: 202}}
+		calls := inOrder(slices.Concat(replicas...), recordWrites(t0, "subject-4-77aa", 80), deleted, leaseReads(t0, 0, 96))
+		want := []string{"subject-1-195f", "subject-2-af09", "subject-3-ef0e"}
+		if got := liveStoreMembers(calls, "director-state"); !reflect.DeepEqual(got, want) {
+			t.Errorf("after the scale-in: live members = %v, want %v: a deleted record is gone at once", got, want)
+		}
+	})
+
+	t.Run("a replica that was killed", func(t *testing.T) {
+		// subject-4 wrote its record at 2 s and 33 s, and was killed. At
+		// 96 s its record is 63 seconds old, more than 1.5 intervals.
+		calls := inOrder(slices.Concat(replicas...), recordWrites(t0, "subject-4-dead", 2, 33), leaseReads(t0, 0, 96))
+		want := []string{"subject-1-195f", "subject-2-af09", "subject-3-ef0e"}
+		if got := liveStoreMembers(calls, "director-state"); !reflect.DeepEqual(got, want) {
+			t.Errorf("after a kill: live members = %v, want %v", got, want)
+		}
+	})
 }
 
 func TestJudgeStream(t *testing.T) {
