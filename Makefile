@@ -20,6 +20,7 @@ RECEIVER_IMAGE  := vmetric/bench-receiver:latest
 COLLECTOR_IMAGE := vmetric/bench-collector:latest
 KDC_IMAGE       := vmetric/bench-kdc:latest
 VERIFIER_IMAGE  := vmetric/bench-verifier:latest
+NETTOOL_IMAGE   := vmetric/bench-nettool:latest
 
 # Set ATTEST=1 to emit SBOM + max-mode provenance (used when publishing to Docker Hub).
 # Requires the docker-container buildx driver; the default docker driver on GitHub
@@ -106,7 +107,18 @@ build-verifier:
 		--load \
 		.
 
-build-containers: build-generator build-receiver build-collector build-kdc build-verifier
+# The link-fault helper: Alpine with iptables and tc, which a scenario step runs
+# in a container's network namespace to cut, delay or drop its traffic.
+build-nettool:
+	$(DOCKER_BUILD) \
+		-f containers/nettool/Dockerfile \
+		-t $(NETTOOL_IMAGE) \
+		--platform linux/amd64 \
+		--build-arg BUILDKIT_INLINE_CACHE=1 \
+		--load \
+		.
+
+build-containers: build-generator build-receiver build-collector build-kdc build-verifier build-nettool
 
 # ── Publish to Docker Hub ─────────────────────────────────────────────────────
 #
@@ -169,7 +181,18 @@ push-verifier:
 		--push \
 		.
 
-push-containers: push-generator push-receiver push-collector push-kdc push-verifier
+push-nettool:
+	$(DOCKER_BUILD) \
+		-f containers/nettool/Dockerfile \
+		-t $(NETTOOL_IMAGE) \
+		-t vmetric/bench-nettool:sha-$(COMMIT) \
+		--platform linux/amd64 \
+		$(ATTEST_FLAGS) \
+		--build-arg BUILDKIT_INLINE_CACHE=1 \
+		--push \
+		.
+
+push-containers: push-generator push-receiver push-collector push-kdc push-verifier push-nettool
 
 # ── End-to-end test ───────────────────────────────────────────────────────────
 
@@ -186,7 +209,7 @@ list: build
 clean:
 	rm -f $(BINARY)
 	$(BINARY) clean 2>/dev/null || true
-	docker rmi -f $(GENERATOR_IMAGE) $(RECEIVER_IMAGE) $(COLLECTOR_IMAGE) $(KDC_IMAGE) 2>/dev/null || true
+	docker rmi -f $(GENERATOR_IMAGE) $(RECEIVER_IMAGE) $(COLLECTOR_IMAGE) $(KDC_IMAGE) $(NETTOOL_IMAGE) 2>/dev/null || true
 
 # ── Go tooling ────────────────────────────────────────────────────────────────
 

@@ -558,6 +558,14 @@ func main() {
 	if cfg.TrackSeq {
 		seqTrack = newSeqTracker()
 	}
+	if expr := os.Getenv("RECEIVER_TRACK_KEYS"); expr != "" {
+		kt, err := newKeyTracker(expr)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "receiver:", err)
+			os.Exit(2)
+		}
+		keyTrack = kt
+	}
 
 	// Start metrics HTTP server on a separate port
 	go serveMetrics(cfg.MetricsPort, cnt, val, cfg)
@@ -786,11 +794,15 @@ func receiveFile(cfg config, cnt *counters, val *validator) error {
 }
 
 // trackSeq hands one received line to the sequence tracker, when
-// RECEIVER_TRACK_SEQ is on. Every input that counts lines calls it, so a
-// tracked line counts as arrived whichever way it came in.
+// RECEIVER_TRACK_SEQ is on, and to the key tracker, when RECEIVER_TRACK_KEYS
+// is set. Every input that counts lines calls it, so a tracked line counts as
+// arrived whichever way it came in.
 func trackSeq(line []byte) {
 	if seqTrack != nil {
 		seqTrack.record(line, time.Now().UnixNano())
+	}
+	if keyTrack != nil {
+		keyTrack.record(line)
 	}
 }
 
@@ -1054,9 +1066,10 @@ func serveMetrics(port string, cnt *counters, val *validator, cfg config) {
 		// Sequence tracking reports distinct lines and first-arrival latency
 		// on its own, without the hash-based dedup check.
 		if seqTrack != nil {
-			unique, dups := seqTrack.counts()
-			resp["unique_lines"] = unique
-			resp["duplicates"] = dups
+			if unique, dups := seqTrack.counts(); seqCountsWin(unique, cfg.ValidateDedup) {
+				resp["unique_lines"] = unique
+				resp["duplicates"] = dups
+			}
 			if ls := seqTrack.latency(0, 0); ls.Count > 0 {
 				resp["latency_p50_ms"] = ls.P50Ms
 				resp["latency_p95_ms"] = ls.P95Ms
@@ -1068,6 +1081,9 @@ func serveMetrics(port string, cnt *counters, val *validator, cfg config) {
 	})
 	if seqTrack != nil {
 		registerSeqHandlers(mux, seqTrack)
+	}
+	if keyTrack != nil {
+		registerKeyHandler(mux, keyTrack)
 	}
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {

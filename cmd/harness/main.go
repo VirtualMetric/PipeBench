@@ -49,6 +49,7 @@ var (
 	receiverImage    string
 	collectorImage   string
 	verifierImage    string
+	nettoolImage     string
 	cpuLimit         string
 	memLimit         string
 	hardware         string
@@ -257,6 +258,7 @@ func testCmd() *cobra.Command {
 				ReceiverImage:    receiverImage,
 				CollectorImage:   collectorImage,
 				VerifierImage:    verifierImage,
+				NettoolImage:     nettoolImage,
 				SubjectVersion:   subjectVersion,
 				SubjectImage:     subjectImage,
 				ConfigName:       configName,
@@ -393,6 +395,7 @@ func testCmd() *cobra.Command {
 	cmd.Flags().StringVar(&receiverImage, "receiver-image", "vmetric/bench-receiver:latest", "receiver container image")
 	cmd.Flags().StringVar(&collectorImage, "collector-image", "vmetric/bench-collector:latest", "collector container image")
 	cmd.Flags().StringVar(&verifierImage, "verifier-image", "vmetric/bench-verifier:latest", "DuckDB verifier container image (S3 avro/parquet correctness cases)")
+	cmd.Flags().StringVar(&nettoolImage, "nettool-image", "vmetric/bench-nettool:latest", "link-fault helper image (cluster scenario link steps)")
 	cmd.Flags().StringVar(&cpuLimit, "cpu-limit", "", "CPU cores for subject container (e.g. \"1\", \"4\", \"0.5\")")
 	cmd.Flags().StringVar(&memLimit, "mem-limit", "", "memory limit for subject container (e.g. \"1g\", \"4g\", \"512m\")")
 	cmd.Flags().StringVar(&hardware, "hardware", "", "hardware tier label — groups results under results/<hardware>/ (e.g. \"c7i.4xlarge\"); defaults to $BENCH_HARDWARE or \"custom\"")

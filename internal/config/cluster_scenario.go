@@ -2,7 +2,9 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -77,6 +79,67 @@ type ScenarioConfig struct {
 	// DrainSeconds bounds the wait, after the load stops, for every
 	// acknowledged line to arrive (default 180).
 	DrainSeconds int `yaml:"drain_seconds"`
+
+	// NodeDisk gives chosen nodes a small disk of their own at a path: a
+	// size-limited tmpfs, which a fill_disk step can fill.
+	NodeDisk *ScenarioNodeDisk `yaml:"node_disk"`
+
+	// Rows compares the rows a database holds with the rows that reached the
+	// receiver, for a case whose data comes from a database device. A row
+	// that never arrives counts as missing.
+	Rows *ScenarioRows `yaml:"rows"`
+}
+
+// ScenarioNodeDisk is the cluster.scenario.node_disk block.
+type ScenarioNodeDisk struct {
+	// Path is where the disk is mounted in each node: the director's storage
+	// directory, to fill the disk the director writes to.
+	Path string `yaml:"path"`
+	// Size is the disk's size, such as 1g. The memory a tmpfs uses counts
+	// against the node's memory limit.
+	Size string `yaml:"size"`
+	// Nodes are the nodes that get the disk. Empty means every node.
+	Nodes []int `yaml:"nodes"`
+}
+
+// HasNode reports whether node n gets the disk.
+func (d *ScenarioNodeDisk) HasNode(n int) bool {
+	if d == nil {
+		return false
+	}
+	if len(d.Nodes) == 0 {
+		return true
+	}
+	for _, x := range d.Nodes {
+		if x == n {
+			return true
+		}
+	}
+	return false
+}
+
+// ScenarioRows is the cluster.scenario.rows block.
+type ScenarioRows struct {
+	// Query returns the key of every row the device should deliver, one per
+	// row, such as SELECT message FROM events.
+	Query string `yaml:"query"`
+	// Key is a regular expression that finds a row's key in a line the
+	// receiver gets. With a group, the first group is the key.
+	Key string `yaml:"key"`
+	// Writer is an endpoint that writes rows while the case runs. The harness
+	// stops it before it counts, so every row it wrote has had a chance to
+	// arrive.
+	Writer string `yaml:"writer"`
+	// DrainSeconds bounds the wait for the last rows to arrive (default 60).
+	DrainSeconds int `yaml:"drain_seconds"`
+}
+
+// DrainOrDefault returns how long to wait for the last rows.
+func (r *ScenarioRows) DrainOrDefault() time.Duration {
+	if r == nil || r.DrainSeconds <= 0 {
+		return 60 * time.Second
+	}
+	return time.Duration(r.DrainSeconds) * time.Second
 }
 
 // ScenarioProxy is one Toxiproxy proxy.
@@ -99,6 +162,14 @@ type ScenarioExpect struct {
 	// MinAcked is the fewest lines the generator must have had
 	// acknowledged, so a run that sent nothing cannot pass.
 	MinAcked int64 `yaml:"min_acked"`
+	// MaxMissingRows is how many database rows (cluster.scenario.rows) may
+	// never arrive.
+	MaxMissingRows *int64 `yaml:"max_missing_rows"`
+	// MaxRowsTwice is how many database rows may arrive more than once. It
+	// counts by the row's key, so a row collected again counts even when its
+	// second line differs from the first (a collection time, the node), which
+	// the receiver's hash-based duplicate count does not see.
+	MaxRowsTwice *int64 `yaml:"max_rows_twice"`
 }
 
 // ScenarioStep is one step. Do names the action; the other fields are its
@@ -132,6 +203,11 @@ type ScenarioStep struct {
 	Signal string `yaml:"signal"`
 	// Grace is the stop timeout for stop and restart (default 30s).
 	Grace string `yaml:"grace"`
+	// Gap is the longest expect_delivery_continues allows between two
+	// arrivals of lines sent in its window (default 10s), and the longest
+	// pause between two acknowledgements expect_writes_continue allows (not
+	// judged when unset).
+	Gap string `yaml:"gap"`
 
 	// Recover passes -recover=<value> to a start (accept-loss or reset).
 	// Needs scenario.node_args.
@@ -170,50 +246,120 @@ type ScenarioStep struct {
 
 	// Soft makes a failed expectation a note instead of a failure.
 	Soft bool `yaml:"soft"`
+
+	// Peer and Peers name the other end of the links a link step acts on:
+	// node selectors, "all" (every other node), or another container of the
+	// run by name (bench-receiver, bench-azurite). A step names one of them.
+	Peer  string   `yaml:"peer"`
+	Peers []string `yaml:"peers"`
+	// OneWay limits a link step to the traffic from node to its peers. The
+	// peers' traffic to node still arrives.
+	OneWay bool `yaml:"one_way"`
+	// Loss is the share of packets a shape_link step drops, such as 20%.
+	// latency and jitter set its delay.
+	Loss string `yaml:"loss"`
+	// Groups are the sides of a split: every link between two nodes of
+	// different groups is cut, both ways.
+	Groups [][]string `yaml:"groups"`
+
+	// EmptyDisk makes a start step replace the node's container with a new
+	// one, which starts on an empty disk, as a node whose disk was replaced.
+	EmptyDisk bool `yaml:"empty_disk"`
+	// Leave is how much free space a fill_disk step leaves on the node's disk
+	// (default 1m).
+	Leave string `yaml:"leave"`
+}
+
+// PeerList returns the peers a link step names: its peers, or its one peer.
+func (s ScenarioStep) PeerList() []string {
+	if len(s.Peers) > 0 {
+		return s.Peers
+	}
+	if s.Peer == "" {
+		return nil
+	}
+	return []string{s.Peer}
+}
+
+// LossPercent parses a loss such as "20%" into 20. An empty loss is 0.
+func LossPercent(s string) (float64, error) {
+	if s == "" {
+		return 0, nil
+	}
+	num, ok := strings.CutSuffix(strings.TrimSpace(s), "%")
+	if !ok {
+		return 0, fmt.Errorf("loss %q must be a percentage such as 20%%", s)
+	}
+	p, err := strconv.ParseFloat(strings.TrimSpace(num), 64)
+	// ParseFloat reads "NaN", and NaN fails every comparison.
+	if err != nil || math.IsNaN(p) || p <= 0 || p > 100 {
+		return 0, fmt.Errorf("loss %q must be a percentage above 0%% and at most 100%%", s)
+	}
+	return p, nil
 }
 
 // scenarioActions lists every step action and whether it needs Node.
 var scenarioActions = map[string]bool{
-	"wait_ready":             false,
-	"start_load":             false,
-	"sleep":                  false,
-	"mark":                   false,
-	"kill":                   true,
-	"stop":                   true,
-	"start":                  true,
-	"restart":                true,
-	"pause":                  true,
-	"unpause":                true,
-	"disconnect":             true,
-	"connect":                true,
-	"wait_leader":            false,
-	"expect_no_leader":       false,
-	"wait_delivery":          false,
-	"expect_writes_stop":     false,
-	"expect_writes_continue": false,
-	"expect_delivery_stops":  false,
-	"wait_healthy":           false,
-	"witness_down":           false,
-	"witness_up":             false,
-	"proxy_latency":          false,
-	"proxy_down":             false,
-	"proxy_up":               false,
-	"receiver_pause":         false,
-	"receiver_unpause":       false,
-	"scale_to":               false,
-	"rolling_restart":        false,
-	"wait_log":               false,
-	"expect_no_log":          true,
-	"wait_stable":            false,
-	"count_pending":          false,
+	"wait_ready":                false,
+	"start_load":                false,
+	"sleep":                     false,
+	"mark":                      false,
+	"kill":                      true,
+	"stop":                      true,
+	"start":                     true,
+	"restart":                   true,
+	"pause":                     true,
+	"unpause":                   true,
+	"disconnect":                true,
+	"connect":                   true,
+	"wait_leader":               false,
+	"expect_no_leader":          false,
+	"wait_delivery":             false,
+	"expect_writes_stop":        false,
+	"expect_writes_continue":    false,
+	"expect_delivery_stops":     false,
+	"expect_delivery_continues": false,
+	"wait_healthy":              false,
+	"witness_down":              false,
+	"witness_up":                false,
+	"proxy_latency":             false,
+	"proxy_down":                false,
+	"proxy_up":                  false,
+	"receiver_pause":            false,
+	"receiver_unpause":          false,
+	"scale_to":                  false,
+	"rolling_restart":           false,
+	"wait_log":                  false,
+	"expect_no_log":             true,
+	"wait_stable":               false,
+	"count_pending":             false,
+	// The link steps check their node themselves: it may be "all".
+	"cut_link":     false,
+	"shape_link":   false,
+	"restore_link": false,
+	"split":        false,
+	"fill_disk":    true,
+	"free_disk":    true,
 }
+
+// linkSteps are the actions that change the links between containers.
+var linkSteps = map[string]bool{"cut_link": true, "shape_link": true, "restore_link": true, "split": true}
 
 // nodeActionSteps are the actions that act on a node, so their `as` can
 // remember it. The driver records a name only for these.
 var nodeActionSteps = map[string]bool{
 	"kill": true, "stop": true, "start": true, "restart": true,
 	"pause": true, "unpause": true, "disconnect": true, "connect": true,
+	"fill_disk": true, "free_disk": true,
 }
+
+// containerPeerPattern is the form of a link step's peer that names another
+// container of the run rather than a node.
+var containerPeerPattern = regexp.MustCompile(`^bench-[a-z0-9][a-z0-9._-]*$`)
+
+// minNodeDisk is the smallest cluster.scenario.node_disk size: a director
+// cannot start on less.
+const minNodeDisk = 64 << 20
 
 // ScenarioActionNeedsNode reports whether the action takes a node.
 func ScenarioActionNeedsNode(do string) bool { return scenarioActions[do] }
@@ -237,6 +383,8 @@ func (s ScenarioStep) DurationOr(field string, def time.Duration) time.Duration 
 		v = s.For
 	} else if field == "grace" {
 		v = s.Grace
+	} else if field == "gap" {
+		v = s.Gap
 	}
 	if v == "" {
 		return def
@@ -405,6 +553,9 @@ func (tc *TestCase) validateClusterScenario() error {
 	}
 
 	maxNodes := tc.Cluster.Nodes + sc.SpareNodes
+	if err := tc.validateScenarioDiskAndRows(maxNodes); err != nil {
+		return err
+	}
 	names := map[string]bool{}
 	// marks holds the labels of the marks set so far: since and sent_before
 	// may only name a mark an earlier step sets.
@@ -416,8 +567,9 @@ func (tc *TestCase) validateClusterScenario() error {
 			return fmt.Errorf("case %q: cluster.scenario.steps[%d]: unknown action %q", tc.Name, i, st.Do)
 		}
 		// A step that acts on a node must name it. A wait that may name one
-		// (wait_leader, wait_log) must name it the same way when it does.
-		if needsNode || st.Node != "" {
+		// (wait_leader, wait_log) must name it the same way when it does. A
+		// link step checks its own node, which may be "all".
+		if (needsNode || st.Node != "") && !linkSteps[st.Do] {
 			if err := validateNodeSelector(st.Node, maxNodes, names); err != nil {
 				return fmt.Errorf("%s: %w", where, err)
 			}
@@ -431,12 +583,29 @@ func (tc *TestCase) validateClusterScenario() error {
 			}
 			names[st.As] = true
 		}
-		for field, v := range map[string]string{"within": st.Within, "for": st.For, "grace": st.Grace, "latency": st.Latency, "jitter": st.Jitter} {
+		for field, v := range map[string]string{"within": st.Within, "for": st.For, "grace": st.Grace, "gap": st.Gap, "latency": st.Latency, "jitter": st.Jitter} {
 			if v == "" {
 				continue
 			}
 			if _, err := time.ParseDuration(v); err != nil {
 				return fmt.Errorf("%s: %s: %w", where, field, err)
+			}
+		}
+		if st.Do == "expect_delivery_continues" && !tc.HasGenerator() {
+			return fmt.Errorf("%s: counts the load's lines, and the case has no generator", where)
+		}
+		if st.Do == "expect_delivery_continues" || (st.Do == "expect_writes_continue" && st.Gap != "") {
+			// The windows default to 30s and 20s, as the driver runs them.
+			window := 30 * time.Second
+			if st.Do == "expect_writes_continue" {
+				window = 20 * time.Second
+			}
+			gap := st.DurationOr("gap", 10*time.Second)
+			if gap < 2*time.Second {
+				return fmt.Errorf("%s: gap must be at least 2s: a line or a confirmation needs time to come", where)
+			}
+			if st.DurationOr("for", window) <= gap {
+				return fmt.Errorf("%s: for must be longer than gap", where)
 			}
 		}
 		if st.Since != "" {
@@ -454,6 +623,14 @@ func (tc *TestCase) validateClusterScenario() error {
 		// is a mistake to report, not a field to ignore.
 		if st.Logs != nil && st.Do != "wait_log" && st.Do != "expect_no_log" {
 			return fmt.Errorf("%s: logs only applies to wait_log and expect_no_log", where)
+		}
+		if err := checkStepFieldOwners(st); err != nil {
+			return fmt.Errorf("%s: %w", where, err)
+		}
+		if linkSteps[st.Do] {
+			if err := validateLinkStep(st, maxNodes, names); err != nil {
+				return fmt.Errorf("%s: %w", where, err)
+			}
 		}
 		switch st.Do {
 		case "sleep":
@@ -486,6 +663,27 @@ func (tc *TestCase) validateClusterScenario() error {
 			}
 			if st.Recover != "" && !sc.NodeArgs {
 				return fmt.Errorf("%s: recover needs cluster.scenario.node_args: true", where)
+			}
+		case "wait_leader":
+			if st.Groups != nil {
+				if len(st.Groups) == 0 {
+					return fmt.Errorf("%s: groups is empty; name at least one group of nodes", where)
+				}
+				if err := validateGroups(st.Groups, maxNodes, names); err != nil {
+					return fmt.Errorf("%s: %w", where, err)
+				}
+			}
+		case "fill_disk", "free_disk":
+			if sc.NodeDisk == nil {
+				return fmt.Errorf("%s: needs cluster.scenario.node_disk, the disk it fills", where)
+			}
+			if n, err := strconv.Atoi(st.Node); err == nil && !sc.NodeDisk.HasNode(n) {
+				return fmt.Errorf("%s: node %d has no disk of its own (cluster.scenario.node_disk.nodes)", where, n)
+			}
+			if st.Leave != "" {
+				if _, err := ParseByteSize(st.Leave); err != nil {
+					return fmt.Errorf("%s: leave %q: %w", where, st.Leave, err)
+				}
 			}
 		case "witness_down", "witness_up":
 			if sc.Witness == "" {
@@ -536,4 +734,198 @@ func validateNodeSelector(sel string, maxNodes int, names map[string]bool) error
 		return fmt.Errorf("node must be leader, follower, owner, @name or 1..%d, got %q", maxNodes, sel)
 	}
 	return nil
+}
+
+// stepFieldOwners lists, for the fields that belong to a few actions only,
+// the actions that read them. A field on any other step is a mistake.
+var stepFieldOwners = []struct {
+	field   string
+	set     func(ScenarioStep) bool
+	actions map[string]bool
+}{
+	{"peer", func(s ScenarioStep) bool { return s.Peer != "" }, map[string]bool{"cut_link": true, "shape_link": true, "restore_link": true}},
+	{"peers", func(s ScenarioStep) bool { return s.Peers != nil }, map[string]bool{"cut_link": true, "shape_link": true, "restore_link": true}},
+	{"one_way", func(s ScenarioStep) bool { return s.OneWay }, map[string]bool{"cut_link": true, "shape_link": true, "restore_link": true}},
+	{"loss", func(s ScenarioStep) bool { return s.Loss != "" }, map[string]bool{"shape_link": true}},
+	{"groups", func(s ScenarioStep) bool { return s.Groups != nil }, map[string]bool{"split": true, "wait_leader": true}},
+	{"empty_disk", func(s ScenarioStep) bool { return s.EmptyDisk }, map[string]bool{"start": true}},
+	{"leave", func(s ScenarioStep) bool { return s.Leave != "" }, map[string]bool{"fill_disk": true}},
+	{"gap", func(s ScenarioStep) bool { return s.Gap != "" }, map[string]bool{"expect_delivery_continues": true, "expect_writes_continue": true}},
+}
+
+func checkStepFieldOwners(st ScenarioStep) error {
+	for _, o := range stepFieldOwners {
+		if o.set(st) && !o.actions[st.Do] {
+			names := make([]string, 0, len(o.actions))
+			for a := range o.actions {
+				names = append(names, a)
+			}
+			sort.Strings(names)
+			return fmt.Errorf("%s only applies to %s", o.field, strings.Join(names, ", "))
+		}
+	}
+	return nil
+}
+
+// validateLinkStep checks a cut_link, shape_link, restore_link or split step.
+func validateLinkStep(st ScenarioStep, maxNodes int, names map[string]bool) error {
+	if st.Peer != "" && st.Peers != nil {
+		return fmt.Errorf("names peer and peers; name one of them")
+	}
+	if st.Peers != nil && len(st.Peers) == 0 {
+		return fmt.Errorf("peers is empty; name at least one peer")
+	}
+	switch st.Do {
+	case "split":
+		if st.Node != "" {
+			return fmt.Errorf("takes groups, not node")
+		}
+		if len(st.Groups) < 2 {
+			return fmt.Errorf("needs groups: at least two lists of nodes, the sides of the split")
+		}
+		return validateGroups(st.Groups, maxNodes, names)
+	case "restore_link":
+		if st.Node == "" {
+			if len(st.PeerList()) > 0 || st.OneWay {
+				return fmt.Errorf("without node it restores every link, so peers and one_way need a node")
+			}
+			return nil
+		}
+	}
+	if st.Node == "" {
+		return fmt.Errorf("needs node, one end of the links (a node selector or all)")
+	}
+	if st.Node != "all" {
+		if err := validateNodeSelector(st.Node, maxNodes, names); err != nil {
+			return err
+		}
+	}
+	peers := st.PeerList()
+	if len(peers) == 0 {
+		return fmt.Errorf("needs peer or peers, the other end of the links")
+	}
+	for _, p := range peers {
+		if err := validateLinkPeer(p, maxNodes, names); err != nil {
+			return err
+		}
+		if p == st.Node && p != "all" {
+			return fmt.Errorf("a link has two ends, and node and peer are both %q", p)
+		}
+	}
+	if st.Do == "shape_link" {
+		loss, err := LossPercent(st.Loss)
+		if err != nil {
+			return err
+		}
+		if st.Latency == "" && loss == 0 {
+			return fmt.Errorf("needs latency or loss")
+		}
+		if st.Jitter != "" && st.Latency == "" {
+			return fmt.Errorf("jitter varies the latency, so it needs latency")
+		}
+	}
+	return nil
+}
+
+// validateGroups checks the groups of a split or a wait_leader: lists of
+// nodes, none empty, and no node in two of them.
+func validateGroups(groups [][]string, maxNodes int, names map[string]bool) error {
+	side := map[string]int{}
+	for gi, g := range groups {
+		if len(g) == 0 {
+			return fmt.Errorf("groups[%d] is empty", gi)
+		}
+		for _, sel := range g {
+			if sel == "all" || containerPeerPattern.MatchString(sel) {
+				return fmt.Errorf("a group lists nodes, not %q", sel)
+			}
+			if err := validateNodeSelector(sel, maxNodes, names); err != nil {
+				return fmt.Errorf("groups[%d]: %w", gi, err)
+			}
+			if prev, seen := side[sel]; seen && prev != gi {
+				return fmt.Errorf("%q is in groups[%d] and groups[%d]", sel, prev, gi)
+			}
+			side[sel] = gi
+		}
+	}
+	return nil
+}
+
+// validateLinkPeer checks one end of a link: a node selector, all, or another
+// container of the run.
+func validateLinkPeer(p string, maxNodes int, names map[string]bool) error {
+	if p == "all" || containerPeerPattern.MatchString(p) {
+		return nil
+	}
+	if err := validateNodeSelector(p, maxNodes, names); err != nil {
+		return fmt.Errorf("peer %q: %w (or all, or a container such as bench-receiver)", p, err)
+	}
+	return nil
+}
+
+// validateScenarioDiskAndRows checks cluster.scenario.node_disk and
+// cluster.scenario.rows.
+func (tc *TestCase) validateScenarioDiskAndRows(maxNodes int) error {
+	sc := tc.Cluster.Scenario
+	if d := sc.NodeDisk; d != nil {
+		if err := checkWitnessDir(d.Path); err != nil {
+			return fmt.Errorf("case %q: cluster.scenario.node_disk.path %q %v", tc.Name, d.Path, err)
+		}
+		size, err := ParseByteSize(d.Size)
+		if err != nil {
+			return fmt.Errorf("case %q: cluster.scenario.node_disk.size %q: %w", tc.Name, d.Size, err)
+		}
+		if size < minNodeDisk {
+			return fmt.Errorf("case %q: cluster.scenario.node_disk.size must be at least 64m; a director cannot start on less", tc.Name)
+		}
+		for _, n := range d.Nodes {
+			if n < 1 || n > maxNodes {
+				return fmt.Errorf("case %q: cluster.scenario.node_disk.nodes: %d is not a node (1..%d)", tc.Name, n, maxNodes)
+			}
+		}
+	}
+	if r := sc.Rows; r != nil {
+		if strings.TrimSpace(r.Query) == "" {
+			return fmt.Errorf("case %q: cluster.scenario.rows needs query, which returns the key of every row", tc.Name)
+		}
+		if r.Key == "" {
+			return fmt.Errorf("case %q: cluster.scenario.rows needs key, the expression that finds a row's key in a received line", tc.Name)
+		}
+		if _, err := regexp.Compile(r.Key); err != nil {
+			return fmt.Errorf("case %q: cluster.scenario.rows.key: %w", tc.Name, err)
+		}
+		// The key reaches the receiver through the compose file, inside double
+		// quotes and past compose's own $ handling.
+		if strings.ContainsAny(r.Key, "\"\\$") {
+			return fmt.Errorf("case %q: cluster.scenario.rows.key must not contain a backslash, a double quote or $; write [0-9] for \\d", tc.Name)
+		}
+		if tc.HasGenerator() {
+			return fmt.Errorf("case %q: cluster.scenario.rows is for a case whose data comes from a database device; this case has a generator", tc.Name)
+		}
+		if tc.Database == nil || tc.Database.Engine != "postgres" {
+			return fmt.Errorf("case %q: cluster.scenario.rows reads the case's database, which must use engine postgres", tc.Name)
+		}
+		if r.Writer != "" && !tc.hasEndpoint(r.Writer) {
+			return fmt.Errorf("case %q: cluster.scenario.rows.writer %q is not one of the case's endpoints", tc.Name, r.Writer)
+		}
+		if r.DrainSeconds < 0 {
+			return fmt.Errorf("case %q: cluster.scenario.rows.drain_seconds must not be negative", tc.Name)
+		}
+	}
+	if sc.Expect.MaxMissingRows != nil && sc.Rows == nil {
+		return fmt.Errorf("case %q: expect.max_missing_rows needs cluster.scenario.rows", tc.Name)
+	}
+	if sc.Expect.MaxRowsTwice != nil && sc.Rows == nil {
+		return fmt.Errorf("case %q: expect.max_rows_twice needs cluster.scenario.rows", tc.Name)
+	}
+	return nil
+}
+
+func (tc *TestCase) hasEndpoint(name string) bool {
+	for _, e := range tc.Endpoints {
+		if e.Name == name {
+			return true
+		}
+	}
+	return false
 }

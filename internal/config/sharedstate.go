@@ -66,6 +66,14 @@ const (
 	// of a container app does. It waits for each new replica to rejoin and for
 	// the replica set to settle before it stops the next. The leader goes last.
 	SharedStateActionRollingRestart = "rolling_restart"
+	// SharedStateActionMoveAcrossCutLink cuts the link between the replica that
+	// runs move_device, which does not lead, and another replica that does not
+	// lead, while both keep the store and the leader. Then it renders the
+	// config's third stage, in which {{@.MoveTarget@}} is the second replica's
+	// member name: the case allows the device only there, so the leader moves
+	// it across the cut link at once. The device must start on the second
+	// replica and must never run on both.
+	SharedStateActionMoveAcrossCutLink = "move_across_cut_link"
 )
 
 var sharedStateActions = []string{
@@ -84,6 +92,7 @@ var sharedStateActions = []string{
 	SharedStateActionMoveThenKill,
 	SharedStateActionStopOwner,
 	SharedStateActionRollingRestart,
+	SharedStateActionMoveAcrossCutLink,
 }
 
 // SharedStateConfig describes the replicas of one serverless director that
@@ -216,6 +225,12 @@ type SharedStateConfig struct {
 	// that writes its state to the store only every so often has more to lose
 	// the longer it has run since its last write.
 	ActionDelaySeconds int `yaml:"action_delay_seconds"`
+	// MoveDevice is the placed device move_across_cut_link moves.
+	MoveDevice int64 `yaml:"move_device"`
+	// CutHoldSeconds is how long move_across_cut_link keeps the link cut
+	// before it moves the device, so both replicas notice the cut first
+	// (default 10).
+	CutHoldSeconds int `yaml:"cut_hold_seconds"`
 	// ExpectLogOnce are lines each replica must log exactly once for every
 	// time its director starts, matched as plain text.
 	ExpectLogOnce []string `yaml:"expect_log_once"`
@@ -228,6 +243,14 @@ func (s *SharedStateConfig) StateWriteToleranceOrDefault() time.Duration {
 		return time.Duration(s.StateWriteToleranceSeconds) * time.Second
 	}
 	return max(2*time.Second, time.Duration(s.StateWriteIntervalSeconds)*time.Second/10)
+}
+
+// CutHoldOrDefault returns CutHoldSeconds, or 10.
+func (s *SharedStateConfig) CutHoldOrDefault() int {
+	if s.CutHoldSeconds > 0 {
+		return s.CutHoldSeconds
+	}
+	return 10
 }
 
 // MoveKillWithinOrDefault returns MoveKillWithinMs, or 2 seconds.
@@ -633,6 +656,23 @@ func (tc *TestCase) validateSharedState() error {
 		if !names[s.ScaleStream] {
 			return fmt.Errorf("case %q: shared_state.action scale_backlog needs shared_state.scale_stream to name a stream", tc.Name)
 		}
+	}
+	if s.Action == SharedStateActionMoveAcrossCutLink {
+		if s.Replicas < 3 {
+			return fmt.Errorf("case %q: shared_state.action move_across_cut_link needs three replicas: the leader, the device's owner and the replica the device moves to", tc.Name)
+		}
+		if s.MoveDevice == 0 || !slices.Contains(s.PlacedDevices, s.MoveDevice) {
+			return fmt.Errorf("case %q: shared_state.action move_across_cut_link needs shared_state.move_device, one of placed_devices", tc.Name)
+		}
+		if !s.SharesBus() {
+			return fmt.Errorf("case %q: shared_state.action move_across_cut_link moves a placed device, and with the shared state in memory no device is placed", tc.Name)
+		}
+	}
+	if s.MoveDevice != 0 && s.Action != SharedStateActionMoveAcrossCutLink {
+		return fmt.Errorf("case %q: shared_state.move_device is only used by the move_across_cut_link action", tc.Name)
+	}
+	if s.CutHoldSeconds < 0 {
+		return fmt.Errorf("case %q: shared_state.cut_hold_seconds must not be negative", tc.Name)
 	}
 	if s.BadReplica != 0 && s.Action != SharedStateActionWrongCredentials {
 		return fmt.Errorf("case %q: shared_state.bad_replica is only used by the wrong_credentials action", tc.Name)

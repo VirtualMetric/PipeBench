@@ -33,6 +33,9 @@ type Options struct {
 	ReceiverImage  string
 	CollectorImage string
 	VerifierImage  string
+	// NettoolImage is the link-fault helper: a scenario step runs it in a
+	// container's network namespace to cut, delay or drop its traffic.
+	NettoolImage string
 	// Override subject version (empty = use registry default)
 	SubjectVersion string
 	// Override subject image repository (empty = use registry default)
@@ -70,6 +73,9 @@ func (o *Options) applyDefaults() {
 	}
 	if o.VerifierImage == "" {
 		o.VerifierImage = "vmetric/bench-verifier:latest"
+	}
+	if o.NettoolImage == "" {
+		o.NettoolImage = "vmetric/bench-nettool:latest"
 	}
 	if o.ConfigName == "" {
 		o.ConfigName = "default"

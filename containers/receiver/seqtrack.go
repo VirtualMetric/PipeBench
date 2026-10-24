@@ -350,6 +350,16 @@ func (t *seqTracker) duplicates() duplicatesView {
 	return out
 }
 
+// seqCountsWin says whether the tracker's distinct and duplicate counts go in
+// /metrics in place of the hash-based ones. They do once the tracker has
+// counted a sequenced line, or when no hash-based count runs. A case whose
+// lines carry no sequence, such as rows from a database, keeps the hash-based
+// counts. The tracker is on for every scenario case, and its zeros used to
+// replace them, so a duplicate check over such lines could never fail.
+func seqCountsWin(seqUnique int64, validateDedup bool) bool {
+	return seqUnique > 0 || !validateDedup
+}
+
 func (t *seqTracker) counts() (unique, dups int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()

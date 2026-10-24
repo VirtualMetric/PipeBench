@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -152,6 +153,53 @@ func streamSelfClaims(r healthRound) map[string][]int {
 		}
 	}
 	return out
+}
+
+// agreedLeaderAmong is agreedLeader within a set of nodes: a node of the set
+// that names itself the leader and that more than half of the set's reachable
+// nodes name too. A split's side uses it, because the other side cannot vote
+// there.
+func agreedLeaderAmong(r healthRound, nodes []int) (int, bool) {
+	in := map[int]bool{}
+	for _, n := range nodes {
+		in[n] = true
+	}
+	side := healthRound{At: r.At}
+	for _, h := range r.Nodes {
+		if in[h.Node] {
+			side.Nodes = append(side.Nodes, h)
+		}
+	}
+	return agreedLeader(side)
+}
+
+// oneSideLeader returns the leader of a split's sides: the leader that one
+// group agrees on, when exactly one group has one and no node outside that
+// group names itself the leader. Right after a split, the side of the old
+// leader still follows it while the other side may elect its own. That is two
+// leaders, not one side leading, so the round does not count.
+func oneSideLeader(r healthRound, groups [][]int) (int, []int, bool) {
+	var side []int
+	leader := 0
+	for _, g := range groups {
+		l, ok := agreedLeaderAmong(r, g)
+		if !ok {
+			continue
+		}
+		if side != nil {
+			return 0, nil, false
+		}
+		side, leader = g, l
+	}
+	if side == nil {
+		return 0, nil, false
+	}
+	for _, h := range r.Nodes {
+		if h.selfLeader() && !slices.Contains(side, h.Node) {
+			return 0, nil, false
+		}
+	}
+	return leader, side, true
 }
 
 // splitInterval is a stretch of rounds in which two or more nodes named

@@ -65,6 +65,11 @@ type configTemplateContext struct {
 	// (ComposeRunner.RenderReplicaConfigs), so a case can, for one, enable a
 	// device only after the leader has placed the first ones.
 	Stage int
+	// MoveTarget is the member name of the replica a shared-state
+	// move_across_cut_link action moves a device to, in the stage it renders
+	// (RenderReplicaConfigsMoving), so the config can allow the device only
+	// there through its placement_nodes. Empty in every other render.
+	MoveTarget string
 }
 
 // T0Plus returns T0 + sec seconds as RFC3339 UTC, for absolute device
@@ -211,6 +216,13 @@ services:
 {{- end }}
 {{- if $.WitnessDirMount }}
       - "witness-dir:{{ $.WitnessDirMount }}"
+{{- end }}
+{{- if .DiskPath }}
+      - type: tmpfs
+        target: "{{ .DiskPath }}"
+        tmpfs:
+          size: {{ .DiskSizeBytes }}
+          mode: 01777
 {{- end }}
 {{- if $.SubjectUser }}
     user: "{{ $.SubjectUser }}"
@@ -1297,11 +1309,13 @@ services:
       AWS_EC2_METADATA_DISABLED: "true"
     restart: "no"
 {{- end }}
-{{- define "helperLimits" }}{{ if .HelperCPULimit }}
+{{- define "helperLimits" }}{{ if or .HelperCPULimit .HelperMemLimit }}
     deploy:
       resources:
         limits:
+{{- if .HelperCPULimit }}
           cpus: "{{ .HelperCPULimit }}"
+{{- end }}
 {{- if .HelperMemLimit }}
           memory: "{{ .HelperMemLimit }}"
 {{- end }}{{ end }}{{ end }}
@@ -1388,6 +1402,12 @@ type ComposeRunner struct {
 // a changed config on its own, so this changes a running replica set without
 // restarting it.
 func (r *ComposeRunner) RenderReplicaConfigs(stage int) error {
+	return r.RenderReplicaConfigsMoving(stage, "")
+}
+
+// RenderReplicaConfigsMoving is RenderReplicaConfigs with {{@.MoveTarget@}}
+// set to moveTarget.
+func (r *ComposeRunner) RenderReplicaConfigsMoving(stage int, moveTarget string) error {
 	raw, err := os.ReadFile(r.cfg.ConfigSrcPath)
 	if err != nil {
 		return err
@@ -1400,7 +1420,7 @@ func (r *ComposeRunner) RenderReplicaConfigs(stage int) error {
 		// Render in memory and write the file in one call: a director that
 		// reads its config while it is written must not find it empty.
 		var buf bytes.Buffer
-		ctx := configTemplateContext{CPUs: runtime.NumCPU(), NodeID: i, T0: r.renderedAt, Stage: stage}
+		ctx := configTemplateContext{CPUs: runtime.NumCPU(), NodeID: i, T0: r.renderedAt, Stage: stage, MoveTarget: moveTarget}
 		if err := tmpl.Execute(&buf, ctx); err != nil {
 			return fmt.Errorf("rendering replica config %d: %w", i, err)
 		}
@@ -1904,6 +1924,10 @@ type clusterNode struct {
 	// a compose profile, so `up` leaves it out until a scale-out action or a
 	// scale_to step names it.
 	Standby bool
+	// DiskPath and DiskSizeBytes give the node a disk of its own: a
+	// size-limited tmpfs at DiskPath (cluster.scenario.node_disk).
+	DiskPath      string
+	DiskSizeBytes int64
 }
 
 // nodeDependency is one depends_on entry of every cluster node service.
@@ -2304,13 +2328,22 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 		if err := renderConfigToFile(cfg.ConfigSrcPath, nodeOut, ctx); err != nil {
 			return err
 		}
-		clusterNodes = append(clusterNodes, clusterNode{
+		node := clusterNode{
 			ID:        i,
 			Container: fmt.Sprintf("bench-subject-%s-%d", s.Name, i),
 			Hostname:  fmt.Sprintf("subject-%d", i),
 			ConfigSrc: filepath.ToSlash(nodeOut),
 			Standby:   tc.StandbyReplica(i) || i > regular,
-		})
+		}
+		if tc.Cluster != nil && tc.Cluster.Scenario != nil && tc.Cluster.Scenario.NodeDisk.HasNode(i) {
+			disk := tc.Cluster.Scenario.NodeDisk
+			size, err := config.ParseByteSize(disk.Size)
+			if err != nil {
+				return fmt.Errorf("cluster.scenario.node_disk.size %q: %w", disk.Size, err)
+			}
+			node.DiskPath, node.DiskSizeBytes = disk.Path, size
+		}
+		clusterNodes = append(clusterNodes, node)
 	}
 
 	// The collector samples targets by container name. Cluster cases have no
@@ -2996,7 +3029,7 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 	// So does a shared-state case. The template caps the helpers it knows,
 	// and this caps the rest: MinIO and its init, an endpoint such as Redis,
 	// and the share's init.
-	if tc.IsDirectorSharedStateType() && cfg.HelperCPULimit != "" && cfg.HelperMemLimit != "" {
+	if tc.IsDirectorSharedStateType() && (cfg.HelperCPULimit != "" || cfg.HelperMemLimit != "") {
 		if out, err = limitHelperServices(out, cfg.HelperCPULimit, cfg.HelperMemLimit); err != nil {
 			return err
 		}

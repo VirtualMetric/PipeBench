@@ -277,3 +277,73 @@ func TestLimitHelperServicesLeavesNodesAndExistingCaps(t *testing.T) {
 		t.Fatalf("a service with a deploy block keeps it")
 	}
 }
+
+func TestLimitHelperServicesAppliesEachLimitAlone(t *testing.T) {
+	in := []byte("services:\n  receiver:\n    image: b\n")
+	for _, tt := range []struct{ cpu, mem string }{{"0.5", ""}, {"", "256m"}} {
+		out, err := limitHelperServices(in, tt.cpu, tt.mem)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var doc map[string]map[string]map[string]any
+		if err := yaml.Unmarshal(out, &doc); err != nil {
+			t.Fatal(err)
+		}
+		// A limit that is not set must be missing, not an empty string, which
+		// Compose would reject.
+		receiver := doc["services"]["receiver"]
+		for key, want := range map[string]string{"cpus": tt.cpu, "mem_limit": tt.mem} {
+			got, has := receiver[key]
+			if want == "" && has {
+				t.Errorf("cpu %q, mem %q: receiver has %s = %v, want none", tt.cpu, tt.mem, key, got)
+			}
+			if want != "" && got != want {
+				t.Errorf("cpu %q, mem %q: receiver %s = %v, want %q", tt.cpu, tt.mem, key, got, want)
+			}
+		}
+	}
+	out, err := limitHelperServices(in, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != string(in) {
+		t.Errorf("no limits must leave the file as it was, got:\n%s", out)
+	}
+}
+
+// TestClusterScenarioComposeNodeDiskAndKeys covers node_disk, a tmpfs on the
+// chosen nodes only, and rows, which has the receiver note each line's key.
+func TestClusterScenarioComposeNodeDiskAndKeys(t *testing.T) {
+	steps := []config.ScenarioStep{{Do: "wait_ready"}}
+	src := "director:\n  id: {{@.NodeID@}}\n"
+	tc := scenarioCase(&config.ScenarioConfig{
+		Steps:    steps,
+		NodeDisk: &config.ScenarioNodeDisk{Path: "/opt/vmetric/storage", Size: "1g", Nodes: []int{3}},
+		Rows:     &config.ScenarioRows{Query: "SELECT message FROM events", Key: "evt-[0-9]+"},
+	})
+	doc, _, _ := renderScenario(t, tc, src)
+
+	tmpfsOn := func(name string) map[string]any {
+		vols, _ := service(t, doc, name)["volumes"].([]any)
+		for _, v := range vols {
+			if m, ok := v.(map[string]any); ok && m["type"] == "tmpfs" {
+				return m
+			}
+		}
+		return nil
+	}
+	if m := tmpfsOn("subject-1"); m != nil {
+		t.Fatalf("subject-1 got a disk of its own: %v", m)
+	}
+	m := tmpfsOn("subject-3")
+	if m == nil {
+		t.Fatalf("subject-3 has no tmpfs: %v", service(t, doc, "subject-3")["volumes"])
+	}
+	opts, _ := m["tmpfs"].(map[string]any)
+	if m["target"] != "/opt/vmetric/storage" || opts["size"] != 1<<30 {
+		t.Fatalf("subject-3's disk = %v, want 1g at /opt/vmetric/storage", m)
+	}
+	if env, _ := service(t, doc, "receiver")["environment"].(map[string]any); env["RECEIVER_TRACK_KEYS"] != "evt-[0-9]+" {
+		t.Fatalf("the receiver must note each line's key: %v", env)
+	}
+}

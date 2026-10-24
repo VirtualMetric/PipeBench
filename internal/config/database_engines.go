@@ -15,6 +15,11 @@ type DatabaseEngine struct {
 	BuildEnv        func(password string) map[string]string
 	BuildHealthCmd  func(password string) string
 	BuildInitCmd    func(password, database string) string
+	// BuildQueryCmd, when set, returns the command that runs query against
+	// database inside the database container (docker exec) and prints one
+	// row a line. A scenario case's rows check (cluster.scenario.rows) reads
+	// the rows the device should deliver with it.
+	BuildQueryCmd func(database, query string) []string
 
 	// TLS wiring (used only when a case sets `database.tls: true`). The
 	// orchestrator generates a CA + RSA server cert and bind-mounts server.crt
@@ -187,6 +192,12 @@ var DatabaseEngines = map[string]DatabaseEngine{
 					`PGPASSWORD=\"$$POSTGRES_PASSWORD\" psql -h database -U postgres -d %s -v ON_ERROR_STOP=1 -f /db-seed/init.sql; `+
 					`echo database seeding complete`,
 				database, database)
+		},
+		BuildQueryCmd: func(database, query string) []string {
+			// Runs inside the database container, where the image trusts a
+			// local socket connection from postgres, so no password is needed.
+			// -tA prints one row a line, with no header and no padding.
+			return []string{"psql", "-U", "postgres", "-d", database, "-v", "ON_ERROR_STOP=1", "-tA", "-c", query}
 		},
 		TLSServerCertPath: "/etc/pg/certs/server.crt",
 		TLSServerKeyPath:  "/etc/pg/certs/server.key",

@@ -918,6 +918,8 @@ func (run *ssRun) act() {
 		}
 	case config.SharedStateActionRollingRestart:
 		run.rollingRestart()
+	case config.SharedStateActionMoveAcrossCutLink:
+		run.moveAcrossCutLink()
 	}
 }
 
