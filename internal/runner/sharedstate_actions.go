@@ -604,24 +604,72 @@ func (run *ssRun) waitStoreMembers(want int, d time.Duration) int {
 			run.fail("reading Azurite's access log: %v", err)
 			return got
 		}
-		got = len(liveStoreMembers(parseAzuriteCalls(run.book.all("bench-azurite")), run.ss.StoreContainerOrDefault(), 6*time.Second))
+		got = len(liveStoreMembers(parseAzuriteCalls(run.book.all("bench-azurite")), run.ss.StoreContainerOrDefault()))
 		if got == want || time.Now().After(deadline) || sleepCtx(run.r.ctx, 2*time.Second) != nil {
 			return got
 		}
 	}
 }
 
-// liveStoreMembers returns the members whose record a replica wrote in the
-// last window of the calls: each replica renews its own every 2 seconds.
-func liveStoreMembers(calls []ssStoreCall, container string, window time.Duration) []string {
+// ssMemberRecordInterval is how often a replica writes its member record, used
+// until the store's log shows a gap that tells. A newer director writes a
+// replica's record when it starts, again as soon as it knows its route
+// address, and then every 30 seconds: the replicas check on each other over
+// their own connections, not through the store. An older director renews the
+// record every 2 seconds.
+const ssMemberRecordInterval = 30 * time.Second
+
+// ssStoreSilence is how long the state container can go without a call that
+// the store answered before the bench takes it for a store outage. Every
+// replica reads its lease every 2 seconds, so a store that is up answers a
+// call at least that often.
+const ssStoreSilence = 10 * time.Second
+
+// ssSilence is a stretch of the store's log in which the store answered no
+// call to the state container.
+type ssSilence struct{ from, to time.Time }
+
+// ssMemberRecord is what the store's log shows of one member record: when a
+// replica wrote it, and when it was last deleted.
+type ssMemberRecord struct {
+	writes  []time.Time
+	deleted time.Time
+}
+
+// liveStoreMembers returns the members whose record is live at the last call
+// in the log. A record is live when a replica wrote it within
+// memberRecordWindow and nobody has deleted it since. A replica deletes its
+// own record when it stops cleanly, so a scale-in shows at once, whatever the
+// interval.
+func liveStoreMembers(calls []ssStoreCall, container string) []string {
 	if len(calls) == 0 {
 		return nil
 	}
 	last := calls[len(calls)-1].At
-	seen := map[string]bool{}
+	records := memberRecords(calls, container)
+	window := memberRecordWindow(records, storeSilences(calls, container))
 	var members []string
+	for member, r := range records {
+		if len(r.writes) == 0 {
+			continue
+		}
+		written := r.writes[len(r.writes)-1]
+		if r.deleted.After(written) || last.Sub(written) > window {
+			continue
+		}
+		members = append(members, member)
+	}
+	slices.Sort(members)
+	return members
+}
+
+// memberRecords collects the writes and deletes of each member record in the
+// container. A write or a delete that the store refused does not count, but
+// deleting a record that is already gone does.
+func memberRecords(calls []ssStoreCall, container string) map[string]*ssMemberRecord {
+	records := map[string]*ssMemberRecord{}
 	for _, c := range calls {
-		if c.Method != "PUT" || c.At.Before(last.Add(-window)) || !c.inContainer(container) {
+		if (c.Method != "PUT" && c.Method != "DELETE") || !c.inContainer(container) {
 			continue
 		}
 		path, err := url.PathUnescape(c.Path)
@@ -633,13 +681,88 @@ func liveStoreMembers(calls []ssStoreCall, container string, window time.Duratio
 			continue
 		}
 		member, _, _ = strings.Cut(member, "?")
-		if member != "" && !seen[member] {
-			seen[member] = true
-			members = append(members, member)
+		if member == "" {
+			continue
+		}
+		r := records[member]
+		if r == nil {
+			r = &ssMemberRecord{}
+			records[member] = r
+		}
+		switch {
+		case c.Method == "PUT" && c.Status/100 == 2:
+			r.writes = append(r.writes, c.At)
+		case c.Method == "DELETE" && (c.Status/100 == 2 || c.Status == 404):
+			r.deleted = c.At
 		}
 	}
-	slices.Sort(members)
-	return members
+	return records
+}
+
+// memberRecordWindow is how long a member record stays live after a replica
+// last wrote it: one and a half times the interval the replicas write their
+// records at, and at least 4 seconds more than one interval. The interval is
+// the median time between two writes of the same record, so the window
+// follows the director under test. A director that renews its record every 2
+// seconds gets 6 seconds, as before. A director that writes it every
+// 30 seconds gets about 45 seconds. That is close to the 45 seconds such a
+// director itself trusts a record for: the record interval plus 15 seconds.
+//
+// Two kinds of gap do not count. The first gap of each record does not: a
+// newer director writes its record again soon after it starts, once it knows
+// its route address, and a gap of a second would make the window a few
+// seconds long. A gap in which the store was silent does not count either:
+// the replicas could not write their records then, so such a gap says
+// nothing about how often they write them. Counted, the gaps of a long store
+// outage would make the window minutes long, and a replica killed during the
+// outage would still count as live after it.
+func memberRecordWindow(records map[string]*ssMemberRecord, silences []ssSilence) time.Duration {
+	var gaps []time.Duration
+	for _, r := range records {
+		for i := 2; i < len(r.writes); i++ {
+			from, to := r.writes[i-1], r.writes[i]
+			if silentBetween(silences, from, to) {
+				continue
+			}
+			gaps = append(gaps, to.Sub(from))
+		}
+	}
+	interval := ssMemberRecordInterval
+	if len(gaps) > 0 {
+		slices.Sort(gaps)
+		interval = gaps[len(gaps)/2]
+	}
+	return max(interval*3/2, interval+4*time.Second)
+}
+
+// storeSilences returns the stretches in which the store answered no call to
+// the container for longer than ssStoreSilence: it was paused, unreachable or
+// failing. A call that the store answered with a status below 500 counts, so a
+// refused write or a missing record shows that the store was up.
+func storeSilences(calls []ssStoreCall, container string) []ssSilence {
+	var silences []ssSilence
+	var answered time.Time
+	for _, c := range calls {
+		if c.Status >= 500 || !c.inContainer(container) {
+			continue
+		}
+		if !answered.IsZero() && c.At.Sub(answered) > ssStoreSilence {
+			silences = append(silences, ssSilence{from: answered, to: c.At})
+		}
+		answered = c.At
+	}
+	return silences
+}
+
+// silentBetween reports whether the store was silent at some point between
+// from and to.
+func silentBetween(silences []ssSilence, from, to time.Time) bool {
+	for _, s := range silences {
+		if s.from.Before(to) && s.to.After(from) {
+			return true
+		}
+	}
+	return false
 }
 
 // coldRestart stops every replica at once, gracefully, and starts a new
@@ -781,9 +904,11 @@ func (run *ssRun) storeCalls() {
 }
 
 // ssStoreStall is how long Azurite may serve no request at all before the
-// driver calls it a stall. Every replica renews its member record every two
-// seconds, so a store that is quiet this long stood still, or the machine
-// did.
+// driver calls it a stall. Every replica reads the lease every two seconds,
+// and the replica that holds it renews it as often, so a store that is quiet
+// this long stood still, or the machine did. The member records do not keep
+// the store busy: a newer director writes a replica's record only every 30
+// seconds.
 const ssStoreStall = 5 * time.Second
 
 // windowDisturbances lists what happened in [from, to) that a steady window
