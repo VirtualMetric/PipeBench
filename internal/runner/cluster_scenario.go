@@ -792,13 +792,13 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 			if err := sleepCtx(sr.ctx, 500*time.Millisecond); err != nil {
 				return false, "", fmt.Errorf("interrupted: %w", err)
 			}
-			if p, ok := readGeneratorProgress(); ok {
-				if p.Acked != prev.Acked {
-					lastChange = time.Now()
-					prev = p
-				} else if f := time.Since(lastChange); f > maxFlat {
-					maxFlat = f
-				}
+			// A read that fails shows no progress, so it counts as a pause:
+			// a confirmation the step cannot see does not keep the gap open.
+			if p, ok := readGeneratorProgress(); ok && p.Acked != prev.Acked {
+				lastChange = time.Now()
+				prev = p
+			} else if f := time.Since(lastChange); f > maxFlat {
+				maxFlat = f
 			}
 		}
 		gained := prev.Acked - first.Acked
