@@ -71,7 +71,7 @@ func TestJudgeRows(t *testing.T) {
 // took, and judges its rows.
 func TestWithoutLoadVerdict(t *testing.T) {
 	zero := int64(0)
-	ex := config.ScenarioExpect{MaxDuplicates: &zero, MaxMissingRows: &zero}
+	ex := config.ScenarioExpect{MaxDuplicates: &zero, MaxMissingRows: &zero, MaxRowsTwice: &zero}
 	allRows := &rowsCheck{Written: 578, Arrived: 578}
 	cases := []struct {
 		name       string
@@ -86,6 +86,9 @@ func TestWithoutLoadVerdict(t *testing.T) {
 		{"counts not read", scenarioReport{Rows: allRows}, true, errors.New("connection refused"), "could not be read"},
 		{"no hashing", scenarioReport{Received: 852, Unique: 852, Rows: allRows}, false, nil, "needs correctness.validate_dedup"},
 		{"a missing row", scenarioReport{Received: 520, Unique: 520, Rows: &rowsCheck{Written: 521, Arrived: 520, Missing: 1, MissingKeys: []string{"evt-999999999"}}}, true, nil, "evt-999999999"},
+		// A row collected again arrives on a line that differs from its first
+		// one, so the hash count sees no duplicate and only the key does.
+		{"a row collected twice", scenarioReport{Received: 670, Unique: 670, Rows: &rowsCheck{Written: 487, Arrived: 487, ArrivedTwice: 183, TwiceKeys: []string{"evt-1", "evt-2"}}}, true, nil, "183 of 487 database rows arrived more than once"},
 	}
 	for _, c := range cases {
 		reasons, _ := withoutLoadVerdict(c.rep, ex, c.dedup, c.metricsErr)

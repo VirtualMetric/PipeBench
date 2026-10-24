@@ -1821,6 +1821,10 @@ func withoutLoadVerdict(rep scenarioReport, ex config.ScenarioExpect, dedup bool
 	if reason != "" {
 		reasons = append(reasons, reason)
 	}
+	if r := rep.Rows; r != nil && r.Error == "" && ex.MaxRowsTwice != nil && r.ArrivedTwice > *ex.MaxRowsTwice {
+		reasons = append(reasons, fmt.Sprintf("%d of %d database rows arrived more than once (max_rows_twice %d); the first: %s",
+			r.ArrivedTwice, r.Written, *ex.MaxRowsTwice, strings.Join(r.TwiceKeys, ", ")))
+	}
 	if note != "" {
 		notes = append(notes, note)
 	}

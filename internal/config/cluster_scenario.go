@@ -164,6 +164,11 @@ type ScenarioExpect struct {
 	// MaxMissingRows is how many database rows (cluster.scenario.rows) may
 	// never arrive.
 	MaxMissingRows *int64 `yaml:"max_missing_rows"`
+	// MaxRowsTwice is how many database rows may arrive more than once. It
+	// counts by the row's key, so a row collected again counts even when its
+	// second line differs from the first (a collection time, the node), which
+	// the receiver's hash-based duplicate count does not see.
+	MaxRowsTwice *int64 `yaml:"max_rows_twice"`
 }
 
 // ScenarioStep is one step. Do names the action; the other fields are its
@@ -881,6 +886,9 @@ func (tc *TestCase) validateScenarioDiskAndRows(maxNodes int) error {
 	}
 	if sc.Expect.MaxMissingRows != nil && sc.Rows == nil {
 		return fmt.Errorf("case %q: expect.max_missing_rows needs cluster.scenario.rows", tc.Name)
+	}
+	if sc.Expect.MaxRowsTwice != nil && sc.Rows == nil {
+		return fmt.Errorf("case %q: expect.max_rows_twice needs cluster.scenario.rows", tc.Name)
 	}
 	return nil
 }

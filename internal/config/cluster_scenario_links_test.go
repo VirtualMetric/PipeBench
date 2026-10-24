@@ -133,6 +133,12 @@ func TestValidateRowsCheck(t *testing.T) {
 		"unknown writer":     {func(tc *TestCase) { tc.Cluster.Scenario.Rows.Writer = "ghost" }, `writer "ghost"`},
 		"negative drain":     {func(tc *TestCase) { tc.Cluster.Scenario.Rows.DrainSeconds = -1 }, "drain_seconds"},
 		"judge without rows": {func(tc *TestCase) { tc.Cluster.Scenario.Rows = nil }, "max_missing_rows needs"},
+		"twice without rows": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Rows = nil
+			tc.Cluster.Scenario.Expect.MaxMissingRows = nil
+			zero := int64(0)
+			tc.Cluster.Scenario.Expect.MaxRowsTwice = &zero
+		}, "max_rows_twice needs"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
