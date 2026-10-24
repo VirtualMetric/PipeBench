@@ -209,9 +209,13 @@ type SharedStateConfig struct {
 	// StateWriteIntervalSeconds is how often the replica that runs the shared
 	// bus should write the state to the store, when the case sets the
 	// director's write interval. store_calls then checks, under load, that
-	// each gap between two of that replica's segment writes lasts the
-	// interval, give or take StateWriteToleranceSeconds. Membership and lease
-	// writes keep their own pace and are not judged. 0 only reports the gaps.
+	// each gap between two rounds of that replica's segment writes lasts the
+	// interval, give or take StateWriteToleranceSeconds. A round is the writes
+	// that come within a second of each other: a snapshot writes a segment for
+	// each stream. A round that comes with a snapshot counts as an interval
+	// write, because a bus takes its snapshots with its interval writes.
+	// Membership and lease writes keep their own pace and are not judged. 0
+	// only reports the gaps.
 	StateWriteIntervalSeconds int `yaml:"state_write_interval_seconds"`
 	// StateWriteToleranceSeconds is how far a gap may stray from the interval
 	// (default: a tenth of the interval, at least 2 seconds).
