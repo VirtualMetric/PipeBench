@@ -1297,11 +1297,13 @@ services:
       AWS_EC2_METADATA_DISABLED: "true"
     restart: "no"
 {{- end }}
-{{- define "helperLimits" }}{{ if .HelperCPULimit }}
+{{- define "helperLimits" }}{{ if or .HelperCPULimit .HelperMemLimit }}
     deploy:
       resources:
         limits:
+{{- if .HelperCPULimit }}
           cpus: "{{ .HelperCPULimit }}"
+{{- end }}
 {{- if .HelperMemLimit }}
           memory: "{{ .HelperMemLimit }}"
 {{- end }}{{ end }}{{ end }}
@@ -2996,7 +2998,7 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 	// So does a shared-state case. The template caps the helpers it knows,
 	// and this caps the rest: MinIO and its init, an endpoint such as Redis,
 	// and the share's init.
-	if tc.IsDirectorSharedStateType() && cfg.HelperCPULimit != "" && cfg.HelperMemLimit != "" {
+	if tc.IsDirectorSharedStateType() && (cfg.HelperCPULimit != "" || cfg.HelperMemLimit != "") {
 		if out, err = limitHelperServices(out, cfg.HelperCPULimit, cfg.HelperMemLimit); err != nil {
 			return err
 		}

@@ -145,9 +145,13 @@ func shellQuote(s string) string {
 
 // limitHelperServices gives every service that is not a director node a CPU
 // and memory cap, unless it already has a deploy block or caps of its own.
+// Each cap applies on its own: an empty cpu or mem leaves that cap off.
 // Director nodes (the services named subject or subject-<n>) keep the
 // limits the case set for them.
 func limitHelperServices(composeYAML []byte, cpu, mem string) ([]byte, error) {
+	if cpu == "" && mem == "" {
+		return composeYAML, nil
+	}
 	var doc yaml.Node
 	if err := yaml.Unmarshal(composeYAML, &doc); err != nil {
 		return nil, fmt.Errorf("parsing rendered compose file: %w", err)
@@ -169,12 +173,18 @@ func limitHelperServices(composeYAML []byte, cpu, mem string) ([]byte, error) {
 		if mappingValue(svc, "deploy") != nil || mappingValue(svc, "cpus") != nil || mappingValue(svc, "mem_limit") != nil {
 			continue
 		}
-		svc.Content = append(svc.Content,
-			&yaml.Node{Kind: yaml.ScalarNode, Value: "cpus"},
-			&yaml.Node{Kind: yaml.ScalarNode, Value: cpu, Style: yaml.DoubleQuotedStyle},
-			&yaml.Node{Kind: yaml.ScalarNode, Value: "mem_limit"},
-			&yaml.Node{Kind: yaml.ScalarNode, Value: mem, Style: yaml.DoubleQuotedStyle},
-		)
+		if cpu != "" {
+			svc.Content = append(svc.Content,
+				&yaml.Node{Kind: yaml.ScalarNode, Value: "cpus"},
+				&yaml.Node{Kind: yaml.ScalarNode, Value: cpu, Style: yaml.DoubleQuotedStyle},
+			)
+		}
+		if mem != "" {
+			svc.Content = append(svc.Content,
+				&yaml.Node{Kind: yaml.ScalarNode, Value: "mem_limit"},
+				&yaml.Node{Kind: yaml.ScalarNode, Value: mem, Style: yaml.DoubleQuotedStyle},
+			)
+		}
 	}
 	var buf bytes.Buffer
 	enc := yaml.NewEncoder(&buf)

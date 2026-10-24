@@ -275,3 +275,76 @@ func TestSharedStateComposeRendersOtherStores(t *testing.T) {
 		}
 	})
 }
+
+// TestSharedStateHelperLimitsApplyEachLimitAlone checks that a helper limit
+// applies without the other: the containers the template caps (Azurite) and
+// the ones capped after rendering (MinIO) both take the one limit that is
+// set, and leave the other off.
+func TestSharedStateHelperLimitsApplyEachLimitAlone(t *testing.T) {
+	for _, tt := range []struct{ name, cpu, mem string }{
+		{"memory only", "", "1g"},
+		{"cpu only", "1", ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			srcCfg := filepath.Join(t.TempDir(), "vmetric.yml")
+			if err := os.WriteFile(srcCfg, []byte("director:\n  id: 7001\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			tc := &config.TestCase{
+				Name:       "director_shared_state_one_limit",
+				Type:       "director_shared_state_correctness",
+				Azure:      &config.AzureConfig{Containers: []string{"bench-in"}},
+				Minio:      &config.MinioConfig{Buckets: []string{"director-state"}},
+				Generators: []config.GeneratorConfig{{ID: "blob", Mode: "azure_blob", Target: "http://azurite:10000", Rate: 10, Format: "raw"}},
+				Receivers:  []config.ReceiverConfig{{ID: "blob", Mode: "tcp", Listen: ":9001"}},
+				SharedState: &config.SharedStateConfig{
+					Replicas: 2,
+					Store:    config.SharedStateStoreS3,
+					Streams:  []config.SharedStateStream{{Generator: "blob", Receiver: "blob"}},
+				},
+			}
+			if err := tc.Validate(); err != nil {
+				t.Fatalf("validate: %v", err)
+			}
+			cr, err := NewComposeRunner(context.Background(), RunConfig{
+				TestCase: tc, Subject: config.Subject{Name: "vmetric", Image: "vmetric/director-enterprise", Version: "dev", ConfigPath: "/config.yml"},
+				ConfigName: "default", ConfigSrcPath: srcCfg, TmpDir: t.TempDir(),
+				GeneratorImage: "img-gen", ReceiverImage: "img-recv", CollectorImage: "img-coll", ReceiverHostPort: 19001,
+				CPULimit: "1.0", MemLimit: "1g", HelperCPULimit: tt.cpu, HelperMemLimit: tt.mem,
+			})
+			if err != nil {
+				t.Fatalf("NewComposeRunner: %v", err)
+			}
+			data, err := os.ReadFile(cr.composeFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var parsed struct {
+				Services map[string]map[string]any `yaml:"services"`
+			}
+			if err := yaml.Unmarshal(data, &parsed); err != nil {
+				t.Fatalf("rendered compose is not valid YAML: %v\n%s", err, data)
+			}
+			azurite := parsed.Services["azurite"]
+			deploy, _ := azurite["deploy"].(map[string]any)
+			resources, _ := deploy["resources"].(map[string]any)
+			limits, _ := resources["limits"].(map[string]any)
+			if cpus, _ := limits["cpus"].(string); cpus != tt.cpu {
+				t.Errorf("azurite cpus = %v, want %q", limits["cpus"], tt.cpu)
+			}
+			if mem, _ := limits["memory"].(string); mem != tt.mem {
+				t.Errorf("azurite memory = %v, want %q", limits["memory"], tt.mem)
+			}
+			minio := parsed.Services["minio"]
+			if minio == nil {
+				t.Fatalf("no minio service:\n%s", data)
+			}
+			if cpus, _ := minio["cpus"].(string); cpus != tt.cpu {
+				t.Errorf("minio cpus = %v, want %q", minio["cpus"], tt.cpu)
+			}
+			if mem, _ := minio["mem_limit"].(string); mem != tt.mem {
+				t.Errorf("minio mem_limit = %v, want %q", minio["mem_limit"], tt.mem)
+			}
+		})
+	}
+}

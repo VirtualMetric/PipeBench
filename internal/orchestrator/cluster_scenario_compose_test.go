@@ -277,3 +277,36 @@ func TestLimitHelperServicesLeavesNodesAndExistingCaps(t *testing.T) {
 		t.Fatalf("a service with a deploy block keeps it")
 	}
 }
+
+func TestLimitHelperServicesAppliesEachLimitAlone(t *testing.T) {
+	in := []byte("services:\n  receiver:\n    image: b\n")
+	for _, tt := range []struct{ cpu, mem string }{{"0.5", ""}, {"", "256m"}} {
+		out, err := limitHelperServices(in, tt.cpu, tt.mem)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var doc map[string]map[string]map[string]any
+		if err := yaml.Unmarshal(out, &doc); err != nil {
+			t.Fatal(err)
+		}
+		// A limit that is not set must be missing, not an empty string, which
+		// Compose would reject.
+		receiver := doc["services"]["receiver"]
+		for key, want := range map[string]string{"cpus": tt.cpu, "mem_limit": tt.mem} {
+			got, has := receiver[key]
+			if want == "" && has {
+				t.Errorf("cpu %q, mem %q: receiver has %s = %v, want none", tt.cpu, tt.mem, key, got)
+			}
+			if want != "" && got != want {
+				t.Errorf("cpu %q, mem %q: receiver %s = %v, want %q", tt.cpu, tt.mem, key, got, want)
+			}
+		}
+	}
+	out, err := limitHelperServices(in, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != string(in) {
+		t.Errorf("no limits must leave the file as it was, got:\n%s", out)
+	}
+}
