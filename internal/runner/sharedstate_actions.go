@@ -295,6 +295,32 @@ func (run *ssRun) isolateReplica() {
 	run.judgeOutageStreams(base, during, back)
 
 	run.recoverAfterOutage(cut, back, rep.Container)
+	takeovers, _ := run.measures["outage_takeover_seconds"].(map[string]float64)
+	for _, p := range isolateTakeoverProblems(owned, takeovers, back.Sub(cut), run.ss.MaxFailoverSeconds) {
+		run.fail("%s", p)
+	}
+}
+
+// isolateTakeoverProblems judges how soon another replica ran each device the
+// cut-off replica ran, counted from the cut, against max_failover_seconds. A
+// device that no other replica ran during the cut was too slow when the cut
+// lasted longer than the limit. With a shorter cut it is not judged: it may
+// have run again on the replica that came back.
+func isolateTakeoverProblems(owned []int64, takeovers map[string]float64, cut time.Duration, limit float64) []string {
+	if limit <= 0 {
+		return nil
+	}
+	var problems []string
+	for _, d := range owned {
+		secs, ok := takeovers[strconv.FormatInt(d, 10)]
+		switch {
+		case ok && secs > limit:
+			problems = append(problems, fmt.Sprintf("device %d of the cut-off replica ran on another replica %.1fs after the cut, above max_failover_seconds %.0f", d, secs, limit))
+		case !ok && cut.Seconds() > limit:
+			problems = append(problems, fmt.Sprintf("device %d of the cut-off replica did not run on another replica within max_failover_seconds %.0f of the cut, which lasted %.0fs", d, limit, cut.Seconds()))
+		}
+	}
+	return problems
 }
 
 // recoverAfterOutage measures the outage's effect from the logs, and waits for

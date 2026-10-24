@@ -306,6 +306,32 @@ func TestLogOncePerRun(t *testing.T) {
 	}
 }
 
+// isolate_replica judges how soon another replica ran the cut-off replica's
+// devices, with max_failover_seconds.
+func TestIsolateTakeoverProblems(t *testing.T) {
+	owned := []int64{11, 12, 13}
+	cut := 31 * time.Second
+	// What a director that hands the devices on quickly did: all within 25 s.
+	if got := isolateTakeoverProblems(owned, map[string]float64{"11": 13.9, "12": 14.0, "13": 14.0}, cut, 25); len(got) != 0 {
+		t.Errorf("takeovers within the limit: %q, want none", got)
+	}
+	// One device too slow, and two that no replica ran before the 31 s cut
+	// ended, as on a director whose routes to the cut-off replica stayed open.
+	got := isolateTakeoverProblems(owned, map[string]float64{"11": 26.9}, cut, 25)
+	if len(got) != 3 || !strings.Contains(got[0], "device 11 of the cut-off replica ran on another replica 26.9s after the cut") ||
+		!strings.Contains(got[1], "device 12 of the cut-off replica did not run on another replica within max_failover_seconds 25") {
+		t.Errorf("a late takeover and two missing: %q, want three problems naming them", got)
+	}
+	// A cut shorter than the limit leaves a device nobody took over unjudged.
+	if got := isolateTakeoverProblems(owned, nil, 20*time.Second, 25); len(got) != 0 {
+		t.Errorf("a 20 s cut with a 25 s limit: %q, want none", got)
+	}
+	// Without a limit nothing is judged.
+	if got := isolateTakeoverProblems(owned, nil, cut, 0); len(got) != 0 {
+		t.Errorf("no limit: %q, want none", got)
+	}
+}
+
 func TestStateWritesBesideSnapshots(t *testing.T) {
 	base := time.Date(2026, 10, 23, 22, 26, 39, 0, time.UTC)
 	at := func(s float64) time.Time { return base.Add(time.Duration(s * float64(time.Second))) }

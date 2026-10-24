@@ -141,8 +141,9 @@ type SharedStateConfig struct {
 	// the replicas log.
 	PlacedDevices []int64 `yaml:"placed_devices"`
 	// MaxFailoverSeconds fails the case when a placed device the action moved
-	// takes longer than this to run again, counted from the action. 0 only
-	// reports the time.
+	// takes longer than this to run again, counted from the action. For
+	// isolate_replica it is how soon another replica must run each device of
+	// the cut-off replica, counted from the cut. 0 only reports the time.
 	MaxFailoverSeconds float64 `yaml:"max_failover_seconds"`
 	// ExpectHealth is the status the director's /health endpoint must report
 	// for its shared_state component on every running replica: "ok" (the
