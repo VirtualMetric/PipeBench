@@ -187,3 +187,33 @@ func TestSeqTrackerSkipsACutLine(t *testing.T) {
 		t.Errorf("tracker: unique %d missing %d unparsed %d, want 2 1 1", got.Unique, got.Missing, got.Unparsed)
 	}
 }
+
+// TestSeqCountsKeepTheHashCountsForLinesWithoutASequence: the tracker is on
+// for every scenario case. Rows from a database carry no sequence number, so
+// the tracker counts no line, and its zeros must not replace the hash-based
+// counts, which see a row that arrived twice.
+func TestSeqCountsKeepTheHashCountsForLinesWithoutASequence(t *testing.T) {
+	val := newValidator()
+	tr := newSeqTracker()
+	now := time.Now().UnixNano()
+	for _, l := range []string{"evt-1 collected", "evt-2 collected", "evt-1 collected"} {
+		val.recordLine([]byte(l), config{ValidateDedup: true})
+		tr.record([]byte(l), now)
+	}
+	seqUnique, _ := tr.counts()
+	if seqCountsWin(seqUnique, true) {
+		t.Fatalf("the tracker's counts (%d distinct) replaced the hash-based ones for lines without a sequence", seqUnique)
+	}
+	if _, dups := val.dedupStats(); dups != 1 {
+		t.Fatalf("hash check: %d duplicates, want 1", dups)
+	}
+	// Sequenced lines: the tracker's counts win.
+	tr.record([]byte("CONN=0 SEQ=0 aaaa"), now)
+	if seqUnique, _ := tr.counts(); !seqCountsWin(seqUnique, true) {
+		t.Fatalf("the tracker's counts lost to the hash-based ones after it counted a sequenced line")
+	}
+	// Without the hash-based check there is nothing else to report.
+	if !seqCountsWin(0, false) {
+		t.Fatalf("the tracker's counts must be reported when no hash-based check runs")
+	}
+}

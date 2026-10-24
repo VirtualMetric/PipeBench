@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -118,16 +120,29 @@ func (l *linkFaults) get(k linkKey) linkFault {
 	return l.faults[k]
 }
 
-// restoreAll removes every fault.
+// restoreAll removes every fault. When a container's rules cannot be
+// rebuilt, the faults stay declared, so that the restore at the end of the
+// steps tries again instead of forgetting a fault that is still in force.
 func (l *linkFaults) restoreAll(ctx context.Context) error {
 	l.mu.Lock()
+	old := l.faults
 	touched := map[string]bool{}
-	for k := range l.faults {
+	for k := range old {
 		touched[k.From], touched[k.To] = true, true
 	}
 	l.faults = map[linkKey]linkFault{}
 	l.mu.Unlock()
-	return l.rebuild(ctx, touched)
+	if err := l.rebuild(ctx, touched); err != nil {
+		l.mu.Lock()
+		for k, f := range old {
+			if _, set := l.faults[k]; !set {
+				l.faults[k] = f
+			}
+		}
+		l.mu.Unlock()
+		return err
+	}
+	return nil
 }
 
 // resync rebuilds the rules of container and of every container it shares a
@@ -203,15 +218,36 @@ func (l *linkFaults) rebuildOne(ctx context.Context, c string) error {
 	}
 	l.mu.Unlock()
 
+	// A peer that is not running has no address, and its rules wait for the
+	// resync after its start. A running peer must have one: skipping it would
+	// report a fault that is not in force.
+	addrOf := func(peer string) (string, bool, error) {
+		addr, err := l.addrOf(peer)
+		if err == nil {
+			return addr, true, nil
+		}
+		if !l.running(peer) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("the address of %s, which runs: %w", peer, err)
+	}
 	var dropAddrs []string
 	for _, peer := range drops {
-		if addr, err := l.addrOf(peer); err == nil {
+		addr, ok, err := addrOf(peer)
+		if err != nil {
+			return err
+		}
+		if ok {
 			dropAddrs = append(dropAddrs, addr)
 		}
 	}
 	var shaped []shapedPeer
 	for peer, f := range shapes {
-		if addr, err := l.addrOf(peer); err == nil {
+		addr, ok, err := addrOf(peer)
+		if err != nil {
+			return err
+		}
+		if ok {
 			shaped = append(shaped, shapedPeer{Addr: addr, Fault: f})
 		}
 	}
@@ -288,11 +324,23 @@ func netemArgs(f linkFault) string {
 	return b.String()
 }
 
+// nettoolSeq numbers the helpers, so that each one gets a name of its own.
+var nettoolSeq atomic.Uint64
+
+// nettoolName returns a name for a new helper that works on container. It
+// starts with bench- so that `harness clean` removes a helper that an
+// interrupted run left behind. It holds the target container and a number that
+// no other helper of this process has. A timestamp was not enough: the helpers
+// for several containers start in parallel, two of them read the same clock
+// tick on Windows, and the second one failed on the name.
+func nettoolName(container string) string {
+	return fmt.Sprintf("bench-linkfault-%s-%d-%d", container, os.Getpid(), nettoolSeq.Add(1))
+}
+
 // runNettool runs script in container's network namespace, in a helper that
-// removes itself. Its name starts with bench- so that `harness clean` removes
-// one an interrupted run left behind.
+// removes itself.
 func runNettool(ctx context.Context, image, container, script string) error {
-	name := fmt.Sprintf("bench-linkfault-%d", time.Now().UnixNano())
+	name := nettoolName(container)
 	cctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(cctx, "docker", "run", "--rm", "--name", name,

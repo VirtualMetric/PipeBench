@@ -1066,9 +1066,10 @@ func serveMetrics(port string, cnt *counters, val *validator, cfg config) {
 		// Sequence tracking reports distinct lines and first-arrival latency
 		// on its own, without the hash-based dedup check.
 		if seqTrack != nil {
-			unique, dups := seqTrack.counts()
-			resp["unique_lines"] = unique
-			resp["duplicates"] = dups
+			if unique, dups := seqTrack.counts(); seqCountsWin(unique, cfg.ValidateDedup) {
+				resp["unique_lines"] = unique
+				resp["duplicates"] = dups
+			}
 			if ls := seqTrack.latency(0, 0); ls.Count > 0 {
 				resp["latency_p50_ms"] = ls.P50Ms
 				resp["latency_p95_ms"] = ls.P95Ms

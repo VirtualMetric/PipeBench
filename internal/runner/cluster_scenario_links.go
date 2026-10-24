@@ -167,6 +167,11 @@ func (sr *scenarioRun) linkEnds(sel, except string) (containers []string, node i
 		}
 		return containers, 0, nil
 	case strings.HasPrefix(sel, "bench-"):
+		// A container that does not run has no namespace to change, so a
+		// fault on it would be reported and not be in force.
+		if !sr.links.running(sel) {
+			return nil, 0, fmt.Errorf("container %s does not run", sel)
+		}
 		return []string{sel}, 0, nil
 	}
 	n, err := sr.resolveNode(sel)
@@ -191,8 +196,10 @@ func describeSides(sides [][]int) string {
 // relink rebuilds the link faults that involve node n, after a step started
 // it: its rules went with its old network namespace.
 func (sr *scenarioRun) relink(n int) {
+	// The case goes on believing the faults are in force, so a failure here
+	// fails the run.
 	if err := sr.links.resync(sr.ctx, sr.containers[n-1]); err != nil {
-		sr.notes = append(sr.notes, fmt.Sprintf("could not put node %d's link faults back after its start: %v", n, err))
+		sr.failures = append(sr.failures, fmt.Sprintf("could not put node %d's link faults back after its start: %v", n, err))
 	}
 }
 
@@ -340,8 +347,10 @@ type rowsCheck struct {
 	// Missing is how many never did, and MissingKeys names the first of them.
 	Missing     int64    `json:"missing"`
 	MissingKeys []string `json:"missing_keys,omitempty"`
-	// ArrivedTwice is how many rows arrived on more than one line.
-	ArrivedTwice int64 `json:"arrived_twice"`
+	// ArrivedTwice is how many rows arrived on more than one line, and
+	// TwiceKeys names the first of them, in the query's order.
+	ArrivedTwice int64    `json:"arrived_twice"`
+	TwiceKeys    []string `json:"twice_keys,omitempty"`
 	// Unknown is how many keys arrived that no row has.
 	Unknown int64 `json:"unknown"`
 	// LinesWithoutKey is how many received lines had no key at all.
@@ -370,6 +379,9 @@ func compareRows(rows []string, received map[string]int64, linesWithoutKey int64
 		case n > 1:
 			c.Arrived++
 			c.ArrivedTwice++
+			if len(c.TwiceKeys) < 20 {
+				c.TwiceKeys = append(c.TwiceKeys, r)
+			}
 		default:
 			c.Arrived++
 		}
@@ -408,6 +420,9 @@ func (sr *scenarioRun) checkRows() rowsCheck {
 	} else {
 		fmt.Printf("  rows: %d written, %d arrived, %d missing, %d arrived twice, %d unknown keys, %d lines without a key\n",
 			last.Written, last.Arrived, last.Missing, last.ArrivedTwice, last.Unknown, last.LinesWithoutKey)
+		if len(last.TwiceKeys) > 0 {
+			fmt.Printf("    the first rows that arrived twice: %s\n", strings.Join(last.TwiceKeys, ", "))
+		}
 	}
 	return last
 }

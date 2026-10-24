@@ -1,6 +1,8 @@
 package runner
 
 import (
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,8 +16,9 @@ func TestCompareRows(t *testing.T) {
 	want := rowsCheck{Written: 3, Arrived: 2, Missing: 1, MissingKeys: []string{"evt-3"}, ArrivedTwice: 1, Unknown: 1, LinesWithoutKey: 4}
 	if got.Written != want.Written || got.Arrived != want.Arrived || got.Missing != want.Missing ||
 		got.ArrivedTwice != want.ArrivedTwice || got.Unknown != want.Unknown || got.LinesWithoutKey != want.LinesWithoutKey ||
-		len(got.MissingKeys) != 1 || got.MissingKeys[0] != "evt-3" {
-		t.Fatalf("compareRows = %+v, want %+v", got, want)
+		len(got.MissingKeys) != 1 || got.MissingKeys[0] != "evt-3" ||
+		len(got.TwiceKeys) != 1 || got.TwiceKeys[0] != "evt-2" {
+		t.Fatalf("compareRows = %+v, want %+v and evt-2 named as twice", got, want)
 	}
 }
 
@@ -27,6 +30,75 @@ func TestCompareRowsListsAtMostTwentyMissing(t *testing.T) {
 	got := compareRows(rows, map[string]int64{}, 0)
 	if got.Missing != 30 || len(got.MissingKeys) != 20 {
 		t.Fatalf("missing = %d with %d keys listed, want 30 with 20", got.Missing, len(got.MissingKeys))
+	}
+}
+
+// A row that never arrived must fail the run. The first version reported the
+// rows and judged them nowhere, so a proof run with a missing row passed.
+func TestJudgeRows(t *testing.T) {
+	zero := int64(0)
+	cases := []struct {
+		name       string
+		rows       *rowsCheck
+		max        *int64
+		fails      bool
+		hasNote    bool
+		reasonPart string
+	}{
+		{"a missing row fails", &rowsCheck{Written: 521, Arrived: 520, Missing: 1, MissingKeys: []string{"evt-999999999"}}, &zero, true, false, "evt-999999999"},
+		{"every row arrived", &rowsCheck{Written: 521, Arrived: 521}, &zero, false, false, ""},
+		{"no rows to compare fails", &rowsCheck{}, &zero, true, false, "no rows"},
+		{"a failed comparison fails", &rowsCheck{Error: "psql: connection refused"}, &zero, true, false, "connection refused"},
+		{"a failed comparison is a note when not judged", &rowsCheck{Error: "psql: connection refused"}, nil, false, true, ""},
+		{"rows not judged", &rowsCheck{Written: 5, Missing: 5}, nil, false, false, ""},
+		{"judged rows that were never read fail", nil, &zero, true, false, "not compared"},
+	}
+	for _, c := range cases {
+		reason, note := judgeRows(c.rows, c.max)
+		if (reason != "") != c.fails {
+			t.Errorf("%s: reason %q, want a failure: %v", c.name, reason, c.fails)
+		}
+		if !strings.Contains(reason, c.reasonPart) {
+			t.Errorf("%s: reason %q does not mention %q", c.name, reason, c.reasonPart)
+		}
+		if (note != "") != c.hasNote {
+			t.Errorf("%s: note %q, want a note: %v", c.name, note, c.hasNote)
+		}
+	}
+}
+
+// A run without load judges duplicates only from a count the receiver really
+// took, and judges its rows.
+func TestWithoutLoadVerdict(t *testing.T) {
+	zero := int64(0)
+	ex := config.ScenarioExpect{MaxDuplicates: &zero, MaxMissingRows: &zero}
+	allRows := &rowsCheck{Written: 578, Arrived: 578}
+	cases := []struct {
+		name       string
+		rep        scenarioReport
+		dedup      bool
+		metricsErr error
+		reasonPart string // "" when the run must pass
+	}{
+		{"clean run", scenarioReport{Received: 578, Unique: 578, Rows: allRows}, true, nil, ""},
+		{"a row delivered twice", scenarioReport{Received: 852, Unique: 578, Duplicates: 274, Rows: allRows}, true, nil, "274 lines arrived more than once"},
+		{"lines counted as none distinct", scenarioReport{Received: 852, Rows: allRows}, true, nil, "counted none as distinct"},
+		{"counts not read", scenarioReport{Rows: allRows}, true, errors.New("connection refused"), "could not be read"},
+		{"no hashing", scenarioReport{Received: 852, Unique: 852, Rows: allRows}, false, nil, "needs correctness.validate_dedup"},
+		{"a missing row", scenarioReport{Received: 520, Unique: 520, Rows: &rowsCheck{Written: 521, Arrived: 520, Missing: 1, MissingKeys: []string{"evt-999999999"}}}, true, nil, "evt-999999999"},
+	}
+	for _, c := range cases {
+		reasons, _ := withoutLoadVerdict(c.rep, ex, c.dedup, c.metricsErr)
+		got := strings.Join(reasons, "; ")
+		if c.reasonPart == "" {
+			if got != "" {
+				t.Errorf("%s: failed with %q, want a pass", c.name, got)
+			}
+			continue
+		}
+		if !strings.Contains(got, c.reasonPart) {
+			t.Errorf("%s: reasons %q, want one that mentions %q", c.name, got, c.reasonPart)
+		}
 	}
 }
 

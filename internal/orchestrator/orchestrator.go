@@ -21,6 +21,11 @@ type Orchestrator interface {
 	// with `database "bench" already exists`.
 	RestartServices(services ...string) error
 
+	// RecreateServices replaces the named services with new containers,
+	// without touching their dependencies. A new container starts on an empty
+	// disk, as a node whose disk was replaced does.
+	RecreateServices(services ...string) error
+
 	// StopServices sends SIGTERM to the named services and waits up to `timeout`
 	// for graceful exit before SIGKILL.
 	//   - persistence_restart_correctness: 30s timeout (subject must flush state to disk)

@@ -166,6 +166,36 @@ func TestRestoreAllEmptiesEveryTouchedContainer(t *testing.T) {
 	}
 }
 
+// A restore that fails keeps the faults declared, so that the restore at the
+// end of the steps tries again.
+func TestAFailedRestoreKeepsTheFaults(t *testing.T) {
+	f := newFakeLinks(map[string]string{"a": "10.0.0.1", "b": "10.0.0.2"})
+	ctx := context.Background()
+	if err := f.set(ctx, map[linkKey]linkFault{{"a", "b"}: {Cut: true}}); err != nil {
+		t.Fatal(err)
+	}
+	working := f.run
+	f.run = func(ctx context.Context, c, script string) error {
+		if c == "b" {
+			return errors.New("docker run failed")
+		}
+		return working(ctx, c, script)
+	}
+	if err := f.restoreAll(ctx); err == nil {
+		t.Fatal("restoreAll succeeded although b's rules could not be rebuilt")
+	}
+	if got := f.describe(); len(got) != 1 {
+		t.Fatalf("describe after a failed restore = %v, want the cut kept", got)
+	}
+	f.run = working
+	if err := f.restoreAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(f.scripts["b"], "-j DROP") {
+		t.Errorf("b keeps the cut after the second restore:\n%s", f.scripts["b"])
+	}
+}
+
 func TestResyncRebuildsTheContainersAFaultJoins(t *testing.T) {
 	f := newFakeLinks(map[string]string{"a": "10.0.0.1", "b": "10.0.0.2", "c": "10.0.0.3"})
 	ctx := context.Background()
@@ -201,6 +231,49 @@ func TestStoppedContainersAreSkipped(t *testing.T) {
 	// The faults stay declared, for the resync after b starts.
 	if got := f.describe(); len(got) != 2 {
 		t.Fatalf("describe = %v, want both directions kept", got)
+	}
+}
+
+// A running peer whose address cannot be read must fail the step. Skipping it
+// would report a cut that is not in force.
+func TestARunningPeerWithoutAnAddressFails(t *testing.T) {
+	f := newFakeLinks(map[string]string{"a": "10.0.0.1", "b": "10.0.0.2"})
+	f.addrOf = func(c string) (string, error) {
+		if c == "b" {
+			return "", errors.New("docker inspect failed")
+		}
+		return "10.0.0.1", nil
+	}
+	err := f.set(context.Background(), map[linkKey]linkFault{{"b", "a"}: {Cut: true}})
+	if err == nil || !strings.Contains(err.Error(), "docker inspect failed") {
+		t.Fatalf("set = %v, want the address error of the running peer", err)
+	}
+}
+
+// The helpers for several containers start at the same moment, so their names
+// must not depend on the clock.
+func TestNettoolNamesDiffer(t *testing.T) {
+	const n = 100
+	names := make(chan string, n)
+	var wg sync.WaitGroup
+	for range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			names <- nettoolName("bench-subject-vmetric-1")
+		}()
+	}
+	wg.Wait()
+	close(names)
+	seen := map[string]bool{}
+	for name := range names {
+		if seen[name] {
+			t.Fatalf("two helpers got the name %s", name)
+		}
+		seen[name] = true
+		if !strings.HasPrefix(name, "bench-linkfault-bench-subject-vmetric-1-") {
+			t.Errorf("name %s does not start with bench- and the target container", name)
+		}
 	}
 }
 

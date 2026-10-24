@@ -1051,11 +1051,18 @@ func (sr *scenarioRun) nodeAction(i int, st config.ScenarioStep, rep *scenarioSt
 		delete(sr.down, n)
 		if st.EmptyDisk {
 			// A new container from the same service starts on an empty disk, as
-			// a node whose disk was replaced does.
-			_ = dockerCmd(sr.ctx, 60*time.Second, "rm", "-f", c)
-			if err := sr.orch.RestartServices(fmt.Sprintf("subject-%d", n)); err != nil {
+			// a node whose disk was replaced does. The director image declares
+			// no volume, so its storage lives in the container. The step checks
+			// that the container really is a new one: the old one would start
+			// on its old disk.
+			oldID := containerID(sr.ctx, c)
+			if err := sr.orch.RecreateServices(fmt.Sprintf("subject-%d", n)); err != nil {
 				_ = os.Remove(argsFile)
 				return false, fmt.Sprintf("starting a new container for node %d: %v", n, err), nil
+			}
+			if newID := containerID(sr.ctx, c); newID == "" || newID == oldID {
+				_ = os.Remove(argsFile)
+				return false, fmt.Sprintf("node %d's container was not replaced (id %.12s before, %.12s after), so its disk is not empty", n, oldID, newID), nil
 			}
 		} else if err := dockerCmd(sr.ctx, 60*time.Second, "start", c); err != nil {
 			_ = os.Remove(argsFile)
@@ -1716,25 +1723,37 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 		v.reasons = append(v.reasons, fmt.Sprintf("two nodes named themselves the leader for %s (max_split_brain_ms %d)",
 			fmtMs(rep.Leadership.SplitBrainMs), *ex.MaxSplitBrainMs))
 	}
-	if rows := rep.Rows; rows != nil {
-		judge := ex.MaxMissingRows != nil
-		switch {
-		case rows.Error != "" && judge:
-			// An unknown count is not zero.
-			v.reasons = append(v.reasons, "the database rows could not be compared with what arrived: "+rows.Error)
-		case rows.Error != "":
-			sr.notes = append(sr.notes, "the database rows could not be compared with what arrived: "+rows.Error)
-		case judge && rows.Written == 0:
-			v.reasons = append(v.reasons, "the rows query returned no rows, so nothing was compared")
-		case judge && rows.Missing > *ex.MaxMissingRows:
-			v.reasons = append(v.reasons, fmt.Sprintf("%d of %d database rows never arrived (max_missing_rows %d); the first: %s",
-				rows.Missing, rows.Written, *ex.MaxMissingRows, strings.Join(rows.MissingKeys, ", ")))
-		}
-	}
 	rep.Failures = v.reasons
 	rep.Notes = sr.notes
 	v.passed = len(v.reasons) == 0
 	return rep, v, nil
+}
+
+// judgeRows judges the rows check of a case whose data came from a database
+// (cluster.scenario.rows; config validation allows it only without a
+// generator). It returns a reason the run fails, or a note when the case does
+// not judge its rows, or neither.
+func judgeRows(rows *rowsCheck, maxMissing *int64) (reason, note string) {
+	if rows == nil {
+		if maxMissing != nil {
+			return "the database rows were not compared with what arrived", ""
+		}
+		return "", ""
+	}
+	judge := maxMissing != nil
+	switch {
+	case rows.Error != "" && judge:
+		// An unknown count is not zero.
+		return "the database rows could not be compared with what arrived: " + rows.Error, ""
+	case rows.Error != "":
+		return "", "the database rows could not be compared with what arrived: " + rows.Error
+	case judge && rows.Written == 0:
+		return "the rows query returned no rows, so nothing was compared", ""
+	case judge && rows.Missing > *maxMissing:
+		return fmt.Sprintf("%d of %d database rows never arrived (max_missing_rows %d); the first: %s",
+			rows.Missing, rows.Written, *maxMissing, strings.Join(rows.MissingKeys, ", ")), ""
+	}
+	return "", ""
 }
 
 // finishWithoutLoad ends a scenario whose data came from a device the
@@ -1746,7 +1765,8 @@ func (sr *scenarioRun) finishWithoutLoad(rep scenarioReport) (scenarioReport, sc
 		rows := sr.checkRows()
 		rep.Rows = &rows
 	}
-	if m, err := sr.r.queryReceiverMetrics(sr.recvPort, 10*time.Second); err == nil {
+	m, metricsErr := sr.r.queryReceiverMetrics(sr.recvPort, 10*time.Second)
+	if metricsErr == nil {
 		rep.Received = m.LinesReceived
 		rep.Unique = m.UniqueLines
 		rep.Duplicates = m.Duplicates
@@ -1760,18 +1780,51 @@ func (sr *scenarioRun) finishWithoutLoad(rep scenarioReport) (scenarioReport, sc
 	fmt.Printf("  leadership: %d rounds read, %d leader changes, most self-named leaders at once %d, two-leader time %s\n",
 		rep.Leadership.Rounds, rep.Leadership.LeaderChanges, rep.Leadership.MaxSelfClaimed, fmtMs(rep.Leadership.SplitBrainMs))
 	v := scenarioVerdict{reasons: append([]string(nil), sr.failures...)}
-	ex := sr.sc.Expect
-	if ex.MaxDuplicates != nil && rep.Duplicates > *ex.MaxDuplicates {
-		v.reasons = append(v.reasons, fmt.Sprintf("%d lines arrived more than once (max_duplicates %d)", rep.Duplicates, *ex.MaxDuplicates))
-	}
-	if ex.MaxSplitBrainMs != nil && rep.Leadership.SplitBrainMs > *ex.MaxSplitBrainMs {
-		v.reasons = append(v.reasons, fmt.Sprintf("two nodes named themselves the leader for %s (max_split_brain_ms %d)",
-			fmtMs(rep.Leadership.SplitBrainMs), *ex.MaxSplitBrainMs))
-	}
+	reasons, notes := withoutLoadVerdict(rep, sr.sc.Expect, sr.tc.Correctness.ValidateDedup, metricsErr)
+	v.reasons = append(v.reasons, reasons...)
+	sr.notes = append(sr.notes, notes...)
 	rep.Failures = v.reasons
 	rep.Notes = sr.notes
 	v.passed = len(v.reasons) == 0
 	return rep, v, nil
+}
+
+// withoutLoadVerdict judges a run whose data came from a device the cluster
+// collected itself. dedup says whether the receiver hashes every line
+// (correctness.validate_dedup), which is the only duplicate count such a run
+// has. metricsErr is the error of reading the receiver's counts.
+//
+// A count that was never taken is not zero. The first version of these cases
+// judged max_duplicates over a count that the receiver's sequence tracker had
+// replaced with zero, so rows that arrived twice went unseen.
+func withoutLoadVerdict(rep scenarioReport, ex config.ScenarioExpect, dedup bool, metricsErr error) (reasons, notes []string) {
+	if ex.MaxDuplicates != nil {
+		switch {
+		case !dedup:
+			reasons = append(reasons, "max_duplicates needs correctness.validate_dedup: without a generator, the receiver counts duplicates only by hashing every line")
+		case metricsErr != nil:
+			reasons = append(reasons, "the receiver's counts could not be read, so duplicates were not checked: "+metricsErr.Error())
+		case rep.Received > 0 && rep.Unique == 0:
+			reasons = append(reasons, fmt.Sprintf("the receiver got %d lines and counted none as distinct, so duplicates were not checked", rep.Received))
+		case rep.Duplicates > *ex.MaxDuplicates:
+			reasons = append(reasons, fmt.Sprintf("%d lines arrived more than once (max_duplicates %d)", rep.Duplicates, *ex.MaxDuplicates))
+		}
+	}
+	if ex.MaxSplitBrainMs != nil && rep.Leadership.SplitBrainMs > *ex.MaxSplitBrainMs {
+		reasons = append(reasons, fmt.Sprintf("two nodes named themselves the leader for %s (max_split_brain_ms %d)",
+			fmtMs(rep.Leadership.SplitBrainMs), *ex.MaxSplitBrainMs))
+	}
+	// The rows are judged here, in the only verdict a case with rows reaches.
+	// A proof run found them reported and never judged: a row was missing, and
+	// the case passed.
+	reason, note := judgeRows(rep.Rows, ex.MaxMissingRows)
+	if reason != "" {
+		reasons = append(reasons, reason)
+	}
+	if note != "" {
+		notes = append(notes, note)
+	}
+	return reasons, notes
 }
 
 // drainSeqCheck reads the receiver's sequence check until every acknowledged
@@ -2051,6 +2104,18 @@ func dockerCmd(ctx context.Context, timeout time.Duration, args ...string) error
 		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// containerID returns a container's full id, or "" when docker cannot inspect
+// it.
+func containerID(ctx context.Context, container string) string {
+	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(cctx, "docker", "inspect", "-f", "{{.Id}}", container).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // containerNetwork returns the name of the (only) network the container is on.
