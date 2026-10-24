@@ -372,30 +372,65 @@ func (run *ssRun) drive() bool {
 	return len(run.errs) == 0
 }
 
-// startInfrastructure starts Azurite and its init, the receivers and the
-// collector, and waits for the init to finish.
+// startInfrastructure starts what the replicas need before they start:
+// Azurite and its init, the store when it is another (MinIO and its init, an
+// endpoint such as Redis, or the share's init), the receivers and the
+// collector. It waits for every init to finish and for every endpoint with a
+// healthcheck to be healthy.
 func (run *ssRun) startInfrastructure() bool {
-	services := []string{"azurite", "azure-init", "receiver", "collector"}
-	fmt.Println("  starting Azurite, the receivers and the collector…")
+	services, inits, names := []string{"azurite", "azure-init"}, []string{"azure-init"}, []string{"Azurite"}
+	if run.tc.UsesMinio() {
+		services, inits, names = append(services, "minio", "minio-init"), append(inits, "minio-init"), append(names, "MinIO")
+	}
+	if run.ss.StoreOrDefault() == config.SharedStateStoreShare {
+		services, inits = append(services, "witness-init"), append(inits, "witness-init")
+	}
+	var healthy []string
+	for _, e := range run.tc.Endpoints {
+		services, names = append(services, e.Name), append(names, e.Name)
+		if e.Healthcheck != nil {
+			healthy = append(healthy, e.Name)
+		}
+	}
+	services = append(services, "receiver", "collector")
+	fmt.Printf("  starting %s, the receivers and the collector…\n", strings.Join(names, ", "))
 	if err := run.orch.UpServices(services...); err != nil {
 		run.fail("starting the infrastructure: %v", err)
 		return false
 	}
 	deadline := time.Now().Add(2 * time.Minute)
-	for time.Now().Before(deadline) {
-		out, _ := exec.Command("docker", "inspect", "-f", "{{.State.Status}} {{.State.ExitCode}}", "bench-azure-init").Output()
-		switch state := strings.TrimSpace(string(out)); {
-		case state == "exited 0":
-			return true
-		case strings.HasPrefix(state, "exited"):
-			run.fail("azure-init failed (%s): %s", state, run.orch.Logs("bench-azure-init", 20))
-			return false
-		}
-		if sleepCtx(run.r.ctx, time.Second) != nil {
+	for _, one := range inits {
+		if !run.waitContainer("bench-"+one, "{{.State.Status}} {{.State.ExitCode}}", "exited 0", deadline) {
 			return false
 		}
 	}
-	run.fail("azure-init did not finish within 2 minutes")
+	for _, name := range healthy {
+		if !run.waitContainer("bench-"+name, "{{.State.Health.Status}}", "healthy", deadline) {
+			return false
+		}
+	}
+	return true
+}
+
+// waitContainer waits until docker inspect's format says want for the
+// container, and fails the run when it never does or the container exits.
+func (run *ssRun) waitContainer(container, format, want string, deadline time.Time) bool {
+	var state string
+	for {
+		out, _ := exec.Command("docker", "inspect", "-f", format, container).Output()
+		state = strings.TrimSpace(string(out))
+		if state == want {
+			return true
+		}
+		if strings.HasPrefix(state, "exited") {
+			run.fail("%s failed (%s): %s", strings.TrimPrefix(container, "bench-"), state, run.orch.Logs(container, 20))
+			return false
+		}
+		if time.Now().After(deadline) || sleepCtx(run.r.ctx, time.Second) != nil {
+			break
+		}
+	}
+	run.fail("%s was not %s within 2 minutes (%s)", strings.TrimPrefix(container, "bench-"), want, state)
 	return false
 }
 
@@ -1360,6 +1395,12 @@ func judgeOverlaps(overlaps []ssOverlap) (fails, notes []string) {
 // countStoreCalls counts the replicas' calls to the shared state's container,
 // over the run and under load.
 func (run *ssRun) countStoreCalls() {
+	if !run.ss.CountsStoreCalls() {
+		why := fmt.Sprintf("not counted: the shared state is in %s, and the harness counts store calls only from Azurite's access log", run.ss.StoreName())
+		run.measures["store_calls"] = why
+		fmt.Printf("  store calls %s\n", why)
+		return
+	}
 	if err := run.book.refresh("bench-azurite"); err != nil {
 		run.fail("reading Azurite's access log to count the store calls: %v", err)
 	}
@@ -1448,6 +1489,10 @@ func (run *ssRun) saveEvidence() {
 		}
 	}
 	write("azurite.log", run.book.text("bench-azurite"))
+	if service := run.ss.StoreService(); service != "" && service != "azurite" {
+		out, _ := exec.Command("docker", "logs", "-t", "bench-"+service).CombinedOutput()
+		write(service+".log", string(out))
+	}
 	for label, body := range run.health {
 		write("health-"+label+".json", body)
 	}

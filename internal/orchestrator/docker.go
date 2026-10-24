@@ -2993,6 +2993,14 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 			return err
 		}
 	}
+	// So does a shared-state case. The template caps the helpers it knows,
+	// and this caps the rest: MinIO and its init, an endpoint such as Redis,
+	// and the share's init.
+	if tc.IsDirectorSharedStateType() && cfg.HelperCPULimit != "" && cfg.HelperMemLimit != "" {
+		if out, err = limitHelperServices(out, cfg.HelperCPULimit, cfg.HelperMemLimit); err != nil {
+			return err
+		}
+	}
 	return os.WriteFile(path, out, 0o644)
 }
 

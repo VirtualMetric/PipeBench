@@ -385,3 +385,41 @@ func TestWindowDisturbances(t *testing.T) {
 		t.Errorf("a store quiet at the end: %q", got)
 	}
 }
+
+// TestStoreOutageArgs: pause_store pauses the container of a store that has
+// one, and makes a share refuse every access through a short root container
+// that mounts the replicas' volumes.
+func TestStoreOutageArgs(t *testing.T) {
+	for store, want := range map[string][2]string{
+		"":                               {"pause bench-azurite", "unpause bench-azurite"},
+		config.SharedStateStoreS3:        {"pause bench-minio", "unpause bench-minio"},
+		config.SharedStateStoreRedis:     {"pause bench-redis", "unpause bench-redis"},
+		config.SharedStateStoreAzureBlob: {"pause bench-azurite", "unpause bench-azurite"},
+	} {
+		ss := &config.SharedStateConfig{Store: store}
+		if got := strings.Join(storeOutageArgs(ss, true, "", "img"), " "); got != want[0] {
+			t.Errorf("store %q, away: %q, want %q", store, got, want[0])
+		}
+		if got := strings.Join(storeOutageArgs(ss, false, "", "img"), " "); got != want[1] {
+			t.Errorf("store %q, back: %q, want %q", store, got, want[1])
+		}
+	}
+	share := &config.SharedStateConfig{Store: config.SharedStateStoreShare, SharePath: "/mnt/vm-state"}
+	away := strings.Join(storeOutageArgs(share, true, "bench-subject-vmetric-1", "vmetric/director-enterprise:dev"), " ")
+	if away != "run --rm --volumes-from bench-subject-vmetric-1 --user 0:0 --network none --cpus 0.5 --memory 64m --entrypoint chmod vmetric/director-enterprise:dev 000 /mnt/vm-state" {
+		t.Errorf("share, away: %q", away)
+	}
+	if back := storeOutageArgs(share, false, "bench-subject-vmetric-1", "img"); back[len(back)-2] != "0777" {
+		t.Errorf("share, back: %q, want mode 0777", back)
+	}
+}
+
+// TestStoreCallsNotCountedOutsideAzurite: the store calls of another store
+// are reported as not counted, never as zero.
+func TestStoreCallsNotCountedOutsideAzurite(t *testing.T) {
+	run := &ssRun{ss: &config.SharedStateConfig{Store: config.SharedStateStoreRedis}, measures: map[string]any{}}
+	run.countStoreCalls()
+	if got, _ := run.measures["store_calls"].(string); !strings.Contains(got, "not counted: the shared state is in Redis") {
+		t.Errorf("store_calls = %v", run.measures["store_calls"])
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -169,4 +170,108 @@ func TestHelperLimitsOffByDefault(t *testing.T) {
 	mustNotContain(t, string(data), "deploy:")
 	mustNotContain(t, string(data), "AZURITE_ACCOUNTS")
 	mustNotContain(t, string(data), "profiles:")
+}
+
+// TestSharedStateComposeRendersOtherStores checks the stores beside Azurite:
+// a share is one volume every replica mounts, made writable by an init the
+// replicas wait for; MinIO comes with its init; and every container the
+// template does not cap itself, Redis included, is held to the helper limits.
+func TestSharedStateComposeRendersOtherStores(t *testing.T) {
+	render := func(t *testing.T, change func(tc *config.TestCase)) map[string]map[string]any {
+		t.Helper()
+		srcCfg := filepath.Join(t.TempDir(), "vmetric.yml")
+		if err := os.WriteFile(srcCfg, []byte("director:\n  id: 7001\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		tc := &config.TestCase{
+			Name:       "director_shared_state_store_render",
+			Type:       "director_shared_state_correctness",
+			Azure:      &config.AzureConfig{Containers: []string{"bench-in"}},
+			Generators: []config.GeneratorConfig{{ID: "blob", Mode: "azure_blob", Target: "http://azurite:10000", Rate: 10, Format: "raw"}},
+			Receivers:  []config.ReceiverConfig{{ID: "blob", Mode: "tcp", Listen: ":9001"}},
+			SharedState: &config.SharedStateConfig{
+				Replicas: 2,
+				Streams:  []config.SharedStateStream{{Generator: "blob", Receiver: "blob"}},
+			},
+		}
+		change(tc)
+		if err := tc.Validate(); err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+		cr, err := NewComposeRunner(context.Background(), RunConfig{
+			TestCase: tc, Subject: config.Subject{Name: "vmetric", Image: "vmetric/director-enterprise", Version: "dev", ConfigPath: "/config.yml"},
+			ConfigName: "default", ConfigSrcPath: srcCfg, TmpDir: t.TempDir(),
+			GeneratorImage: "img-gen", ReceiverImage: "img-recv", CollectorImage: "img-coll", ReceiverHostPort: 19001,
+			CPULimit: "1.0", MemLimit: "1g", HelperCPULimit: "1", HelperMemLimit: "1g",
+		})
+		if err != nil {
+			t.Fatalf("NewComposeRunner: %v", err)
+		}
+		data, err := os.ReadFile(cr.composeFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var parsed struct {
+			Services map[string]map[string]any `yaml:"services"`
+		}
+		if err := yaml.Unmarshal(data, &parsed); err != nil {
+			t.Fatalf("rendered compose is not valid YAML: %v\n%s", err, data)
+		}
+		return parsed.Services
+	}
+	capped := func(svc map[string]any) bool {
+		if svc["cpus"] != nil && svc["mem_limit"] != nil {
+			return true
+		}
+		deploy, _ := svc["deploy"].(map[string]any)
+		resources, _ := deploy["resources"].(map[string]any)
+		limits, _ := resources["limits"].(map[string]any)
+		return limits["cpus"] != nil && limits["memory"] != nil
+	}
+
+	t.Run("share", func(t *testing.T) {
+		services := render(t, func(tc *config.TestCase) {
+			tc.SharedState.Store = config.SharedStateStoreShare
+			tc.SharedState.SharePath = "/mnt/vm-state"
+		})
+		for _, name := range []string{"subject-1", "subject-2"} {
+			volumes, _ := services[name]["volumes"].([]any)
+			if !slices.Contains(volumes, any("witness-dir:/mnt/vm-state")) {
+				t.Errorf("%s volumes = %v, want the share at /mnt/vm-state", name, volumes)
+			}
+			if deps, _ := services[name]["depends_on"].(map[string]any); deps["witness-init"] == nil {
+				t.Errorf("%s does not wait for the share's init", name)
+			}
+		}
+		if svc := services["witness-init"]; svc == nil || !capped(svc) {
+			t.Errorf("witness-init = %v, want it rendered and capped", svc)
+		}
+	})
+	t.Run("s3", func(t *testing.T) {
+		services := render(t, func(tc *config.TestCase) {
+			tc.Minio = &config.MinioConfig{Buckets: []string{"director-state"}}
+			tc.SharedState.Store = config.SharedStateStoreS3
+		})
+		for _, name := range []string{"minio", "minio-init"} {
+			if svc := services[name]; svc == nil || !capped(svc) {
+				t.Errorf("%s = %v, want it rendered and capped", name, svc)
+			}
+		}
+		if deps, _ := services["subject-1"]["depends_on"].(map[string]any); deps["minio-init"] == nil {
+			t.Error("subject-1 does not wait for minio-init")
+		}
+	})
+	t.Run("redis", func(t *testing.T) {
+		services := render(t, func(tc *config.TestCase) {
+			tc.Endpoints = []config.Endpoint{{Name: "redis", Image: "redis:7-alpine"}}
+			tc.SharedState.Store = config.SharedStateStoreRedis
+		})
+		if svc := services["redis"]; svc == nil || !capped(svc) {
+			t.Errorf("redis = %v, want it rendered and capped", svc)
+		}
+		// The replicas are the subject, with limits of their own.
+		if svc := services["subject-1"]; svc["cpus"] != nil {
+			t.Errorf("subject-1 was given the helper limits: %v", svc)
+		}
+	})
 }

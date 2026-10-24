@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/base64"
 	"fmt"
+	"path"
 	"regexp"
 	"slices"
 	"time"
@@ -142,6 +143,14 @@ type SharedStateConfig struct {
 	// driver can count the store calls the replicas make (default
 	// "director-state").
 	StoreContainer string `yaml:"store_container"`
+	// Store is where the replicas keep their shared state. It tells the driver
+	// what pause_store takes away and whether it can count the store calls:
+	// "azure_blob" (the default) is Azurite, "s3" is the case's MinIO
+	// (`minio:`), "redis" is the case's endpoint named redis, and "share" is
+	// a directory every replica mounts at SharePath.
+	Store string `yaml:"store"`
+	// SharePath is where every replica mounts the share (store "share").
+	SharePath string `yaml:"share_path"`
 	// SecretValues must never appear in a replica's log or in its /health
 	// answer: the store's account key, for one. The driver also looks for
 	// three 16-character pieces of each, from its start, its middle and its
@@ -359,6 +368,56 @@ func (s *SharedStateConfig) SharesBus() bool {
 	return s.ModeOrDefault() != SharedStateModeMemory
 }
 
+// The stores the replicas can keep their shared state in (Store).
+const (
+	SharedStateStoreAzureBlob = "azure_blob"
+	SharedStateStoreS3        = "s3"
+	SharedStateStoreRedis     = "redis"
+	SharedStateStoreShare     = "share"
+)
+
+// StoreOrDefault returns Store, or "azure_blob".
+func (s *SharedStateConfig) StoreOrDefault() string {
+	if s == nil || s.Store == "" {
+		return SharedStateStoreAzureBlob
+	}
+	return s.Store
+}
+
+// StoreService returns the compose service that serves the store, which
+// pause_store pauses: azurite, minio or redis. A share has none.
+func (s *SharedStateConfig) StoreService() string {
+	switch s.StoreOrDefault() {
+	case SharedStateStoreAzureBlob:
+		return "azurite"
+	case SharedStateStoreS3:
+		return "minio"
+	case SharedStateStoreRedis:
+		return "redis"
+	}
+	return ""
+}
+
+// StoreName names the store for people: Azurite, MinIO, Redis or the share.
+func (s *SharedStateConfig) StoreName() string {
+	switch s.StoreOrDefault() {
+	case SharedStateStoreAzureBlob:
+		return "Azurite"
+	case SharedStateStoreS3:
+		return "MinIO"
+	case SharedStateStoreRedis:
+		return "Redis"
+	}
+	return "the share"
+}
+
+// CountsStoreCalls reports whether the driver can count the replicas' store
+// calls. It reads them from Azurite's access log, and no other store here
+// logs every request.
+func (s *SharedStateConfig) CountsStoreCalls() bool {
+	return s.StoreOrDefault() == SharedStateStoreAzureBlob
+}
+
 // StoreContainerOrDefault returns StoreContainer, or "director-state".
 func (s *SharedStateConfig) StoreContainerOrDefault() string {
 	if s == nil || s.StoreContainer == "" {
@@ -435,7 +494,7 @@ func (tc *TestCase) validateSharedState() error {
 		return fmt.Errorf("case %q: type director_shared_state_correctness requires a `shared_state:` block", tc.Name)
 	}
 	if tc.Azure == nil {
-		return fmt.Errorf("case %q: type director_shared_state_correctness requires an `azure:` block: the replicas keep their shared state in Azurite", tc.Name)
+		return fmt.Errorf("case %q: type director_shared_state_correctness requires an `azure:` block: Azurite serves the blob pollers' data, and the shared state unless shared_state.store names another store", tc.Name)
 	}
 	if s.Replicas < 2 {
 		return fmt.Errorf("case %q: shared_state.replicas must be at least 2, got %d", tc.Name, s.Replicas)
@@ -450,6 +509,32 @@ func (tc *TestCase) validateSharedState() error {
 	case SharedStateModeStateBus, SharedStateModeEmbedded, SharedStateModeMemory:
 	default:
 		return fmt.Errorf("case %q: shared_state.mode must be state_bus, embedded or memory, got %q", tc.Name, s.Mode)
+	}
+	switch s.StoreOrDefault() {
+	case SharedStateStoreAzureBlob:
+	case SharedStateStoreS3:
+		if !tc.UsesMinio() {
+			return fmt.Errorf("case %q: shared_state.store s3 needs a `minio:` block: MinIO serves the bucket", tc.Name)
+		}
+	case SharedStateStoreRedis:
+		if !slices.ContainsFunc(tc.Endpoints, func(e Endpoint) bool { return e.Name == "redis" }) {
+			return fmt.Errorf("case %q: shared_state.store redis needs an endpoint named redis, which serves the store", tc.Name)
+		}
+	case SharedStateStoreShare:
+		if !path.IsAbs(s.SharePath) || path.Clean(s.SharePath) == "/" {
+			return fmt.Errorf("case %q: shared_state.store share needs shared_state.share_path: the absolute path, below /, at which every replica mounts the share", tc.Name)
+		}
+	default:
+		return fmt.Errorf("case %q: shared_state.store must be azure_blob, s3, redis or share, got %q", tc.Name, s.Store)
+	}
+	if s.SharePath != "" && s.StoreOrDefault() != SharedStateStoreShare {
+		return fmt.Errorf("case %q: shared_state.share_path is only used by shared_state.store share", tc.Name)
+	}
+	if !s.CountsStoreCalls() && (s.Action == SharedStateActionStoreCalls || s.Action == SharedStateActionScaleOutIn) {
+		return fmt.Errorf("case %q: shared_state.action %s counts store calls in Azurite's access log, so it needs shared_state.store azure_blob", tc.Name, s.Action)
+	}
+	if s.StoreOrDefault() == SharedStateStoreShare && s.Action == SharedStateActionIsolateReplica {
+		return fmt.Errorf("case %q: shared_state.action isolate_replica cuts a replica off the network, and a share is a local mount, so the replica would keep its store", tc.Name)
 	}
 	seen := map[int]bool{}
 	for _, g := range s.StartOrder {

@@ -10,13 +10,16 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/VirtualMetric/PipeBench/internal/config"
 )
 
 // The actions of a shared-state case that disturb the store, the network or
 // the size of the replica set, rather than one replica.
 
-// pauseStore pauses Azurite for the outage, so no replica can reach the
-// store, then lets it go on. It measures when the leader stops leading and
+// pauseStore takes the store away for the outage, so no replica can reach it,
+// then gives it back: it pauses Azurite, MinIO or Redis, or makes the share
+// refuse every access. It measures when the leader stops leading and
 // when the replicas stop their placed devices, samples /health and the
 // outage streams while the store is away, and measures how long the replica
 // set takes to lead and run every placed device again once it is back.
@@ -33,12 +36,18 @@ func (run *ssRun) pauseStore() {
 			return
 		}
 	}
-	fmt.Printf("  pausing Azurite for %s…\n", outage)
-	paused := time.Now()
-	if err := exec.Command("docker", "pause", "bench-azurite").Run(); err != nil {
-		run.fail("docker pause bench-azurite: %v (the outage did not happen)", err)
+	if run.ss.StoreOrDefault() == config.SharedStateStoreShare {
+		what := fmt.Sprintf("The share refuses access for %d s (chmod 000). This fails fast, unlike a network share that stops answering.", run.ss.OutageOrDefault())
+		run.measures["outage_kind"] = what
+		fmt.Printf("  %s\n", what)
+	} else {
+		fmt.Printf("  pausing %s for %s…\n", run.ss.StoreName(), outage)
+	}
+	if err := run.takeStore(true); err != nil {
+		run.fail("%v (the outage did not happen)", err)
 		return
 	}
+	paused := time.Now()
 	run.measures["outage_from"] = paused.UTC()
 
 	// While the store is away: /health on every replica, and the streams.
@@ -63,8 +72,8 @@ func (run *ssRun) pauseStore() {
 	}
 	during := run.streamCounts()
 	held := run.holdOthers(leader, hold)
-	if err := exec.Command("docker", "unpause", "bench-azurite").Run(); err != nil {
-		run.fail("docker unpause bench-azurite: %v", err)
+	if err := run.takeStore(false); err != nil {
+		run.fail("%v", err)
 		run.thaw(held)
 		return
 	}
@@ -96,6 +105,39 @@ func (run *ssRun) pauseStore() {
 			fmt.Printf("    %s, which led before the outage, led again after it\n", run.replica(leader).Service)
 		}
 	}
+}
+
+// takeStore takes the store away (away) or gives it back.
+func (run *ssRun) takeStore(away bool) error {
+	via := ""
+	if run.ss.StoreOrDefault() == config.SharedStateStoreShare {
+		via = run.replicas[0].Container
+	}
+	args := storeOutageArgs(run.ss, away, via, run.subject.ImageRef())
+	if out, err := exec.Command("docker", args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("docker %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// storeOutageArgs returns the docker arguments that take the store away, or
+// give it back. A paused container stops answering. A share that is chmod 000
+// refuses every access at once: a short container of the subject's image,
+// with the volumes of replica via (running, paused or stopped), changes the
+// mode as root, so the replicas' own user can no longer reach the share.
+func storeOutageArgs(ss *config.SharedStateConfig, away bool, via, image string) []string {
+	if ss.StoreOrDefault() == config.SharedStateStoreShare {
+		mode := "0777"
+		if away {
+			mode = "000"
+		}
+		return []string{"run", "--rm", "--volumes-from", via, "--user", "0:0", "--network", "none",
+			"--cpus", "0.5", "--memory", "64m", "--entrypoint", "chmod", image, mode, ss.SharePath}
+	}
+	if away {
+		return []string{"pause", "bench-" + ss.StoreService()}
+	}
+	return []string{"unpause", "bench-" + ss.StoreService()}
 }
 
 // holdOthers freezes every running replica but keep, when hold is set, so
