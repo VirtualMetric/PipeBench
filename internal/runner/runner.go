@@ -3642,8 +3642,9 @@ func clusterNodeContainers(subjectName string, n int) []string {
 
 // containerRunning reports whether a docker container is currently running (not
 // stopped/exited). Used so a STOPPED ex-leader (whose log buffer still holds its
-// old "became leader" line) is never counted as the current leader.
-func containerRunning(container string) bool {
+// old "became leader" line) is never counted as the current leader. Tests
+// replace it.
+var containerRunning = func(container string) bool {
 	out, err := exec.Command("docker", "inspect", "-f", "{{.State.Running}}", container).CombinedOutput()
 	if err != nil {
 		return false
