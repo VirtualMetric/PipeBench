@@ -695,7 +695,11 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		if side != nil {
 			detail = fmt.Sprintf("node %d leads the side %v, first seen %s after the disruption", leader, side, fmtMs(ms))
 		}
-		if at, found := firstLogLineSince(sr.containers[leader-1], "became leader on", since); found {
+		at, found, err := firstLogLineSince(sr.containers[leader-1], "became leader on", since)
+		if err != nil {
+			return false, fmt.Sprintf("%s, but its log could not be read for when it logged the election: %v", detail, err), nil
+		}
+		if found {
 			logMs := at.Sub(since).Milliseconds()
 			sr.record(st.Record+"_log", float64(logMs))
 			detail += fmt.Sprintf(" (its log says %s)", fmtMs(logMs))
@@ -993,7 +997,14 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		for {
 			last := time.Time{}
 			for n := 1; n <= len(sr.containers); n++ {
-				if !sr.active[n] || !containerRunning(sr.containers[n-1]) {
+				if !sr.active[n] {
+					continue
+				}
+				running, err := containerRunningState(sr.containers[n-1])
+				if err != nil {
+					return false, fmt.Sprintf("could not tell whether node %d runs, so it is not known whether the cluster settled: %v", n, err), nil
+				}
+				if !running {
 					continue
 				}
 				at, found, err := lastLogLineSince(sr.containers[n-1], settlingMarkers, time.Now().Add(-hold))
@@ -1041,8 +1052,14 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 			n, at, line, found, readErr := earliestLogMatch(nodes, func(n int) (time.Time, string, bool, error) {
 				// Without a node, only running nodes count: the last lines of a
 				// node a step just killed must not satisfy the wait.
-				if st.Node == "" && !containerRunning(sr.containers[n-1]) {
-					return time.Time{}, "", false, nil
+				if st.Node == "" {
+					running, err := containerRunningState(sr.containers[n-1])
+					if err != nil {
+						return time.Time{}, "", false, fmt.Errorf("could not tell whether node %d runs: %w", n, err)
+					}
+					if !running {
+						return time.Time{}, "", false, nil
+					}
 				}
 				// The read stops at the deadline: a line logged after it is
 				// too late, even when the read happens to see it.
@@ -1184,8 +1201,12 @@ func (sr *scenarioRun) nodeAction(i int, st config.ScenarioStep, rep *scenarioSt
 			// The wrapper reads the file when the container starts. Remove it
 			// once the node said it took it, so the next start is a plain one.
 			used := false
+			var readErr error
 			for range 30 {
-				if _, found := firstLogLineSince(c, "bench: starting with", start); found {
+				_, found, err := firstLogLineSince(c, "bench: starting with", start)
+				if err != nil {
+					readErr = err
+				} else if found {
 					used = true
 					break
 				}
@@ -1195,6 +1216,9 @@ func (sr *scenarioRun) nodeAction(i int, st config.ScenarioStep, rep *scenarioSt
 			}
 			_ = os.Remove(argsFile)
 			if !used {
+				if readErr != nil {
+					return false, fmt.Sprintf("node %d did not report starting with -recover=%s, and its log could not be read: %v", n, st.Recover, readErr), nil
+				}
 				return false, fmt.Sprintf("node %d did not report starting with -recover=%s", n, st.Recover), nil
 			}
 			return true, fmt.Sprintf("started node %d once with -recover=%s", n, st.Recover), nil
@@ -2371,11 +2395,11 @@ func containerNetwork(container string) string {
 }
 
 // firstLogLineSince returns the docker timestamp of the first line since t
-// that contains needle. Its callers wait for the line, so a log that cannot
-// be read counts as a log without the line yet.
-func firstLogLineSince(container, needle string, t time.Time) (time.Time, bool) {
-	at, _, found, _ := firstLogLineInWindow(container, []string{needle}, t, time.Time{})
-	return at, found
+// that contains needle. It returns an error when the log cannot be read, so
+// that a caller does not take an unread log for a log without the line.
+func firstLogLineSince(container, needle string, t time.Time) (time.Time, bool, error) {
+	at, _, found, err := firstLogLineInWindow(container, []string{needle}, t, time.Time{})
+	return at, found, err
 }
 
 // errNoContainer is the error readLogWindow returns for a container that does

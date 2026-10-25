@@ -3652,14 +3652,27 @@ func clusterNodeContainers(subjectName string, n int) []string {
 
 // containerRunning reports whether a docker container is currently running (not
 // stopped/exited). Used so a STOPPED ex-leader (whose log buffer still holds its
-// old "became leader" line) is never counted as the current leader. Tests
-// replace it.
-var containerRunning = func(container string) bool {
+// old "became leader" line) is never counted as the current leader. A container
+// that docker cannot inspect counts as not running. A check that must not take
+// that unknown state for a stopped node calls containerRunningState.
+func containerRunning(container string) bool {
+	running, err := containerRunningState(container)
+	return err == nil && running
+}
+
+// containerRunningState reports whether a docker container is running, or why
+// docker could not say. A container that does not exist, such as a spare node
+// that never started, is not running, and that is not an error. Tests replace
+// it.
+var containerRunningState = func(container string) (bool, error) {
 	out, err := exec.Command("docker", "inspect", "-f", "{{.State.Running}}", container).CombinedOutput()
 	if err != nil {
-		return false
+		if strings.Contains(string(out), "No such object") || strings.Contains(string(out), "No such container") {
+			return false, nil
+		}
+		return false, fmt.Errorf("docker inspect %s: %w: %s", container, err, strings.TrimSpace(string(out)))
 	}
-	return strings.TrimSpace(string(out)) == "true"
+	return strings.TrimSpace(string(out)) == "true", nil
 }
 
 // clusterFormed reports whether every node logged cluster formation.
@@ -3894,14 +3907,20 @@ func leaderExistsNow(containers []string) (int, bool) {
 	return n, ok
 }
 
-// currentLeader is leaderExistsNow that also returns why it could not read a
-// running node's full log. Such a node may be the leader, so a caller that
-// must know that no node leads cannot take a read error for "no leader". The
-// error is returned only when no node it could read leads.
+// currentLeader is leaderExistsNow that also returns why it could not tell
+// whether a node runs, or could not read a running node's full log. Such a
+// node may be the leader, so a caller that must know that no node leads cannot
+// take the error for "no leader". The error is returned only when no node it
+// could read leads.
 func currentLeader(containers []string) (int, bool, error) {
 	var unread error
 	for i, c := range containers {
-		if !containerRunning(c) {
+		running, err := containerRunningState(c)
+		if err != nil {
+			unread = errors.Join(unread, fmt.Errorf("could not tell whether node %d runs: %w", i+1, err))
+			continue
+		}
+		if !running {
 			continue
 		}
 		full, err := readDockerLogsAll(c)

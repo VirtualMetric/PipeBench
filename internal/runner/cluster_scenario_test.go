@@ -540,9 +540,7 @@ func TestStopStepFailsWhenDockerHadToKillTheNode(t *testing.T) {
 
 func TestWaitStableFailsOnALogItCannotRead(t *testing.T) {
 	stubLogs(t, nil, map[string]error{"node-2": errors.New("docker logs node-2: exit status 1: the daemon did not answer")})
-	origRunning := containerRunning
-	containerRunning = func(string) bool { return true }
-	t.Cleanup(func() { containerRunning = origRunning })
+	stubRunning(t, func(string) (bool, error) { return true, nil })
 	sr := &scenarioRun{ctx: context.Background(), containers: []string{"node-1", "node-2"}, active: map[int]bool{1: true, 2: true}}
 	st := config.ScenarioStep{Do: "wait_stable", For: "1s", Within: "1s"}
 	var rep scenarioStepReport
@@ -555,6 +553,64 @@ func TestWaitStableFailsOnALogItCannotRead(t *testing.T) {
 	}
 	if !strings.Contains(detail, "could not read node 2's log") {
 		t.Fatalf("detail %q does not name the node whose log could not be read", detail)
+	}
+}
+
+// stubRunning makes the running checks of one test answer from running.
+func stubRunning(t *testing.T, running func(string) (bool, error)) {
+	t.Helper()
+	orig := containerRunningState
+	containerRunningState = running
+	t.Cleanup(func() { containerRunningState = orig })
+}
+
+// wait_stable used to skip a node that docker could not inspect, as if the
+// node had stopped. When that was every node, it passed without reading a log.
+func TestWaitStableFailsWhenDockerCannotSayANodeRuns(t *testing.T) {
+	stubLogs(t, nil, nil)
+	stubRunning(t, func(c string) (bool, error) {
+		if c == "node-2" {
+			return false, errors.New("docker inspect node-2: exit status 1: the daemon did not answer")
+		}
+		return true, nil
+	})
+	sr := &scenarioRun{ctx: context.Background(), containers: []string{"node-1", "node-2"}, active: map[int]bool{1: true, 2: true}}
+	st := config.ScenarioStep{Do: "wait_stable", For: "1s", Within: "1s"}
+	var rep scenarioStepReport
+	ok, detail, err := sr.doStep(0, st, &rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok || !strings.Contains(detail, "could not tell whether node 2 runs") {
+		t.Fatalf("ok %v, detail %q; want the step failed and node 2's unknown state named", ok, detail)
+	}
+}
+
+// wait_log without a node skips the nodes that do not run. A node that
+// docker could not inspect used to be skipped as well, without a word.
+func TestWaitLogNamesANodeDockerCannotInspect(t *testing.T) {
+	stubLogs(t, nil, nil)
+	stubRunning(t, func(string) (bool, error) {
+		return false, errors.New("docker inspect: exit status 1: the daemon did not answer")
+	})
+	sr := &scenarioRun{ctx: context.Background(), containers: []string{"node-1", "node-2"}, active: map[int]bool{1: true, 2: true}}
+	st := config.ScenarioStep{Do: "wait_log", Log: "became leader on", Within: "1ms"}
+	var rep scenarioStepReport
+	ok, detail, err := sr.doStep(0, st, &rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok || !strings.Contains(detail, "could not tell whether node") || !strings.Contains(detail, "the daemon did not answer") {
+		t.Fatalf("ok %v, detail %q; want the step failed with the inspect error named", ok, detail)
+	}
+}
+
+// firstLogLineSince used to drop the read error, so its callers took a log
+// that could not be read for a log without the line.
+func TestFirstLogLineSinceReturnsTheReadError(t *testing.T) {
+	stubLogs(t, nil, map[string]error{"node-1": errors.New("docker logs node-1: exit status 1: the daemon did not answer")})
+	if _, found, err := firstLogLineSince("node-1", "became leader on", time.Now()); found || err == nil {
+		t.Fatalf("found %v, err %v; want the read error", found, err)
 	}
 }
 

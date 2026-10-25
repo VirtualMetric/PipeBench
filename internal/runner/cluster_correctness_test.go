@@ -15,8 +15,8 @@ import (
 // on. Only the containers in running run.
 func stubClusterLogs(t *testing.T, logs map[string][]string, running ...string) {
 	t.Helper()
-	origAll, origSince, origRunning := readDockerLogsAll, dockerLogsSince, containerRunning
-	t.Cleanup(func() { readDockerLogsAll, dockerLogsSince, containerRunning = origAll, origSince, origRunning })
+	origAll, origSince, origRunning := readDockerLogsAll, dockerLogsSince, containerRunningState
+	t.Cleanup(func() { readDockerLogsAll, dockerLogsSince, containerRunningState = origAll, origSince, origRunning })
 	readDockerLogsAll = func(c string) (string, error) { return strings.Join(logs[c], "\n"), nil }
 	dockerLogsSince = func(c, since string) string {
 		from, err := time.Parse(time.RFC3339Nano, since)
@@ -36,13 +36,13 @@ func stubClusterLogs(t *testing.T, logs map[string][]string, running ...string) 
 		}
 		return strings.Join(out, "\n")
 	}
-	containerRunning = func(c string) bool {
+	containerRunningState = func(c string) (bool, error) {
 		for _, r := range running {
 			if r == c {
-				return true
+				return true, nil
 			}
 		}
-		return false
+		return false, nil
 	}
 }
 
@@ -151,5 +151,14 @@ func TestStopTwoRecoverFailsALeaderWithoutQuorum(t *testing.T) {
 	}
 	if why := leaderWithoutQuorum(nodes, 1, 3); !strings.Contains(why, "node 2 still led") {
 		t.Fatalf("leaderWithoutQuorum = %q; want node 2 named as leading", why)
+	}
+
+	// Docker cannot say whether node 1 runs, so node 1 may still lead.
+	stubClusterLogs(t, map[string][]string{
+		"node-1": {stamp(-10*time.Minute) + " Node 1 became leader on 7001"},
+	}, "node-1")
+	containerRunningState = func(string) (bool, error) { return false, errors.New("the daemon did not answer") }
+	if why := leaderWithoutQuorum(nodes, 2, 3); !strings.Contains(why, "could not tell whether node 1 runs") {
+		t.Fatalf("leaderWithoutQuorum = %q; want a failure that names node 1's unknown state", why)
 	}
 }
