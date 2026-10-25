@@ -3625,7 +3625,8 @@ func setAllowedIPs(node any, ips []string) int {
 // ===== director cluster driver ================================================
 
 // dockerLogsAll returns the full combined logs of a container ("" on error).
-func dockerLogsAll(container string) string {
+// Tests replace it.
+var dockerLogsAll = func(container string) string {
 	out, _ := exec.Command("docker", "logs", container).CombinedOutput()
 	return string(out)
 }
@@ -3855,8 +3856,9 @@ func clusterReassignedFrom(containers []string, owner string) (string, bool) {
 
 // dockerLogsSince returns a container's logs from the last `since` window (e.g.
 // "30s") — used to read CURRENT cluster state, robust to stale history across
-// restarts (full logs keep old "became leader" lines forever).
-func dockerLogsSince(container, since string) string {
+// restarts (full logs keep old "became leader" lines forever). since may also be
+// a timestamp. Tests replace it.
+var dockerLogsSince = func(container, since string) string {
 	out, _ := exec.Command("docker", "logs", "--since", since, container).CombinedOutput()
 	return string(out)
 }
@@ -3906,6 +3908,30 @@ func electedLeaderSince(containers []string, since string) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+// reElection returns the node that logged "became leader on" after the restart
+// of the leader began, or why no node did. A leader that is merely present
+// after the restart does not show a re-election: it may be the old leader,
+// back after the restart. The window starts 2 seconds before the restart, to
+// allow for a difference between the host's clock and Docker's.
+func reElection(containers []string, restartBegan time.Time) (int, string) {
+	since := restartBegan.Add(-2 * time.Second).UTC().Format(time.RFC3339Nano)
+	if n, ok := electedLeaderSince(containers, since); ok {
+		return n, ""
+	}
+	return 0, "no node logged \"became leader on\" after the restart of the leader began, so the cluster did not elect a leader again"
+}
+
+// leaderWithoutQuorum is for the moment after the harness stopped `stopped` of
+// the `total` nodes. That leaves the other nodes without a quorum, so no node
+// may lead. It returns why it is wrong when a node still leads, or "" when no
+// node leads.
+func leaderWithoutQuorum(containers []string, stopped, total int) string {
+	if n, ok := leaderExistsNow(containers); ok {
+		return fmt.Sprintf("node %d still led with %d of %d nodes stopped, but the nodes left have no quorum, so no node may lead", n, stopped, total)
+	}
+	return ""
 }
 
 // pickFollowerAvoiding returns a 1-based node index that is neither the leader nor
@@ -4185,26 +4211,23 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 			r.sampleDelivery(metricsPort, finalCount)
 		case "restart_leader":
 			fmt.Printf("  restarting LEADER node %d (%s)…\n", leader, nodes[leader-1])
+			// A leader restart must make the cluster elect a leader again, so a
+			// node must log "became leader on" after the restart began. The
+			// election can come while docker restart still runs, so the window
+			// starts when the restart begins, not when it ends.
+			restartBegan := time.Now()
 			if rerr := exec.Command("docker", "restart", "-t", "10", nodes[leader-1]).Run(); rerr != nil {
 				actionOK = false
 				errs = append(errs, fmt.Sprintf("docker restart %s failed: %v (disruption did not happen)", nodes[leader-1], rerr))
 			}
-			restartedAt := time.Now()
 			if err := sleepCtx(r.ctx, settle); err != nil {
 				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
 			}
-			// A leader restart must trigger a re-election. Anchor the search window to
-			// the instant the restart completed so a stale pre-restart "became leader"
-			// line can't satisfy the check; fall back to a leader simply being present.
-			elIdx, elected := electedLeaderSince(nodes, fmt.Sprintf("%ds", int(time.Since(restartedAt).Seconds())+2))
-			nowIdx, haveLeader := leaderExistsNow(nodes)
-			if !elected && !haveLeader {
+			if elIdx, why := reElection(nodes, restartBegan); why != "" {
 				actionOK = false
-				errs = append(errs, "no leader re-elected after restarting the leader")
-			} else if elected {
-				fmt.Printf("  re-election after leader restart: node %d became leader ✓\n", elIdx)
+				errs = append(errs, why)
 			} else {
-				fmt.Printf("  leader present after restart: node %d ✓\n", nowIdx)
+				fmt.Printf("  re-election after leader restart: node %d became leader ✓\n", elIdx)
 			}
 			r.sampleDelivery(metricsPort, finalCount)
 		case "stop_two_recover":
@@ -4228,8 +4251,9 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 			if err := sleepCtx(r.ctx, settle); err != nil {
 				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
 			}
-			if _, ok := leaderExistsNow(nodes); ok {
-				fmt.Printf("  note: a leader still appears present with %d/%d down (unexpected — quorum should be lost)\n", len(stopped), tc.Cluster.Nodes)
+			if why := leaderWithoutQuorum(nodes, len(stopped), tc.Cluster.Nodes); why != "" {
+				actionOK = false
+				errs = append(errs, why)
 			} else {
 				fmt.Printf("  quorum lost (no leader with %d/%d nodes down), as expected ✓\n", len(stopped), tc.Cluster.Nodes)
 			}
