@@ -505,6 +505,39 @@ func TestExpectNoLogSkipsASpareThatNeverStarted(t *testing.T) {
 	}
 }
 
+// docker stop sends SIGTERM and, when the grace period runs out, SIGKILL. A
+// node that needed the SIGKILL did not stop gracefully, and the stop step
+// used to pass all the same.
+func TestStopStepFailsWhenDockerHadToKillTheNode(t *testing.T) {
+	var ran [][]string
+	origCmd := dockerCmd
+	dockerCmd = func(_ context.Context, _ time.Duration, args ...string) error {
+		ran = append(ran, args)
+		return nil
+	}
+	t.Cleanup(func() { dockerCmd = origCmd })
+	sr := &scenarioRun{ctx: context.Background(), containers: []string{"node-1", "node-2"}, active: map[int]bool{1: true, 2: true}, down: map[int]bool{}}
+	st := config.ScenarioStep{Do: "stop", Node: "2", Grace: "10s"}
+
+	stubContainerExit(t, 137)
+	var rep scenarioStepReport
+	ok, detail, err := sr.doStep(0, st, &rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok || detail != "node 2 did not exit within 10s of the SIGTERM, so Docker killed it (exit code 137)" {
+		t.Fatalf("a stop that ended in SIGKILL: ok %v, detail %q; want the step failed and the kill named", ok, detail)
+	}
+	if len(ran) != 1 || strings.Join(ran[0], " ") != "stop -t 10 node-2" {
+		t.Fatalf("docker commands = %v, want one stop of node-2 with a 10 s grace period", ran)
+	}
+
+	stubContainerExit(t, 0)
+	if ok, detail, err := sr.doStep(0, st, &rep); err != nil || !ok {
+		t.Fatalf("a stop that exited by itself: ok %v, detail %q, err %v; want the step passed", ok, detail, err)
+	}
+}
+
 func TestWaitStableFailsOnALogItCannotRead(t *testing.T) {
 	stubLogs(t, nil, map[string]error{"node-2": errors.New("docker logs node-2: exit status 1: the daemon did not answer")})
 	origRunning := containerRunning

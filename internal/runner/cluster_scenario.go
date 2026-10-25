@@ -1138,6 +1138,9 @@ func (sr *scenarioRun) nodeAction(i int, st config.ScenarioStep, rep *scenarioSt
 		if err := dockerCmd(sr.ctx, grace+30*time.Second, "stop", "-t", graceSecs, c); err != nil {
 			return false, fmt.Sprintf("docker stop %s: %v", c, err), nil
 		}
+		if why := ungracefulStop(n, c, grace); why != "" {
+			return false, why, nil
+		}
 		return true, fmt.Sprintf("stopped node %d in %s", n, fmtMs(time.Since(start).Milliseconds())), nil
 	case "restart":
 		sr.disrupt(i, "restart", n)
@@ -2314,8 +2317,25 @@ func firstLine(s string) string {
 	return s
 }
 
-// dockerCmd runs one docker command with a timeout.
-func dockerCmd(ctx context.Context, timeout time.Duration, args ...string) error {
+// ungracefulStop returns why node n, which docker stop ended, did not stop by
+// itself, or "" when it did. docker stop sends SIGTERM, and then SIGKILL when
+// the grace period runs out. Exit code 137 means that the node needed the
+// SIGKILL.
+func ungracefulStop(n int, container string, grace time.Duration) string {
+	code, oom, err := containerExit(container)
+	switch {
+	case err != nil:
+		return fmt.Sprintf("could not read how node %d's process ended: %v", n, err)
+	case oom:
+		return fmt.Sprintf("node %d ran out of memory, so its process did not stop by itself", n)
+	case code == 137:
+		return fmt.Sprintf("node %d did not exit within %s of the SIGTERM, so Docker killed it (exit code 137)", n, grace)
+	}
+	return ""
+}
+
+// dockerCmd runs one docker command with a timeout. Tests replace it.
+var dockerCmd = func(ctx context.Context, timeout time.Duration, args ...string) error {
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	out, err := exec.CommandContext(cctx, "docker", args...).CombinedOutput()
