@@ -3625,10 +3625,19 @@ func setAllowedIPs(node any, ips []string) int {
 // ===== director cluster driver ================================================
 
 // dockerLogsAll returns the full combined logs of a container ("" on error).
-// Tests replace it.
-var dockerLogsAll = func(container string) string {
-	out, _ := exec.Command("docker", "logs", container).CombinedOutput()
-	return string(out)
+func dockerLogsAll(container string) string {
+	out, _ := readDockerLogsAll(container)
+	return out
+}
+
+// readDockerLogsAll returns the full combined logs of a container, or why
+// docker could not read them. Tests replace it.
+var readDockerLogsAll = func(container string) (string, error) {
+	out, err := exec.Command("docker", "logs", container).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("docker logs %s: %w: %s", container, err, strings.TrimSpace(string(out)))
+	}
+	return string(out), nil
 }
 
 // clusterNodeContainers returns the N node container names the cluster compose
@@ -3881,11 +3890,25 @@ var dockerLogsSince = func(container, since string) string {
 // During quorum loss every survivor disclaims and no node holds net leadership →
 // returns (0,false).
 func leaderExistsNow(containers []string) (int, bool) {
+	n, ok, _ := currentLeader(containers)
+	return n, ok
+}
+
+// currentLeader is leaderExistsNow that also returns why it could not read a
+// running node's full log. Such a node may be the leader, so a caller that
+// must know that no node leads cannot take a read error for "no leader". The
+// error is returned only when no node it could read leads.
+func currentLeader(containers []string) (int, bool, error) {
+	var unread error
 	for i, c := range containers {
 		if !containerRunning(c) {
 			continue
 		}
-		full := dockerLogsAll(c)
+		full, err := readDockerLogsAll(c)
+		if err != nil {
+			unread = errors.Join(unread, fmt.Errorf("could not read node %d's log: %w", i+1, err))
+			continue
+		}
 		net := strings.Count(full, "became leader on") - strings.Count(full, "is no longer the leader")
 		if net <= 0 {
 			continue
@@ -3893,9 +3916,9 @@ func leaderExistsNow(containers []string) (int, bool) {
 		if strings.Contains(dockerLogsSince(c, "20s"), "not cluster leader") {
 			continue // restarted ex-leader, now a follower
 		}
-		return i + 1, true
+		return i + 1, true, nil
 	}
-	return 0, false
+	return 0, false, unread
 }
 
 // electedLeaderSince reports whether any node logged a FRESH leader election
@@ -3925,11 +3948,15 @@ func reElection(containers []string, restartBegan time.Time) (int, string) {
 
 // leaderWithoutQuorum is for the moment after the harness stopped `stopped` of
 // the `total` nodes. That leaves the other nodes without a quorum, so no node
-// may lead. It returns why it is wrong when a node still leads, or "" when no
-// node leads.
+// may lead. It returns why it is wrong when a node still leads, or when it
+// cannot read a running node's log, or "" when no node leads.
 func leaderWithoutQuorum(containers []string, stopped, total int) string {
-	if n, ok := leaderExistsNow(containers); ok {
+	n, ok, err := currentLeader(containers)
+	if ok {
 		return fmt.Sprintf("node %d still led with %d of %d nodes stopped, but the nodes left have no quorum, so no node may lead", n, stopped, total)
+	}
+	if err != nil {
+		return fmt.Sprintf("could not tell whether a node still led with %d of %d nodes stopped: %v", stopped, total, err)
 	}
 	return ""
 }

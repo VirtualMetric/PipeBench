@@ -15,9 +15,9 @@ import (
 // on. Only the containers in running run.
 func stubClusterLogs(t *testing.T, logs map[string][]string, running ...string) {
 	t.Helper()
-	origAll, origSince, origRunning := dockerLogsAll, dockerLogsSince, containerRunning
-	t.Cleanup(func() { dockerLogsAll, dockerLogsSince, containerRunning = origAll, origSince, origRunning })
-	dockerLogsAll = func(c string) string { return strings.Join(logs[c], "\n") }
+	origAll, origSince, origRunning := readDockerLogsAll, dockerLogsSince, containerRunning
+	t.Cleanup(func() { readDockerLogsAll, dockerLogsSince, containerRunning = origAll, origSince, origRunning })
+	readDockerLogsAll = func(c string) (string, error) { return strings.Join(logs[c], "\n"), nil }
 	dockerLogsSince = func(c, since string) string {
 		from, err := time.Parse(time.RFC3339Nano, since)
 		if err != nil {
@@ -129,5 +129,27 @@ func TestStopTwoRecoverFailsALeaderWithoutQuorum(t *testing.T) {
 	}, "node-1")
 	if why := leaderWithoutQuorum(nodes, 2, 3); why != "" {
 		t.Fatalf("leaderWithoutQuorum = %q; want nothing when no node leads", why)
+	}
+
+	// Node 1 is running, but its log cannot be read, so it may still lead.
+	stubClusterLogs(t, map[string][]string{}, "node-1")
+	readDockerLogsAll = func(string) (string, error) { return "", errors.New("docker is not answering") }
+	if why := leaderWithoutQuorum(nodes, 2, 3); !strings.Contains(why, "could not tell whether a node still led") || !strings.Contains(why, "node 1's log") {
+		t.Fatalf("leaderWithoutQuorum = %q; want a failure that names node 1's unreadable log", why)
+	}
+
+	// A node that can be read and leads is still named when another node's
+	// log cannot be read.
+	stubClusterLogs(t, map[string][]string{
+		"node-2": {stamp(-10*time.Minute) + " Node 2 became leader on 7001"},
+	}, "node-1", "node-2")
+	readDockerLogsAll = func(c string) (string, error) {
+		if c == "node-1" {
+			return "", errors.New("docker is not answering")
+		}
+		return stamp(-10*time.Minute) + " Node 2 became leader on 7001", nil
+	}
+	if why := leaderWithoutQuorum(nodes, 1, 3); !strings.Contains(why, "node 2 still led") {
+		t.Fatalf("leaderWithoutQuorum = %q; want node 2 named as leading", why)
 	}
 }
