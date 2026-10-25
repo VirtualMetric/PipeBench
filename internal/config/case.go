@@ -2992,6 +2992,8 @@ type CorrectnessConfig struct {
 	// offsets, not re-consume the topic). Zero = strict, no
 	// over-delivery allowed. Ignored by case types that don't document
 	// it — at-least-once types deliberately tolerate duplicates.
+	// The device_failover cluster action, with validate_dedup, takes it
+	// as the share of the unique lines received that may arrive twice.
 	MaxOverDeliveryPct float64 `yaml:"max_overdelivery_pct"`
 
 	// ExpectFailure inverts the verdict for NEGATIVE (security) tests: the case

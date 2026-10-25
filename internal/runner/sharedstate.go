@@ -1021,6 +1021,9 @@ func (run *ssRun) disruptAndReplace(n int, how string, replace bool) {
 	}
 	fmt.Printf("  %s %s (%s, runs devices %v)…\n", map[string]string{"kill": "killing", "stop": "stopping"}[how], rep.Service, role, owned)
 	run.measures["victim"] = map[string]any{"replica": rep.Service, "leader": wasLeader, "devices": owned, "how": how}
+	if why := untestedDeviceFailover(run.ss.PlacedDevices, owned); why != "" {
+		run.fail("%s", why)
+	}
 
 	// A read that fails here loses nothing: endReplica reads every line
 	// since the last one read.
@@ -1130,6 +1133,18 @@ func (run *ssRun) disruptAndReplace(n int, how string, replace bool) {
 	}
 	run.checkSettled("after", earliest(time.Now().Add(60*time.Second), run.deadline))
 	run.checkHealthAll("after")
+}
+
+// untestedDeviceFailover returns why a disruption does not test the failover
+// of the placed devices: the replica it ends runs none of them. Without this
+// check, a case whose victim ran no placed device passed with no device
+// checked at all. It returns "" when the victim runs a placed device, or when
+// the case places none.
+func untestedDeviceFailover(placed, owned []int64) string {
+	if len(placed) > 0 && len(owned) == 0 {
+		return "the victim ran no placed device, so the failover of the devices was not tested"
+	}
+	return ""
 }
 
 // firstAfter returns the time of the first event of the kind (for the device,

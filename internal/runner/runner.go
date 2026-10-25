@@ -3626,8 +3626,18 @@ func setAllowedIPs(node any, ips []string) int {
 
 // dockerLogsAll returns the full combined logs of a container ("" on error).
 func dockerLogsAll(container string) string {
-	out, _ := exec.Command("docker", "logs", container).CombinedOutput()
-	return string(out)
+	out, _ := readDockerLogsAll(container)
+	return out
+}
+
+// readDockerLogsAll returns the full combined logs of a container, or why
+// docker could not read them. Tests replace it.
+var readDockerLogsAll = func(container string) (string, error) {
+	out, err := exec.Command("docker", "logs", container).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("docker logs %s: %w: %s", container, err, strings.TrimSpace(string(out)))
+	}
+	return string(out), nil
 }
 
 // clusterNodeContainers returns the N node container names the cluster compose
@@ -3642,13 +3652,27 @@ func clusterNodeContainers(subjectName string, n int) []string {
 
 // containerRunning reports whether a docker container is currently running (not
 // stopped/exited). Used so a STOPPED ex-leader (whose log buffer still holds its
-// old "became leader" line) is never counted as the current leader.
+// old "became leader" line) is never counted as the current leader. A container
+// that docker cannot inspect counts as not running. A check that must not take
+// that unknown state for a stopped node calls containerRunningState.
 func containerRunning(container string) bool {
+	running, err := containerRunningState(container)
+	return err == nil && running
+}
+
+// containerRunningState reports whether a docker container is running, or why
+// docker could not say. A container that does not exist, such as a spare node
+// that never started, is not running, and that is not an error. Tests replace
+// it.
+var containerRunningState = func(container string) (bool, error) {
 	out, err := exec.Command("docker", "inspect", "-f", "{{.State.Running}}", container).CombinedOutput()
 	if err != nil {
-		return false
+		if strings.Contains(string(out), "No such object") || strings.Contains(string(out), "No such container") {
+			return false, nil
+		}
+		return false, fmt.Errorf("docker inspect %s: %w: %s", container, err, strings.TrimSpace(string(out)))
 	}
-	return strings.TrimSpace(string(out)) == "true"
+	return strings.TrimSpace(string(out)) == "true", nil
 }
 
 // clusterFormed reports whether every node logged cluster formation.
@@ -3854,8 +3878,9 @@ func clusterReassignedFrom(containers []string, owner string) (string, bool) {
 
 // dockerLogsSince returns a container's logs from the last `since` window (e.g.
 // "30s") — used to read CURRENT cluster state, robust to stale history across
-// restarts (full logs keep old "became leader" lines forever).
-func dockerLogsSince(container, since string) string {
+// restarts (full logs keep old "became leader" lines forever). since may also be
+// a timestamp. Tests replace it.
+var dockerLogsSince = func(container, since string) string {
 	out, _ := exec.Command("docker", "logs", "--since", since, container).CombinedOutput()
 	return string(out)
 }
@@ -3878,11 +3903,31 @@ func dockerLogsSince(container, since string) string {
 // During quorum loss every survivor disclaims and no node holds net leadership →
 // returns (0,false).
 func leaderExistsNow(containers []string) (int, bool) {
+	n, ok, _ := currentLeader(containers)
+	return n, ok
+}
+
+// currentLeader is leaderExistsNow that also returns why it could not tell
+// whether a node runs, or could not read a running node's full log. Such a
+// node may be the leader, so a caller that must know that no node leads cannot
+// take the error for "no leader". The error is returned only when no node it
+// could read leads.
+func currentLeader(containers []string) (int, bool, error) {
+	var unread error
 	for i, c := range containers {
-		if !containerRunning(c) {
+		running, err := containerRunningState(c)
+		if err != nil {
+			unread = errors.Join(unread, fmt.Errorf("could not tell whether node %d runs: %w", i+1, err))
 			continue
 		}
-		full := dockerLogsAll(c)
+		if !running {
+			continue
+		}
+		full, err := readDockerLogsAll(c)
+		if err != nil {
+			unread = errors.Join(unread, fmt.Errorf("could not read node %d's log: %w", i+1, err))
+			continue
+		}
 		net := strings.Count(full, "became leader on") - strings.Count(full, "is no longer the leader")
 		if net <= 0 {
 			continue
@@ -3890,9 +3935,9 @@ func leaderExistsNow(containers []string) (int, bool) {
 		if strings.Contains(dockerLogsSince(c, "20s"), "not cluster leader") {
 			continue // restarted ex-leader, now a follower
 		}
-		return i + 1, true
+		return i + 1, true, nil
 	}
-	return 0, false
+	return 0, false, unread
 }
 
 // electedLeaderSince reports whether any node logged a FRESH leader election
@@ -3905,6 +3950,34 @@ func electedLeaderSince(containers []string, since string) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+// reElection returns the node that logged "became leader on" after the restart
+// of the leader began, or why no node did. A leader that is merely present
+// after the restart does not show a re-election: it may be the old leader,
+// back after the restart. The window starts 2 seconds before the restart, to
+// allow for a difference between the host's clock and Docker's.
+func reElection(containers []string, restartBegan time.Time) (int, string) {
+	since := restartBegan.Add(-2 * time.Second).UTC().Format(time.RFC3339Nano)
+	if n, ok := electedLeaderSince(containers, since); ok {
+		return n, ""
+	}
+	return 0, "no node logged \"became leader on\" after the restart of the leader began, so the cluster did not elect a leader again"
+}
+
+// leaderWithoutQuorum is for the moment after the harness stopped `stopped` of
+// the `total` nodes. That leaves the other nodes without a quorum, so no node
+// may lead. It returns why it is wrong when a node still leads, or when it
+// cannot read a running node's log, or "" when no node leads.
+func leaderWithoutQuorum(containers []string, stopped, total int) string {
+	n, ok, err := currentLeader(containers)
+	if ok {
+		return fmt.Sprintf("node %d still led with %d of %d nodes stopped, but the nodes left have no quorum, so no node may lead", n, stopped, total)
+	}
+	if err != nil {
+		return fmt.Sprintf("could not tell whether a node still led with %d of %d nodes stopped: %v", stopped, total, err)
+	}
+	return ""
 }
 
 // pickFollowerAvoiding returns a 1-based node index that is neither the leader nor
@@ -4184,26 +4257,23 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 			r.sampleDelivery(metricsPort, finalCount)
 		case "restart_leader":
 			fmt.Printf("  restarting LEADER node %d (%s)…\n", leader, nodes[leader-1])
+			// A leader restart must make the cluster elect a leader again, so a
+			// node must log "became leader on" after the restart began. The
+			// election can come while docker restart still runs, so the window
+			// starts when the restart begins, not when it ends.
+			restartBegan := time.Now()
 			if rerr := exec.Command("docker", "restart", "-t", "10", nodes[leader-1]).Run(); rerr != nil {
 				actionOK = false
 				errs = append(errs, fmt.Sprintf("docker restart %s failed: %v (disruption did not happen)", nodes[leader-1], rerr))
 			}
-			restartedAt := time.Now()
 			if err := sleepCtx(r.ctx, settle); err != nil {
 				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
 			}
-			// A leader restart must trigger a re-election. Anchor the search window to
-			// the instant the restart completed so a stale pre-restart "became leader"
-			// line can't satisfy the check; fall back to a leader simply being present.
-			elIdx, elected := electedLeaderSince(nodes, fmt.Sprintf("%ds", int(time.Since(restartedAt).Seconds())+2))
-			nowIdx, haveLeader := leaderExistsNow(nodes)
-			if !elected && !haveLeader {
+			if elIdx, why := reElection(nodes, restartBegan); why != "" {
 				actionOK = false
-				errs = append(errs, "no leader re-elected after restarting the leader")
-			} else if elected {
-				fmt.Printf("  re-election after leader restart: node %d became leader ✓\n", elIdx)
+				errs = append(errs, why)
 			} else {
-				fmt.Printf("  leader present after restart: node %d ✓\n", nowIdx)
+				fmt.Printf("  re-election after leader restart: node %d became leader ✓\n", elIdx)
 			}
 			r.sampleDelivery(metricsPort, finalCount)
 		case "stop_two_recover":
@@ -4227,8 +4297,9 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 			if err := sleepCtx(r.ctx, settle); err != nil {
 				return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
 			}
-			if _, ok := leaderExistsNow(nodes); ok {
-				fmt.Printf("  note: a leader still appears present with %d/%d down (unexpected — quorum should be lost)\n", len(stopped), tc.Cluster.Nodes)
+			if why := leaderWithoutQuorum(nodes, len(stopped), tc.Cluster.Nodes); why != "" {
+				actionOK = false
+				errs = append(errs, why)
 			} else {
 				fmt.Printf("  quorum lost (no leader with %d/%d nodes down), as expected ✓\n", len(stopped), tc.Cluster.Nodes)
 			}
@@ -4582,7 +4653,8 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 		passed = baselineOK && actionOK
 	}
 
-	if rm, qerr := r.queryReceiverMetrics(metricsPort, 30*time.Second); qerr == nil {
+	rm, qerr := r.queryReceiverMetrics(metricsPort, 30*time.Second)
+	if qerr == nil {
 		finalCount = rm.LinesReceived
 		// device_failover: receiver delivery is a SOFT signal. A cluster collector
 		// device's route/sender may run on a different node than the collecting
@@ -4590,7 +4662,9 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 		// (mem:// → not-found, natsobj → evicted) — the same gap agentless_failover
 		// soft-logs. When delivery DOES happen (owner co-located with the router),
 		// the receiver's dedup verdict shows the resumed cursor did not re-deliver;
-		// log it either way, but do not gate the cluster verdict on it.
+		// log it either way. Only the duplicates of a device_failover case that
+		// sets validate_dedup fail the run, below: the gap loses lines, but it
+		// does not send any twice.
 		if tc.Cluster != nil && (tc.Cluster.Action == "device_failover" || tc.Cluster.Action == "owner_pause_fence") {
 			switch {
 			case rm.Passed != nil && !*rm.Passed:
@@ -4600,6 +4674,15 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 			default:
 				fmt.Println("  (soft) post-failover delivery: 0 at the receiver (owner not co-located with router — known cluster data-plane gap)")
 			}
+		}
+	}
+	if tc.Cluster != nil && tc.Cluster.Action == "device_failover" && tc.Correctness.ValidateDedup {
+		if why := failoverDuplicates(tc.Correctness, rm, qerr); why != "" {
+			passed = false
+			errs = append(errs, why)
+			fmt.Printf("  ✗ %s\n", why)
+		} else {
+			fmt.Printf("  duplicates at the receiver: %s, within what the case allows ✓\n", formatCount(rm.Duplicates))
 		}
 	}
 
@@ -4657,6 +4740,32 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 	}
 	fmt.Printf("  done. results → %s\n", dir)
 	return result, nil
+}
+
+// failoverDuplicates judges the receiver's duplicates for a device_failover
+// case that sets validate_dedup. A new owner that starts the device from the
+// beginning, instead of from the saved position, sends lines again, and the
+// receiver counts them as duplicates. The case may allow a few duplicates for
+// lines that were on their way during the handover: max_overdelivery_pct of
+// the unique lines. Without it, no duplicate is allowed. It returns why the
+// duplicates fail the case, or "" when they do not. A receiver that could not
+// be read fails the case too, because its duplicates are not known.
+func failoverDuplicates(c config.CorrectnessConfig, rm ReceiverMetrics, readErr error) string {
+	if !c.ValidateDedup {
+		return ""
+	}
+	if readErr != nil {
+		return fmt.Sprintf("could not read the receiver's counts, so the duplicates after the failover were not checked: %v", readErr)
+	}
+	allowed := int64(float64(rm.UniqueLines) * c.MaxOverDeliveryPct / 100)
+	if rm.Duplicates <= allowed {
+		return ""
+	}
+	if c.MaxOverDeliveryPct > 0 {
+		return fmt.Sprintf("the receiver got %s duplicate lines, but max_overdelivery_pct allows only %s (%.1f%% of its %s unique lines)",
+			formatCount(rm.Duplicates), formatCount(allowed), c.MaxOverDeliveryPct, formatCount(rm.UniqueLines))
+	}
+	return fmt.Sprintf("the receiver got %s duplicate lines, and validate_dedup allows none", formatCount(rm.Duplicates))
 }
 
 // sampleDelivery logs the current receiver count after a disruption WITHOUT

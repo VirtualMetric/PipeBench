@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/VirtualMetric/PipeBench/internal/config"
 )
 
 func h(node int, name, metaLeader string) nodeHealth {
@@ -422,15 +425,192 @@ func TestFirstMatchingLineStopsAtTheWindowEnd(t *testing.T) {
 func TestEarliestLogMatchAcrossNodes(t *testing.T) {
 	t0 := time.Date(2026, 10, 24, 1, 0, 0, 0, time.UTC)
 	found := map[int]time.Time{1: t0.Add(8 * time.Second), 2: t0.Add(3 * time.Second)}
-	n, at, line, ok := earliestLogMatch([]int{1, 2, 3}, func(n int) (time.Time, string, bool) {
+	n, at, line, ok, err := earliestLogMatch([]int{1, 2, 3}, func(n int) (time.Time, string, bool, error) {
 		at, ok := found[n]
-		return at, "lost on node", ok
+		return at, "lost on node", ok, nil
 	})
-	if !ok || n != 2 || !at.Equal(t0.Add(3*time.Second)) || line != "lost on node" {
-		t.Fatalf("earliestLogMatch = node %d at %v (%q, %v); want node 2, the earlier line", n, at, line, ok)
+	if err != nil || !ok || n != 2 || !at.Equal(t0.Add(3*time.Second)) || line != "lost on node" {
+		t.Fatalf("earliestLogMatch = node %d at %v (%q, %v, %v); want node 2, the earlier line", n, at, line, ok, err)
 	}
-	if _, _, _, ok := earliestLogMatch([]int{1, 2}, func(int) (time.Time, string, bool) { return time.Time{}, "", false }); ok {
-		t.Fatalf("earliestLogMatch found a match no node had")
+	if _, _, _, ok, err := earliestLogMatch([]int{1, 2}, func(int) (time.Time, string, bool, error) { return time.Time{}, "", false, nil }); ok || err != nil {
+		t.Fatalf("earliestLogMatch found a match no node had (%v)", err)
+	}
+}
+
+func TestEarliestLogMatchNamesTheNodesItCouldNotRead(t *testing.T) {
+	t0 := time.Date(2026, 10, 24, 1, 0, 0, 0, time.UTC)
+	n, _, _, ok, err := earliestLogMatch([]int{1, 2, 3}, func(n int) (time.Time, string, bool, error) {
+		switch n {
+		case 1:
+			return t0, "lost on node", true, nil
+		case 3:
+			return time.Time{}, "", false, errors.New("docker logs failed")
+		}
+		return time.Time{}, "", false, nil
+	})
+	if !ok || n != 1 {
+		t.Fatalf("earliestLogMatch = node %d (%v); want node 1's line", n, ok)
+	}
+	if err == nil || !strings.Contains(err.Error(), "node 3: docker logs failed") {
+		t.Fatalf("earliestLogMatch error = %v; want node 3's read error", err)
+	}
+}
+
+// stubLogs makes the log reads of one test answer from logs, and fail with the
+// error fail holds for a container.
+func stubLogs(t *testing.T, logs map[string]string, fail map[string]error) {
+	t.Helper()
+	orig := readLogWindow
+	readLogWindow = func(container string, since, until time.Time) (string, error) {
+		if err, ok := fail[container]; ok {
+			return "", err
+		}
+		return logs[container], nil
+	}
+	t.Cleanup(func() { readLogWindow = orig })
+}
+
+func TestExpectNoLogFailsOnALogItCannotRead(t *testing.T) {
+	stubLogs(t, nil, map[string]error{"node-2": errors.New("docker logs node-2: exit status 1: the daemon did not answer")})
+	sr := &scenarioRun{ctx: context.Background(), containers: []string{"node-1", "node-2", "node-3"}, active: map[int]bool{1: true, 2: true, 3: true}}
+	for _, node := range []string{"2", "all"} {
+		st := config.ScenarioStep{Do: "expect_no_log", Node: node, Log: "Falling back to in-process", For: "1ms"}
+		var rep scenarioStepReport
+		ok, detail, err := sr.doStep(0, st, &rep)
+		if err != nil {
+			t.Fatalf("node %s: %v", node, err)
+		}
+		if ok {
+			t.Fatalf("node %s: expect_no_log passed on a log it could not read: %s", node, detail)
+		}
+		if !strings.Contains(detail, "could not read the log") || !strings.Contains(detail, "the daemon did not answer") {
+			t.Fatalf("node %s: detail %q does not say the log could not be read and why", node, detail)
+		}
+	}
+}
+
+func TestExpectNoLogSkipsASpareThatNeverStarted(t *testing.T) {
+	noContainer := func(c string) error { return fmt.Errorf("%w: %s", errNoContainer, c) }
+	stubLogs(t, nil, map[string]error{"node-4": noContainer("node-4")})
+	sr := &scenarioRun{ctx: context.Background(), containers: []string{"node-1", "node-2", "node-3", "node-4"}, active: map[int]bool{1: true, 2: true, 3: true}}
+	st := config.ScenarioStep{Do: "expect_no_log", Node: "all", Log: "Falling back to in-process", For: "1ms"}
+	var rep scenarioStepReport
+	if ok, detail, err := sr.doStep(0, st, &rep); err != nil || !ok {
+		t.Fatalf("expect_no_log failed on a spare node that never started: %v %s", err, detail)
+	}
+	// A member without a container is not a spare: its log is missing.
+	sr.active[4] = true
+	if ok, detail, err := sr.doStep(0, st, &rep); err != nil || ok {
+		t.Fatalf("expect_no_log passed on a member with no container: %v %s", err, detail)
+	}
+}
+
+// docker stop sends SIGTERM and, when the grace period runs out, SIGKILL. A
+// node that needed the SIGKILL did not stop gracefully, and the stop step
+// used to pass all the same.
+func TestStopStepFailsWhenDockerHadToKillTheNode(t *testing.T) {
+	var ran [][]string
+	origCmd := dockerCmd
+	dockerCmd = func(_ context.Context, _ time.Duration, args ...string) error {
+		ran = append(ran, args)
+		return nil
+	}
+	t.Cleanup(func() { dockerCmd = origCmd })
+	sr := &scenarioRun{ctx: context.Background(), containers: []string{"node-1", "node-2"}, active: map[int]bool{1: true, 2: true}, down: map[int]bool{}}
+	st := config.ScenarioStep{Do: "stop", Node: "2", Grace: "10s"}
+
+	stubContainerExit(t, 137)
+	var rep scenarioStepReport
+	ok, detail, err := sr.doStep(0, st, &rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok || detail != "node 2 did not exit within 10s of the SIGTERM, so Docker killed it (exit code 137)" {
+		t.Fatalf("a stop that ended in SIGKILL: ok %v, detail %q; want the step failed and the kill named", ok, detail)
+	}
+	if len(ran) != 1 || strings.Join(ran[0], " ") != "stop -t 10 node-2" {
+		t.Fatalf("docker commands = %v, want one stop of node-2 with a 10 s grace period", ran)
+	}
+
+	stubContainerExit(t, 0)
+	if ok, detail, err := sr.doStep(0, st, &rep); err != nil || !ok {
+		t.Fatalf("a stop that exited by itself: ok %v, detail %q, err %v; want the step passed", ok, detail, err)
+	}
+}
+
+func TestWaitStableFailsOnALogItCannotRead(t *testing.T) {
+	stubLogs(t, nil, map[string]error{"node-2": errors.New("docker logs node-2: exit status 1: the daemon did not answer")})
+	stubRunning(t, func(string) (bool, error) { return true, nil })
+	sr := &scenarioRun{ctx: context.Background(), containers: []string{"node-1", "node-2"}, active: map[int]bool{1: true, 2: true}}
+	st := config.ScenarioStep{Do: "wait_stable", For: "1s", Within: "1s"}
+	var rep scenarioStepReport
+	ok, detail, err := sr.doStep(0, st, &rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatalf("wait_stable passed on a log it could not read: %s", detail)
+	}
+	if !strings.Contains(detail, "could not read node 2's log") {
+		t.Fatalf("detail %q does not name the node whose log could not be read", detail)
+	}
+}
+
+// stubRunning makes the running checks of one test answer from running.
+func stubRunning(t *testing.T, running func(string) (bool, error)) {
+	t.Helper()
+	orig := containerRunningState
+	containerRunningState = running
+	t.Cleanup(func() { containerRunningState = orig })
+}
+
+// wait_stable used to skip a node that docker could not inspect, as if the
+// node had stopped. When that was every node, it passed without reading a log.
+func TestWaitStableFailsWhenDockerCannotSayANodeRuns(t *testing.T) {
+	stubLogs(t, nil, nil)
+	stubRunning(t, func(c string) (bool, error) {
+		if c == "node-2" {
+			return false, errors.New("docker inspect node-2: exit status 1: the daemon did not answer")
+		}
+		return true, nil
+	})
+	sr := &scenarioRun{ctx: context.Background(), containers: []string{"node-1", "node-2"}, active: map[int]bool{1: true, 2: true}}
+	st := config.ScenarioStep{Do: "wait_stable", For: "1s", Within: "1s"}
+	var rep scenarioStepReport
+	ok, detail, err := sr.doStep(0, st, &rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok || !strings.Contains(detail, "could not tell whether node 2 runs") {
+		t.Fatalf("ok %v, detail %q; want the step failed and node 2's unknown state named", ok, detail)
+	}
+}
+
+// wait_log without a node skips the nodes that do not run. A node that
+// docker could not inspect used to be skipped as well, without a word.
+func TestWaitLogNamesANodeDockerCannotInspect(t *testing.T) {
+	stubLogs(t, nil, nil)
+	stubRunning(t, func(string) (bool, error) {
+		return false, errors.New("docker inspect: exit status 1: the daemon did not answer")
+	})
+	sr := &scenarioRun{ctx: context.Background(), containers: []string{"node-1", "node-2"}, active: map[int]bool{1: true, 2: true}}
+	st := config.ScenarioStep{Do: "wait_log", Log: "became leader on", Within: "1ms"}
+	var rep scenarioStepReport
+	ok, detail, err := sr.doStep(0, st, &rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok || !strings.Contains(detail, "could not tell whether node") || !strings.Contains(detail, "the daemon did not answer") {
+		t.Fatalf("ok %v, detail %q; want the step failed with the inspect error named", ok, detail)
+	}
+}
+
+// firstLogLineSince used to drop the read error, so its callers took a log
+// that could not be read for a log without the line.
+func TestFirstLogLineSinceReturnsTheReadError(t *testing.T) {
+	stubLogs(t, nil, map[string]error{"node-1": errors.New("docker logs node-1: exit status 1: the daemon did not answer")})
+	if _, found, err := firstLogLineSince("node-1", "became leader on", time.Now()); found || err == nil {
+		t.Fatalf("found %v, err %v; want the read error", found, err)
 	}
 }
 

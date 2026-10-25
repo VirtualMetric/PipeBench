@@ -695,7 +695,11 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		if side != nil {
 			detail = fmt.Sprintf("node %d leads the side %v, first seen %s after the disruption", leader, side, fmtMs(ms))
 		}
-		if at, found := firstLogLineSince(sr.containers[leader-1], "became leader on", since); found {
+		at, found, err := firstLogLineSince(sr.containers[leader-1], "became leader on", since)
+		if err != nil {
+			return false, fmt.Sprintf("%s, but its log could not be read for when it logged the election: %v", detail, err), nil
+		}
+		if found {
 			logMs := at.Sub(since).Milliseconds()
 			sr.record(st.Record+"_log", float64(logMs))
 			detail += fmt.Sprintf(" (its log says %s)", fmtMs(logMs))
@@ -940,13 +944,23 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		}
 		// The read stops at the window's end: a line logged between the end
 		// and the read is outside the window. The first line in time is the
-		// one reported.
-		n, at, line, found := earliestLogMatch(nodes, func(n int) (time.Time, string, bool) {
-			return firstLogLineInWindow(sr.containers[n-1], st.LogLines(), from, end)
+		// one reported. If a log cannot be read, the step fails, because the
+		// line may be in that log.
+		n, at, line, found, err := earliestLogMatch(nodes, func(n int) (time.Time, string, bool, error) {
+			at, line, found, err := firstLogLineInWindow(sr.containers[n-1], st.LogLines(), from, end)
+			// A spare node that never started has no container, and so
+			// logged nothing.
+			if errors.Is(err, errNoContainer) && !sr.active[n] {
+				return time.Time{}, "", false, nil
+			}
+			return at, line, found, err
 		})
 		if found {
 			rep.Node = n
 			return false, fmt.Sprintf("node %d logged %q %s after %s", n, line, fmtMs(at.Sub(from).Milliseconds()), fromWhat), nil
+		}
+		if err != nil {
+			return false, fmt.Sprintf("could not read the log, so it is not known whether %s was logged: %v", quoteLines(st.LogLines()), err), nil
 		}
 		window := fmtMs(end.Sub(from).Milliseconds())
 		if st.Node == "all" {
@@ -983,10 +997,21 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		for {
 			last := time.Time{}
 			for n := 1; n <= len(sr.containers); n++ {
-				if !sr.active[n] || !containerRunning(sr.containers[n-1]) {
+				if !sr.active[n] {
 					continue
 				}
-				if at, found := lastLogLineSince(sr.containers[n-1], settlingMarkers, time.Now().Add(-hold)); found && at.After(last) {
+				running, err := containerRunningState(sr.containers[n-1])
+				if err != nil {
+					return false, fmt.Sprintf("could not tell whether node %d runs, so it is not known whether the cluster settled: %v", n, err), nil
+				}
+				if !running {
+					continue
+				}
+				at, found, err := lastLogLineSince(sr.containers[n-1], settlingMarkers, time.Now().Add(-hold))
+				if err != nil {
+					return false, fmt.Sprintf("could not read node %d's log, so it is not known whether the cluster settled: %v", n, err), nil
+				}
+				if found && at.After(last) {
 					last = at
 				}
 			}
@@ -1021,12 +1046,20 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		deadline := time.Now().Add(within)
 		for {
 			// Every node is read, and the first line in time wins, so the
-			// measure and the report name the first node to log it.
-			n, at, line, found := earliestLogMatch(nodes, func(n int) (time.Time, string, bool) {
+			// measure and the report name the first node to log it. A node
+			// whose log cannot be read is read again in the next round. If
+			// the wait runs out, the step names the error.
+			n, at, line, found, readErr := earliestLogMatch(nodes, func(n int) (time.Time, string, bool, error) {
 				// Without a node, only running nodes count: the last lines of a
 				// node a step just killed must not satisfy the wait.
-				if st.Node == "" && !containerRunning(sr.containers[n-1]) {
-					return time.Time{}, "", false
+				if st.Node == "" {
+					running, err := containerRunningState(sr.containers[n-1])
+					if err != nil {
+						return time.Time{}, "", false, fmt.Errorf("could not tell whether node %d runs: %w", n, err)
+					}
+					if !running {
+						return time.Time{}, "", false, nil
+					}
 				}
 				// The read stops at the deadline: a line logged after it is
 				// too late, even when the read happens to see it.
@@ -1039,6 +1072,9 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 				return true, fmt.Sprintf("node %d logged %q %s after the disruption", n, line, fmtMs(ms)), nil
 			}
 			if time.Now().After(deadline) {
+				if readErr != nil {
+					return false, fmt.Sprintf("no node logged %s within %s, and a log could not be read: %v", quoteLines(st.LogLines()), within, readErr), nil
+				}
 				return false, fmt.Sprintf("no node logged %s within %s", quoteLines(st.LogLines()), within), nil
 			}
 			if err := sleepCtx(sr.ctx, time.Second); err != nil {
@@ -1119,6 +1155,9 @@ func (sr *scenarioRun) nodeAction(i int, st config.ScenarioStep, rep *scenarioSt
 		if err := dockerCmd(sr.ctx, grace+30*time.Second, "stop", "-t", graceSecs, c); err != nil {
 			return false, fmt.Sprintf("docker stop %s: %v", c, err), nil
 		}
+		if why := ungracefulStop(n, c, grace); why != "" {
+			return false, why, nil
+		}
 		return true, fmt.Sprintf("stopped node %d in %s", n, fmtMs(time.Since(start).Milliseconds())), nil
 	case "restart":
 		sr.disrupt(i, "restart", n)
@@ -1162,8 +1201,12 @@ func (sr *scenarioRun) nodeAction(i int, st config.ScenarioStep, rep *scenarioSt
 			// The wrapper reads the file when the container starts. Remove it
 			// once the node said it took it, so the next start is a plain one.
 			used := false
+			var readErr error
 			for range 30 {
-				if _, found := firstLogLineSince(c, "bench: starting with", start); found {
+				_, found, err := firstLogLineSince(c, "bench: starting with", start)
+				if err != nil {
+					readErr = err
+				} else if found {
 					used = true
 					break
 				}
@@ -1173,6 +1216,9 @@ func (sr *scenarioRun) nodeAction(i int, st config.ScenarioStep, rep *scenarioSt
 			}
 			_ = os.Remove(argsFile)
 			if !used {
+				if readErr != nil {
+					return false, fmt.Sprintf("node %d did not report starting with -recover=%s, and its log could not be read: %v", n, st.Recover, readErr), nil
+				}
 				return false, fmt.Sprintf("node %d did not report starting with -recover=%s", n, st.Recover), nil
 			}
 			return true, fmt.Sprintf("started node %d once with -recover=%s", n, st.Recover), nil
@@ -2295,8 +2341,25 @@ func firstLine(s string) string {
 	return s
 }
 
-// dockerCmd runs one docker command with a timeout.
-func dockerCmd(ctx context.Context, timeout time.Duration, args ...string) error {
+// ungracefulStop returns why node n, which docker stop ended, did not stop by
+// itself, or "" when it did. docker stop sends SIGTERM, and then SIGKILL when
+// the grace period runs out. Exit code 137 means that the node needed the
+// SIGKILL.
+func ungracefulStop(n int, container string, grace time.Duration) string {
+	code, oom, err := containerExit(container)
+	switch {
+	case err != nil:
+		return fmt.Sprintf("could not read how node %d's process ended: %v", n, err)
+	case oom:
+		return fmt.Sprintf("node %d ran out of memory, so its process did not stop by itself", n)
+	case code == 137:
+		return fmt.Sprintf("node %d did not exit within %s of the SIGTERM, so Docker killed it (exit code 137)", n, grace)
+	}
+	return ""
+}
+
+// dockerCmd runs one docker command with a timeout. Tests replace it.
+var dockerCmd = func(ctx context.Context, timeout time.Duration, args ...string) error {
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	out, err := exec.CommandContext(cctx, "docker", args...).CombinedOutput()
@@ -2332,25 +2395,46 @@ func containerNetwork(container string) string {
 }
 
 // firstLogLineSince returns the docker timestamp of the first line since t
-// that contains needle.
-func firstLogLineSince(container, needle string, t time.Time) (time.Time, bool) {
-	at, _, found := firstLogLineInWindow(container, []string{needle}, t, time.Time{})
-	return at, found
+// that contains needle. It returns an error when the log cannot be read, so
+// that a caller does not take an unread log for a log without the line.
+func firstLogLineSince(container, needle string, t time.Time) (time.Time, bool, error) {
+	at, _, found, err := firstLogLineInWindow(container, []string{needle}, t, time.Time{})
+	return at, found, err
 }
 
-// firstLogLineInWindow returns the docker timestamp of the first line from
-// since up to until that contains any of the needles, and the needle it
-// contains. A zero until leaves the window open: up to the moment of the read.
-func firstLogLineInWindow(container string, needles []string, since, until time.Time) (time.Time, string, bool) {
+// errNoContainer is the error readLogWindow returns for a container that does
+// not exist: a spare node that never started.
+var errNoContainer = errors.New("no such container")
+
+// readLogWindow returns what a container logged from since up to until, as
+// `docker logs -t` prints it. A zero until reads up to the moment of the read.
+// Tests replace it.
+var readLogWindow = func(container string, since, until time.Time) (string, error) {
 	args := []string{"logs", "-t", "--since", since.UTC().Format(time.RFC3339Nano)}
 	if !until.IsZero() {
 		args = append(args, "--until", until.UTC().Format(time.RFC3339Nano))
 	}
 	out, err := exec.Command("docker", append(args, container)...).CombinedOutput()
 	if err != nil {
-		return time.Time{}, "", false
+		if strings.Contains(string(out), "No such container") {
+			return "", fmt.Errorf("%w: %s", errNoContainer, container)
+		}
+		return "", fmt.Errorf("docker logs %s: %w: %s", container, err, strings.TrimSpace(string(out)))
 	}
-	return firstMatchingLine(string(out), needles, until)
+	return string(out), nil
+}
+
+// firstLogLineInWindow returns the docker timestamp of the first line from
+// since up to until that contains any of the needles, and the needle it
+// contains. A zero until leaves the window open: up to the moment of the read.
+// It returns an error when the log cannot be read.
+func firstLogLineInWindow(container string, needles []string, since, until time.Time) (time.Time, string, bool, error) {
+	out, err := readLogWindow(container, since, until)
+	if err != nil {
+		return time.Time{}, "", false, err
+	}
+	at, needle, found := firstMatchingLine(out, needles, until)
+	return at, needle, found, nil
 }
 
 // firstMatchingLine finds the first line of `docker logs -t` output that
@@ -2389,9 +2473,6 @@ func readProgressBaseline(ctx context.Context, read func() (genProgress, bool), 
 	return genProgress{}, false
 }
 
-// earliestLogMatch asks each node for its first matching line and returns the
-// node whose line came first, its time and the text it matched. find reports
-// a node's first match, or false when it has none.
 // noLogNodes returns the nodes an expect_no_log step reads: every node
 // container for "all", else the one node the selector names.
 func (sr *scenarioRun) noLogNodes(sel string) ([]int, error) {
@@ -2409,10 +2490,21 @@ func (sr *scenarioRun) noLogNodes(sel string) ([]int, error) {
 	return []int{n}, nil
 }
 
-func earliestLogMatch(nodes []int, find func(n int) (time.Time, string, bool)) (int, time.Time, string, bool) {
+// earliestLogMatch asks each node for its first matching line and returns the
+// node whose line came first, its time and the text it matched. find reports
+// a node's first match, or false when it has none, or an error when it cannot
+// read the node's log. The returned error names every node whose log could not
+// be read. A step that checks that a line was not logged must not pass on a
+// log it never read.
+func earliestLogMatch(nodes []int, find func(n int) (time.Time, string, bool, error)) (int, time.Time, string, bool, error) {
 	bestNode, bestAt, bestLine := 0, time.Time{}, ""
+	var errs []error
 	for _, n := range nodes {
-		at, line, found := find(n)
+		at, line, found, err := find(n)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("node %d: %w", n, err))
+			continue
+		}
 		if !found {
 			continue
 		}
@@ -2420,7 +2512,7 @@ func earliestLogMatch(nodes []int, find func(n int) (time.Time, string, bool)) (
 			bestNode, bestAt, bestLine = n, at, line
 		}
 	}
-	return bestNode, bestAt, bestLine, bestNode != 0
+	return bestNode, bestAt, bestLine, bestNode != 0, errors.Join(errs...)
 }
 
 // quoteLines names the texts a log step looks for: one quoted text, or the
@@ -2624,15 +2716,16 @@ var settlingMarkers = []string{
 }
 
 // lastLogLineSince returns the docker timestamp of the last line since t that
-// contains any of the needles.
-func lastLogLineSince(container string, needles []string, t time.Time) (time.Time, bool) {
-	out, err := exec.Command("docker", "logs", "-t", "--since", t.UTC().Format(time.RFC3339Nano), container).CombinedOutput()
+// contains any of the needles. It returns an error when the log cannot be
+// read.
+func lastLogLineSince(container string, needles []string, t time.Time) (time.Time, bool, error) {
+	out, err := readLogWindow(container, t, time.Time{})
 	if err != nil {
-		return time.Time{}, false
+		return time.Time{}, false, err
 	}
 	var last time.Time
 	found := false
-	for _, line := range strings.Split(string(out), "\n") {
+	for _, line := range strings.Split(out, "\n") {
 		for _, needle := range needles {
 			if !strings.Contains(line, needle) {
 				continue
@@ -2644,5 +2737,5 @@ func lastLogLineSince(container string, needles []string, t time.Time) (time.Tim
 			break
 		}
 	}
-	return last, found
+	return last, found, nil
 }
