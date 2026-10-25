@@ -1,9 +1,12 @@
 package runner
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/VirtualMetric/PipeBench/internal/config"
 )
 
 // stubClusterLogs makes the older cluster driver read the logs from logs, for
@@ -71,6 +74,37 @@ func TestRestartLeaderNeedsAReElection(t *testing.T) {
 	}, nodes...)
 	if n, why := reElection(nodes, began); why != "" || n != 2 {
 		t.Fatalf("reElection = node %d, %q; want node 2, elected during the restart", n, why)
+	}
+}
+
+// device_failover printed the receiver's duplicates and never failed on them,
+// even in a case that sets validate_dedup. So a new owner that read the whole
+// file again from the start passed.
+func TestFailoverDuplicates(t *testing.T) {
+	strict := config.CorrectnessConfig{ValidateDedup: true}
+	bounded := config.CorrectnessConfig{ValidateDedup: true, MaxOverDeliveryPct: 10}
+
+	// A new owner that started from the beginning sent all 100 rows again.
+	if why := failoverDuplicates(strict, ReceiverMetrics{UniqueLines: 100, Duplicates: 100}, nil); why != "the receiver got 100 duplicate lines, and validate_dedup allows none" {
+		t.Errorf("100 rows sent twice: %q, want them named", why)
+	}
+	if why := failoverDuplicates(strict, ReceiverMetrics{UniqueLines: 100}, nil); why != "" {
+		t.Errorf("no duplicates: %q, want nothing", why)
+	}
+	// 10% of 200 unique lines may arrive twice, and no more.
+	if why := failoverDuplicates(bounded, ReceiverMetrics{UniqueLines: 200, Duplicates: 20}, nil); why != "" {
+		t.Errorf("20 duplicates of 200 lines with a 10%% limit: %q, want nothing", why)
+	}
+	if why := failoverDuplicates(bounded, ReceiverMetrics{UniqueLines: 200, Duplicates: 21}, nil); why != "the receiver got 21 duplicate lines, but max_overdelivery_pct allows only 20 (10.0% of its 200 unique lines)" {
+		t.Errorf("21 duplicates of 200 lines with a 10%% limit: %q, want them named with the limit", why)
+	}
+	// A receiver that could not be read leaves the duplicates unknown.
+	if why := failoverDuplicates(strict, ReceiverMetrics{}, errors.New("connection refused")); !strings.Contains(why, "could not read the receiver's counts") {
+		t.Errorf("an unreadable receiver: %q, want a failure", why)
+	}
+	// Without validate_dedup, the duplicates are not judged.
+	if why := failoverDuplicates(config.CorrectnessConfig{}, ReceiverMetrics{UniqueLines: 100, Duplicates: 100}, nil); why != "" {
+		t.Errorf("a case without validate_dedup: %q, want nothing", why)
 	}
 }
 

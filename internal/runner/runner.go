@@ -4607,7 +4607,8 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 		passed = baselineOK && actionOK
 	}
 
-	if rm, qerr := r.queryReceiverMetrics(metricsPort, 30*time.Second); qerr == nil {
+	rm, qerr := r.queryReceiverMetrics(metricsPort, 30*time.Second)
+	if qerr == nil {
 		finalCount = rm.LinesReceived
 		// device_failover: receiver delivery is a SOFT signal. A cluster collector
 		// device's route/sender may run on a different node than the collecting
@@ -4615,7 +4616,9 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 		// (mem:// → not-found, natsobj → evicted) — the same gap agentless_failover
 		// soft-logs. When delivery DOES happen (owner co-located with the router),
 		// the receiver's dedup verdict shows the resumed cursor did not re-deliver;
-		// log it either way, but do not gate the cluster verdict on it.
+		// log it either way. Only the duplicates of a device_failover case that
+		// sets validate_dedup fail the run, below: the gap loses lines, but it
+		// does not send any twice.
 		if tc.Cluster != nil && (tc.Cluster.Action == "device_failover" || tc.Cluster.Action == "owner_pause_fence") {
 			switch {
 			case rm.Passed != nil && !*rm.Passed:
@@ -4625,6 +4628,15 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 			default:
 				fmt.Println("  (soft) post-failover delivery: 0 at the receiver (owner not co-located with router — known cluster data-plane gap)")
 			}
+		}
+	}
+	if tc.Cluster != nil && tc.Cluster.Action == "device_failover" && tc.Correctness.ValidateDedup {
+		if why := failoverDuplicates(tc.Correctness, rm, qerr); why != "" {
+			passed = false
+			errs = append(errs, why)
+			fmt.Printf("  ✗ %s\n", why)
+		} else {
+			fmt.Printf("  duplicates at the receiver: %s, within what the case allows ✓\n", formatCount(rm.Duplicates))
 		}
 	}
 
@@ -4682,6 +4694,32 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 	}
 	fmt.Printf("  done. results → %s\n", dir)
 	return result, nil
+}
+
+// failoverDuplicates judges the receiver's duplicates for a device_failover
+// case that sets validate_dedup. A new owner that starts the device from the
+// beginning, instead of from the saved position, sends lines again, and the
+// receiver counts them as duplicates. The case may allow a few duplicates for
+// lines that were on their way during the handover: max_overdelivery_pct of
+// the unique lines. Without it, no duplicate is allowed. It returns why the
+// duplicates fail the case, or "" when they do not. A receiver that could not
+// be read fails the case too, because its duplicates are not known.
+func failoverDuplicates(c config.CorrectnessConfig, rm ReceiverMetrics, readErr error) string {
+	if !c.ValidateDedup {
+		return ""
+	}
+	if readErr != nil {
+		return fmt.Sprintf("could not read the receiver's counts, so the duplicates after the failover were not checked: %v", readErr)
+	}
+	allowed := int64(float64(rm.UniqueLines) * c.MaxOverDeliveryPct / 100)
+	if rm.Duplicates <= allowed {
+		return ""
+	}
+	if c.MaxOverDeliveryPct > 0 {
+		return fmt.Sprintf("the receiver got %s duplicate lines, but max_overdelivery_pct allows only %s (%.1f%% of its %s unique lines)",
+			formatCount(rm.Duplicates), formatCount(allowed), c.MaxOverDeliveryPct, formatCount(rm.UniqueLines))
+	}
+	return fmt.Sprintf("the receiver got %s duplicate lines, and validate_dedup allows none", formatCount(rm.Duplicates))
 }
 
 // sampleDelivery logs the current receiver count after a disruption WITHOUT
