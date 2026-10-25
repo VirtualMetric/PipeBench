@@ -347,3 +347,32 @@ func TestClusterScenarioComposeNodeDiskAndKeys(t *testing.T) {
 		t.Fatalf("the receiver must note each line's key: %v", env)
 	}
 }
+
+// A scenario case with several receivers starts its one generator after all
+// of them. It has no service called receiver to wait for.
+func TestClusterScenarioComposeGeneratorWaitsForEachReceiver(t *testing.T) {
+	src := "director:\n  id: {{@.NodeID@}}\n"
+	tc := scenarioCase(&config.ScenarioConfig{Steps: []config.ScenarioStep{{Do: "wait_ready"}}})
+	tc.Receiver = config.ReceiverConfig{}
+	tc.Receivers = []config.ReceiverConfig{{ID: "a", Mode: "tcp", Listen: ":9001"}, {ID: "b", Mode: "tcp", Listen: ":9001"}}
+	doc, _, _ := renderScenario(t, tc, src)
+	deps, _ := service(t, doc, "generator")["depends_on"].(map[string]any)
+	for _, name := range []string{"receiver-a", "receiver-b"} {
+		if _, ok := deps[name]; !ok {
+			t.Fatalf("the generator must wait for %s: %v", name, keys(deps))
+		}
+	}
+	services, _ := doc["services"].(map[string]any)
+	for name := range deps {
+		if _, ok := services[name]; !ok {
+			t.Fatalf("the generator waits for %q, which is not a service of the file: %v", name, keys(services))
+		}
+	}
+
+	// A case with one receiver waits for it, as before.
+	doc, _, _ = renderScenario(t, scenarioCase(&config.ScenarioConfig{Steps: []config.ScenarioStep{{Do: "wait_ready"}}}), src)
+	deps, _ = service(t, doc, "generator")["depends_on"].(map[string]any)
+	if _, ok := deps["receiver"]; !ok {
+		t.Fatalf("the generator of a case with one receiver must wait for it: %v", keys(deps))
+	}
+}

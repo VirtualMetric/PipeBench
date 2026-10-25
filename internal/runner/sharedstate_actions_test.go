@@ -306,34 +306,75 @@ func TestLogOncePerRun(t *testing.T) {
 	}
 }
 
+// isolate_replica judges how soon another replica ran the cut-off replica's
+// devices, with max_failover_seconds.
+func TestIsolateTakeoverProblems(t *testing.T) {
+	owned := []int64{11, 12, 13}
+	cut := 31 * time.Second
+	// What a director that hands the devices on quickly did: all within 25 s.
+	if got := isolateTakeoverProblems(owned, map[string]float64{"11": 13.9, "12": 14.0, "13": 14.0}, cut, 25); len(got) != 0 {
+		t.Errorf("takeovers within the limit: %q, want none", got)
+	}
+	// One device too slow, and two that no replica ran before the 31 s cut
+	// ended, as on a director whose routes to the cut-off replica stayed open.
+	got := isolateTakeoverProblems(owned, map[string]float64{"11": 26.9}, cut, 25)
+	if len(got) != 3 || !strings.Contains(got[0], "device 11 of the cut-off replica ran on another replica 26.9s after the cut") ||
+		!strings.Contains(got[1], "device 12 of the cut-off replica did not run on another replica within max_failover_seconds 25") {
+		t.Errorf("a late takeover and two missing: %q, want three problems naming them", got)
+	}
+	// A cut shorter than the limit leaves a device nobody took over unjudged.
+	if got := isolateTakeoverProblems(owned, nil, 20*time.Second, 25); len(got) != 0 {
+		t.Errorf("a 20 s cut with a 25 s limit: %q, want none", got)
+	}
+	// Without a limit nothing is judged.
+	if got := isolateTakeoverProblems(owned, nil, cut, 0); len(got) != 0 {
+		t.Errorf("no limit: %q, want none", got)
+	}
+}
+
 func TestStateWritesBesideSnapshots(t *testing.T) {
 	base := time.Date(2026, 10, 23, 22, 26, 39, 0, time.UTC)
 	at := func(s float64) time.Time { return base.Add(time.Duration(s * float64(time.Second))) }
-	// What the 10-second run wrote: every 10 s, and a snapshot round at 75 s
-	// that wrote what was waiting twice, after which the interval counted on.
-	writes := []time.Time{at(0), at(10), at(20), at(30), at(40), at(50), at(60), at(70), at(75), at(75.007), at(85.007), at(95.007)}
-	snaps := []time.Time{at(75.002), at(75.005), at(75.008), at(75.011)}
+	// A 10-second interval whose snapshot came with an interval write: the
+	// snapshot round wrote what was waiting twice, a few milliseconds apart,
+	// at 60 s, and the interval counted on from it.
+	writes := []time.Time{at(0), at(10), at(20), at(30), at(40), at(50), at(60), at(60.007), at(70.007), at(80.007)}
+	snaps := []time.Time{at(60.002), at(60.005), at(60.008), at(60.011)}
 	forced := withSnapshot(writes, snaps)
-	if !forced[8] || !forced[9] || forced[7] || forced[10] {
-		t.Fatalf("with snapshot = %v: only the two writes at 75 s came with it", forced)
+	if !forced[6] || !forced[7] || forced[5] || forced[8] {
+		t.Fatalf("with snapshot = %v: only the two writes at 60 s came with it", forced)
 	}
-	if problems, judged := judgeWriteGaps(writes, forced, 10*time.Second, 2*time.Second); len(problems) != 0 || judged != 9 {
-		t.Errorf("10 s interval with a snapshot round: problems %v, judged %d; want none and 9", problems, judged)
+	if problems, judged := judgeWriteGaps(writes, 10*time.Second, 2*time.Second); len(problems) != 0 || judged != 8 {
+		t.Errorf("10 s interval with a snapshot round on an interval write: problems %v, judged %d; want none and 8", problems, judged)
 	}
 	if rounds := writeRounds(snaps, time.Second); len(rounds) != 1 {
 		t.Errorf("four snapshot writes within 10 ms are %d rounds, want 1", len(rounds))
 	}
 
-	// A 300-second interval whose every write a snapshot asked for, every 75 s:
-	// no gap follows the interval, and none is judged.
-	writes = []time.Time{at(0), at(75), at(150), at(225), at(300)}
-	snaps = []time.Time{at(0.003), at(75.003), at(150.003), at(225.003), at(300.003)}
-	if problems, judged := judgeWriteGaps(writes, withSnapshot(writes, snaps), 300*time.Second, 30*time.Second); len(problems) != 0 || judged != 0 {
-		t.Errorf("every write with a snapshot: problems %v, judged %d; want none judged", problems, judged)
+	// What a 10-second run wrote when its director's snapshots came one check
+	// late: a snapshot round at 75 s, between two interval writes. The round
+	// counts as an interval write, so its gap of 5 s is a problem.
+	writes = []time.Time{at(0), at(10), at(20), at(30), at(40), at(50), at(60), at(70), at(75), at(75.007), at(85.007), at(95.007)}
+	if problems, judged := judgeWriteGaps(writes, 10*time.Second, 2*time.Second); len(problems) != 1 || judged != 10 || !strings.Contains(problems[0], "round 9 came 5s") {
+		t.Errorf("10 s interval with a late snapshot round: problems %v, judged %d; want the round at 75 s named and 10 judged", problems, judged)
+	}
+
+	// A 300-second interval whose snapshots come with its interval writes:
+	// one round every 300 s.
+	writes = []time.Time{at(0), at(0.006), at(300), at(300.006), at(600), at(600.006)}
+	if problems, judged := judgeWriteGaps(writes, 300*time.Second, 30*time.Second); len(problems) != 0 || judged != 2 {
+		t.Errorf("300 s interval with its snapshots on its interval writes: problems %v, judged %d; want none and 2", problems, judged)
+	}
+	// The same interval when the snapshots came one check late: an interval
+	// write, then a snapshot round 75 s later, from which the interval counted
+	// on. The snapshot round is a store call of its own.
+	writes = []time.Time{at(0), at(300), at(375), at(375.006), at(675)}
+	if problems, judged := judgeWriteGaps(writes, 300*time.Second, 30*time.Second); len(problems) != 1 || judged != 3 || !strings.Contains(problems[0], "round 3 came 1m15s") {
+		t.Errorf("300 s interval with a late snapshot round: problems %v, judged %d; want the round at 375 s named and 3 judged", problems, judged)
 	}
 	// And an interval write too early is named.
 	writes = []time.Time{at(0), at(5)}
-	if problems, _ := judgeWriteGaps(writes, []bool{false, false}, 10*time.Second, 2*time.Second); len(problems) != 1 {
+	if problems, _ := judgeWriteGaps(writes, 10*time.Second, 2*time.Second); len(problems) != 1 {
 		t.Errorf("a write 5 s after the last with a 10 s interval: %v, want one problem", problems)
 	}
 }
@@ -538,7 +579,7 @@ func TestWindowDisturbances(t *testing.T) {
 
 	// The old check: the busiest writer's gaps, judged against 300 s.
 	writer, ts := busiestWriter(segmentWrites(calls, "director-state", at(0), at(900)))
-	if problems, judged := judgeWriteGaps(ts, make([]bool, len(ts)), 300*time.Second, 30*time.Second); writer != "subject-2-a" || len(problems) != 0 || judged != 2 {
+	if problems, judged := judgeWriteGaps(ts, 300*time.Second, 30*time.Second); writer != "subject-2-a" || len(problems) != 0 || judged != 2 {
 		t.Fatalf("old check: writer %s, problems %v, judged %d; want subject-2-a passing on 2 gaps", writer, problems, judged)
 	}
 

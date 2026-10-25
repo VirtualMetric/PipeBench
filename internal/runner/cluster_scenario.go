@@ -10,6 +10,9 @@ package runner
 // answered 2xx, retrying a refused post on the next node. The receiver
 // tracks which numbered lines arrived (RECEIVER_TRACK_SEQ), so loss is
 // exact: acknowledged lines that never arrived. Duplicates are reported.
+// A case with several receivers (`receivers:`, one per target of the
+// route) needs every acknowledged line at each of them, and its delivery
+// steps, timelines and latencies read the first one.
 //
 // A prober reads every node's /health once a second (cluster_probe.go). The
 // waits read it to see a leader, a healthy cluster or a lost one, and the
@@ -194,7 +197,11 @@ type scenarioRun struct {
 	tmpDir     string
 	configSrc  string
 	network    string
-	recvPort   int
+	// receivers are the run's receivers, in the case's order. recvPort is
+	// the first one's port: the delivery steps, the timelines and the
+	// latencies read that receiver.
+	receivers []scenarioReceiver
+	recvPort  int
 
 	probe *clusterProbe
 
@@ -229,6 +236,52 @@ type scenarioRun struct {
 
 	imageID     string
 	imageLabels map[string]string
+}
+
+// scenarioReceiver is one receiver of a scenario run: the case's one
+// `receiver:` (ID empty), or one of its `receivers:`.
+type scenarioReceiver struct {
+	ID        string
+	Container string
+	Port      int // the host port of its /metrics and query endpoints
+}
+
+// scenarioReceivers lists the run's receivers in the case's order, with the
+// host ports the orchestrator gave them (ports, keyed by id, or "default"
+// for the one receiver of a case without `receivers:`).
+func scenarioReceivers(tc *config.TestCase, ports map[string]int, defaultPort int) []scenarioReceiver {
+	if !tc.MultiReceiver() {
+		port := defaultPort
+		if p, ok := ports["default"]; ok {
+			port = p
+		}
+		return []scenarioReceiver{{Container: "bench-receiver", Port: port}}
+	}
+	out := make([]scenarioReceiver, 0, len(tc.Receivers))
+	for _, rc := range tc.Receivers {
+		out = append(out, scenarioReceiver{ID: rc.ID, Container: "bench-receiver-" + rc.ID, Port: ports[rc.ID]})
+	}
+	return out
+}
+
+// receiverByID returns the receiver with that id. An empty id is the case's
+// one receiver.
+func (sr *scenarioRun) receiverByID(id string) (scenarioReceiver, bool) {
+	for _, rc := range sr.receivers {
+		if rc.ID == id {
+			return rc, true
+		}
+	}
+	return scenarioReceiver{}, false
+}
+
+// receiverContainers names the run's receiver containers.
+func receiverContainers(recvs []scenarioReceiver) []string {
+	out := make([]string, len(recvs))
+	for i, rc := range recvs {
+		out[i] = rc.Container
+	}
+	return out
 }
 
 func (r *Runner) runClusterScenario(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
@@ -305,7 +358,13 @@ func (r *Runner) runClusterScenario(tc *config.TestCase, subject config.Subject)
 	}
 
 	containers := clusterNodeContainers(subject.Name, tc.Cluster.Nodes+sc.SpareNodes)
+	recvs := scenarioReceivers(tc, orch.ReceiverMetricsPorts(), r.opts.ReceiverHostPort)
+	// bench-receiver stays on the list in every case, so that one an
+	// interrupted earlier run left behind goes too.
 	extras := []string{"bench-generator", "bench-receiver", "bench-collector", "bench-toxiproxy", "bench-witness-init"}
+	if tc.MultiReceiver() {
+		extras = append(extras, receiverContainers(recvs)...)
+	}
 	removeContainers := func() {
 		for _, c := range append(append([]string{}, extras...), containers...) {
 			_ = exec.Command("docker", "unpause", c).Run()
@@ -328,7 +387,7 @@ func (r *Runner) runClusterScenario(tc *config.TestCase, subject config.Subject)
 	sr := &scenarioRun{
 		r: r, ctx: r.ctx, tc: tc, sc: sc, subject: subject, orch: orch,
 		containers: containers, active: map[int]bool{}, size: tc.Cluster.Nodes,
-		tmpDir: tmpDir, configSrc: srcCfg, recvPort: r.opts.ReceiverHostPort,
+		tmpDir: tmpDir, configSrc: srcCfg, receivers: recvs, recvPort: recvs[0].Port,
 		names: map[string]int{}, disconnected: map[int]bool{}, down: map[int]bool{}, measures: map[string]float64{},
 		counts: map[string]int64{}, imageID: imageID, imageLabels: imageLabels, filled: map[int]bool{},
 	}
@@ -381,7 +440,8 @@ func (r *Runner) runClusterScenario(tc *config.TestCase, subject config.Subject)
 
 	// Keep every container's log next to the report: the evidence for a
 	// failure is in the nodes' logs, and teardown removes the containers.
-	if dir, err := r.saveScenarioLogs(tc.Name, append(append([]string{}, containers...), "bench-generator", "bench-receiver")); err == nil {
+	logged := append(append(append([]string{}, containers...), "bench-generator"), receiverContainers(recvs)...)
+	if dir, err := r.saveScenarioLogs(tc.Name, logged); err == nil {
 		report.LogsDir = dir
 		fmt.Printf("  container logs → %s\n", dir)
 	} else {
@@ -508,6 +568,7 @@ func describeStepArgs(st config.ScenarioStep) string {
 	add("logs", strings.Join(st.Logs, " | "))
 	add("since", st.Since)
 	add("sent_before", st.SentBefore)
+	add("receiver", st.Receiver)
 	add("peers", strings.Join(st.PeerList(), ","))
 	add("loss", st.Loss)
 	add("jitter", st.Jitter)
@@ -828,11 +889,20 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		return sr.proxyAction(i, st)
 
 	case "receiver_pause", "receiver_unpause":
+		// A paused receiver keeps its counts, which a stopped one would lose,
+		// and the targets that send to it build a backlog meanwhile.
+		rc, ok := sr.receiverByID(st.Receiver)
+		if !ok {
+			return false, fmt.Sprintf("receiver %q is not one of the case's receivers", st.Receiver), nil
+		}
 		verb := strings.TrimPrefix(st.Do, "receiver_")
-		if err := dockerCmd(sr.ctx, 30*time.Second, verb, "bench-receiver"); err != nil {
-			return false, fmt.Sprintf("docker %s bench-receiver: %v", verb, err), nil
+		if err := dockerCmd(sr.ctx, 30*time.Second, verb, rc.Container); err != nil {
+			return false, fmt.Sprintf("docker %s %s: %v", verb, rc.Container, err), nil
 		}
 		sr.disrupt(i, st.Do, 0)
+		if rc.ID != "" {
+			return true, fmt.Sprintf("receiver %s %sd", rc.ID, verb), nil
+		}
 		return true, "", nil
 
 	case "scale_to":
@@ -845,13 +915,17 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		// The node must not log the text for the window: an old owner that
 		// must not collect any more, for one. The window starts at this step,
 		// or at the mark that since names, so that it also covers the steps
-		// in between. It ends `for` after this step starts.
+		// in between. It ends `for` after this step starts. With node all,
+		// no node may log it: every node container is read, the stopped ones
+		// too, because a node a step stopped in the window logged until then.
 		hold := st.DurationOr("for", 30*time.Second)
-		n, err := sr.resolveNode(st.Node)
+		nodes, err := sr.noLogNodes(st.Node)
 		if err != nil {
 			return false, err.Error(), nil
 		}
-		rep.Node = n
+		if st.Node != "all" {
+			rep.Node = nodes[0]
+		}
 		from, fromWhat := time.Now(), "this step"
 		if st.Since != "" {
 			at, ok := sr.markAt(st.Since)
@@ -865,11 +939,20 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 			return false, "", fmt.Errorf("interrupted: %w", err)
 		}
 		// The read stops at the window's end: a line logged between the end
-		// and the read is outside the window.
-		if at, line, found := firstLogLineInWindow(sr.containers[n-1], st.LogLines(), from, end); found {
+		// and the read is outside the window. The first line in time is the
+		// one reported.
+		n, at, line, found := earliestLogMatch(nodes, func(n int) (time.Time, string, bool) {
+			return firstLogLineInWindow(sr.containers[n-1], st.LogLines(), from, end)
+		})
+		if found {
+			rep.Node = n
 			return false, fmt.Sprintf("node %d logged %q %s after %s", n, line, fmtMs(at.Sub(from).Milliseconds()), fromWhat), nil
 		}
-		return true, fmt.Sprintf("node %d did not log %s from %s for %s", n, quoteLines(st.LogLines()), fromWhat, fmtMs(end.Sub(from).Milliseconds())), nil
+		window := fmtMs(end.Sub(from).Milliseconds())
+		if st.Node == "all" {
+			return true, fmt.Sprintf("no node logged %s from %s for %s", quoteLines(st.LogLines()), fromWhat, window), nil
+		}
+		return true, fmt.Sprintf("node %d did not log %s from %s for %s", nodes[0], quoteLines(st.LogLines()), fromWhat, window), nil
 
 	case "count_pending":
 		// Count the lines sent before the mark that have reached the receiver
@@ -1434,19 +1517,22 @@ type scenarioReport struct {
 	Image string `json:"image"`
 	// ImageID and ImageLabels say exactly which build ran: a tag can move,
 	// the ID cannot, and a build usually labels the commit it came from.
-	ImageID     string                  `json:"image_id,omitempty"`
-	ImageLabels map[string]string       `json:"image_labels,omitempty"`
-	Nodes       int                     `json:"nodes"`
-	NodeCPU     string                  `json:"node_cpu_limit"`
-	NodeMem     string                  `json:"node_mem_limit"`
-	Acked       int64                   `json:"acked"`
-	Received    int64                   `json:"received"`
-	Unique      int64                   `json:"unique"`
-	Missing     int64                   `json:"missing"`
-	Duplicates  int64                   `json:"duplicates"`
-	Extra       int64                   `json:"extra"`
-	Latency     latencyStats            `json:"latency"`
-	Windows     map[string]latencyStats `json:"latency_windows,omitempty"`
+	ImageID     string            `json:"image_id,omitempty"`
+	ImageLabels map[string]string `json:"image_labels,omitempty"`
+	Nodes       int               `json:"nodes"`
+	NodeCPU     string            `json:"node_cpu_limit"`
+	NodeMem     string            `json:"node_mem_limit"`
+	Acked       int64             `json:"acked"`
+	// Received, Unique, Missing, Duplicates and Extra are the receiver's
+	// counts. With several receivers they are the counts of the receiver
+	// that missed the most lines, and Receivers lists each one.
+	Received   int64                   `json:"received"`
+	Unique     int64                   `json:"unique"`
+	Missing    int64                   `json:"missing"`
+	Duplicates int64                   `json:"duplicates"`
+	Extra      int64                   `json:"extra"`
+	Latency    latencyStats            `json:"latency"`
+	Windows    map[string]latencyStats `json:"latency_windows,omitempty"`
 	// AckMaxWindows is the slowest acknowledgement the client waited for in
 	// each window between marks, in milliseconds.
 	AckMaxWindows map[string]int64   `json:"ack_latency_max_ms_windows,omitempty"`
@@ -1465,6 +1551,9 @@ type scenarioReport struct {
 	Leadership leadershipStats      `json:"leadership"`
 	Generator  *generatorAck        `json:"generator,omitempty"`
 	SeqCheck   *seqCheckResult      `json:"seqcheck,omitempty"`
+	// Receivers holds each receiver's counts in a case with several
+	// (`receivers:`). Every acknowledged line must reach each of them.
+	Receivers []receiverResult `json:"receivers,omitempty"`
 	// DuplicateRanges groups the lines that arrived twice, with when the
 	// first copy and the second copy arrived.
 	DuplicateRanges []duplicateRange `json:"duplicate_ranges,omitempty"`
@@ -1497,6 +1586,10 @@ func (rep scenarioReport) summary() map[string]any {
 		if lk := strings.ToLower(k); strings.Contains(lk, "commit") || strings.Contains(lk, "revision") {
 			out["image_revision"] = v
 		}
+	}
+	for _, rr := range rep.Receivers {
+		out["missing_"+rr.ID] = rr.Missing
+		out["duplicates_"+rr.ID] = rr.Duplicates
 	}
 	for k, v := range rep.Measures {
 		out["ms_"+k] = v
@@ -1565,30 +1658,33 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 		sr.failures = append(sr.failures, "the generator's acknowledgement summary is missing")
 	}
 
-	// Drain: wait until every acknowledged line arrived, or nothing new
-	// arrives for 30 seconds, within the drain budget.
+	// Drain: wait until every acknowledged line arrived at every receiver,
+	// or nothing new arrives at one for 30 seconds, within the drain budget.
 	drain := sr.sc.DrainOrDefault()
 	fmt.Printf("  draining (up to %s)…\n", drain)
-	check, checked, err := drainSeqCheck(sr.ctx, func() (seqCheckResult, error) { return sr.receiverSeqCheck(acked) },
-		time.Now().Add(drain), 30*time.Second, 2*time.Second)
-	if sr.ctx.Err() != nil {
-		return rep, scenarioVerdict{}, fmt.Errorf("interrupted: %w", sr.ctx.Err())
+	deadline := time.Now().Add(drain)
+	recvResults := make([]receiverResult, 0, len(sr.receivers))
+	for _, rc := range sr.receivers {
+		res, err := sr.checkReceiver(rc, acked, deadline)
+		if err != nil {
+			return rep, scenarioVerdict{}, err
+		}
+		recvResults = append(recvResults, res)
 	}
-	if !checked {
-		// Without one answer from the receiver the loss is unknown, and a
-		// zero count would pass max_loss on a check that never ran.
-		sr.failures = append(sr.failures, fmt.Sprintf("the receiver never answered the sequence check, so loss is unknown: %v", err))
+	// The top-level counts are those of the receiver that missed the most
+	// lines; with one receiver, its own. A case with several receivers
+	// lists each of them too.
+	worst := recvResults[worstReceiver(recvResults)]
+	rep.SeqCheck = worst.SeqCheck
+	rep.Missing = worst.Missing
+	rep.Duplicates = worst.Duplicates
+	rep.Extra = worst.Extra
+	rep.Unique = worst.Unique
+	rep.Received = worst.Received
+	rep.DuplicateRanges = worst.DuplicateRanges
+	if sr.tc.MultiReceiver() {
+		rep.Receivers = recvResults
 	}
-	rep.SeqCheck = &check
-	rep.Missing = check.Missing
-	rep.Duplicates = check.Duplicates
-	rep.Extra = check.Extra
-	rep.Unique = check.Unique
-	if m, err := sr.r.queryReceiverMetrics(sr.recvPort, 10*time.Second); err == nil {
-		rep.Received = m.LinesReceived
-	}
-	fmt.Printf("  delivery: %d acknowledged, %d of them arrived, %d missing, %d duplicates, %d extra\n",
-		check.Acked, check.ReceivedAcked, check.Missing, check.Duplicates, check.Extra)
 	// The count_pending steps: count again, now that every line that will
 	// arrive has arrived. The lines that arrived after the step were still
 	// on their way when it ran.
@@ -1613,25 +1709,6 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 		sr.notes = append(sr.notes, fmt.Sprintf("the client left %d lines unconfirmed; a count_pending count can include those of them sent before its mark", gen.Ack.LinesUnacked))
 	}
 	rep.Pending = sr.pending
-	for conn, cc := range check.Conns {
-		if cc.Missing > 0 {
-			fmt.Printf("    conn %s: missing %d, first ranges %v\n", conn, cc.Missing, cc.MissingRanges)
-		}
-	}
-	if check.Duplicates > 0 {
-		var d duplicatesView
-		if err := sr.receiverGet("/duplicates", &d); err == nil {
-			rep.DuplicateRanges = summarizeDuplicates(d.Samples, 50)
-			for i, dr := range rep.DuplicateRanges {
-				if i == 10 {
-					fmt.Printf("    … %d duplicate ranges in all, see the report\n", len(rep.DuplicateRanges))
-					break
-				}
-				fmt.Printf("    duplicates conn %d seq %d-%d: sent %s, the copy arrived %s after the first\n",
-					dr.Conn, dr.FromSeq, dr.ToSeq, dr.Sent.UTC().Format("15:04:05.000"), fmtMs(dr.CopyAfterMs))
-			}
-		}
-	}
 
 	// Latency: the whole run, each window between marks, and the lines
 	// sent in the minute after each disruption.
@@ -1718,11 +1795,15 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 	if ex.MinAcked > 0 && rep.Acked < ex.MinAcked {
 		v.reasons = append(v.reasons, fmt.Sprintf("only %d lines were acknowledged, fewer than min_acked %d", rep.Acked, ex.MinAcked))
 	}
-	if ex.MaxLoss != nil && rep.Missing > *ex.MaxLoss {
-		v.reasons = append(v.reasons, fmt.Sprintf("%d acknowledged lines never arrived (max_loss %d)", rep.Missing, *ex.MaxLoss))
-	}
-	if ex.MaxDuplicates != nil && rep.Duplicates > *ex.MaxDuplicates {
-		v.reasons = append(v.reasons, fmt.Sprintf("%d lines arrived more than once (max_duplicates %d)", rep.Duplicates, *ex.MaxDuplicates))
+	if len(rep.Receivers) > 0 {
+		v.reasons = append(v.reasons, receiverVerdict(rep.Receivers, ex.MaxLoss, ex.MaxDuplicates)...)
+	} else {
+		if ex.MaxLoss != nil && rep.Missing > *ex.MaxLoss {
+			v.reasons = append(v.reasons, fmt.Sprintf("%d acknowledged lines never arrived (max_loss %d)", rep.Missing, *ex.MaxLoss))
+		}
+		if ex.MaxDuplicates != nil && rep.Duplicates > *ex.MaxDuplicates {
+			v.reasons = append(v.reasons, fmt.Sprintf("%d lines arrived more than once (max_duplicates %d)", rep.Duplicates, *ex.MaxDuplicates))
+		}
 	}
 	if ex.MaxSplitBrainMs != nil && rep.Leadership.SplitBrainMs > *ex.MaxSplitBrainMs {
 		v.reasons = append(v.reasons, fmt.Sprintf("two nodes named themselves the leader for %s (max_split_brain_ms %d)",
@@ -1738,6 +1819,107 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 	rep.Notes = sr.notes
 	v.passed = len(v.reasons) == 0
 	return rep, v, nil
+}
+
+// receiverResult is what one receiver got. In a case with several receivers
+// (`receivers:`) every acknowledged line must reach each of them, and the
+// report lists each one.
+type receiverResult struct {
+	ID string `json:"id"`
+	// Checked is false when the receiver never answered the sequence check,
+	// so that its loss is unknown.
+	Checked    bool            `json:"checked"`
+	Received   int64           `json:"received"`
+	Unique     int64           `json:"unique"`
+	Missing    int64           `json:"missing"`
+	Duplicates int64           `json:"duplicates"`
+	Extra      int64           `json:"extra"`
+	SeqCheck   *seqCheckResult `json:"seqcheck,omitempty"`
+	// DuplicateRanges groups the lines that arrived at this receiver twice.
+	DuplicateRanges []duplicateRange `json:"duplicate_ranges,omitempty"`
+}
+
+// describe names the receiver in a sentence.
+func (rc scenarioReceiver) describe() string {
+	if rc.ID == "" {
+		return "the receiver"
+	}
+	return "receiver " + rc.ID
+}
+
+// checkReceiver drains one receiver and reads its counts. It waits until
+// every acknowledged line arrived there, or nothing new arrives for 30
+// seconds, until the deadline. A receiver that never answers is a failure:
+// a zero count would pass max_loss on a check that never ran.
+func (sr *scenarioRun) checkReceiver(rc scenarioReceiver, acked map[string]int64, deadline time.Time) (receiverResult, error) {
+	check, checked, err := drainSeqCheck(sr.ctx, func() (seqCheckResult, error) { return receiverSeqCheckAt(rc.Port, acked) },
+		deadline, 30*time.Second, 2*time.Second)
+	if sr.ctx.Err() != nil {
+		return receiverResult{}, fmt.Errorf("interrupted: %w", sr.ctx.Err())
+	}
+	res := receiverResult{ID: rc.ID, Checked: checked, SeqCheck: &check,
+		Unique: check.Unique, Missing: check.Missing, Duplicates: check.Duplicates, Extra: check.Extra}
+	if !checked {
+		sr.failures = append(sr.failures, fmt.Sprintf("%s never answered the sequence check, so loss is unknown: %v", rc.describe(), err))
+	}
+	if m, err := sr.r.queryReceiverMetrics(rc.Port, 10*time.Second); err == nil {
+		res.Received = m.LinesReceived
+	}
+	at := ""
+	if rc.ID != "" {
+		at = " at receiver " + rc.ID
+	}
+	fmt.Printf("  delivery%s: %d acknowledged, %d of them arrived, %d missing, %d duplicates, %d extra\n",
+		at, check.Acked, check.ReceivedAcked, check.Missing, check.Duplicates, check.Extra)
+	for conn, cc := range check.Conns {
+		if cc.Missing > 0 {
+			fmt.Printf("    conn %s: missing %d, first ranges %v\n", conn, cc.Missing, cc.MissingRanges)
+		}
+	}
+	if check.Duplicates > 0 {
+		var d duplicatesView
+		if err := receiverGetAt(rc.Port, "/duplicates", &d); err == nil {
+			res.DuplicateRanges = summarizeDuplicates(d.Samples, 50)
+			for i, dr := range res.DuplicateRanges {
+				if i == 10 {
+					fmt.Printf("    … %d duplicate ranges in all, see the report\n", len(res.DuplicateRanges))
+					break
+				}
+				fmt.Printf("    duplicates conn %d seq %d-%d: sent %s, the copy arrived %s after the first\n",
+					dr.Conn, dr.FromSeq, dr.ToSeq, dr.Sent.UTC().Format("15:04:05.000"), fmtMs(dr.CopyAfterMs))
+			}
+		}
+	}
+	return res, nil
+}
+
+// worstReceiver returns the index of the receiver that missed the most
+// lines, the first of them on a tie. A receiver that never answered comes
+// before one that did, because its loss is unknown.
+func worstReceiver(rs []receiverResult) int {
+	worst := 0
+	for i, r := range rs {
+		w := rs[worst]
+		if (!r.Checked && w.Checked) || (r.Checked == w.Checked && r.Missing > w.Missing) {
+			worst = i
+		}
+	}
+	return worst
+}
+
+// receiverVerdict judges each receiver of a case with several against
+// max_loss and max_duplicates: every acknowledged line must reach each one.
+func receiverVerdict(rs []receiverResult, maxLoss, maxDuplicates *int64) []string {
+	var reasons []string
+	for _, r := range rs {
+		if maxLoss != nil && r.Missing > *maxLoss {
+			reasons = append(reasons, fmt.Sprintf("%d acknowledged lines never arrived at receiver %s (max_loss %d)", r.Missing, r.ID, *maxLoss))
+		}
+		if maxDuplicates != nil && r.Duplicates > *maxDuplicates {
+			reasons = append(reasons, fmt.Sprintf("%d lines arrived at receiver %s more than once (max_duplicates %d)", r.Duplicates, r.ID, *maxDuplicates))
+		}
+	}
+	return reasons
 }
 
 // judgeRows judges the rows check of a case whose data came from a database
@@ -2210,6 +2392,23 @@ func readProgressBaseline(ctx context.Context, read func() (genProgress, bool), 
 // earliestLogMatch asks each node for its first matching line and returns the
 // node whose line came first, its time and the text it matched. find reports
 // a node's first match, or false when it has none.
+// noLogNodes returns the nodes an expect_no_log step reads: every node
+// container for "all", else the one node the selector names.
+func (sr *scenarioRun) noLogNodes(sel string) ([]int, error) {
+	if sel == "all" {
+		nodes := make([]int, len(sr.containers))
+		for i := range sr.containers {
+			nodes[i] = i + 1
+		}
+		return nodes, nil
+	}
+	n, err := sr.resolveNode(sel)
+	if err != nil {
+		return nil, err
+	}
+	return []int{n}, nil
+}
+
 func earliestLogMatch(nodes []int, find func(n int) (time.Time, string, bool)) (int, time.Time, string, bool) {
 	bestNode, bestAt, bestLine := 0, time.Time{}, ""
 	for _, n := range nodes {
@@ -2277,8 +2476,15 @@ func parseGeneratorAck(stdout string) *generatorAck {
 // receiver, and a query to a paused container would otherwise wait forever.
 var receiverClient = &http.Client{Timeout: 10 * time.Second}
 
+// receiverGet queries the first receiver, which the delivery steps, the
+// timelines and the latencies read.
 func (sr *scenarioRun) receiverGet(path string, out any) error {
-	resp, err := receiverClient.Get(fmt.Sprintf("http://localhost:%d%s", sr.recvPort, path)) //nolint:noctx // short local call
+	return receiverGetAt(sr.recvPort, path, out)
+}
+
+// receiverGetAt queries the receiver whose endpoints are on port.
+func receiverGetAt(port int, path string, out any) error {
+	resp, err := receiverClient.Get(fmt.Sprintf("http://localhost:%d%s", port, path)) //nolint:noctx // short local call
 	if err != nil {
 		return err
 	}
@@ -2293,7 +2499,9 @@ func (sr *scenarioRun) receiverGet(path string, out any) error {
 	return json.Unmarshal(body, out)
 }
 
-func (sr *scenarioRun) receiverSeqCheck(acked map[string]int64) (seqCheckResult, error) {
+// receiverSeqCheckAt asks the receiver on port which acknowledged lines it
+// got.
+func receiverSeqCheckAt(port int, acked map[string]int64) (seqCheckResult, error) {
 	keys := make([]string, 0, len(acked))
 	for k := range acked {
 		keys = append(keys, k)
@@ -2304,7 +2512,7 @@ func (sr *scenarioRun) receiverSeqCheck(acked map[string]int64) (seqCheckResult,
 		parts = append(parts, k+":"+strconv.FormatInt(acked[k], 10))
 	}
 	var out seqCheckResult
-	err := sr.receiverGet("/seqcheck?acked="+url.QueryEscape(strings.Join(parts, ",")), &out)
+	err := receiverGetAt(port, "/seqcheck?acked="+url.QueryEscape(strings.Join(parts, ",")), &out)
 	return out, err
 }
 

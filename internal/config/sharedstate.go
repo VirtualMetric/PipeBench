@@ -141,8 +141,9 @@ type SharedStateConfig struct {
 	// the replicas log.
 	PlacedDevices []int64 `yaml:"placed_devices"`
 	// MaxFailoverSeconds fails the case when a placed device the action moved
-	// takes longer than this to run again, counted from the action. 0 only
-	// reports the time.
+	// takes longer than this to run again, counted from the action. For
+	// isolate_replica it is how soon another replica must run each device of
+	// the cut-off replica, counted from the cut. 0 only reports the time.
 	MaxFailoverSeconds float64 `yaml:"max_failover_seconds"`
 	// ExpectHealth is the status the director's /health endpoint must report
 	// for its shared_state component on every running replica: "ok" (the
@@ -209,9 +210,14 @@ type SharedStateConfig struct {
 	// StateWriteIntervalSeconds is how often the replica that runs the shared
 	// bus should write the state to the store, when the case sets the
 	// director's write interval. store_calls then checks, under load, that
-	// each gap between two of that replica's segment writes lasts the
-	// interval, give or take StateWriteToleranceSeconds. Membership and lease
-	// writes keep their own pace and are not judged. 0 only reports the gaps.
+	// each gap between two rounds of that replica's segment writes lasts the
+	// interval, give or take StateWriteToleranceSeconds. A round is the writes
+	// that come within a second of each other, or within a tenth of the
+	// interval when that is shorter: a snapshot writes a segment for each
+	// stream. A round that comes with a snapshot counts as an interval write,
+	// because a bus takes its snapshots with its interval writes.
+	// Membership and lease writes keep their own pace and are not judged. 0
+	// only reports the gaps.
 	StateWriteIntervalSeconds int `yaml:"state_write_interval_seconds"`
 	// StateWriteToleranceSeconds is how far a gap may stray from the interval
 	// (default: a tenth of the interval, at least 2 seconds).

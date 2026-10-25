@@ -492,8 +492,15 @@ services:
       {{ if .Subjects }}{{ (index .Subjects 0).Hostname }}{{ else }}subject{{ end }}:
         condition: service_started
 {{- if and (not .DeferReceiver) (not .VerifierEnabled) }}
+{{- if .Receivers }}
+{{- range .Receivers }}
+      receiver-{{ .ID }}:
+        condition: service_started
+{{- end }}
+{{- else }}
       receiver:
         condition: service_started
+{{- end }}
 {{- end }}
 {{- if .AWSEnabled }}
       localstack:
