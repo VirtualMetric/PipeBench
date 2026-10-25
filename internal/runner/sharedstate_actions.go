@@ -266,6 +266,9 @@ func (run *ssRun) isolateReplica() {
 	outage := time.Duration(run.ss.OutageOrDefault()) * time.Second
 	fmt.Printf("  cutting %s (the leader, runs devices %v) off the network for %s…\n", rep.Service, owned, outage)
 	run.measures["victim"] = map[string]any{"replica": rep.Service, "leader": true, "devices": owned, "how": "isolate"}
+	if why := untestedDeviceFailover(run.ss.PlacedDevices, owned); why != "" {
+		run.fail("%s", why)
+	}
 	cut := time.Now()
 	if err := exec.Command("docker", "network", "disconnect", network, rep.Container).Run(); err != nil {
 		run.fail("docker network disconnect %s: %v (the outage did not happen)", rep.Service, err)

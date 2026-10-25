@@ -332,6 +332,23 @@ func TestIsolateTakeoverProblems(t *testing.T) {
 	}
 }
 
+// kill_leader, stop_leader and isolate_replica check that the others take
+// over the devices the victim ran. A victim that ran none of the placed
+// devices left nothing to check, and the case passed all the same.
+func TestUntestedDeviceFailover(t *testing.T) {
+	placed := []int64{11, 12, 13}
+	if got := untestedDeviceFailover(placed, nil); got != "the victim ran no placed device, so the failover of the devices was not tested" {
+		t.Errorf("a victim that ran no placed device: %q, want the failover named as not tested", got)
+	}
+	if got := untestedDeviceFailover(placed, []int64{12}); got != "" {
+		t.Errorf("a victim that ran device 12: %q, want nothing", got)
+	}
+	// A case that places no device does not test the failover of devices.
+	if got := untestedDeviceFailover(nil, nil); got != "" {
+		t.Errorf("a case without placed devices: %q, want nothing", got)
+	}
+}
+
 func TestStateWritesBesideSnapshots(t *testing.T) {
 	base := time.Date(2026, 10, 23, 22, 26, 39, 0, time.UTC)
 	at := func(s float64) time.Time { return base.Add(time.Duration(s * float64(time.Second))) }
