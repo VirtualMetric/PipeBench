@@ -895,6 +895,10 @@ func (run *ssRun) act() {
 		if owner, ok := run.ownerNotLeading(); ok {
 			run.disrupt(owner, "kill")
 		}
+	case config.SharedStateActionKillReceiver:
+		if receiver, ok := run.receiverNotLeading(); ok {
+			run.disrupt(receiver, "kill")
+		}
 	case config.SharedStateActionPauseStore:
 		run.pauseStore()
 	case config.SharedStateActionIsolateReplica:
@@ -958,16 +962,47 @@ func (run *ssRun) ownerNotLeading() (int, bool) {
 	return candidates[0], true
 }
 
-// generatorTargets returns the replicas a generator sends to.
+// generatorTargets returns the replicas a generator sends to. A target can
+// be a URL, such as the http_ack generator's http://subject-2:9000/, which
+// the host:port reading this used to have took for host "http".
 func (run *ssRun) generatorTargets() map[int]bool {
 	out := map[int]bool{}
 	for _, g := range run.tc.AllGenerators() {
-		host, _, _ := strings.Cut(g.Target, ":")
-		if n, err := strconv.Atoi(strings.TrimPrefix(host, "subject-")); err == nil {
+		for _, n := range config.TargetReplicas(g.Target) {
 			out[n] = true
 		}
 	}
 	return out
+}
+
+// receiverNotLeading returns a running replica that a generator sends to and
+// that does not lead (kill_receiver): the replica that took the records in.
+// A replica that both leads and takes records in is not chosen, because its
+// kill would test the takeover of the lead instead.
+func (run *ssRun) receiverNotLeading() (int, bool) {
+	run.refreshAll()
+	leaders := run.leaders(current())
+	if n, ok := pickReceiver(run.generatorTargets(), leaders, run.running); ok {
+		return n, true
+	}
+	run.fail("no running replica that a generator sends to is free of the lead (leader %s): the action cannot run", run.names(leaders))
+	return 0, false
+}
+
+// pickReceiver returns the lowest-numbered replica that a generator sends to
+// (targets), that runs, and that does not lead.
+func pickReceiver(targets map[int]bool, leaders []int, running map[int]bool) (int, bool) {
+	var candidates []int
+	for n := range targets {
+		if running[n] && !slices.Contains(leaders, n) {
+			candidates = append(candidates, n)
+		}
+	}
+	if len(candidates) == 0 {
+		return 0, false
+	}
+	slices.Sort(candidates)
+	return candidates[0], true
 }
 
 // watchPlacement watches the replicas for d and fails the case if a placed
@@ -1275,12 +1310,22 @@ func (run *ssRun) analyse() {
 func (run *ssRun) checkStreams() {
 	ports := run.orch.ReceiverMetricsPorts()
 	streams := map[string]any{}
+	modes := map[string]string{}
+	for _, g := range run.tc.AllGenerators() {
+		modes[g.ID] = g.Mode
+	}
 	for _, st := range run.ss.Streams {
 		out, _ := exec.Command("docker", "logs", "bench-generator-"+st.Generator).Output()
 		sent := run.r.parseGeneratorStats(string(out)).LinesSent
 		m, err := run.r.queryReceiverMetrics(ports[st.Receiver], 10*time.Second)
 		if err != nil {
 			run.fail("stream %s: the receiver did not answer: %v", st.StreamName(), err)
+			continue
+		}
+		if modes[st.Generator] == "http_ack" {
+			if counts := run.checkAckedStream(st, string(out), ports[st.Receiver], sent, m.LinesReceived); counts != nil {
+				streams[st.StreamName()] = counts
+			}
 			continue
 		}
 		seq, err := receiverSeqCounts(ports[st.Receiver])
@@ -1356,6 +1401,17 @@ func judgeStream(st config.SharedStateStream, sent int64, got ssStreamCounts) []
 	if sent == 0 {
 		return []string{fmt.Sprintf("stream %s: the generator sent nothing", st.StreamName())}
 	}
+	out := numberingProblems(st, sent, got)
+	if loss := max(sent-got.Unique, 0); loss > st.MaxLoss {
+		out = append(out, fmt.Sprintf("stream %s: %d records were lost, above max_loss %d", st.StreamName(), loss, st.MaxLoss))
+	}
+	return append(out, duplicateProblems(st, got)...)
+}
+
+// numberingProblems returns why the records that arrived do not match what
+// the generator sent: lines without a record's number, and more distinct
+// records than the generator sent.
+func numberingProblems(st config.SharedStateStream, sent int64, got ssStreamCounts) []string {
 	var out []string
 	if got.Unparsed > 0 {
 		out = append(out, fmt.Sprintf("stream %s: %d lines arrived without a record's sequence number, so they arrived cut or garbled", st.StreamName(), got.Unparsed))
@@ -1363,19 +1419,97 @@ func judgeStream(st config.SharedStateStream, sent int64, got ssStreamCounts) []
 	if got.Unique > sent {
 		out = append(out, fmt.Sprintf("stream %s: %d distinct records arrived, %d more than the generator sent", st.StreamName(), got.Unique, got.Unique-sent))
 	}
-	if loss := max(sent-got.Unique, 0); loss > st.MaxLoss {
-		out = append(out, fmt.Sprintf("stream %s: %d records were lost, above max_loss %d", st.StreamName(), loss, st.MaxLoss))
-	}
+	return out
+}
+
+// duplicateProblems returns why the records that arrived more than once are
+// too many for the stream's bound.
+func duplicateProblems(st config.SharedStateStream, got ssStreamCounts) []string {
 	dupPct := got.duplicatePct()
 	switch {
 	case st.MaxDuplicates != nil:
 		if got.Duplicates > *st.MaxDuplicates {
-			out = append(out, fmt.Sprintf("stream %s: %d records arrived more than once, above max_duplicates %d", st.StreamName(), got.Duplicates, *st.MaxDuplicates))
+			return []string{fmt.Sprintf("stream %s: %d records arrived more than once, above max_duplicates %d", st.StreamName(), got.Duplicates, *st.MaxDuplicates)}
 		}
 	case dupPct > st.MaxDuplicatePct:
-		out = append(out, fmt.Sprintf("stream %s: %d records arrived more than once (%.2f%%), above max_duplicate_pct %.2f", st.StreamName(), got.Duplicates, dupPct, st.MaxDuplicatePct))
+		return []string{fmt.Sprintf("stream %s: %d records arrived more than once (%.2f%%), above max_duplicate_pct %.2f", st.StreamName(), got.Duplicates, dupPct, st.MaxDuplicatePct)}
 	}
-	return out
+	return nil
+}
+
+// checkAckedStream judges a stream whose generator posts its records over
+// HTTP and waits for each answer (http_ack). A record counts as confirmed
+// once its sender got a 2xx for its post. Loss counts the confirmed records
+// that never arrived. A record whose post was never confirmed may be missing
+// without failing the case: its sender knows that it was not taken. The
+// check also keeps how long the confirmations took, which is what a sender
+// waits for. It returns the stream's counts, or nil when it cannot count
+// them, which fails the run.
+func (run *ssRun) checkAckedStream(st config.SharedStateStream, genOut string, port int, sent, received int64) map[string]any {
+	gen := parseGeneratorAck(genOut)
+	if gen == nil || gen.Ack == nil {
+		run.fail("stream %s: the generator's summary of the confirmed records is missing, so they cannot be counted", st.StreamName())
+		return nil
+	}
+	deadline := earliest(time.Now().Add(time.Minute), run.deadline)
+	check, checked, err := drainSeqCheck(run.r.ctx, func() (seqCheckResult, error) {
+		return receiverSeqCheckAt(port, gen.Ack.AckedPerConn)
+	}, deadline, 30*time.Second, 2*time.Second)
+	if !checked {
+		run.fail("stream %s: the receiver did not answer the sequence check, so the loss is unknown: %v", st.StreamName(), err)
+		return nil
+	}
+	got := ssStreamCounts{Received: received, Unique: check.Unique, Duplicates: check.Duplicates, Unparsed: check.Unparsed}
+	counts := map[string]any{
+		"sent": sent, "confirmed": gen.Ack.LinesAcked, "unconfirmed": gen.Ack.LinesUnacked,
+		"received": got.Received, "unique": got.Unique, "duplicates": got.Duplicates, "duplicate_pct": got.duplicatePct(),
+		"lost": check.Missing, "unnumbered": got.Unparsed,
+		"requests": gen.Ack.Requests, "failed_requests": gen.Ack.Failures, "status_counts": gen.Ack.StatusCounts,
+	}
+	if lat := gen.Ack.AckLatency; lat != nil {
+		counts["ack_latency_ms"] = map[string]int64{"p50": lat.P50, "p95": lat.P95, "p99": lat.P99, "max": lat.Max}
+	}
+	run.linesIn += gen.Ack.LinesAcked
+	run.linesOut += got.Received
+	run.uniqueOut += check.ReceivedAcked
+	run.perReceiver[st.Receiver] = got.Received
+	fmt.Printf("  stream %s: sent %d, %d confirmed and %d not, received %d (%d distinct, %d repeated, %.2f%%, %d without a number), %d confirmed records lost\n",
+		st.StreamName(), sent, gen.Ack.LinesAcked, gen.Ack.LinesUnacked, got.Received, got.Unique, got.Duplicates, got.duplicatePct(), got.Unparsed, check.Missing)
+	if lat := gen.Ack.AckLatency; lat != nil {
+		fmt.Printf("    a confirmation took %d ms at the median, %d ms at p95, %d ms at p99 and %d ms at most\n", lat.P50, lat.P95, lat.P99, lat.Max)
+	}
+	for conn, cc := range check.Conns {
+		if cc.Missing > 0 {
+			fmt.Printf("    conn %s: %d confirmed records missing, first ranges %v\n", conn, cc.Missing, cc.MissingRanges)
+		}
+	}
+	for _, why := range judgeAckedStream(st, sent, gen.Ack.LinesAcked, check, got) {
+		run.fail("%s", why)
+	}
+	return counts
+}
+
+// judgeAckedStream returns why a stream of confirmed records fails, if it
+// does. sent is what the generator sent, and acked how many of its records
+// the sender got confirmed. check is the receiver's count of those, and got
+// what arrived.
+func judgeAckedStream(st config.SharedStateStream, sent, acked int64, check seqCheckResult, got ssStreamCounts) []string {
+	if st.ExpectNothing {
+		return judgeStream(st, sent, got)
+	}
+	if acked == 0 {
+		return []string{fmt.Sprintf("stream %s: the sender got no record confirmed", st.StreamName())}
+	}
+	out := numberingProblems(st, sent, got)
+	// The receiver checks the records the harness names to it. A count that
+	// differs from the sender's would let a lost record go unchecked.
+	if check.Acked != acked {
+		out = append(out, fmt.Sprintf("stream %s: the receiver checked %d confirmed records, and the sender got %d confirmed", st.StreamName(), check.Acked, acked))
+	}
+	if check.Missing > st.MaxLoss {
+		out = append(out, fmt.Sprintf("stream %s: %d of the %d records the sender got a 2xx for never arrived, above max_loss %d", st.StreamName(), check.Missing, acked, st.MaxLoss))
+	}
+	return append(out, duplicateProblems(st, got)...)
 }
 
 // checkOwnershipOverlaps fails the case for every time two replicas ran the
