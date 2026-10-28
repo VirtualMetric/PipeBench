@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/VirtualMetric/PipeBench/internal/config"
 )
@@ -88,5 +89,34 @@ func TestFollowersFirst(t *testing.T) {
 	}
 	if got := followersFirst(replicas, running, nil); !reflect.DeepEqual(got, []int{1, 2, 3}) {
 		t.Errorf("followersFirst with no leader = %v, want [1 2 3]", got)
+	}
+}
+
+// TestProgressWait: the reads of a sender's progress cover two of its
+// progress intervals, and at least five seconds, so a case that writes
+// progress less often does not fail a healthy run. They stop at the run's
+// deadline.
+func TestProgressWait(t *testing.T) {
+	far := time.Now().Add(time.Hour)
+	for name, tc := range map[string]struct {
+		env      map[string]string
+		deadline time.Time
+		want     time.Duration
+	}{
+		"the default interval":               {nil, far, 5 * time.Second},
+		"a 10-second interval":               {map[string]string{"GENERATOR_PROGRESS_INTERVAL": "10s"}, far, 20 * time.Second},
+		"an interval that is not a duration": {map[string]string{"GENERATOR_PROGRESS_INTERVAL": "often"}, far, 5 * time.Second},
+		"no deadline":                        {map[string]string{"GENERATOR_PROGRESS_INTERVAL": "10s"}, time.Time{}, 20 * time.Second},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tries, wait := progressWait(config.GeneratorConfig{Env: tc.env}, tc.deadline)
+			if got := time.Duration(tries) * wait; got != tc.want {
+				t.Errorf("progressWait reads for %v (%d tries %v apart), want %v", got, tries, wait, tc.want)
+			}
+		})
+	}
+	tries, wait := progressWait(config.GeneratorConfig{Env: map[string]string{"GENERATOR_PROGRESS_INTERVAL": "10s"}}, time.Now().Add(2*time.Second))
+	if got := time.Duration(tries) * wait; got > 2*time.Second {
+		t.Errorf("progressWait reads for %v with the deadline 2 seconds away, want at most 2s", got)
 	}
 }

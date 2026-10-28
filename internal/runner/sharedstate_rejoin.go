@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/VirtualMetric/PipeBench/internal/config"
@@ -37,10 +38,11 @@ func (run *ssRun) countConfirmedAtRejoin(n int, at time.Time) {
 			continue
 		}
 		container := "bench-generator-" + st.Generator
+		tries, wait := progressWait(gens[st.Generator], run.deadline)
 		p, ok := readProgressBaseline(run.r.ctx, func() (genProgress, bool) {
 			p, ok := readGeneratorProgressOf(container)
 			return p, ok && !p.At.Before(at)
-		}, 20, 250*time.Millisecond)
+		}, tries, wait)
 		if !ok {
 			run.fail("stream %s: the sender wrote no progress line after %s rejoined, so the records it confirmed after that cannot be counted (did the sender stop first?)", st.StreamName(), rep.Service)
 			continue
@@ -100,4 +102,26 @@ func judgeAfterRejoin(st config.SharedStateStream, after map[int]int64) []string
 		}
 	}
 	return out
+}
+
+// progressStep is how far apart the reads of a sender's progress are.
+const progressStep = 250 * time.Millisecond
+
+// progressWait returns how many times, and how far apart, to read a sender's
+// progress line before giving up. The sender writes one every
+// GENERATOR_PROGRESS_INTERVAL, which is 1 second unless the case sets it. So
+// the reads cover two of its intervals, and at least five seconds, but never
+// go past the run's deadline.
+func progressWait(g config.GeneratorConfig, deadline time.Time) (tries int, wait time.Duration) {
+	interval := time.Second
+	if v := strings.TrimSpace(g.Env["GENERATOR_PROGRESS_INTERVAL"]); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			interval = d
+		}
+	}
+	window := max(5*time.Second, 2*interval)
+	if !deadline.IsZero() {
+		window = max(min(window, time.Until(deadline)), progressStep)
+	}
+	return int(window / progressStep), progressStep
 }

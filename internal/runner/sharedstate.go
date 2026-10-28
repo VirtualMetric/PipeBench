@@ -946,20 +946,25 @@ func (run *ssRun) act() {
 // countConfirmedBefore reads, for each stream that sets min_after_action, how
 // many records its sender has got confirmed so far: the count on its last
 // progress line. checkAckedStream subtracts it from the final count. The
-// sender writes its first progress line a second after it starts, and the
-// baseline can be reached before that, so the read is tried for up to five
-// seconds. A sender whose progress still cannot be read fails the run,
-// because what it got confirmed after the action could not be told apart
-// from what came before.
+// sender writes its first progress line one interval after it starts, and
+// the baseline can be reached before that, so the read is tried for as long
+// as progressWait allows. A sender whose progress still cannot be read fails
+// the run, because what it got confirmed after the action could not be told
+// apart from what came before.
 func (run *ssRun) countConfirmedBefore() {
+	gens := map[string]config.GeneratorConfig{}
+	for _, g := range run.tc.AllGenerators() {
+		gens[g.ID] = g
+	}
 	for _, st := range run.ss.Streams {
 		if st.MinAfterAction <= 0 {
 			continue
 		}
 		container := "bench-generator-" + st.Generator
+		tries, wait := progressWait(gens[st.Generator], run.deadline)
 		p, ok := readProgressBaseline(run.r.ctx, func() (genProgress, bool) {
 			return readGeneratorProgressOf(container)
-		}, 20, 250*time.Millisecond)
+		}, tries, wait)
 		if !ok {
 			run.fail("stream %s: the sender's progress could not be read before the action, so the records confirmed after it cannot be counted", st.StreamName())
 			continue
