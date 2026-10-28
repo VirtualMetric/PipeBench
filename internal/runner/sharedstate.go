@@ -937,15 +937,21 @@ func (run *ssRun) act() {
 
 // countConfirmedBefore reads, for each stream that sets min_after_action, how
 // many records its sender has got confirmed so far: the count on its last
-// progress line. checkAckedStream subtracts it from the final count. A
-// sender whose progress cannot be read fails the run, because what it got
-// confirmed after the action could not be told apart from what came before.
+// progress line. checkAckedStream subtracts it from the final count. The
+// sender writes its first progress line a second after it starts, and the
+// baseline can be reached before that, so the read is tried for up to five
+// seconds. A sender whose progress still cannot be read fails the run,
+// because what it got confirmed after the action could not be told apart
+// from what came before.
 func (run *ssRun) countConfirmedBefore() {
 	for _, st := range run.ss.Streams {
 		if st.MinAfterAction <= 0 {
 			continue
 		}
-		p, ok := readGeneratorProgressOf("bench-generator-" + st.Generator)
+		container := "bench-generator-" + st.Generator
+		p, ok := readProgressBaseline(run.r.ctx, func() (genProgress, bool) {
+			return readGeneratorProgressOf(container)
+		}, 20, 250*time.Millisecond)
 		if !ok {
 			run.fail("stream %s: the sender's progress could not be read before the action, so the records confirmed after it cannot be counted", st.StreamName())
 			continue

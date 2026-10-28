@@ -78,7 +78,7 @@ failed check shows as `FAIL` in the summary, and as `"passed": false` in the res
 failed check fail the command too, for example in CI, add `--fail-on-verdict`:
 
 ```bash
-./bin/harness test -s vector --all-tests --type correctness --fail-on-verdict
+./bin/harness test -s vector --all-tests --type correctness --hardware c7i.4xlarge --fail-on-verdict
 ```
 
 To run only performance tests:
