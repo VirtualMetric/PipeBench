@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/VirtualMetric/PipeBench/internal/config"
 )
@@ -70,7 +71,7 @@ func TestReceiverVerdict(t *testing.T) {
 		{ID: "a", Checked: true, Missing: 0, Duplicates: 3},
 		{ID: "b", Checked: true, Missing: 1150, Duplicates: 0},
 	}
-	got := receiverVerdict(rs, &zero, &two)
+	got := receiverVerdict(rs, config.ScenarioExpect{MaxLoss: &zero, MaxDuplicates: &two})
 	if len(got) != 2 {
 		t.Fatalf("receiverVerdict = %q, want two reasons", got)
 	}
@@ -82,10 +83,10 @@ func TestReceiverVerdict(t *testing.T) {
 	}
 	// A receiver that got every line passes, and without limits nothing is
 	// judged.
-	if got := receiverVerdict(rs[:1], &zero, nil); len(got) != 0 {
+	if got := receiverVerdict(rs[:1], config.ScenarioExpect{MaxLoss: &zero}); len(got) != 0 {
 		t.Fatalf("receiverVerdict of a full receiver = %q", got)
 	}
-	if got := receiverVerdict(rs, nil, nil); len(got) != 0 {
+	if got := receiverVerdict(rs, config.ScenarioExpect{}); len(got) != 0 {
 		t.Fatalf("receiverVerdict without limits = %q", got)
 	}
 }
@@ -114,5 +115,104 @@ func TestNoLogNodes(t *testing.T) {
 	}
 	if _, err := sr.noLogNodes("4"); err == nil {
 		t.Fatalf("noLogNodes(4) of a three-node run must fail")
+	}
+}
+
+// A receiver that expect.receivers names is judged by its own limits: the
+// case's other receivers must still get every line, and the named one must
+// miss at least its min_loss.
+func TestReceiverVerdictPerReceiver(t *testing.T) {
+	zero, planned, one := int64(0), int64(5000), int64(1)
+	ex := config.ScenarioExpect{
+		MaxLoss:   &zero,
+		Receivers: map[string]config.ScenarioReceiverExpect{"b": {MaxLoss: &planned, MinLoss: &one}},
+	}
+	rs := []receiverResult{
+		{ID: "a", Checked: true},
+		{ID: "b", Checked: true, Missing: 1150},
+	}
+	if got := receiverVerdict(rs, ex); len(got) != 0 {
+		t.Fatalf("receiverVerdict = %q, want none: b may miss up to 5000", got)
+	}
+
+	// The loss the case tests did not happen
+	rs[1].Missing = 0
+	got := receiverVerdict(rs, ex)
+	if len(got) != 1 || !strings.Contains(got[0], "only 0 acknowledged lines never arrived at receiver b, fewer than min_loss 1") {
+		t.Fatalf("receiverVerdict without the loss = %q", got)
+	}
+
+	// More than the receiver's own limit, and a line missing at a receiver
+	// that keeps the case's
+	rs[0].Missing, rs[1].Missing = 1, 5001
+	got = receiverVerdict(rs, ex)
+	if len(got) != 2 || !strings.Contains(got[0], "1 acknowledged lines never arrived at receiver a (max_loss 0)") ||
+		!strings.Contains(got[1], "5001 acknowledged lines never arrived at receiver b (max_loss 5000)") {
+		t.Fatalf("receiverVerdict = %q", got)
+	}
+}
+
+func TestJudgeArrived(t *testing.T) {
+	lo, hi := int64(100), int64(2000)
+	c := arrivedCheck{Name: "early_kept", Receiver: "b", SentAfter: "b_down", SentBefore: "b_early", Max: &hi}
+	if got := judgeArrived(c, 2000, 0); got != "" {
+		t.Fatalf("judgeArrived at max = %q", got)
+	}
+	if got := judgeArrived(c, 2001, 0); !strings.Contains(got, `early_kept: 2001 lines sent between marks "b_down" and "b_early" arrived at receiver b, more than max 2000`) {
+		t.Fatalf("judgeArrived over max = %q", got)
+	}
+	c.Min, c.Max, c.Receiver = &lo, nil, ""
+	if got := judgeArrived(c, 99, 0); !strings.Contains(got, `arrived, fewer than min 100`) {
+		t.Fatalf("judgeArrived under min = %q", got)
+	}
+	if got := judgeArrived(c, 100, 0); got != "" {
+		t.Fatalf("judgeArrived at min = %q", got)
+	}
+}
+
+// A share is of what the compare_to receiver got of the same window.
+func TestJudgeArrivedShare(t *testing.T) {
+	most, few := 0.9, 0.02
+	late := arrivedCheck{Name: "b_newest", Receiver: "b", SentAfter: "late_from", SentBefore: "b_up", CompareTo: "a", MinShare: &most}
+	if got := judgeArrived(late, 9000, 10000); got != "" {
+		t.Fatalf("judgeArrived at min_share = %q", got)
+	}
+	if got := judgeArrived(late, 8999, 10000); !strings.Contains(got, "8999 lines sent between marks \"late_from\" and \"b_up\" arrived at receiver b, 0.900 of the 10000 that reached receiver a, less than min_share 0.9") {
+		t.Fatalf("judgeArrived under min_share = %q", got)
+	}
+	early := arrivedCheck{Name: "b_oldest", Receiver: "b", SentAfter: "early_from", SentBefore: "early_to", CompareTo: "a", MaxShare: &few}
+	if got := judgeArrived(early, 1000, 50000); got != "" {
+		t.Fatalf("judgeArrived at max_share = %q", got)
+	}
+	if got := judgeArrived(early, 1001, 50000); !strings.Contains(got, "more than max_share 0.02") {
+		t.Fatalf("judgeArrived over max_share = %q", got)
+	}
+	// With nothing at the receiver the share is of, the window tested
+	// nothing, and the step fails
+	if got := judgeArrived(early, 0, 0); !strings.Contains(got, "no line sent between marks \"early_from\" and \"early_to\" reached receiver a") {
+		t.Fatalf("judgeArrived without lines to compare with = %q", got)
+	}
+}
+
+func TestLatencyPath(t *testing.T) {
+	from := time.Unix(0, 1_000)
+	to := time.Unix(0, 2_000)
+	if got := latencyPath(from, to); got != "/latency?from_ns=1000&to_ns=2000" {
+		t.Fatalf("latencyPath = %q", got)
+	}
+	if got := latencyPath(time.Time{}, to); got != "/latency?to_ns=2000" {
+		t.Fatalf("latencyPath with an open start = %q", got)
+	}
+}
+
+func TestSummaryListsEachArrivedCount(t *testing.T) {
+	n := int64(42)
+	rep := scenarioReport{Arrived: []arrivedCheck{{Name: "late_kept", Arrived: &n}, {Name: "unread"}}}
+	s := rep.summary()
+	if s["arrived_late_kept"] != int64(42) {
+		t.Fatalf("summary = %v", s)
+	}
+	if _, ok := s["arrived_unread"]; ok {
+		t.Fatalf("a window that could not be counted is listed: %v", s)
 	}
 }

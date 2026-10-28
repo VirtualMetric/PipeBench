@@ -219,7 +219,7 @@ func TestValidateClusterScenarioReceiverSteps(t *testing.T) {
 		}, "the case has one receiver"},
 		"a receiver on another action": {twoReceiverScenarioCase, func(tc *TestCase) {
 			tc.Cluster.Scenario.Steps[6].Receiver = "a"
-		}, "receiver only applies to receiver_pause, receiver_unpause"},
+		}, "receiver only applies to expect_arrived, receiver_pause, receiver_unpause"},
 		"several receivers without the load": {twoReceiverScenarioCase, func(tc *TestCase) { tc.Generator = GeneratorConfig{} }, "needs the http_ack generator"},
 	}
 	for name, c := range cases {
@@ -261,5 +261,171 @@ func TestValidateClusterScenarioExpectNoLogOnEveryNode(t *testing.T) {
 	tc.Cluster.Scenario.Steps[9].Node = ""
 	if err := tc.Validate(); err == nil || !strings.Contains(err.Error(), "needs node") {
 		t.Fatalf("Validate() of expect_no_log without a node = %v, want needs node", err)
+	}
+}
+
+// int64p returns a pointer to v.
+func int64p(v int64) *int64 { return &v }
+
+// float64p returns a pointer to v.
+func float64p(v float64) *float64 { return &v }
+
+// A receiver that expect.receivers names is judged by its own limits, and the
+// others by the case's.
+func TestScenarioExpectReceiverLimits(t *testing.T) {
+	ex := ScenarioExpect{
+		MaxLoss:       int64p(0),
+		MaxDuplicates: int64p(10),
+		Receivers:     map[string]ScenarioReceiverExpect{"b": {MaxLoss: int64p(5000), MinLoss: int64p(1)}},
+	}
+	maxLoss, maxDuplicates, minLoss := ex.ReceiverLimits("a")
+	if *maxLoss != 0 || *maxDuplicates != 10 || minLoss != nil {
+		t.Fatalf("receiver a: max_loss %v, max_duplicates %v, min_loss %v; want the case's, and no min_loss", maxLoss, maxDuplicates, minLoss)
+	}
+	maxLoss, maxDuplicates, minLoss = ex.ReceiverLimits("b")
+	if *maxLoss != 5000 || *maxDuplicates != 10 || *minLoss != 1 {
+		t.Fatalf("receiver b: max_loss %d, max_duplicates %d, min_loss %d; want its own, and the case's max_duplicates", *maxLoss, *maxDuplicates, *minLoss)
+	}
+}
+
+// expectArrivedCase is a valid case with two receivers whose last steps mark
+// a window and count the lines sent in it at receiver b.
+func expectArrivedCase() *TestCase {
+	tc := twoReceiverScenarioCase()
+	tc.Cluster.Scenario.Expect.MaxLoss = int64p(0)
+	tc.Cluster.Scenario.Expect.Receivers = map[string]ScenarioReceiverExpect{"b": {MaxLoss: int64p(50000), MinLoss: int64p(1)}}
+	tc.Cluster.Scenario.Steps = append(tc.Cluster.Scenario.Steps,
+		ScenarioStep{Do: "mark", Label: "early"},
+		ScenarioStep{Do: "sleep", For: "20s"},
+		ScenarioStep{Do: "mark", Label: "early_end"},
+		ScenarioStep{Do: "expect_arrived", Receiver: "b", SentAfter: "early", SentBefore: "early_end", Max: int64p(2000), Record: "early_kept"},
+	)
+	return tc
+}
+
+func TestValidateClusterScenarioAcceptsExpectArrived(t *testing.T) {
+	if err := expectArrivedCase().Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	// A share is of what another receiver got of the same window.
+	shared := expectArrivedCase()
+	shared.Cluster.Scenario.Steps = append(shared.Cluster.Scenario.Steps,
+		ScenarioStep{Do: "expect_arrived", Receiver: "b", SentAfter: "early", SentBefore: "early_end", CompareTo: "a", MaxShare: float64p(0.02), Record: "early_share"},
+	)
+	if err := shared.Validate(); err != nil {
+		t.Fatalf("Validate with a share: %v", err)
+	}
+	// A case with one receiver counts at it without naming it.
+	tc := validScenarioCase()
+	tc.Cluster.Scenario.Steps = append(tc.Cluster.Scenario.Steps,
+		ScenarioStep{Do: "mark", Label: "late"},
+		ScenarioStep{Do: "expect_arrived", SentAfter: "end", SentBefore: "late", Min: int64p(1), Record: "kept"},
+	)
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("Validate with one receiver: %v", err)
+	}
+}
+
+func TestValidateClusterScenarioRejectsBadReceiverExpectations(t *testing.T) {
+	last := func(tc *TestCase) *ScenarioStep {
+		return &tc.Cluster.Scenario.Steps[len(tc.Cluster.Scenario.Steps)-1]
+	}
+	cases := map[string]struct {
+		edit func(tc *TestCase)
+		want string
+	}{
+		"expect.receivers with one receiver": {func(tc *TestCase) {
+			tc.Receivers = nil
+			tc.Receiver = ReceiverConfig{Mode: "tcp", Listen: ":9001"}
+			last(tc).Receiver = ""
+			for i := range tc.Cluster.Scenario.Steps {
+				if tc.Cluster.Scenario.Steps[i].Do == "receiver_pause" || tc.Cluster.Scenario.Steps[i].Do == "receiver_unpause" {
+					tc.Cluster.Scenario.Steps[i].Receiver = ""
+				}
+			}
+		}, "the case has one; use expect's own limits"},
+		"expect.receivers naming no receiver of the case": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Expect.Receivers["c"] = ScenarioReceiverExpect{MaxLoss: int64p(1)}
+		}, `receiver "c" is not one of the case's receivers`},
+		"a negative limit": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Expect.Receivers["b"] = ScenarioReceiverExpect{MaxLoss: int64p(-1)}
+		}, "expect.receivers.b.max_loss must be 0 or more"},
+		"min_loss above max_loss": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Expect.Receivers["b"] = ScenarioReceiverExpect{MaxLoss: int64p(10), MinLoss: int64p(11)}
+		}, "min_loss 11 is more than max_loss 10"},
+		"min_loss above the case's max_loss": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Expect.Receivers["b"] = ScenarioReceiverExpect{MinLoss: int64p(1)}
+		}, "min_loss 1 is more than max_loss 0"},
+		"an entry without a limit": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Expect.Receivers["a"] = ScenarioReceiverExpect{}
+		}, "expect.receivers.a sets no limit"},
+		"expect_arrived without a window":       {func(tc *TestCase) { last(tc).SentAfter = "" }, "needs sent_after and sent_before"},
+		"expect_arrived naming an unknown mark": {func(tc *TestCase) { last(tc).SentBefore = "later" }, `names mark "later", which no earlier step sets`},
+		"expect_arrived with one mark twice":    {func(tc *TestCase) { last(tc).SentAfter = "early_end" }, "the window is empty"},
+		"expect_arrived without a bound":        {func(tc *TestCase) { last(tc).Max = nil }, "needs min, max, min_share or max_share"},
+		"a share without compare_to":            {func(tc *TestCase) { last(tc).MinShare = float64p(0.5) }, "go together with compare_to"},
+		"compare_to without a share":            {func(tc *TestCase) { last(tc).CompareTo = "a" }, "go together with compare_to"},
+		"a share above 1": {func(tc *TestCase) {
+			last(tc).CompareTo, last(tc).MaxShare = "a", float64p(1.5)
+		}, "max_share must be a share from 0 to 1"},
+		"min_share above max_share": {func(tc *TestCase) {
+			last(tc).CompareTo, last(tc).MinShare, last(tc).MaxShare = "a", float64p(0.5), float64p(0.1)
+		}, "min_share 0.5 is more than max_share 0.1"},
+		"compare_to its own receiver": {func(tc *TestCase) {
+			last(tc).CompareTo, last(tc).MinShare = "b", float64p(0.5)
+		}, "compare_to names the receiver the step counts at"},
+		"compare_to an unknown receiver": {func(tc *TestCase) {
+			last(tc).CompareTo, last(tc).MinShare = "c", float64p(0.5)
+		}, `compare_to: receiver "c" is not one of the case's receivers`},
+		"expect_arrived with min above max":   {func(tc *TestCase) { last(tc).Min = int64p(3000) }, "min 3000 is more than max 2000"},
+		"expect_arrived without record":       {func(tc *TestCase) { last(tc).Record = "" }, "needs record"},
+		"expect_arrived without its receiver": {func(tc *TestCase) { last(tc).Receiver = "" }, "needs receiver"},
+		"sent_after on another step": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Steps[6].SentAfter = "end"
+		}, "sent_after only applies to expect_arrived"},
+		"min on another step": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Steps[6].Min = int64p(1)
+		}, "min only applies to expect_arrived"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			tc := expectArrivedCase()
+			c.edit(tc)
+			err := tc.Validate()
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("Validate() = %v, want an error containing %q", err, c.want)
+			}
+		})
+	}
+}
+
+// The new keys read from case.yaml as the cases write them.
+func TestScenarioReceiverExpectationsParse(t *testing.T) {
+	var sc ScenarioConfig
+	err := yaml.Unmarshal([]byte(`
+steps:
+  - do: expect_arrived
+    receiver: b
+    sent_after: b_down
+    sent_before: b_early
+    max: 2000
+    record: early_kept
+expect:
+  max_loss: 0
+  receivers:
+    b:
+      max_loss: 200000
+      min_loss: 1
+`), &sc)
+	if err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	st := sc.Steps[0]
+	if st.SentAfter != "b_down" || st.SentBefore != "b_early" || st.Max == nil || *st.Max != 2000 || st.Min != nil {
+		t.Fatalf("step = %+v", st)
+	}
+	b := sc.Expect.Receivers["b"]
+	if b.MaxLoss == nil || *b.MaxLoss != 200000 || b.MinLoss == nil || *b.MinLoss != 1 || b.MaxDuplicates != nil {
+		t.Fatalf("expect.receivers.b = %+v", b)
 	}
 }
