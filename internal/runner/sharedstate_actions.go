@@ -839,6 +839,7 @@ func (run *ssRun) coldRestart() {
 		since := containerStartedAt(rep.Container, started)
 		if at, ok := run.waitReady(rep.N, since, earliest(time.Now().Add(run.replicaWarmup()), run.deadline)); ok {
 			ready[rep.Service] = at.Sub(since).Seconds()
+			run.countConfirmedAtRejoin(rep.N, at)
 		} else {
 			run.fail("%s was not ready after the cold restart: %s", rep.Service, run.readiness(rep.N, since))
 		}
@@ -1413,6 +1414,8 @@ func (run *ssRun) replaceAll(ns []int) bool {
 		since := containerStartedAt(rep.Container, started)
 		if at, ok := run.waitReady(n, since, earliest(time.Now().Add(run.replicaWarmup()), run.deadline)); ok {
 			fmt.Printf("    %s rejoined after %.1fs\n", rep.Service, at.Sub(since).Seconds())
+			run.noteRejoin(rep.Service, at.Sub(since).Seconds())
+			run.countConfirmedAtRejoin(n, at)
 		} else {
 			run.fail("%s did not rejoin after it was replaced: %s", rep.Service, run.readiness(n, since))
 			rejoined = false
@@ -1421,28 +1424,48 @@ func (run *ssRun) replaceAll(ns []int) bool {
 	return rejoined
 }
 
-// rollingRestart stops each replica in turn, gracefully, and replaces it with
-// a new container on an empty disk, as a new revision of a container app does:
-// the followers first, the leader last. Before it stops the next replica, the
-// new one must have rejoined and the replica set must have settled. When one
-// has not, the restart ends there: stopping another replica of a set that is
-// already short would test something else.
-func (run *ssRun) rollingRestart() {
-	run.refreshAll()
-	leaders := run.leaders(current())
-	var order []int
-	for _, rep := range run.replicas {
-		if run.running[rep.N] && !slices.Contains(leaders, rep.N) {
-			order = append(order, rep.N)
-		}
+// noteRejoin keeps how long each replaced replica took to rejoin, by
+// service. A replica replaced twice keeps both times.
+func (run *ssRun) noteRejoin(service string, secs float64) {
+	times, _ := run.measures["rejoin_seconds_by_replica"].(map[string][]float64)
+	if times == nil {
+		times = map[string][]float64{}
+		run.measures["rejoin_seconds_by_replica"] = times
 	}
-	order = append(order, leaders...)
+	times[service] = append(times[service], secs)
+}
+
+// rollingReplace ends each replica in turn and replaces it with a new
+// container on an empty disk: gracefully (how "stop"), as a new revision of
+// a container app does, or with SIGKILL (how "kill"), as a platform replaces
+// a replica that failed. The followers go first and the leader last. Before
+// it ends the next replica, the new one must have rejoined and the replica
+// set must have settled. When one has not, the action ends there: ending
+// another replica of a set that is already short would test something else.
+func (run *ssRun) rollingReplace(how string) {
+	run.refreshAll()
+	order := followersFirst(run.replicas, run.running, run.leaders(current()))
 	exits := map[string]float64{}
-	run.measures["rolling_restart_exit_seconds"] = exits
-	if !inTurn(order, func(n int) bool { return run.restartOne(n, exits) }) {
+	if how == "stop" {
+		run.measures["rolling_restart_exit_seconds"] = exits
+	}
+	run.measures["rolling_order"] = run.names(order)
+	if !inTurn(order, func(n int) bool { return run.replaceOneInTurn(n, how, exits) }) {
 		return
 	}
 	run.checkHealthAll("after")
+}
+
+// followersFirst returns the running replicas in the order a rolling action
+// ends them: the ones that do not lead, by number, then the leaders.
+func followersFirst(replicas []ssReplica, running map[int]bool, leaders []int) []int {
+	var order []int
+	for _, rep := range replicas {
+		if running[rep.N] && !slices.Contains(leaders, rep.N) {
+			order = append(order, rep.N)
+		}
+	}
+	return append(order, leaders...)
 }
 
 // inTurn calls step for each replica in order, and stops at the first step
@@ -1456,27 +1479,53 @@ func inTurn(order []int, step func(n int) bool) bool {
 	return true
 }
 
-// restartOne stops replica n gracefully, replaces it with a new container,
-// and waits for the replica set to settle. It reports whether all of that
-// happened.
-func (run *ssRun) restartOne(n int, exits map[string]float64) bool {
+// replaceOneInTurn ends replica n, gracefully (how "stop") or with SIGKILL
+// (how "kill"), replaces it with a new container, and waits for the replica
+// set to settle. It reports whether all of that happened. A stop's exit time
+// goes into exits.
+func (run *ssRun) replaceOneInTurn(n int, how string, exits map[string]float64) bool {
 	rep := run.replica(n)
-	fmt.Printf("  restarting %s…\n", rep.Service)
-	issued := time.Now()
-	if err := exec.Command("docker", "stop", "-t", "30", rep.Container).Run(); err != nil {
-		run.fail("docker stop %s: %v", rep.Service, err)
-		return false
+	action, verb, ended := "rolling restart", "restarting", "was asked to stop"
+	if how == "kill" {
+		action, verb, ended = "rolling kill", "killing", "was killed"
 	}
-	exits[rep.Service] = time.Since(issued).Seconds()
-	fmt.Printf("    %s exited %.1fs after the stop began\n", rep.Service, exits[rep.Service])
+	fmt.Printf("  %s %s…\n", verb, rep.Service)
+	// A read that fails here loses nothing: endReplica reads every line
+	// since the last one read.
+	_ = run.book.refresh(rep.Container)
+	issued := time.Now()
+	if how == "kill" {
+		if err := exec.Command("docker", "kill", "-s", "KILL", rep.Container).Run(); err != nil {
+			run.fail("docker kill %s: %v", rep.Service, err)
+			return false
+		}
+	} else {
+		if err := exec.Command("docker", "stop", "-t", "30", rep.Container).Run(); err != nil {
+			run.fail("docker stop %s: %v", rep.Service, err)
+			return false
+		}
+		exits[rep.Service] = time.Since(issued).Seconds()
+		fmt.Printf("    %s exited %.1fs after the stop began\n", rep.Service, exits[rep.Service])
+	}
 	// The new container takes the old one's log with it.
-	if !run.endReplica(n, containerFinishedAt(rep.Container, time.Now()), "rolling restart", true) {
+	if !run.endReplica(n, containerFinishedAt(rep.Container, time.Now()), action, how == "stop") {
 		return false
 	}
 	if !run.replaceAll([]int{n}) {
 		return false
 	}
-	return run.checkSettled("after restarting "+rep.Service, earliest(time.Now().Add(time.Duration(run.ss.SettleOrDefault())*time.Second), run.deadline))
+	settled := run.checkSettled("after "+verb+" "+rep.Service, earliest(time.Now().Add(time.Duration(run.ss.SettleOrDefault())*time.Second), run.deadline))
+	if settled {
+		secs := time.Since(issued).Seconds()
+		fmt.Printf("    the replica set settled %.1fs after %s %s\n", secs, rep.Service, ended)
+		times, _ := run.measures["rolling_settled_seconds"].(map[string]float64)
+		if times == nil {
+			times = map[string]float64{}
+			run.measures["rolling_settled_seconds"] = times
+		}
+		times[rep.Service] = secs
+	}
+	return settled
 }
 
 // checkLogOnce fails the case for a replica that did not log a line of

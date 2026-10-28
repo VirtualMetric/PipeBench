@@ -78,6 +78,15 @@ const (
 	// of a container app does. It waits for each new replica to rejoin and for
 	// the replica set to settle before it stops the next. The leader goes last.
 	SharedStateActionRollingRestart = "rolling_restart"
+	// SharedStateActionRollingKill kills each replica in turn with SIGKILL and
+	// replaces it with a new container on an empty disk, as a container
+	// platform replaces a replica that failed. Like rolling_restart, it waits
+	// for each new replica to rejoin and for the replica set to settle before
+	// it kills the next, and the leader goes last. Unlike a graceful stop, a
+	// kill gives no replica the time to pass on what it holds, so each kill
+	// shows whether the subject confirmed records that were still only on
+	// that replica's disk.
+	SharedStateActionRollingKill = "rolling_kill"
 	// SharedStateActionMoveAcrossCutLink cuts the link between the replica that
 	// runs move_device, which does not lead, and another replica that does not
 	// lead, while both keep the store and the leader. Then it renders the
@@ -105,7 +114,21 @@ var sharedStateActions = []string{
 	SharedStateActionMoveThenKill,
 	SharedStateActionStopOwner,
 	SharedStateActionRollingRestart,
+	SharedStateActionRollingKill,
 	SharedStateActionMoveAcrossCutLink,
+}
+
+// replacingActions are the actions that replace a replica with a new
+// container: the replica that action ended, or every replica in turn.
+var replacingActions = []string{
+	SharedStateActionKillLeader,
+	SharedStateActionKillOwner,
+	SharedStateActionKillReceiver,
+	SharedStateActionStopLeader,
+	SharedStateActionColdRestart,
+	SharedStateActionMoveThenKill,
+	SharedStateActionRollingRestart,
+	SharedStateActionRollingKill,
 }
 
 // SharedStateConfig describes the replicas of one serverless director that
@@ -344,6 +367,20 @@ type SharedStateStream struct {
 	// progress line before the action, which can be up to a second old.
 	// Default 0: not judged.
 	MinAfterAction int64 `yaml:"min_after_action"`
+	// MinAfterRejoin is how many records the sender must get confirmed
+	// through each replica the action replaced, after that replica rejoined.
+	// It shows that every new replica takes records again. min_after_action
+	// cannot show that when the sender posts to several replicas, because a
+	// sender whose post fails moves on to the next replica, and gets its
+	// records confirmed there even if one replica never answers again. The
+	// count starts from the sender's first progress line after the replica
+	// rejoined, and ends with the sender's final count, so a replica
+	// replaced near the end of the run has less time to reach it. Only a
+	// generator in http_ack mode whose target names a replica can set it,
+	// and only with an action that replaces replicas. It needs the
+	// generator of PipeBench v0.4.16 or later, which reports on each
+	// progress line what each target confirmed. Default 0: not judged.
+	MinAfterRejoin int64 `yaml:"min_after_rejoin"`
 	// MaxLoss is how many of the generator's records may never arrive
 	// (default 0).
 	MaxLoss int64 `yaml:"max_loss"`
@@ -666,8 +703,19 @@ func (tc *TestCase) validateSharedState() error {
 			return fmt.Errorf("case %q: shared_state.streams has two streams named %q", tc.Name, st.StreamName())
 		}
 		names[st.StreamName()] = true
-		if st.MaxLoss < 0 || st.MaxDuplicatePct < 0 || st.MinBaseline < 0 || st.MinAfterAction < 0 || (st.MaxDuplicates != nil && *st.MaxDuplicates < 0) {
-			return fmt.Errorf("case %q: shared_state.streams[%d]: max_loss, max_duplicates, max_duplicate_pct, min_baseline and min_after_action must not be negative", tc.Name, i)
+		if st.MaxLoss < 0 || st.MaxDuplicatePct < 0 || st.MinBaseline < 0 || st.MinAfterAction < 0 || st.MinAfterRejoin < 0 || (st.MaxDuplicates != nil && *st.MaxDuplicates < 0) {
+			return fmt.Errorf("case %q: shared_state.streams[%d]: max_loss, max_duplicates, max_duplicate_pct, min_baseline, min_after_action and min_after_rejoin must not be negative", tc.Name, i)
+		}
+		if st.MinAfterRejoin > 0 {
+			if g.Mode != "http_ack" {
+				return fmt.Errorf("case %q: shared_state stream %q sets min_after_rejoin, but its generator %q runs in mode %q: only a generator in http_ack mode reports what each replica confirmed", tc.Name, st.StreamName(), g.ID, g.Mode)
+			}
+			if !slices.Contains(replacingActions, s.Action) {
+				return fmt.Errorf("case %q: shared_state stream %q sets min_after_rejoin, which counts from the time a replaced replica rejoined, but shared_state.action %q replaces no replica", tc.Name, st.StreamName(), s.Action)
+			}
+			if !slices.ContainsFunc(TargetReplicas(g.Target), func(n int) bool { return n >= 1 && n <= s.Replicas }) {
+				return fmt.Errorf("case %q: shared_state stream %q sets min_after_rejoin, but its generator %q posts to no replica: give it a target such as http://subject-2:9000/", tc.Name, st.StreamName(), g.ID)
+			}
 		}
 		if st.MinAfterAction > 0 {
 			if g.Mode != "http_ack" {

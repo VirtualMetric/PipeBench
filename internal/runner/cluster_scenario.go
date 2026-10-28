@@ -241,9 +241,19 @@ type genProgress struct {
 	Pending  int64
 	// LastAck is when the client last got a 2xx; zero before the first one.
 	LastAck time.Time
+	// AckedPerTarget is how many records each target confirmed, by the
+	// target as the generator's target list names it. It is nil on the
+	// progress lines of a generator older than PipeBench v0.4.16, which did
+	// not report it.
+	AckedPerTarget map[string]int64
 }
 
-var progressRE = regexp.MustCompile(`PROGRESS t_ms=(\d+) acked=(\d+) unacked=\d+ requests=\d+ failures=(\d+) failovers=\d+ pending=(\d+) last_ack_ns=(\d+)`)
+var (
+	progressRE = regexp.MustCompile(`PROGRESS t_ms=(\d+) acked=(\d+) unacked=\d+ requests=\d+ failures=(\d+) failovers=\d+ pending=(\d+) last_ack_ns=(\d+)`)
+	// The counts per target are a JSON object, which holds no space, ahead
+	// of last_error, whose text can hold anything.
+	progressPerTargetRE = regexp.MustCompile(` acked_per_target=(\{[^ ]*\})`)
+)
 
 type scenarioRun struct {
 	r       *Runner
@@ -2703,6 +2713,12 @@ func parseGeneratorProgress(out string) (genProgress, bool) {
 		p := genProgress{At: time.UnixMilli(tms), Acked: acked, Failures: fails, Pending: pending}
 		if ns, _ := strconv.ParseInt(m[5], 10, 64); ns > 0 {
 			p.LastAck = time.Unix(0, ns)
+		}
+		if pt := progressPerTargetRE.FindStringSubmatch(lines[i]); pt != nil {
+			var perTarget map[string]int64
+			if json.Unmarshal([]byte(pt[1]), &perTarget) == nil {
+				p.AckedPerTarget = perTarget
+			}
 		}
 		return p, true
 	}

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -222,5 +223,28 @@ func TestSplitTargets(t *testing.T) {
 	got := splitTargets(" http://a:1/ ,, http://b:2/")
 	if len(got) != 2 || got[0] != "http://a:1/" || got[1] != "http://b:2/" {
 		t.Fatalf("splitTargets: %q", got)
+	}
+}
+
+// TestAckProgressLineCountsEachTarget: each progress line says how many lines
+// each target acknowledged, so the harness can tell whether a replica that a
+// container platform replaced takes posts again. The count sits ahead of
+// last_error, whose text can hold spaces, so the harness can cut it out.
+func TestAckProgressLineCountsEachTarget(t *testing.T) {
+	s := &ackStats{status: map[string]int64{}, perConn: map[string]int64{}, perTarget: map[string]int64{}}
+	line := ackProgressLine(s, time.UnixMilli(1000))
+	if !strings.Contains(line, " acked_per_target={} last_error=") {
+		t.Fatalf("before any acknowledgement, the line is %q, want an empty acked_per_target ahead of last_error", line)
+	}
+	s.noteAck(1, "http://subject-1:9000/", 10, 100, 5)
+	s.noteAck(2, "http://subject-2:9000/", 10, 100, 6)
+	s.noteAck(3, "http://subject-1:9000/", 10, 100, 7)
+	s.noteError("dial tcp: lookup subject-3 on 127.0.0.11:53: no such host")
+	line = ackProgressLine(s, time.UnixMilli(2000))
+	want := `PROGRESS t_ms=2000 acked=30 unacked=0 requests=0 failures=0 failovers=0 pending=0 last_ack_ns=7 ` +
+		`acked_per_target={"http://subject-1:9000/":20,"http://subject-2:9000/":10} ` +
+		`last_error="dial tcp: lookup subject-3 on 127.0.0.11:53: no such host"` + "\n"
+	if line != want {
+		t.Fatalf("progress line\n got %q\nwant %q", line, want)
 	}
 }

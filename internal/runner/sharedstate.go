@@ -220,6 +220,11 @@ type ssRun struct {
 	// confirmed just before the action, by stream name. Only streams that
 	// set min_after_action are counted.
 	confirmedBefore map[string]int64
+	// confirmedAtRejoin is how many records each stream's sender had got
+	// confirmed through each replaced replica when that replica rejoined, by
+	// stream name and then replica. Only streams that set min_after_rejoin
+	// are counted.
+	confirmedAtRejoin map[string]map[int]int64
 }
 
 func newSSRun(r *Runner, tc *config.TestCase, subject config.Subject, orch *orchestrator.ComposeRunner) *ssRun {
@@ -233,7 +238,8 @@ func newSSRun(r *Runner, tc *config.TestCase, subject config.Subject, orch *orch
 		perReceiver: map[string]int64{},
 		evidence:    filepath.Join(r.opts.ResultsDir, hardwareID(), "shared-state", tc.Name),
 
-		confirmedBefore: map[string]int64{},
+		confirmedBefore:   map[string]int64{},
+		confirmedAtRejoin: map[string]map[int]int64{},
 	}
 	run.measures["evidence"] = run.evidence
 	if tc.SharedState.Action == config.SharedStateActionWrongCredentials {
@@ -929,7 +935,9 @@ func (run *ssRun) act() {
 			run.disruptAndReplace(owner, "stop", false)
 		}
 	case config.SharedStateActionRollingRestart:
-		run.rollingRestart()
+		run.rollingReplace("stop")
+	case config.SharedStateActionRollingKill:
+		run.rollingReplace("kill")
 	case config.SharedStateActionMoveAcrossCutLink:
 		run.moveAcrossCutLink()
 	}
@@ -1196,6 +1204,7 @@ func (run *ssRun) disruptAndReplace(n int, how string, replace bool) {
 	if readyAt, ok := run.waitReady(n, replacedAt, earliest(time.Now().Add(run.replicaWarmup()), run.deadline)); ok {
 		run.measures["rejoin_seconds"] = readyAt.Sub(replacedAt).Seconds()
 		fmt.Printf("    %s rejoined after %.1fs\n", rep.Service, readyAt.Sub(replacedAt).Seconds())
+		run.countConfirmedAtRejoin(n, readyAt)
 	} else {
 		run.fail("%s did not rejoin after it was replaced: %s", rep.Service, run.readiness(n, replacedAt))
 	}
@@ -1535,6 +1544,18 @@ func (run *ssRun) checkAckedStream(st config.SharedStateStream, genOut string, p
 			for _, why := range judgeAfterAction(st, after) {
 				run.fail("%s", why)
 			}
+		}
+	}
+	if st.MinAfterRejoin > 0 {
+		after := confirmedAfterRejoin(gen.Ack.AckedPerTarget, run.confirmedAtRejoin[st.StreamName()])
+		byReplica := map[string]int64{}
+		for _, n := range slices.Sorted(maps.Keys(after)) {
+			byReplica[run.replica(n).Service] = after[n]
+			fmt.Printf("    %d records were confirmed through %s after it rejoined\n", after[n], run.replica(n).Service)
+		}
+		counts["confirmed_after_rejoin"] = byReplica
+		for _, why := range judgeAfterRejoin(st, after) {
+			run.fail("%s", why)
 		}
 	}
 	return counts

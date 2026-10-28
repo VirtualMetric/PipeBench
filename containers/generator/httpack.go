@@ -18,6 +18,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -360,12 +361,22 @@ func runHTTPAck(cfg config, clock *sendClock) (int64, int64, error) {
 }
 
 func printAckProgress(s *ackStats) {
+	fmt.Fprint(os.Stderr, ackProgressLine(s, time.Now()))
+}
+
+// ackProgressLine is one progress line. acked_per_target is how many lines
+// each target acknowledged so far, as a JSON object keyed by the target as
+// GENERATOR_TARGET names it. It holds no space, and comes before last_error,
+// whose text can hold anything, so a reader can cut it out of the line. A
+// target that acknowledged nothing yet is left out.
+func ackProgressLine(s *ackStats, now time.Time) string {
 	s.mu.Lock()
 	lastErr := s.lastErr
+	perTarget, _ := json.Marshal(s.perTarget)
 	s.mu.Unlock()
-	fmt.Fprintf(os.Stderr, "PROGRESS t_ms=%d acked=%d unacked=%d requests=%d failures=%d failovers=%d pending=%d last_ack_ns=%d last_error=%q\n",
-		time.Now().UnixMilli(), s.acked.Load(), s.unacked.Load(), s.requests.Load(), s.failures.Load(),
-		s.failovers.Load(), s.pending.Load(), s.lastAck.Load(), lastErr)
+	return fmt.Sprintf("PROGRESS t_ms=%d acked=%d unacked=%d requests=%d failures=%d failovers=%d pending=%d last_ack_ns=%d acked_per_target=%s last_error=%q\n",
+		now.UnixMilli(), s.acked.Load(), s.unacked.Load(), s.requests.Load(), s.failures.Load(),
+		s.failovers.Load(), s.pending.Load(), s.lastAck.Load(), perTarget, lastErr)
 }
 
 // runAckWorker sends one CONN id's lines until the deadline, a batch at a
