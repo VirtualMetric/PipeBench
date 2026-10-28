@@ -279,3 +279,54 @@ func TestMoveAcrossCutLinkValidation(t *testing.T) {
 		t.Fatalf("CutHoldOrDefault = %d, want 10", got)
 	}
 }
+
+// TestTargetReplicas: kill_receiver needs to know which replica a generator
+// sends to. The http_ack generator takes a URL, or a list of them, and a
+// host:port reading took http://subject-2:9000/ for the host "http".
+func TestTargetReplicas(t *testing.T) {
+	for target, want := range map[string][]int{
+		"subject-2:9000":                 {2},
+		"http://subject-2:9000/":         {2},
+		"https://subject-12:8443/ingest": {12},
+		"subject-3":                      {3},
+		"http://subject-1:9000/, http://subject-3:9000/": {1, 3},
+		"subject-2:9000,subject-2:9001":                  {2},
+		"http://azurite:10000":                           nil,
+		"azurite:10000":                                  nil,
+		"subject-x:9000":                                 nil,
+		"subject-0:9000":                                 nil,
+		"":                                               nil,
+	} {
+		if got := TargetReplicas(target); !reflect.DeepEqual(got, want) {
+			t.Errorf("TargetReplicas(%q) = %v, want %v", target, got, want)
+		}
+	}
+}
+
+// TestKillReceiverValidation: kill_receiver kills the replica a generator
+// sends to, so a case whose generators send to no replica is refused.
+func TestKillReceiverValidation(t *testing.T) {
+	tc := sharedStateCase()
+	tc.SharedState.Action = SharedStateActionKillReceiver
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("a case whose syslog generator sends to subject-2 was refused: %v", err)
+	}
+	tc.Generators[1] = GeneratorConfig{ID: "syslog", Mode: "http_ack", Target: "http://subject-3:9000/"}
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("a case whose http_ack generator sends to http://subject-3:9000/ was refused: %v", err)
+	}
+	for name, target := range map[string]string{
+		"sends to no replica":     "relay:9000",
+		"sends past the replicas": "http://subject-4:9000/",
+	} {
+		t.Run(name, func(t *testing.T) {
+			tc := sharedStateCase()
+			tc.SharedState.Action = SharedStateActionKillReceiver
+			tc.Generators[1].Target = target
+			err := tc.Validate()
+			if err == nil || !strings.Contains(err.Error(), "no generator sends to a replica") {
+				t.Fatalf("Validate = %v, want an error that no generator sends to a replica", err)
+			}
+		})
+	}
+}

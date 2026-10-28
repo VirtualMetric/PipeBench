@@ -3,9 +3,13 @@ package config
 import (
 	"encoding/base64"
 	"fmt"
+	"net"
+	"net/url"
 	"path"
 	"regexp"
 	"slices"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -26,6 +30,14 @@ const (
 	// SharedStateActionKillOwner kills, with SIGKILL, a replica that runs a
 	// placed device and does not lead.
 	SharedStateActionKillOwner = "kill_owner"
+	// SharedStateActionKillReceiver kills, with SIGKILL, a replica that a
+	// generator sends to and that does not lead: the replica that took the
+	// records in. Then it replaces the replica with a new container on an
+	// empty disk, as a container platform replaces a replica that failed.
+	// What the replica took in and had not passed on is gone with its disk,
+	// so a stream shows whether the subject confirmed records it still held
+	// only there.
+	SharedStateActionKillReceiver = "kill_receiver"
 	// SharedStateActionStopLeader stops the leader gracefully (docker stop).
 	SharedStateActionStopLeader = "stop_leader"
 	// SharedStateActionPauseStore pauses Azurite for outage_seconds, so no
@@ -81,6 +93,7 @@ var sharedStateActions = []string{
 	SharedStateActionPlacement,
 	SharedStateActionKillLeader,
 	SharedStateActionKillOwner,
+	SharedStateActionKillReceiver,
 	SharedStateActionStopLeader,
 	SharedStateActionPauseStore,
 	SharedStateActionIsolateReplica,
@@ -481,6 +494,36 @@ func (s *SharedStateConfig) StartGroups() [][]int {
 	return groups
 }
 
+// TargetReplicas returns the replicas that a generator's target names: the
+// number of each subject-<n> host in it. The target can be host:port
+// (subject-2:9000), a URL (http://subject-2:9000/) or a comma-separated list
+// of either, as the http_ack generator takes. Hosts that are not a replica,
+// such as azurite, are left out.
+func TargetReplicas(target string) []int {
+	var out []int
+	for _, part := range strings.Split(target, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		host := part
+		// A host:port parses as a URL whose scheme is the host, with no
+		// authority, so only a URL with one is read as a URL.
+		if u, err := url.Parse(part); err == nil && u.Host != "" {
+			host = u.Hostname()
+		} else if h, _, err := net.SplitHostPort(part); err == nil {
+			host = h
+		}
+		num, isReplica := strings.CutPrefix(host, "subject-")
+		n, err := strconv.Atoi(num)
+		if !isReplica || err != nil || n < 1 || slices.Contains(out, n) {
+			continue
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
 // IsDirectorSharedStateType reports whether the case drives replicas of one
 // director that share their state through a store
 // (runDirectorSharedStateCorrectness).
@@ -661,6 +704,14 @@ func (tc *TestCase) validateSharedState() error {
 	case SharedStateActionScaleBacklog:
 		if !names[s.ScaleStream] {
 			return fmt.Errorf("case %q: shared_state.action scale_backlog needs shared_state.scale_stream to name a stream", tc.Name)
+		}
+	case SharedStateActionKillReceiver:
+		var sentTo []int
+		for _, g := range tc.AllGenerators() {
+			sentTo = append(sentTo, TargetReplicas(g.Target)...)
+		}
+		if !slices.ContainsFunc(sentTo, func(n int) bool { return n >= 1 && n <= s.Replicas }) {
+			return fmt.Errorf("case %q: shared_state.action kill_receiver kills a replica that a generator sends to, and no generator sends to a replica: give one a target such as subject-2:9000 or http://subject-2:9000/", tc.Name)
 		}
 	}
 	if s.Action == SharedStateActionMoveAcrossCutLink {
