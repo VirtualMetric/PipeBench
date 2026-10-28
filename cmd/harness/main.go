@@ -54,6 +54,7 @@ var (
 	memLimit         string
 	hardware         string
 	drain            time.Duration
+	failOnVerdict    bool
 )
 
 func main() {
@@ -372,6 +373,11 @@ func testCmd() *cobra.Command {
 			if len(failed) > 0 {
 				return fmt.Errorf("%d run(s) failed: %v", len(failed), failed)
 			}
+			if failOnVerdict {
+				if notPassed := failedVerdicts(outcomes); len(notPassed) > 0 {
+					return fmt.Errorf("%d run(s) did not pass their checks: %v", len(notPassed), notPassed)
+				}
+			}
 			return nil
 		},
 	}
@@ -400,8 +406,21 @@ func testCmd() *cobra.Command {
 	cmd.Flags().StringVar(&memLimit, "mem-limit", "", "memory limit for subject container (e.g. \"1g\", \"4g\", \"512m\")")
 	cmd.Flags().StringVar(&hardware, "hardware", "", "hardware tier label — groups results under results/<hardware>/ (e.g. \"c7i.4xlarge\"); defaults to $BENCH_HARDWARE or \"custom\"")
 	cmd.Flags().StringVar(&typeFilter, "type", "", "with --all-tests, run only cases whose type matches (e.g. \"correctness\" also matches \"persistence_correctness\"); \"performance\" matches only the plain performance type")
+	cmd.Flags().BoolVar(&failOnVerdict, "fail-on-verdict", false, "exit with code 1 when a run's checks fail, as well as when a run cannot finish (by default a failed check only shows as FAIL in the summary and in the results)")
 
 	return cmd
+}
+
+// failedVerdicts names the runs that finished but did not pass their checks.
+// A run that could not finish, or whose case has no checks, is not named.
+func failedVerdicts(outcomes []runOutcome) []string {
+	var names []string
+	for _, o := range outcomes {
+		if o.runErr == nil && o.result.Passed != nil && !*o.result.Passed {
+			names = append(names, o.testName+"/"+o.subjectName)
+		}
+	}
+	return names
 }
 
 // matchesTypeFilter reports whether a case's type: field satisfies the

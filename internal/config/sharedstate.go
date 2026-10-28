@@ -336,6 +336,14 @@ type SharedStateStream struct {
 	// MinBaseline is how many records the receiver must hold before the action
 	// runs (default 1).
 	MinBaseline int64 `yaml:"min_baseline"`
+	// MinAfterAction is how many records the sender must get confirmed after
+	// the action starts. It shows that the replicas take records again once
+	// the action is over, for example that a replaced receiver answers posts
+	// again. Only a generator in http_ack mode reports what it got confirmed,
+	// so only its streams can set it. The count starts from the sender's last
+	// progress line before the action, which can be up to a second old.
+	// Default 0: not judged.
+	MinAfterAction int64 `yaml:"min_after_action"`
 	// MaxLoss is how many of the generator's records may never arrive
 	// (default 0).
 	MaxLoss int64 `yaml:"max_loss"`
@@ -658,8 +666,16 @@ func (tc *TestCase) validateSharedState() error {
 			return fmt.Errorf("case %q: shared_state.streams has two streams named %q", tc.Name, st.StreamName())
 		}
 		names[st.StreamName()] = true
-		if st.MaxLoss < 0 || st.MaxDuplicatePct < 0 || st.MinBaseline < 0 || (st.MaxDuplicates != nil && *st.MaxDuplicates < 0) {
-			return fmt.Errorf("case %q: shared_state.streams[%d]: max_loss, max_duplicates, max_duplicate_pct and min_baseline must not be negative", tc.Name, i)
+		if st.MaxLoss < 0 || st.MaxDuplicatePct < 0 || st.MinBaseline < 0 || st.MinAfterAction < 0 || (st.MaxDuplicates != nil && *st.MaxDuplicates < 0) {
+			return fmt.Errorf("case %q: shared_state.streams[%d]: max_loss, max_duplicates, max_duplicate_pct, min_baseline and min_after_action must not be negative", tc.Name, i)
+		}
+		if st.MinAfterAction > 0 {
+			if g.Mode != "http_ack" {
+				return fmt.Errorf("case %q: shared_state stream %q sets min_after_action, but its generator %q runs in mode %q: only a generator in http_ack mode reports what it got confirmed", tc.Name, st.StreamName(), g.ID, g.Mode)
+			}
+			if s.Action == SharedStateActionNone {
+				return fmt.Errorf("case %q: shared_state stream %q sets min_after_action, which counts from the action, but shared_state.action is not set", tc.Name, st.StreamName())
+			}
 		}
 		if st.MaxDuplicates != nil && st.MaxDuplicatePct > 0 {
 			return fmt.Errorf("case %q: shared_state.streams[%d] sets both max_duplicates and max_duplicate_pct; set one", tc.Name, i)
