@@ -215,6 +215,11 @@ type ssRun struct {
 
 	linesIn, linesOut, uniqueOut int64
 	perReceiver                  map[string]int64
+
+	// confirmedBefore is how many records each stream's sender had got
+	// confirmed just before the action, by stream name. Only streams that
+	// set min_after_action are counted.
+	confirmedBefore map[string]int64
 }
 
 func newSSRun(r *Runner, tc *config.TestCase, subject config.Subject, orch *orchestrator.ComposeRunner) *ssRun {
@@ -227,6 +232,8 @@ func newSSRun(r *Runner, tc *config.TestCase, subject config.Subject, orch *orch
 		measures:    map[string]any{},
 		perReceiver: map[string]int64{},
 		evidence:    filepath.Join(r.opts.ResultsDir, hardwareID(), "shared-state", tc.Name),
+
+		confirmedBefore: map[string]int64{},
 	}
 	run.measures["evidence"] = run.evidence
 	if tc.SharedState.Action == config.SharedStateActionWrongCredentials {
@@ -879,6 +886,7 @@ func (run *ssRun) waitBaseline() bool {
 func (run *ssRun) act() {
 	ss := run.ss
 	run.measures["action"] = sharedStateActionLabel(ss.Action)
+	run.countConfirmedBefore()
 	switch ss.Action {
 	case config.SharedStateActionNone:
 	case config.SharedStateActionPlacement:
@@ -924,6 +932,31 @@ func (run *ssRun) act() {
 		run.rollingRestart()
 	case config.SharedStateActionMoveAcrossCutLink:
 		run.moveAcrossCutLink()
+	}
+}
+
+// countConfirmedBefore reads, for each stream that sets min_after_action, how
+// many records its sender has got confirmed so far: the count on its last
+// progress line. checkAckedStream subtracts it from the final count. The
+// sender writes its first progress line a second after it starts, and the
+// baseline can be reached before that, so the read is tried for up to five
+// seconds. A sender whose progress still cannot be read fails the run,
+// because what it got confirmed after the action could not be told apart
+// from what came before.
+func (run *ssRun) countConfirmedBefore() {
+	for _, st := range run.ss.Streams {
+		if st.MinAfterAction <= 0 {
+			continue
+		}
+		container := "bench-generator-" + st.Generator
+		p, ok := readProgressBaseline(run.r.ctx, func() (genProgress, bool) {
+			return readGeneratorProgressOf(container)
+		}, 20, 250*time.Millisecond)
+		if !ok {
+			run.fail("stream %s: the sender's progress could not be read before the action, so the records confirmed after it cannot be counted", st.StreamName())
+			continue
+		}
+		run.confirmedBefore[st.StreamName()] = p.Acked
 	}
 }
 
@@ -1323,7 +1356,7 @@ func (run *ssRun) checkStreams() {
 			continue
 		}
 		if modes[st.Generator] == "http_ack" {
-			if counts := run.checkAckedStream(st, string(out), ports[st.Receiver], sent, m.LinesReceived); counts != nil {
+			if counts := run.checkAckedStream(st, string(out), ports[st.Receiver], m.LinesReceived); counts != nil {
 				streams[st.StreamName()] = counts
 			}
 			continue
@@ -1445,12 +1478,18 @@ func duplicateProblems(st config.SharedStateStream, got ssStreamCounts) []string
 // check also keeps how long the confirmations took, which is what a sender
 // waits for. It returns the stream's counts, or nil when it cannot count
 // them, which fails the run.
-func (run *ssRun) checkAckedStream(st config.SharedStateStream, genOut string, port int, sent, received int64) map[string]any {
+//
+// The records sent are the ones the sender got confirmed and the ones it
+// gave up on. Any of them may arrive. The generator's own lines_sent counts
+// only the confirmed ones in http_ack mode, so it is not used here: a record
+// that arrived without its confirmation would read as more than was sent.
+func (run *ssRun) checkAckedStream(st config.SharedStateStream, genOut string, port int, received int64) map[string]any {
 	gen := parseGeneratorAck(genOut)
 	if gen == nil || gen.Ack == nil {
 		run.fail("stream %s: the generator's summary of the confirmed records is missing, so they cannot be counted", st.StreamName())
 		return nil
 	}
+	sent := gen.Ack.LinesAcked + gen.Ack.LinesUnacked
 	deadline := earliest(time.Now().Add(time.Minute), run.deadline)
 	check, checked, err := drainSeqCheck(run.r.ctx, func() (seqCheckResult, error) {
 		return receiverSeqCheckAt(port, gen.Ack.AckedPerConn)
@@ -1486,7 +1525,28 @@ func (run *ssRun) checkAckedStream(st config.SharedStateStream, genOut string, p
 	for _, why := range judgeAckedStream(st, sent, gen.Ack.LinesAcked, check, got) {
 		run.fail("%s", why)
 	}
+	if st.MinAfterAction > 0 {
+		// A sender whose count before the action is missing already failed
+		// the run in countConfirmedBefore.
+		if before, ok := run.confirmedBefore[st.StreamName()]; ok {
+			after := gen.Ack.LinesAcked - before
+			counts["confirmed_after_action"] = after
+			fmt.Printf("    %d records were confirmed after the action\n", after)
+			for _, why := range judgeAfterAction(st, after) {
+				run.fail("%s", why)
+			}
+		}
+	}
 	return counts
+}
+
+// judgeAfterAction returns why a stream fails min_after_action, if it does:
+// after is how many records the sender got confirmed after the action.
+func judgeAfterAction(st config.SharedStateStream, after int64) []string {
+	if st.MinAfterAction <= 0 || after >= st.MinAfterAction {
+		return nil
+	}
+	return []string{fmt.Sprintf("stream %s: the sender got %d records confirmed after the action, below min_after_action %d, so the replicas did not take records again as they should", st.StreamName(), after, st.MinAfterAction)}
 }
 
 // judgeAckedStream returns why a stream of confirmed records fails, if it

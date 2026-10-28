@@ -2527,11 +2527,22 @@ func quoteLines(lines []string) string {
 
 // readGeneratorProgress returns the generator's last PROGRESS line.
 func readGeneratorProgress() (genProgress, bool) {
-	out, err := exec.Command("docker", "logs", "--tail", "6", "bench-generator").CombinedOutput()
+	return readGeneratorProgressOf("bench-generator")
+}
+
+// readGeneratorProgressOf returns the last PROGRESS line of the generator
+// container with that name.
+func readGeneratorProgressOf(container string) (genProgress, bool) {
+	out, err := exec.Command("docker", "logs", "--tail", "6", container).CombinedOutput()
 	if err != nil {
 		return genProgress{}, false
 	}
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	return parseGeneratorProgress(string(out))
+}
+
+// parseGeneratorProgress returns the last PROGRESS line of a generator's log.
+func parseGeneratorProgress(out string) (genProgress, bool) {
+	lines := strings.Split(strings.TrimSpace(out), "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
 		m := progressRE.FindStringSubmatch(lines[i])
 		if m == nil {
