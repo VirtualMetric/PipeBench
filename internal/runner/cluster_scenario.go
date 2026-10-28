@@ -94,6 +94,68 @@ type pendingCount struct {
 	ArrivedLater *int64 `json:"arrived_later,omitempty"`
 }
 
+// arrivedCheck is one expect_arrived step: the lines sent between two marks
+// that must, or must not, reach a receiver. The step only names the window.
+// The run counts after the drain, so that a line still on its way at the step
+// counts too.
+type arrivedCheck struct {
+	Name       string    `json:"name"`
+	Receiver   string    `json:"receiver,omitempty"`
+	SentAfter  string    `json:"sent_after"`
+	SentBefore string    `json:"sent_before"`
+	From       time.Time `json:"from"`
+	To         time.Time `json:"to"`
+	Min        *int64    `json:"min,omitempty"`
+	Max        *int64    `json:"max,omitempty"`
+	CompareTo  string    `json:"compare_to,omitempty"`
+	MinShare   *float64  `json:"min_share,omitempty"`
+	MaxShare   *float64  `json:"max_share,omitempty"`
+	Soft       bool      `json:"soft,omitempty"`
+	// Arrived is how many of the window's lines reached the receiver, counted
+	// after the drain. It is nil when the receiver could not be read.
+	Arrived *int64 `json:"arrived,omitempty"`
+	// ComparedArrived is how many of the window's lines reached the
+	// compare_to receiver, when the step names one.
+	ComparedArrived *int64 `json:"compared_arrived,omitempty"`
+
+	port        int
+	comparePort int
+}
+
+// judgeArrived returns why an expect_arrived count fails its bounds, or "".
+// compared is what the compare_to receiver got of the window, and is read
+// only when the step names one.
+func judgeArrived(c arrivedCheck, arrived, compared int64) string {
+	at := ""
+	if c.Receiver != "" {
+		at = " at receiver " + c.Receiver
+	}
+	switch {
+	case c.Min != nil && arrived < *c.Min:
+		return fmt.Sprintf("%s: %d lines sent between marks %q and %q arrived%s, fewer than min %d", c.Name, arrived, c.SentAfter, c.SentBefore, at, *c.Min)
+	case c.Max != nil && arrived > *c.Max:
+		return fmt.Sprintf("%s: %d lines sent between marks %q and %q arrived%s, more than max %d", c.Name, arrived, c.SentAfter, c.SentBefore, at, *c.Max)
+	}
+	if c.CompareTo == "" || (c.MinShare == nil && c.MaxShare == nil) {
+		return ""
+	}
+	// No line of the window reached the receiver the share is of, so there
+	// is nothing to compare with: the window tested nothing.
+	if compared == 0 {
+		return fmt.Sprintf("%s: no line sent between marks %q and %q reached receiver %s, so the share%s is not known", c.Name, c.SentAfter, c.SentBefore, c.CompareTo, at)
+	}
+	share := float64(arrived) / float64(compared)
+	switch {
+	case c.MinShare != nil && share < *c.MinShare:
+		return fmt.Sprintf("%s: %d lines sent between marks %q and %q arrived%s, %.3f of the %d that reached receiver %s, less than min_share %v",
+			c.Name, arrived, c.SentAfter, c.SentBefore, at, share, compared, c.CompareTo, *c.MinShare)
+	case c.MaxShare != nil && share > *c.MaxShare:
+		return fmt.Sprintf("%s: %d lines sent between marks %q and %q arrived%s, %.3f of the %d that reached receiver %s, more than max_share %v",
+			c.Name, arrived, c.SentAfter, c.SentBefore, at, share, compared, c.CompareTo, *c.MaxShare)
+	}
+	return ""
+}
+
 // arrivedSince is how many lines arrived between a count_pending step and
 // the end of the run, from the two counts of lines sent before its mark. The
 // receiver counts each line once, at its first arrival, so the count cannot
@@ -229,6 +291,7 @@ type scenarioRun struct {
 	events   []scenarioEvent
 	marks    []scenarioMark
 	pending  []pendingCount
+	arrived  []arrivedCheck
 	measures map[string]float64
 	counts   map[string]int64
 	failures []string
@@ -968,6 +1031,36 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		}
 		return true, fmt.Sprintf("node %d did not log %s from %s for %s", nodes[0], quoteLines(st.LogLines()), fromWhat, window), nil
 
+	case "expect_arrived":
+		// Name the window now, while its marks are the latest of their
+		// labels. The run counts the window after the drain.
+		from, okFrom := sr.markAt(st.SentAfter)
+		to, okTo := sr.markAt(st.SentBefore)
+		if !okFrom || !okTo {
+			return false, fmt.Sprintf("marks %q and %q must both be set before this step", st.SentAfter, st.SentBefore), nil
+		}
+		if !to.After(from) {
+			return false, fmt.Sprintf("mark %q is not before mark %q, so the window is empty", st.SentAfter, st.SentBefore), nil
+		}
+		rc, ok := sr.receiverByID(st.Receiver)
+		if !ok {
+			return false, fmt.Sprintf("receiver %q is not one of the case's receivers", st.Receiver), nil
+		}
+		check := arrivedCheck{
+			Name: st.Record, Receiver: rc.ID, SentAfter: st.SentAfter, SentBefore: st.SentBefore,
+			From: from, To: to, Min: st.Min, Max: st.Max, Soft: st.Soft, port: rc.Port,
+			CompareTo: st.CompareTo, MinShare: st.MinShare, MaxShare: st.MaxShare,
+		}
+		if st.CompareTo != "" {
+			other, ok := sr.receiverByID(st.CompareTo)
+			if !ok {
+				return false, fmt.Sprintf("receiver %q is not one of the case's receivers", st.CompareTo), nil
+			}
+			check.comparePort = other.Port
+		}
+		sr.arrived = append(sr.arrived, check)
+		return true, fmt.Sprintf("the lines sent between marks %q and %q are counted at %s after the drain", st.SentAfter, st.SentBefore, rc.describe()), nil
+
 	case "count_pending":
 		// Count the lines sent before the mark that have reached the receiver
 		// so far. The run counts them again after the drain: the difference
@@ -1591,7 +1684,10 @@ type scenarioReport struct {
 	Rows *rowsCheck `json:"rows,omitempty"`
 	// Pending holds the count_pending steps' counts: the lines sent before a
 	// mark that were still on their way when the step ran.
-	Pending    []pendingCount       `json:"pending,omitempty"`
+	Pending []pendingCount `json:"pending,omitempty"`
+	// Arrived holds the expect_arrived steps' counts: the lines sent between
+	// two marks that reached a receiver, counted after the drain.
+	Arrived    []arrivedCheck       `json:"arrived,omitempty"`
 	Events     []scenarioEvent      `json:"events"`
 	Steps      []scenarioStepReport `json:"steps"`
 	Leadership leadershipStats      `json:"leadership"`
@@ -1651,6 +1747,12 @@ func (rep scenarioReport) summary() map[string]any {
 		// A count that could not be finished is left out, not reported as 0.
 		if p.ArrivedLater != nil {
 			out["pending_"+p.Name] = *p.ArrivedLater
+		}
+	}
+	for _, a := range rep.Arrived {
+		// A window that could not be counted is left out, not reported as 0.
+		if a.Arrived != nil {
+			out["arrived_"+a.Name] = *a.Arrived
 		}
 	}
 	for i, ev := range rep.Events {
@@ -1756,6 +1858,46 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 	}
 	rep.Pending = sr.pending
 
+	// The expect_arrived steps: count each window now that every line that
+	// will arrive has arrived.
+	for i := range sr.arrived {
+		c := &sr.arrived[i]
+		var ls, cs latencyStats
+		err := receiverGetAt(c.port, latencyPath(c.From, c.To), &ls)
+		if err == nil && c.CompareTo != "" {
+			err = receiverGetAt(c.comparePort, latencyPath(c.From, c.To), &cs)
+		}
+		if err != nil {
+			reason := fmt.Sprintf("%s: could not count the lines that arrived, so the expectation is not known to hold: %v", c.Name, err)
+			if c.Soft {
+				sr.notes = append(sr.notes, reason)
+			} else {
+				sr.failures = append(sr.failures, reason)
+			}
+			continue
+		}
+		arrived, compared := int64(ls.Count), int64(cs.Count)
+		c.Arrived = &arrived
+		at := ""
+		if c.Receiver != "" {
+			at = " at receiver " + c.Receiver
+		}
+		of := ""
+		if c.CompareTo != "" {
+			c.ComparedArrived = &compared
+			of = fmt.Sprintf(", and %d at receiver %s", compared, c.CompareTo)
+		}
+		fmt.Printf("  %s: %d lines sent between marks %q and %q arrived%s%s\n", c.Name, arrived, c.SentAfter, c.SentBefore, at, of)
+		if reason := judgeArrived(*c, arrived, compared); reason != "" {
+			if c.Soft {
+				sr.notes = append(sr.notes, reason)
+			} else {
+				sr.failures = append(sr.failures, reason)
+			}
+		}
+	}
+	rep.Arrived = sr.arrived
+
 	// Latency: the whole run, each window between marks, and the lines
 	// sent in the minute after each disruption.
 	if ls, err := sr.receiverLatency(time.Time{}, time.Time{}); err == nil {
@@ -1842,7 +1984,7 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 		v.reasons = append(v.reasons, fmt.Sprintf("only %d lines were acknowledged, fewer than min_acked %d", rep.Acked, ex.MinAcked))
 	}
 	if len(rep.Receivers) > 0 {
-		v.reasons = append(v.reasons, receiverVerdict(rep.Receivers, ex.MaxLoss, ex.MaxDuplicates)...)
+		v.reasons = append(v.reasons, receiverVerdict(rep.Receivers, ex)...)
 	} else {
 		if ex.MaxLoss != nil && rep.Missing > *ex.MaxLoss {
 			v.reasons = append(v.reasons, fmt.Sprintf("%d acknowledged lines never arrived (max_loss %d)", rep.Missing, *ex.MaxLoss))
@@ -1955,9 +2097,15 @@ func worstReceiver(rs []receiverResult) int {
 
 // receiverVerdict judges each receiver of a case with several against
 // max_loss and max_duplicates: every acknowledged line must reach each one.
-func receiverVerdict(rs []receiverResult, maxLoss, maxDuplicates *int64) []string {
+// A receiver that expect.receivers names is judged by its own limits there,
+// and must miss at least its min_loss.
+func receiverVerdict(rs []receiverResult, ex config.ScenarioExpect) []string {
 	var reasons []string
 	for _, r := range rs {
+		maxLoss, maxDuplicates, minLoss := ex.ReceiverLimits(r.ID)
+		if minLoss != nil && r.Missing < *minLoss {
+			reasons = append(reasons, fmt.Sprintf("only %d acknowledged lines never arrived at receiver %s, fewer than min_loss %d: the loss the case tests did not happen", r.Missing, r.ID, *minLoss))
+		}
 		if maxLoss != nil && r.Missing > *maxLoss {
 			reasons = append(reasons, fmt.Sprintf("%d acknowledged lines never arrived at receiver %s (max_loss %d)", r.Missing, r.ID, *maxLoss))
 		}
@@ -2620,6 +2768,14 @@ func receiverSeqCheckAt(port int, acked map[string]int64) (seqCheckResult, error
 }
 
 func (sr *scenarioRun) receiverLatency(from, to time.Time) (latencyStats, error) {
+	var out latencyStats
+	err := sr.receiverGet(latencyPath(from, to), &out)
+	return out, err
+}
+
+// latencyPath is the receiver query for the lines sent from from up to to. A
+// zero time leaves that end open.
+func latencyPath(from, to time.Time) string {
 	q := url.Values{}
 	if !from.IsZero() {
 		q.Set("from_ns", strconv.FormatInt(from.UnixNano(), 10))
@@ -2627,9 +2783,7 @@ func (sr *scenarioRun) receiverLatency(from, to time.Time) (latencyStats, error)
 	if !to.IsZero() {
 		q.Set("to_ns", strconv.FormatInt(to.UnixNano(), 10))
 	}
-	var out latencyStats
-	err := sr.receiverGet("/latency?"+q.Encode(), &out)
-	return out, err
+	return "/latency?" + q.Encode()
 }
 
 func (sr *scenarioRun) receiverTimeline() (receiverTimeline, error) {

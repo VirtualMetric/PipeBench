@@ -173,6 +173,44 @@ type ScenarioExpect struct {
 	// second line differs from the first (a collection time, the node), which
 	// the receiver's hash-based duplicate count does not see.
 	MaxRowsTwice *int64 `yaml:"max_rows_twice"`
+
+	// Receivers judges chosen receivers of a case with several on their own,
+	// keyed by the receiver's id. A limit set for a receiver here replaces
+	// the case's own for that receiver, and the other receivers keep the
+	// case's. A case that tests data a subject drops on purpose at one target
+	// (at a size limit, for one) names that target's receiver here, while
+	// every other receiver must still get every line.
+	Receivers map[string]ScenarioReceiverExpect `yaml:"receivers"`
+}
+
+// ScenarioReceiverExpect is how one receiver is judged
+// (cluster.scenario.expect.receivers.<id>).
+type ScenarioReceiverExpect struct {
+	// MaxLoss and MaxDuplicates replace the case's own for this receiver.
+	MaxLoss       *int64 `yaml:"max_loss"`
+	MaxDuplicates *int64 `yaml:"max_duplicates"`
+	// MinLoss is the fewest acknowledged lines that must be missing at this
+	// receiver. A case that tests a loss the subject makes on purpose fails
+	// when nothing was lost, because it then tested nothing.
+	MinLoss *int64 `yaml:"min_loss"`
+}
+
+// ReceiverLimits returns the limits receiver id is judged by: the case's
+// max_loss and max_duplicates, each replaced by the receiver's own where
+// expect.receivers sets one, and the receiver's min_loss.
+func (ex ScenarioExpect) ReceiverLimits(id string) (maxLoss, maxDuplicates, minLoss *int64) {
+	maxLoss, maxDuplicates = ex.MaxLoss, ex.MaxDuplicates
+	own, ok := ex.Receivers[id]
+	if !ok {
+		return maxLoss, maxDuplicates, nil
+	}
+	if own.MaxLoss != nil {
+		maxLoss = own.MaxLoss
+	}
+	if own.MaxDuplicates != nil {
+		maxDuplicates = own.MaxDuplicates
+	}
+	return maxLoss, maxDuplicates, own.MinLoss
 }
 
 // ScenarioStep is one step. Do names the action; the other fields are its
@@ -252,6 +290,23 @@ type ScenarioStep struct {
 	// example, records that killed nodes still held on their own disks,
 	// counted just before the nodes start again.
 	SentBefore string `yaml:"sent_before"`
+
+	// SentAfter names an earlier mark for an expect_arrived step, which
+	// counts the lines sent between SentAfter and SentBefore that reached its
+	// receiver. It counts after the drain, so a line still on its way at the
+	// step counts too.
+	SentAfter string `yaml:"sent_after"`
+	// Min and Max bound an expect_arrived step's count.
+	Min *int64 `yaml:"min"`
+	Max *int64 `yaml:"max"`
+	// CompareTo names another receiver for an expect_arrived step, and
+	// MinShare and MaxShare bound the step's count as a share of what that
+	// receiver got of the same window, from 0 to 1. A receiver that gets every
+	// line is the measure of how many were sent, whatever rate the load
+	// reached. A step sets at least one of min, max, min_share and max_share.
+	CompareTo string   `yaml:"compare_to"`
+	MinShare  *float64 `yaml:"min_share"`
+	MaxShare  *float64 `yaml:"max_share"`
 
 	// Soft makes a failed expectation a note instead of a failure.
 	Soft bool `yaml:"soft"`
@@ -342,6 +397,7 @@ var scenarioActions = map[string]bool{
 	"expect_no_log":             true,
 	"wait_stable":               false,
 	"count_pending":             false,
+	"expect_arrived":            false,
 	// The link steps check their node themselves: it may be "all".
 	"cut_link":     false,
 	"shape_link":   false,
@@ -570,6 +626,9 @@ func (tc *TestCase) validateClusterScenario() error {
 	if err := tc.validateScenarioDiskAndRows(maxNodes); err != nil {
 		return err
 	}
+	if err := tc.validateReceiverExpect(sc.Expect); err != nil {
+		return fmt.Errorf("case %q: %w", tc.Name, err)
+	}
 	names := map[string]bool{}
 	// marks holds the labels of the marks set so far: since and sent_before
 	// may only name a mark an earlier step sets.
@@ -632,8 +691,8 @@ func (tc *TestCase) validateClusterScenario() error {
 				return fmt.Errorf("%s: since names mark %q, which no earlier step sets", where, st.Since)
 			}
 		}
-		if st.SentBefore != "" && st.Do != "count_pending" {
-			return fmt.Errorf("%s: sent_before only applies to count_pending", where)
+		if st.SentBefore != "" && st.Do != "count_pending" && st.Do != "expect_arrived" {
+			return fmt.Errorf("%s: sent_before only applies to count_pending and expect_arrived", where)
 		}
 		// A logs key that is present counts, even as an empty list: logs: []
 		// is a mistake to report, not a field to ignore.
@@ -717,6 +776,10 @@ func (tc *TestCase) validateClusterScenario() error {
 			if err := tc.validateScenarioReceiver(st.Receiver); err != nil {
 				return fmt.Errorf("%s: %w", where, err)
 			}
+		case "expect_arrived":
+			if err := tc.validateExpectArrived(st, marks); err != nil {
+				return fmt.Errorf("%s: %w", where, err)
+			}
 		case "wait_log", "expect_no_log":
 			if st.Log != "" && st.Logs != nil {
 				return fmt.Errorf("%s: names log and logs; name one of them", where)
@@ -735,6 +798,95 @@ func (tc *TestCase) validateClusterScenario() error {
 		}
 	}
 	return nil
+}
+
+// validateReceiverExpect checks cluster.scenario.expect.receivers: each
+// entry names one of the case's several receivers, and its limits make sense.
+func (tc *TestCase) validateReceiverExpect(ex ScenarioExpect) error {
+	if ex.Receivers == nil {
+		return nil
+	}
+	if !tc.MultiReceiver() {
+		return fmt.Errorf("expect.receivers judges receivers of a case with several, and the case has one; use expect's own limits")
+	}
+	ids := make([]string, 0, len(ex.Receivers))
+	for id := range ex.Receivers {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		own := ex.Receivers[id]
+		if err := tc.validateScenarioReceiver(id); err != nil {
+			return fmt.Errorf("expect.receivers: %w", err)
+		}
+		for field, v := range map[string]*int64{"max_loss": own.MaxLoss, "max_duplicates": own.MaxDuplicates, "min_loss": own.MinLoss} {
+			if v != nil && *v < 0 {
+				return fmt.Errorf("expect.receivers.%s.%s must be 0 or more, got %d", id, field, *v)
+			}
+		}
+		maxLoss, _, minLoss := ex.ReceiverLimits(id)
+		if minLoss != nil && maxLoss != nil && *minLoss > *maxLoss {
+			return fmt.Errorf("expect.receivers.%s: min_loss %d is more than max_loss %d", id, *minLoss, *maxLoss)
+		}
+		if own.MaxLoss == nil && own.MaxDuplicates == nil && own.MinLoss == nil {
+			return fmt.Errorf("expect.receivers.%s sets no limit", id)
+		}
+	}
+	return nil
+}
+
+// validateExpectArrived checks an expect_arrived step: a window between two
+// earlier marks, the receiver it counts at, and at least one bound.
+func (tc *TestCase) validateExpectArrived(st ScenarioStep, marks map[string]bool) error {
+	if !tc.HasGenerator() {
+		return fmt.Errorf("counts the load's lines, and the case has no generator")
+	}
+	if st.SentAfter == "" || st.SentBefore == "" {
+		return fmt.Errorf("needs sent_after and sent_before, the marks the lines it counts were sent between")
+	}
+	for _, m := range []string{st.SentAfter, st.SentBefore} {
+		if !marks[m] {
+			return fmt.Errorf("names mark %q, which no earlier step sets", m)
+		}
+	}
+	if st.SentAfter == st.SentBefore {
+		return fmt.Errorf("sent_after and sent_before are both %q, so the window is empty", st.SentAfter)
+	}
+	if st.Min == nil && st.Max == nil && st.MinShare == nil && st.MaxShare == nil {
+		return fmt.Errorf("needs min, max, min_share or max_share")
+	}
+	if (st.MinShare != nil || st.MaxShare != nil) != (st.CompareTo != "") {
+		return fmt.Errorf("min_share and max_share are shares of what the compare_to receiver got, so they go together with compare_to")
+	}
+	for field, v := range map[string]*float64{"min_share": st.MinShare, "max_share": st.MaxShare} {
+		if v != nil && (math.IsNaN(*v) || *v < 0 || *v > 1) {
+			return fmt.Errorf("%s must be a share from 0 to 1, got %v", field, *v)
+		}
+	}
+	if st.MinShare != nil && st.MaxShare != nil && *st.MinShare > *st.MaxShare {
+		return fmt.Errorf("min_share %v is more than max_share %v", *st.MinShare, *st.MaxShare)
+	}
+	if st.CompareTo != "" {
+		if !tc.MultiReceiver() {
+			return fmt.Errorf("compare_to names another receiver, and the case has one")
+		}
+		if st.CompareTo == st.Receiver {
+			return fmt.Errorf("compare_to names the receiver the step counts at, %q", st.CompareTo)
+		}
+		if err := tc.validateScenarioReceiver(st.CompareTo); err != nil {
+			return fmt.Errorf("compare_to: %w", err)
+		}
+	}
+	if (st.Min != nil && *st.Min < 0) || (st.Max != nil && *st.Max < 0) {
+		return fmt.Errorf("min and max must be 0 or more")
+	}
+	if st.Min != nil && st.Max != nil && *st.Min > *st.Max {
+		return fmt.Errorf("min %d is more than max %d", *st.Min, *st.Max)
+	}
+	if st.Record == "" {
+		return fmt.Errorf("needs record, the name the count is reported under")
+	}
+	return tc.validateScenarioReceiver(st.Receiver)
 }
 
 // validateScenarioReceiver checks the receiver a receiver_pause or
@@ -792,7 +944,13 @@ var stepFieldOwners = []struct {
 	{"empty_disk", func(s ScenarioStep) bool { return s.EmptyDisk }, map[string]bool{"start": true}},
 	{"leave", func(s ScenarioStep) bool { return s.Leave != "" }, map[string]bool{"fill_disk": true}},
 	{"gap", func(s ScenarioStep) bool { return s.Gap != "" }, map[string]bool{"expect_delivery_continues": true, "expect_writes_continue": true}},
-	{"receiver", func(s ScenarioStep) bool { return s.Receiver != "" }, map[string]bool{"receiver_pause": true, "receiver_unpause": true}},
+	{"receiver", func(s ScenarioStep) bool { return s.Receiver != "" }, map[string]bool{"receiver_pause": true, "receiver_unpause": true, "expect_arrived": true}},
+	{"sent_after", func(s ScenarioStep) bool { return s.SentAfter != "" }, map[string]bool{"expect_arrived": true}},
+	{"min", func(s ScenarioStep) bool { return s.Min != nil }, map[string]bool{"expect_arrived": true}},
+	{"max", func(s ScenarioStep) bool { return s.Max != nil }, map[string]bool{"expect_arrived": true}},
+	{"compare_to", func(s ScenarioStep) bool { return s.CompareTo != "" }, map[string]bool{"expect_arrived": true}},
+	{"min_share", func(s ScenarioStep) bool { return s.MinShare != nil }, map[string]bool{"expect_arrived": true}},
+	{"max_share", func(s ScenarioStep) bool { return s.MaxShare != nil }, map[string]bool{"expect_arrived": true}},
 }
 
 func checkStepFieldOwners(st ScenarioStep) error {
