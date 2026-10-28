@@ -48,7 +48,7 @@ func (run *ssRun) countConfirmedAtRejoin(n int, at time.Time) {
 			continue
 		}
 		if p.AckedPerTarget == nil {
-			run.fail("stream %s: the sender's progress does not say what each replica confirmed, so min_after_rejoin cannot be judged; it needs the generator of PipeBench v0.4.16 or later", st.StreamName())
+			run.fail("stream %s: the sender's progress does not say what each replica confirmed, so min_after_rejoin cannot be judged; it needs the generator of PipeBench v0.4.17 or later", st.StreamName())
 			continue
 		}
 		atRejoin := run.confirmedAtRejoin[st.StreamName()]

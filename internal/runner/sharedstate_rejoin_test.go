@@ -10,7 +10,7 @@ import (
 )
 
 // TestParseProgressPerTarget: a progress line of the generator of PipeBench
-// v0.4.16 or later says what each target confirmed. An older line does not,
+// v0.4.17 or later says what each target confirmed. An older line does not,
 // which leaves AckedPerTarget nil, so the harness can tell "nothing
 // confirmed yet" from "not reported".
 func TestParseProgressPerTarget(t *testing.T) {

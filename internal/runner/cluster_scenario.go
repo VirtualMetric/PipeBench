@@ -243,7 +243,7 @@ type genProgress struct {
 	LastAck time.Time
 	// AckedPerTarget is how many records each target confirmed, by the
 	// target as the generator's target list names it. It is nil on the
-	// progress lines of a generator older than PipeBench v0.4.16, which did
+	// progress lines of a generator older than PipeBench v0.4.17, which did
 	// not report it.
 	AckedPerTarget map[string]int64
 }

@@ -378,7 +378,7 @@ type SharedStateStream struct {
 	// replaced near the end of the run has less time to reach it. Only a
 	// generator in http_ack mode whose target names a replica can set it,
 	// and only with an action that replaces replicas. It needs the
-	// generator of PipeBench v0.4.16 or later, which reports on each
+	// generator of PipeBench v0.4.17 or later, which reports on each
 	// progress line what each target confirmed. Default 0: not judged.
 	MinAfterRejoin int64 `yaml:"min_after_rejoin"`
 	// MaxLoss is how many of the generator's records may never arrive
