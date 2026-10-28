@@ -220,6 +220,11 @@ type ssRun struct {
 	// confirmed just before the action, by stream name. Only streams that
 	// set min_after_action are counted.
 	confirmedBefore map[string]int64
+	// confirmedAtRejoin is how many records each stream's sender had got
+	// confirmed through each replaced replica when that replica rejoined, by
+	// stream name and then replica. Only streams that set min_after_rejoin
+	// are counted.
+	confirmedAtRejoin map[string]map[int]int64
 }
 
 func newSSRun(r *Runner, tc *config.TestCase, subject config.Subject, orch *orchestrator.ComposeRunner) *ssRun {
@@ -233,7 +238,8 @@ func newSSRun(r *Runner, tc *config.TestCase, subject config.Subject, orch *orch
 		perReceiver: map[string]int64{},
 		evidence:    filepath.Join(r.opts.ResultsDir, hardwareID(), "shared-state", tc.Name),
 
-		confirmedBefore: map[string]int64{},
+		confirmedBefore:   map[string]int64{},
+		confirmedAtRejoin: map[string]map[int]int64{},
 	}
 	run.measures["evidence"] = run.evidence
 	if tc.SharedState.Action == config.SharedStateActionWrongCredentials {
@@ -929,7 +935,9 @@ func (run *ssRun) act() {
 			run.disruptAndReplace(owner, "stop", false)
 		}
 	case config.SharedStateActionRollingRestart:
-		run.rollingRestart()
+		run.rollingReplace("stop")
+	case config.SharedStateActionRollingKill:
+		run.rollingReplace("kill")
 	case config.SharedStateActionMoveAcrossCutLink:
 		run.moveAcrossCutLink()
 	}
@@ -938,20 +946,25 @@ func (run *ssRun) act() {
 // countConfirmedBefore reads, for each stream that sets min_after_action, how
 // many records its sender has got confirmed so far: the count on its last
 // progress line. checkAckedStream subtracts it from the final count. The
-// sender writes its first progress line a second after it starts, and the
-// baseline can be reached before that, so the read is tried for up to five
-// seconds. A sender whose progress still cannot be read fails the run,
-// because what it got confirmed after the action could not be told apart
-// from what came before.
+// sender writes its first progress line one interval after it starts, and
+// the baseline can be reached before that, so the read is tried for as long
+// as progressWait allows. A sender whose progress still cannot be read fails
+// the run, because what it got confirmed after the action could not be told
+// apart from what came before.
 func (run *ssRun) countConfirmedBefore() {
+	gens := map[string]config.GeneratorConfig{}
+	for _, g := range run.tc.AllGenerators() {
+		gens[g.ID] = g
+	}
 	for _, st := range run.ss.Streams {
 		if st.MinAfterAction <= 0 {
 			continue
 		}
 		container := "bench-generator-" + st.Generator
+		tries, wait := progressWait(gens[st.Generator], run.deadline)
 		p, ok := readProgressBaseline(run.r.ctx, func() (genProgress, bool) {
 			return readGeneratorProgressOf(container)
-		}, 20, 250*time.Millisecond)
+		}, tries, wait)
 		if !ok {
 			run.fail("stream %s: the sender's progress could not be read before the action, so the records confirmed after it cannot be counted", st.StreamName())
 			continue
@@ -1196,6 +1209,7 @@ func (run *ssRun) disruptAndReplace(n int, how string, replace bool) {
 	if readyAt, ok := run.waitReady(n, replacedAt, earliest(time.Now().Add(run.replicaWarmup()), run.deadline)); ok {
 		run.measures["rejoin_seconds"] = readyAt.Sub(replacedAt).Seconds()
 		fmt.Printf("    %s rejoined after %.1fs\n", rep.Service, readyAt.Sub(replacedAt).Seconds())
+		run.countConfirmedAtRejoin(n, readyAt)
 	} else {
 		run.fail("%s did not rejoin after it was replaced: %s", rep.Service, run.readiness(n, replacedAt))
 	}
@@ -1535,6 +1549,18 @@ func (run *ssRun) checkAckedStream(st config.SharedStateStream, genOut string, p
 			for _, why := range judgeAfterAction(st, after) {
 				run.fail("%s", why)
 			}
+		}
+	}
+	if st.MinAfterRejoin > 0 {
+		after := confirmedAfterRejoin(gen.Ack.AckedPerTarget, run.confirmedAtRejoin[st.StreamName()])
+		byReplica := map[string]int64{}
+		for _, n := range slices.Sorted(maps.Keys(after)) {
+			byReplica[run.replica(n).Service] = after[n]
+			fmt.Printf("    %d records were confirmed through %s after it rejoined\n", after[n], run.replica(n).Service)
+		}
+		counts["confirmed_after_rejoin"] = byReplica
+		for _, why := range judgeAfterRejoin(st, after) {
+			run.fail("%s", why)
 		}
 	}
 	return counts
