@@ -65,8 +65,14 @@ func (run *ssRun) pauseStore() {
 	health := map[string]map[string]int{}
 	end := earliest(paused.Add(outage), run.deadline)
 	base := newOutageBaseline(paused)
+	// What the senders got confirmed from the baseline's time to the end of
+	// the outage (max_confirmed_during_outage)
+	var confirmFrom outageConfirms
 	for time.Now().Before(end) {
 		base.take(run.streamCounts)
+		if confirmFrom == nil && time.Since(paused) >= outageBaselineDelay {
+			confirmFrom = run.readOutageConfirms()
+		}
 		for _, rep := range run.replicas {
 			if !run.running[rep.N] {
 				continue
@@ -82,6 +88,11 @@ func (run *ssRun) pauseStore() {
 		}
 	}
 	during := run.streamCounts()
+	if confirmFrom != nil {
+		run.judgeOutageConfirms(confirmFrom, run.readOutageConfirms())
+	} else if slices.ContainsFunc(run.ss.Streams, func(st config.SharedStateStream) bool { return st.MaxConfirmedDuringOutage != nil }) {
+		run.fail("the outage ended before the senders' confirmations were counted %s into it, so max_confirmed_during_outage cannot be judged", outageBaselineDelay)
+	}
 	held := run.holdOthers(leader, hold)
 	if err := run.takeStore(false); err != nil {
 		run.fail("%v", err)
@@ -93,6 +104,7 @@ func (run *ssRun) pauseStore() {
 		_ = sleepCtx(run.r.ctx, hold)
 		run.thaw(held)
 	}
+	run.countConfirmedAtResume(resumed)
 	run.measures["outage_to"] = resumed.UTC()
 	run.measures["outage_health"] = health
 	fmt.Printf("    /health while the store was away: %v\n", health)

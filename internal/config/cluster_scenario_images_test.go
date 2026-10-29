@@ -213,4 +213,9 @@ func TestValidateWaitCopies(t *testing.T) {
 	if err := tc.Validate(); err == nil || !strings.Contains(err.Error(), "wait_copies only applies to rolling_restart") {
 		t.Errorf("Validate = %v, want an error that wait_copies only applies to rolling_restart", err)
 	}
+	// A step of its own waits for the copies once
+	tc.Cluster.Scenario.Steps = []ScenarioStep{{Do: "wait_ready"}, {Do: "start_load"}, {Do: "rolling_restart", Image: "subject"}, {Do: "wait_copies", Within: "60s", Record: "copies"}}
+	if err := tc.Validate(); err != nil {
+		t.Errorf("Validate with a wait_copies step: %v", err)
+	}
 }

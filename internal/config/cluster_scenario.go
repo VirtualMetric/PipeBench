@@ -400,7 +400,9 @@ type ScenarioStep struct {
 	// members (five at most), and no copy offline or behind. Only then does
 	// it stop the next node. A node that starts
 	// can make streams lose copies for a moment, and stopping the next node
-	// before they are back can leave a stream without a leader.
+	// before they are back can leave a stream without a leader. A step that
+	// does wait_copies waits the same way once, for up to within (default
+	// 120s), and fails when the copies are not all there by then.
 	WaitCopies bool `yaml:"wait_copies"`
 	// Leave is how much free space a fill_disk step leaves on the node's disk
 	// (default 1m).
@@ -477,6 +479,7 @@ var scenarioActions = map[string]bool{
 	"wait_log":                  false,
 	"expect_no_log":             true,
 	"wait_stable":               false,
+	"wait_copies":               false,
 	"count_pending":             false,
 	"expect_arrived":            false,
 	// The link steps check their node themselves: it may be "all".

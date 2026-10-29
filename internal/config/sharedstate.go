@@ -381,6 +381,23 @@ type SharedStateStream struct {
 	// generator of PipeBench v0.4.17 or later, which reports on each
 	// progress line what each target confirmed. Default 0: not judged.
 	MinAfterRejoin int64 `yaml:"min_after_rejoin"`
+	// MinEachAfterOutage is how many records the sender must get confirmed
+	// through each replica it posts to after the store came back, in a
+	// pause_store case. It shows that every replica takes records again.
+	// min_after_action cannot show that, because a sender whose post fails
+	// moves on to the next replica. The count starts from the sender's first
+	// progress line after the store came back, and ends with its final
+	// count. Only a generator in http_ack mode whose target names a replica
+	// can set it. Default 0: not judged.
+	MinEachAfterOutage int64 `yaml:"min_each_after_outage"`
+	// MaxConfirmedDuringOutage is how many records the sender may get
+	// confirmed while the store is away, in a pause_store case: from 15
+	// seconds into the outage to its end. A director that confirms a record
+	// only once the store holds it confirms none then. The first 15 seconds
+	// are left out, as for outage_streams: a post sent before the outage can
+	// still be confirmed in them. Only a generator in http_ack mode reports
+	// what it got confirmed. Unset: not judged.
+	MaxConfirmedDuringOutage *int64 `yaml:"max_confirmed_during_outage"`
 	// MaxLoss is how many of the generator's records may never arrive
 	// (default 0).
 	MaxLoss int64 `yaml:"max_loss"`
@@ -703,8 +720,27 @@ func (tc *TestCase) validateSharedState() error {
 			return fmt.Errorf("case %q: shared_state.streams has two streams named %q", tc.Name, st.StreamName())
 		}
 		names[st.StreamName()] = true
-		if st.MaxLoss < 0 || st.MaxDuplicatePct < 0 || st.MinBaseline < 0 || st.MinAfterAction < 0 || st.MinAfterRejoin < 0 || (st.MaxDuplicates != nil && *st.MaxDuplicates < 0) {
-			return fmt.Errorf("case %q: shared_state.streams[%d]: max_loss, max_duplicates, max_duplicate_pct, min_baseline, min_after_action and min_after_rejoin must not be negative", tc.Name, i)
+		if st.MaxLoss < 0 || st.MaxDuplicatePct < 0 || st.MinBaseline < 0 || st.MinAfterAction < 0 || st.MinAfterRejoin < 0 || st.MinEachAfterOutage < 0 ||
+			(st.MaxDuplicates != nil && *st.MaxDuplicates < 0) || (st.MaxConfirmedDuringOutage != nil && *st.MaxConfirmedDuringOutage < 0) {
+			return fmt.Errorf("case %q: shared_state.streams[%d]: max_loss, max_duplicates, max_duplicate_pct, min_baseline, min_after_action, min_after_rejoin, min_each_after_outage and max_confirmed_during_outage must not be negative", tc.Name, i)
+		}
+		if st.MinEachAfterOutage > 0 || st.MaxConfirmedDuringOutage != nil {
+			field := "min_each_after_outage"
+			if st.MinEachAfterOutage <= 0 {
+				field = "max_confirmed_during_outage"
+			}
+			if g.Mode != "http_ack" {
+				return fmt.Errorf("case %q: shared_state stream %q sets %s, but its generator %q runs in mode %q: only a generator in http_ack mode reports what it got confirmed", tc.Name, st.StreamName(), field, g.ID, g.Mode)
+			}
+			if s.Action != SharedStateActionPauseStore {
+				return fmt.Errorf("case %q: shared_state stream %q sets %s, which only the pause_store action judges", tc.Name, st.StreamName(), field)
+			}
+		}
+		if st.MinEachAfterOutage > 0 && !slices.ContainsFunc(TargetReplicas(g.Target), func(n int) bool { return n >= 1 && n <= s.Replicas }) {
+			return fmt.Errorf("case %q: shared_state stream %q sets min_each_after_outage, but its generator %q posts to no replica: give it a target such as http://subject-2:9000/", tc.Name, st.StreamName(), g.ID)
+		}
+		if st.MaxConfirmedDuringOutage != nil && s.OutageOrDefault() < MinOutageForStreamsSeconds {
+			return fmt.Errorf("case %q: shared_state stream %q sets max_confirmed_during_outage, which needs outage_seconds of %d or more: the confirmations are counted from 15 seconds into the outage", tc.Name, st.StreamName(), MinOutageForStreamsSeconds)
 		}
 		if st.MinAfterRejoin > 0 {
 			if g.Mode != "http_ack" {

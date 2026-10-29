@@ -717,6 +717,21 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		leader, _ := agreedLeader(round)
 		return true, fmt.Sprintf("healthy after %s, leader node %d", fmtMs(ms), leader), nil
 
+	case "wait_copies":
+		// Every stream has all its copies, as its leader reports them
+		within := st.DurationOr("within", 120*time.Second)
+		waited := time.Now()
+		round, ok, err := sr.waitRound(within, func(r healthRound) bool { return sr.healthy(r) && copiesComplete(r) })
+		if err != nil {
+			return false, "", err
+		}
+		if !ok {
+			return false, fmt.Sprintf("the streams did not have all their copies within %s: %s", within, describeCopies(round)), nil
+		}
+		ms := time.Since(waited).Milliseconds()
+		sr.record(st.Record, float64(ms))
+		return true, fmt.Sprintf("every stream has all its copies, after %s", fmtMs(ms)), nil
+
 	case "start_load":
 		if err := sr.startLoad(); err != nil {
 			return false, "", err
