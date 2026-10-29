@@ -1747,7 +1747,22 @@ func (sr *scenarioRun) rollingRestart(i int, st config.ScenarioStep) (bool, stri
 		if !ok {
 			return false, fmt.Sprintf("the cluster was not healthy within %s after restarting node %d: %s", within, n, describeRound(round)), nil
 		}
-		lines = append(lines, fmt.Sprintf("node %d %s", n, fmtMs(ms)))
+		line := fmt.Sprintf("node %d %s", n, fmtMs(ms))
+		if st.WaitCopies {
+			// Every stream has all its copies back before the next node stops
+			waited := time.Now()
+			round, ok, err := sr.waitRound(within, func(r healthRound) bool { return sr.healthy(r) && copiesComplete(r) })
+			if err != nil {
+				return false, "", err
+			}
+			copiesMs := time.Since(waited).Milliseconds()
+			sr.record(fmt.Sprintf("%s_node%d_copies", defaultStr(st.Record, "rolling_restart"), n), float64(copiesMs))
+			if !ok {
+				return false, fmt.Sprintf("the streams did not have all their copies back within %s after node %d restarted: %s", within, n, describeCopies(round)), nil
+			}
+			line += fmt.Sprintf(" (copies back %s later)", fmtMs(copiesMs))
+		}
+		lines = append(lines, line)
 	}
 	if st.Image != "" {
 		return true, fmt.Sprintf("moved to %s and healthy again: %s", sr.imageRef(st.Image), strings.Join(lines, ", ")), nil

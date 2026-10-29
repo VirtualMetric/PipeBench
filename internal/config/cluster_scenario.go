@@ -394,6 +394,14 @@ type ScenarioStep struct {
 	// moment before its stop: the case tests what the restart keeps, not
 	// what a version does with the records of its last moment.
 	PauseLoadAtStop bool `yaml:"pause_load_at_stop"`
+	// WaitCopies makes a rolling_restart step wait, after each node is
+	// healthy again, until every stream has all its copies back: on every
+	// node that reports its streams, each stream has a leader, as many
+	// copies as the cluster has members (five at most), and no copy offline
+	// or behind. Only then does it stop the next node. A node that starts
+	// can make streams lose copies for a moment, and stopping the next node
+	// before they are back can leave a stream without a leader.
+	WaitCopies bool `yaml:"wait_copies"`
 	// Leave is how much free space a fill_disk step leaves on the node's disk
 	// (default 1m).
 	Leave string `yaml:"leave"`
@@ -1170,6 +1178,7 @@ var stepFieldOwners = []struct {
 	{"image", func(s ScenarioStep) bool { return s.Image != "" }, map[string]bool{"start": true, "rolling_restart": true}},
 	{"stage", func(s ScenarioStep) bool { return s.Stage != 0 }, map[string]bool{"set_stage": true}},
 	{"pause_load_at_stop", func(s ScenarioStep) bool { return s.PauseLoadAtStop }, map[string]bool{"rolling_restart": true}},
+	{"wait_copies", func(s ScenarioStep) bool { return s.WaitCopies }, map[string]bool{"rolling_restart": true}},
 	{"leave", func(s ScenarioStep) bool { return s.Leave != "" }, map[string]bool{"fill_disk": true}},
 	{"disk_bps", func(s ScenarioStep) bool { return s.DiskBPS != "" }, map[string]bool{"slow_disk": true}},
 	{"disk_iops", func(s ScenarioStep) bool { return s.DiskIOPS != 0 }, map[string]bool{"slow_disk": true}},

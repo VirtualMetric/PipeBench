@@ -199,3 +199,18 @@ func TestValidateStreamLeaderlessLimit(t *testing.T) {
 		t.Fatalf("Validate on one director = %v, want the limit refused", err)
 	}
 }
+
+// TestValidateWaitCopies checks rolling_restart's wait_copies: a rolling
+// restart takes it, and no other step does.
+func TestValidateWaitCopies(t *testing.T) {
+	tc := upgradeScenarioCase()
+	tc.Cluster.Nodes = 3
+	tc.Cluster.Scenario.Steps = []ScenarioStep{{Do: "wait_ready"}, {Do: "start_load"}, {Do: "rolling_restart", Image: "subject", WaitCopies: true}}
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	tc.Cluster.Scenario.Steps[2] = ScenarioStep{Do: "start", Node: "1", Image: "subject", WaitCopies: true}
+	if err := tc.Validate(); err == nil || !strings.Contains(err.Error(), "wait_copies only applies to rolling_restart") {
+		t.Errorf("Validate = %v, want an error that wait_copies only applies to rolling_restart", err)
+	}
+}

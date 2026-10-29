@@ -40,10 +40,11 @@ type healthDoc struct {
 		Streams                int `json:"streams"`
 		StreamsUnderReplicated int `json:"streams_under_replicated"`
 		StreamDetail           []struct {
-			Name            string `json:"name"`
-			Leader          string `json:"leader"`
-			DesiredReplicas int    `json:"desired_replicas"`
-			ActualReplicas  int    `json:"actual_replicas"`
+			Name            string   `json:"name"`
+			Leader          string   `json:"leader"`
+			DesiredReplicas int      `json:"desired_replicas"`
+			ActualReplicas  int      `json:"actual_replicas"`
+			OfflinePeers    []string `json:"offline_peers"`
 		} `json:"stream_detail"`
 	} `json:"jetstream"`
 }
@@ -65,6 +66,32 @@ type nodeHealth struct {
 	UnderRepl     int               `json:"under_replicated,omitempty"`
 	Reconfiguring bool              `json:"reconfiguring,omitempty"`
 	StreamLeaders map[string]string `json:"-"`
+	// Streams is how many streams the node reports, and CopiesShort how many
+	// of them lack a leader, a copy on every member (five at most), or a
+	// copy that is current (rolling_restart wait_copies).
+	Streams     int `json:"-"`
+	CopiesShort int `json:"-"`
+}
+
+// maxStreamCopies is the most copies of a stream the director's bus keeps.
+const maxStreamCopies = 5
+
+// copiesComplete reports whether every stream has all its copies back in the
+// round: each reachable node in a cluster that reports streams reports none
+// short of a leader, of a copy on every member (five at most), or of a copy
+// that is current, and at least one node reports streams.
+func copiesComplete(r healthRound) bool {
+	reported := false
+	for _, h := range r.Nodes {
+		if !h.Reachable || !h.Clustered || h.Streams == 0 {
+			continue
+		}
+		if h.CopiesShort > 0 {
+			return false
+		}
+		reported = true
+	}
+	return reported
 }
 
 // selfLeader reports whether the node names itself the leader.
@@ -516,6 +543,12 @@ func readNodeHealth(ctx context.Context, n int, container string) nodeHealth {
 	if err != nil {
 		return h
 	}
+	return parseNodeHealth(n, raw)
+}
+
+// parseNodeHealth reads node n's /health answer.
+func parseNodeHealth(n int, raw []byte) nodeHealth {
+	h := nodeHealth{Node: n}
 	var doc healthDoc
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return h
@@ -539,8 +572,16 @@ func readNodeHealth(ctx context.Context, n int, container string) nodeHealth {
 	if doc.JetStream != nil {
 		h.UnderRepl = doc.JetStream.StreamsUnderReplicated
 		h.StreamLeaders = map[string]string{}
+		expected := 1
+		if doc.Cluster != nil {
+			expected = max(1, min(doc.Cluster.Size, maxStreamCopies))
+		}
 		for _, s := range doc.JetStream.StreamDetail {
 			h.StreamLeaders[s.Name] = s.Leader
+			h.Streams++
+			if s.Leader == "" || s.DesiredReplicas < expected || s.ActualReplicas < s.DesiredReplicas || len(s.OfflinePeers) > 0 {
+				h.CopiesShort++
+			}
 		}
 	}
 	return h
@@ -563,6 +604,23 @@ func describeRound(r healthRound) string {
 				ml = "-"
 			}
 			parts = append(parts, fmt.Sprintf("n%d:%s/leader=%s/q=%s/ur=%d", h.Node, h.Phase, ml, h.Quorum, h.UnderRepl))
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+// describeCopies renders, for each reachable node in a cluster, how many of
+// the streams it reports lack a copy (rolling_restart wait_copies).
+func describeCopies(r healthRound) string {
+	parts := make([]string, 0, len(r.Nodes))
+	for _, h := range r.Nodes {
+		switch {
+		case !h.Reachable:
+			parts = append(parts, fmt.Sprintf("n%d:no-answer", h.Node))
+		case !h.Clustered:
+			parts = append(parts, fmt.Sprintf("n%d:standalone", h.Node))
+		default:
+			parts = append(parts, fmt.Sprintf("n%d:%d of %d streams short of copies", h.Node, h.CopiesShort, h.Streams))
 		}
 	}
 	return strings.Join(parts, " ")
