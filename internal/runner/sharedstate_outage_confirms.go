@@ -96,9 +96,12 @@ func (run *ssRun) countConfirmedAtResume(at time.Time) {
 		g := gens[st.Generator]
 		container := "bench-generator-" + st.Generator
 		tries, wait := progressWait(g, run.deadline)
+		// The progress lines carry the time of the Docker daemon's clock, and
+		// at is the harness's
+		from := at.Add(run.daemonSkew())
 		p, ok := readProgressBaseline(run.r.ctx, func() (genProgress, bool) {
 			p, ok := readGeneratorProgressOf(container)
-			return p, ok && !p.At.Before(at)
+			return p, ok && !p.At.Before(from)
 		}, tries, wait)
 		if !ok {
 			run.fail("stream %s: the sender wrote no progress line after the store came back, so the records each replica confirmed after the outage cannot be counted", st.StreamName())
