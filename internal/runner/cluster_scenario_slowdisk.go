@@ -161,10 +161,18 @@ func (sr *scenarioRun) slowDiskAction(i int, st config.ScenarioStep, rep *scenar
 		sr.disrupt(i, "slow_disk", n)
 	}
 	// A node that does not run has no limit: it went with its process. Its
-	// next start puts back no limit either.
-	if limit.none() && !containerRunning(sr.containers[n-1]) {
-		delete(sr.slowed, n)
-		return true, fmt.Sprintf("node %d does not run, so its disk has no limit, and none goes back at its next start", n), nil
+	// next start puts back no limit either. When Docker cannot say whether
+	// the node runs, the step fails and the limit stays tracked, so that the
+	// end of the steps tries to lift it again.
+	if limit.none() {
+		running, err := containerRunningState(sr.containers[n-1])
+		if err != nil {
+			return false, fmt.Sprintf("could not tell whether node %d runs, so its disk may still be limited: %v", n, err), nil
+		}
+		if !running {
+			delete(sr.slowed, n)
+			return true, fmt.Sprintf("node %d does not run, so its disk has no limit, and none goes back at its next start", n), nil
+		}
 	}
 	line, err := setDiskLimit(sr.ctx, sr.r.opts.NettoolImage, sr.containers[n-1], sr.sc.NodeVolume, limit)
 	if err != nil {
@@ -193,15 +201,21 @@ func (sr *scenarioRun) reslow(n int) {
 }
 
 // restoreDisks lifts every disk limit the steps left in force. A node that
-// does not run has no limit left: it went with its process.
+// does not run has no limit left: it went with its process. A node whose
+// state Docker cannot tell fails the run, and its limit stays tracked.
 func (sr *scenarioRun) restoreDisks(ctx context.Context) {
 	for n := 1; n <= len(sr.containers); n++ {
 		limit, ok := sr.slowed[n]
 		if !ok {
 			continue
 		}
+		running, err := containerRunningState(sr.containers[n-1])
+		if err != nil {
+			sr.failures = append(sr.failures, fmt.Sprintf("could not tell whether node %d runs at the end of the steps, so its disk may still be limited to %s: %v", n, limit, err))
+			continue
+		}
 		delete(sr.slowed, n)
-		if !containerRunning(sr.containers[n-1]) {
+		if !running {
 			continue
 		}
 		if _, err := setDiskLimit(ctx, sr.r.opts.NettoolImage, sr.containers[n-1], sr.sc.NodeVolume, diskLimit{}); err != nil {

@@ -1509,14 +1509,21 @@ func (sr *scenarioRun) healthy(r healthRound) bool {
 }
 
 // waitRound waits for a round that satisfies ok, reading the prober's
-// newest round twice a second.
+// newest round twice a second. Only a round that began after the last
+// disruption counts.
 func (sr *scenarioRun) waitRound(within time.Duration, ok func(healthRound) bool) (healthRound, bool, error) {
+	return sr.waitRoundAfter(sr.lastDisruption, within, ok)
+}
+
+// waitRoundAfter waits for a round that began after since and satisfies ok,
+// reading the prober's newest round twice a second.
+func (sr *scenarioRun) waitRoundAfter(since time.Time, within time.Duration, ok func(healthRound) bool) (healthRound, bool, error) {
 	deadline := time.Now().Add(within)
 	var last healthRound
 	for {
 		if r, have := sr.probe.latest(); have {
 			last = r
-			if r.At.After(sr.lastDisruption) && ok(r) {
+			if r.At.After(since) && ok(r) {
 				return r, true, nil
 			}
 		}
@@ -1753,7 +1760,12 @@ func (sr *scenarioRun) rollingRestart(i int, st config.ScenarioStep) (bool, stri
 			return false, failure, nil
 		}
 		sr.relink(n)
-		round, ok, err := sr.waitRound(within, func(r healthRound) bool { return sr.healthy(r) })
+		// Only a round that began once the node was back counts. The
+		// disruption is noted before the node stops, and a round read while
+		// it was stopping could still show every node healthy, with every
+		// copy.
+		back := time.Now()
+		round, ok, err := sr.waitRoundAfter(back, within, func(r healthRound) bool { return sr.healthy(r) })
 		if err != nil {
 			return false, "", err
 		}
@@ -1766,7 +1778,7 @@ func (sr *scenarioRun) rollingRestart(i int, st config.ScenarioStep) (bool, stri
 		if st.WaitCopies {
 			// Every stream has all its copies back before the next node stops
 			waited := time.Now()
-			round, ok, err := sr.waitRound(within, func(r healthRound) bool { return sr.healthy(r) && copiesComplete(r) })
+			round, ok, err := sr.waitRoundAfter(back, within, func(r healthRound) bool { return sr.healthy(r) && copiesComplete(r) })
 			if err != nil {
 				return false, "", err
 			}

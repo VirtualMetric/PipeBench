@@ -684,3 +684,22 @@ func TestLineCountsStayApartFromTimes(t *testing.T) {
 		t.Fatalf("report measures_ms = %v, counts = %v; want the count under counts only", doc.Measures, doc.Counts)
 	}
 }
+
+// A rolling restart notes the disruption before it stops a node. A round read
+// while the node was stopping can still show every node healthy, so the waits
+// after the restart count only a round that began once the node was back.
+func TestWaitRoundAfterCountsOnlyALaterRound(t *testing.T) {
+	read := time.Now()
+	sr := &scenarioRun{
+		ctx:   context.Background(),
+		probe: &clusterProbe{rounds: []healthRound{{At: read}}},
+	}
+	always := func(healthRound) bool { return true }
+
+	if _, ok, err := sr.waitRoundAfter(read, 700*time.Millisecond, always); err != nil || ok {
+		t.Fatalf("waitRoundAfter took a round that began at the time it waits from (ok %v, err %v)", ok, err)
+	}
+	if _, ok, err := sr.waitRoundAfter(read.Add(-time.Second), 700*time.Millisecond, always); err != nil || !ok {
+		t.Fatalf("waitRoundAfter refused a round that began after the time it waits from (ok %v, err %v)", ok, err)
+	}
+}

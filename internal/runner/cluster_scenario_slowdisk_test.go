@@ -1,6 +1,8 @@
 package runner
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -78,5 +80,38 @@ func TestRestoreDiskOnAStoppedNode(t *testing.T) {
 	}
 	if _, kept := sr.slowed[1]; kept {
 		t.Fatalf("the limit is still tracked, so the node's next start would put it back")
+	}
+}
+
+// When Docker cannot say whether a node runs, its disk may still be limited.
+// restore_disk then fails, and the end of the steps fails the run, and both
+// keep the limit tracked instead of taking the node for a stopped one.
+func TestRestoreDiskKeepsTheLimitWhenDockerCannotTell(t *testing.T) {
+	orig := containerRunningState
+	t.Cleanup(func() { containerRunningState = orig })
+	containerRunningState = func(string) (bool, error) { return false, errors.New("the daemon did not answer") }
+
+	sr := &scenarioRun{
+		ctx:        context.Background(),
+		containers: []string{"bench-subject-vmetric-1"},
+		names:      map[string]int{},
+		slowed:     map[int]diskLimit{1: {BPS: 1 << 20}},
+		sc:         &config.ScenarioConfig{NodeVolume: "/opt/vmetric/storage"},
+	}
+	var rep scenarioStepReport
+	ok, detail, err := sr.slowDiskAction(3, config.ScenarioStep{Do: "restore_disk", Node: "1"}, &rep)
+	if err != nil || ok {
+		t.Fatalf("restore_disk = %v, %q, %v; want a failure", ok, detail, err)
+	}
+	if _, kept := sr.slowed[1]; !kept {
+		t.Fatalf("restore_disk forgot the limit of a node whose state Docker could not tell")
+	}
+
+	sr.restoreDisks(context.Background())
+	if len(sr.failures) != 1 || !strings.Contains(sr.failures[0], "could not tell whether node 1 runs") {
+		t.Fatalf("the end of the steps reported %q, want one failure for node 1", sr.failures)
+	}
+	if _, kept := sr.slowed[1]; !kept {
+		t.Fatalf("the end of the steps forgot the limit of a node whose state Docker could not tell")
 	}
 }
