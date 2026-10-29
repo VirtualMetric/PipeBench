@@ -770,6 +770,9 @@ func (tc *TestCase) validateClusterScenario() error {
 	if err := tc.validateReceiverExpect(sc.Expect); err != nil {
 		return fmt.Errorf("case %q: %w", tc.Name, err)
 	}
+	if sc.Expect.MaxStreamLeaderlessMs != nil && *sc.Expect.MaxStreamLeaderlessMs < 0 {
+		return fmt.Errorf("case %q: expect.max_stream_leaderless_ms must not be negative, got %d", tc.Name, *sc.Expect.MaxStreamLeaderlessMs)
+	}
 	if sc.Expect.MaxStreamLeaderlessMs != nil && tc.Cluster.Nodes+sc.SpareNodes < 2 {
 		return fmt.Errorf("case %q: expect.max_stream_leaderless_ms measures the leaders of a cluster's streams, and one director leads its streams itself", tc.Name)
 	}

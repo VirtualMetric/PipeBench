@@ -75,7 +75,7 @@ func TestAnalyzeLeadershipStreamLeaderless(t *testing.T) {
 		{At: at(6), Nodes: []nodeHealth{node(1, senderless), down, node(3, led)}},
 		{At: at(7), Nodes: []nodeHealth{node(1, led), down, node(3, led)}},
 	}
-	st := analyzeLeadership(rounds)
+	st := analyzeLeadership(rounds, time.Time{})
 	if st.StreamLeaderlessMs != 4000 || st.StreamLeaderless == nil || st.StreamLeaderless.Stream != "vm-pipeline-sender" {
 		t.Fatalf("stream leaderless = %d ms, %+v; want 4000 ms of vm-pipeline-sender", st.StreamLeaderlessMs, st.StreamLeaderless)
 	}
@@ -97,11 +97,42 @@ func TestAnalyzeLeadershipStreamLeaderless(t *testing.T) {
 	// measured, and a limit then fails rather than pass on nothing.
 	solo := nodeHealth{Node: 1, State: "running", Reachable: true, Name: "1", Phase: "running", VMMQ: "ok",
 		StreamLeaders: map[string]string{"vm-pipeline-sender": ""}}
-	st = analyzeLeadership([]healthRound{{At: at(0), Nodes: []nodeHealth{solo}}, {At: at(1), Nodes: []nodeHealth{solo}}})
+	st = analyzeLeadership([]healthRound{{At: at(0), Nodes: []nodeHealth{solo}}, {At: at(1), Nodes: []nodeHealth{solo}}}, time.Time{})
 	if st.StreamLeaderlessMs != 0 || st.StreamsReported != 0 {
 		t.Fatalf("a standalone director was measured: %d ms over %d streams", st.StreamLeaderlessMs, st.StreamsReported)
 	}
 	if reason := judgeStreamLeaderless(st, &limit); !strings.Contains(reason, "no clustered node reported a stream") {
 		t.Fatalf("a limit over nothing measured: %q", reason)
+	}
+}
+
+// A stream still without a leader in the last round has no round after it:
+// its stretch lasts until the rounds were read, so one round of it counts.
+func TestAnalyzeLeadershipLeaderlessAtTheEnd(t *testing.T) {
+	t0 := time.Unix(4000, 0)
+	x := h(1, "1", "1")
+	x.StreamLeaders = map[string]string{"vm-pipeline-router": ""}
+	y := h(2, "2", "1")
+	y.StreamLeaders = map[string]string{"vm-pipeline-router": ""}
+	rounds := []healthRound{{At: t0, Nodes: []nodeHealth{x, y}}}
+	st := analyzeLeadership(rounds, t0.Add(1500*time.Millisecond))
+	if st.StreamLeaderlessMs != 1500 {
+		t.Fatalf("a stream leaderless in the one round read lasted %d ms, want 1500 (until the rounds were read)", st.StreamLeaderlessMs)
+	}
+	limit := int64(0)
+	if reason := judgeStreamLeaderless(st, &limit); !strings.Contains(reason, "had no leader for 1.5 s") {
+		t.Fatalf("a limit of 0 must fail on it: %q", reason)
+	}
+	// A zero end, or one before the last round, ends it at the last round.
+	if st := analyzeLeadership(rounds, time.Time{}); st.StreamLeaderlessMs != 0 {
+		t.Fatalf("with no end the stretch lasted %d ms, want 0", st.StreamLeaderlessMs)
+	}
+	// A negative limit that validation would refuse fails instead of
+	// panicking on a stretch that was never measured.
+	none := analyzeLeadership([]healthRound{{At: t0, Nodes: []nodeHealth{h(1, "1", "1")}}}, t0)
+	none.StreamsReported = 1
+	negative := int64(-1)
+	if reason := judgeStreamLeaderless(none, &negative); !strings.Contains(reason, "must not be negative") {
+		t.Fatalf("a negative limit: %q", reason)
 	}
 }

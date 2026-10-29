@@ -1951,6 +1951,10 @@ func judgeStreamLeaderless(l leadershipStats, limit *int64) string {
 		return ""
 	}
 	iv := l.StreamLeaderless
+	if iv == nil {
+		// Validation refuses a negative limit, the only way to get here.
+		return fmt.Sprintf("max_stream_leaderless_ms must not be negative, got %d", *limit)
+	}
 	return fmt.Sprintf("stream %s had no leader for %s from %s (max_stream_leaderless_ms %d)",
 		iv.Stream, fmtMs(l.StreamLeaderlessMs), iv.From.UTC().Format("15:04:05.000"), *limit)
 }
@@ -2182,7 +2186,7 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 	rep.Steps = sr.steps
 
 	rounds := sr.probe.all()
-	rep.Leadership = analyzeLeadership(rounds)
+	rep.Leadership = analyzeLeadership(rounds, time.Now())
 	rep.HealthTrail = healthTrail(rounds)
 	fmt.Printf("  leadership: %d rounds read, %d leader changes, most self-named leaders at once %d, two-leader time %s, stream two-leader time %s, longest time a stream had no leader %s\n",
 		rep.Leadership.Rounds, rep.Leadership.LeaderChanges, rep.Leadership.MaxSelfClaimed,
@@ -2382,7 +2386,7 @@ func (sr *scenarioRun) finishWithoutLoad(rep scenarioReport) (scenarioReport, sc
 	rep.Events = sr.events
 	rep.Steps = sr.steps
 	rounds := sr.probe.all()
-	rep.Leadership = analyzeLeadership(rounds)
+	rep.Leadership = analyzeLeadership(rounds, time.Now())
 	rep.HealthTrail = healthTrail(rounds)
 	fmt.Printf("  leadership: %d rounds read, %d leader changes, most self-named leaders at once %d, two-leader time %s\n",
 		rep.Leadership.Rounds, rep.Leadership.LeaderChanges, rep.Leadership.MaxSelfClaimed, fmtMs(rep.Leadership.SplitBrainMs))

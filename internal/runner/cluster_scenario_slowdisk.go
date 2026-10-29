@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -60,12 +61,22 @@ func (l diskLimit) String() string {
 	return strings.Join(parts, " and ")
 }
 
+// deviceNumber is the form of a device number in /proc/self/mountinfo:
+// major:minor, in decimal.
+var deviceNumber = regexp.MustCompile(`^[0-9]+:[0-9]+$`)
+
 // parseMountDevice returns the device number (major:minor) of the file system
-// mounted at dir, from /proc/self/mountinfo.
+// mounted at dir, from /proc/self/mountinfo. The text comes from a cat in the
+// container of the image under test, and the number goes into a script that
+// runs privileged on the host, so anything that is not a device number is an
+// error.
 func parseMountDevice(mountinfo, dir string) (string, error) {
 	for _, line := range strings.Split(mountinfo, "\n") {
 		f := strings.Fields(line)
 		if len(f) >= 5 && f[4] == dir {
+			if !deviceNumber.MatchString(f[2]) {
+				return "", fmt.Errorf("the mount at %s has %q for a device number, not major:minor", dir, f[2])
+			}
 			return f[2], nil
 		}
 	}
@@ -148,6 +159,12 @@ func (sr *scenarioRun) slowDiskAction(i int, st config.ScenarioStep, rep *scenar
 		}
 		limit.IOPS = st.DiskIOPS
 		sr.disrupt(i, "slow_disk", n)
+	}
+	// A node that does not run has no limit: it went with its process. Its
+	// next start puts back no limit either.
+	if limit.none() && !containerRunning(sr.containers[n-1]) {
+		delete(sr.slowed, n)
+		return true, fmt.Sprintf("node %d does not run, so its disk has no limit, and none goes back at its next start", n), nil
 	}
 	line, err := setDiskLimit(sr.ctx, sr.r.opts.NettoolImage, sr.containers[n-1], sr.sc.NodeVolume, limit)
 	if err != nil {

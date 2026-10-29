@@ -3,6 +3,8 @@ package runner
 import (
 	"strings"
 	"testing"
+
+	"github.com/VirtualMetric/PipeBench/internal/config"
 )
 
 func TestParseMountDevice(t *testing.T) {
@@ -42,5 +44,39 @@ func TestDiskLimitIOMax(t *testing.T) {
 		if !strings.Contains(script, want) {
 			t.Errorf("the script lacks %q:\n%s", want, script)
 		}
+	}
+}
+
+// A device number goes into a script that runs privileged on the host, so a
+// mountinfo line that carries anything else is refused.
+func TestParseMountDeviceRefusesWhatIsNotADeviceNumber(t *testing.T) {
+	for _, dev := range []string{"$(id)", "8:48;reboot", "8", "8:48:1", "a:b"} {
+		line := "1316 1290 " + dev + " /x /opt/vmetric/storage rw - ext4 /dev/sdd rw"
+		if got, err := parseMountDevice(line, "/opt/vmetric/storage"); err == nil {
+			t.Errorf("device number %q was taken as %q", dev, got)
+		}
+	}
+}
+
+// restore_disk on a node that does not run succeeds: the node's limit went
+// with its process, and its next start must not put the limit back.
+func TestRestoreDiskOnAStoppedNode(t *testing.T) {
+	orig := containerRunningState
+	t.Cleanup(func() { containerRunningState = orig })
+	containerRunningState = func(string) (bool, error) { return false, nil }
+
+	sr := &scenarioRun{
+		containers: []string{"bench-subject-vmetric-1"},
+		names:      map[string]int{},
+		slowed:     map[int]diskLimit{1: {BPS: 1 << 20}},
+		sc:         &config.ScenarioConfig{NodeVolume: "/opt/vmetric/storage"},
+	}
+	var rep scenarioStepReport
+	ok, detail, err := sr.slowDiskAction(3, config.ScenarioStep{Do: "restore_disk", Node: "1"}, &rep)
+	if err != nil || !ok {
+		t.Fatalf("restore_disk on a stopped node = %v, %q, %v; want success", ok, detail, err)
+	}
+	if _, kept := sr.slowed[1]; kept {
+		t.Fatalf("the limit is still tracked, so the node's next start would put it back")
 	}
 }

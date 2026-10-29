@@ -237,8 +237,11 @@ type leadershipStats struct {
 // analyzeLeadership measures, over consecutive rounds, how long two or more
 // nodes named themselves the cluster's leader (and each stream's). A
 // stretch lasts from its first round to the round after its last, which is
-// the most the overlap can have lasted given one read per round.
-func analyzeLeadership(rounds []healthRound) leadershipStats {
+// the most the overlap can have lasted given one read per round. A stream
+// still without a leader in the last round has no round after it: its
+// stretch lasts until end, the time the rounds were read, or until the last
+// round when end is zero or earlier.
+func analyzeLeadership(rounds []healthRound, end time.Time) leadershipStats {
 	var st leadershipStats
 	st.Rounds = len(rounds)
 	var open *splitInterval
@@ -327,8 +330,14 @@ func analyzeLeadership(rounds []healthRound) leadershipStats {
 			}
 		}
 	}
-	for _, iv := range leaderlessOpen {
-		st.noteLeaderless(closeAt(iv, rounds[len(rounds)-1].At))
+	if len(rounds) > 0 {
+		until := rounds[len(rounds)-1].At
+		if end.After(until) {
+			until = end
+		}
+		for _, iv := range leaderlessOpen {
+			st.noteLeaderless(closeAt(iv, until))
+		}
 	}
 	if open != nil && len(rounds) > 0 {
 		iv := closeAt(open, rounds[len(rounds)-1].At)

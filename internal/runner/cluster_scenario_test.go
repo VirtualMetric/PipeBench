@@ -57,7 +57,7 @@ func TestAnalyzeLeadershipMeasuresTwoLeaderTime(t *testing.T) {
 		{At: at(3), Nodes: []nodeHealth{h(1, "1", "1"), h(2, "2", "1"), h(3, "3", "3")}},
 		{At: at(4), Nodes: []nodeHealth{h(1, "1", "1"), h(2, "2", "1"), h(3, "3", "")}},
 	}
-	st := analyzeLeadership(rounds)
+	st := analyzeLeadership(rounds, time.Time{})
 	if st.MaxSelfClaimed != 2 {
 		t.Fatalf("MaxSelfClaimed = %d, want 2", st.MaxSelfClaimed)
 	}
@@ -80,7 +80,7 @@ func TestAnalyzeLeadershipStreams(t *testing.T) {
 	st := analyzeLeadership([]healthRound{
 		{At: t0, Nodes: []nodeHealth{a, b}},
 		{At: t0.Add(time.Second), Nodes: []nodeHealth{a, c}},
-	})
+	}, time.Time{})
 	if st.MaxStreamClaims != 2 || st.StreamSplitMs != 1000 {
 		t.Fatalf("stream split: max %d, %d ms", st.MaxStreamClaims, st.StreamSplitMs)
 	}
