@@ -395,10 +395,10 @@ type ScenarioStep struct {
 	// what a version does with the records of its last moment.
 	PauseLoadAtStop bool `yaml:"pause_load_at_stop"`
 	// WaitCopies makes a rolling_restart step wait, after each node is
-	// healthy again, until every stream has all its copies back: on every
-	// node that reports its streams, each stream has a leader, as many
-	// copies as the cluster has members (five at most), and no copy offline
-	// or behind. Only then does it stop the next node. A node that starts
+	// healthy again, until every stream has all its copies back, as the
+	// stream's leader reports them: as many copies as the cluster has
+	// members (five at most), and no copy offline or behind. Only then does
+	// it stop the next node. A node that starts
 	// can make streams lose copies for a moment, and stopping the next node
 	// before they are back can leave a stream without a leader.
 	WaitCopies bool `yaml:"wait_copies"`

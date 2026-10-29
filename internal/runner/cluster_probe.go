@@ -45,6 +45,7 @@ type healthDoc struct {
 			DesiredReplicas int      `json:"desired_replicas"`
 			ActualReplicas  int      `json:"actual_replicas"`
 			OfflinePeers    []string `json:"offline_peers"`
+			MaxLag          uint64   `json:"max_lag"`
 		} `json:"stream_detail"`
 	} `json:"jetstream"`
 }
@@ -66,32 +67,71 @@ type nodeHealth struct {
 	UnderRepl     int               `json:"under_replicated,omitempty"`
 	Reconfiguring bool              `json:"reconfiguring,omitempty"`
 	StreamLeaders map[string]string `json:"-"`
-	// Streams is how many streams the node reports, and CopiesShort how many
-	// of them lack a leader, a copy on every member (five at most), or a
-	// copy that is current (rolling_restart wait_copies).
-	Streams     int `json:"-"`
-	CopiesShort int `json:"-"`
+	// Copies are the streams the node reports, by name, with their copies
+	// as the node sees them, and ExpectedCopies how many copies a stream
+	// should have in its cluster: one on every member, five at most
+	// (rolling_restart wait_copies).
+	Copies         map[string]streamCopies `json:"-"`
+	ExpectedCopies int                     `json:"-"`
+}
+
+// streamCopies is a stream's copies as one node reports them.
+type streamCopies struct {
+	Leader          string
+	Desired, Actual int
+	Offline         int    // copies offline or behind
+	MaxLag          uint64 // how far the furthest copy is behind, in operations
+}
+
+// copiesLagSlack is how far behind its leader a copy may be and still count
+// as caught up, in operations. Under load the leader commits an operation
+// once most copies have it, so the slowest copy is often an operation or two
+// behind, and the leader reports it as behind.
+const copiesLagSlack = 10
+
+// short reports whether the stream lacks a copy: fewer copies than expected,
+// or a copy offline or more than copiesLagSlack operations behind. Only the stream's leader tells this right: a
+// node that does not lead a stream does not follow the other copies, and
+// reports some of them as behind.
+func (s streamCopies) short(expected int) bool {
+	return s.Desired < expected || s.Actual < s.Desired || (s.Offline > 0 && s.MaxLag > copiesLagSlack)
 }
 
 // maxStreamCopies is the most copies of a stream the director's bus keeps.
 const maxStreamCopies = 5
 
 // copiesComplete reports whether every stream has all its copies back in the
-// round: each reachable node in a cluster that reports streams reports none
-// short of a leader, of a copy on every member (five at most), or of a copy
-// that is current, and at least one node reports streams.
+// round, as its leader reports them: every stream that a node reports has a
+// leader that answered, and that leader reports a copy on every member (five
+// at most) and every copy current. A round in which no node reports a stream
+// is not complete.
 func copiesComplete(r healthRound) bool {
-	reported := false
+	streams := map[string]bool{}
+	led := map[string]bool{}
 	for _, h := range r.Nodes {
-		if !h.Reachable || !h.Clustered || h.Streams == 0 {
+		if !h.Reachable || !h.Clustered {
 			continue
 		}
-		if h.CopiesShort > 0 {
+		for name, s := range h.Copies {
+			streams[name] = true
+			if s.Leader != h.Name {
+				continue
+			}
+			if s.short(h.ExpectedCopies) {
+				return false
+			}
+			led[name] = true
+		}
+	}
+	if len(streams) == 0 {
+		return false
+	}
+	for name := range streams {
+		if !led[name] {
 			return false
 		}
-		reported = true
 	}
-	return reported
+	return true
 }
 
 // selfLeader reports whether the node names itself the leader.
@@ -572,16 +612,14 @@ func parseNodeHealth(n int, raw []byte) nodeHealth {
 	if doc.JetStream != nil {
 		h.UnderRepl = doc.JetStream.StreamsUnderReplicated
 		h.StreamLeaders = map[string]string{}
-		expected := 1
+		h.ExpectedCopies = 1
 		if doc.Cluster != nil {
-			expected = max(1, min(doc.Cluster.Size, maxStreamCopies))
+			h.ExpectedCopies = max(1, min(doc.Cluster.Size, maxStreamCopies))
 		}
+		h.Copies = map[string]streamCopies{}
 		for _, s := range doc.JetStream.StreamDetail {
 			h.StreamLeaders[s.Name] = s.Leader
-			h.Streams++
-			if s.Leader == "" || s.DesiredReplicas < expected || s.ActualReplicas < s.DesiredReplicas || len(s.OfflinePeers) > 0 {
-				h.CopiesShort++
-			}
+			h.Copies[s.Name] = streamCopies{Leader: s.Leader, Desired: s.DesiredReplicas, Actual: s.ActualReplicas, Offline: len(s.OfflinePeers), MaxLag: s.MaxLag}
 		}
 	}
 	return h
@@ -609,8 +647,9 @@ func describeRound(r healthRound) string {
 	return strings.Join(parts, " ")
 }
 
-// describeCopies renders, for each reachable node in a cluster, how many of
-// the streams it reports lack a copy (rolling_restart wait_copies).
+// describeCopies renders, for each reachable node in a cluster, how many
+// streams it leads, and how many of those lack a copy (rolling_restart
+// wait_copies).
 func describeCopies(r healthRound) string {
 	parts := make([]string, 0, len(r.Nodes))
 	for _, h := range r.Nodes {
@@ -620,7 +659,17 @@ func describeCopies(r healthRound) string {
 		case !h.Clustered:
 			parts = append(parts, fmt.Sprintf("n%d:standalone", h.Node))
 		default:
-			parts = append(parts, fmt.Sprintf("n%d:%d of %d streams short of copies", h.Node, h.CopiesShort, h.Streams))
+			leads, short := 0, 0
+			for _, s := range h.Copies {
+				if s.Leader != h.Name {
+					continue
+				}
+				leads++
+				if s.short(h.ExpectedCopies) {
+					short++
+				}
+			}
+			parts = append(parts, fmt.Sprintf("n%d:leads %d streams, %d short of copies", h.Node, leads, short))
 		}
 	}
 	return strings.Join(parts, " ")
