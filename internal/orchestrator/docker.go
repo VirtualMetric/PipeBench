@@ -171,13 +171,18 @@ volumes:
 {{- if .WitnessDirMount }}
   witness-dir:
 {{- end }}
+{{- range .Subjects }}
+{{- if .Volume }}
+  {{ .Volume }}:
+{{- end }}
+{{- end }}
 
 services:
 
 {{- if .Subjects }}
 {{- range .Subjects }}
   {{ .Hostname }}:
-    image: "{{ $.SubjectImage }}"
+    image: "{{ if .Image }}{{ .Image }}{{ else }}{{ $.SubjectImage }}{{ end }}"
     container_name: "{{ .Container }}"
     hostname: "{{ .Hostname }}"
     networks: [bench]
@@ -223,6 +228,9 @@ services:
         tmpfs:
           size: {{ .DiskSizeBytes }}
           mode: 01777
+{{- end }}
+{{- if .Volume }}
+      - "{{ .Volume }}:{{ .VolumePath }}"
 {{- end }}
 {{- if $.SubjectUser }}
     user: "{{ $.SubjectUser }}"
@@ -1608,6 +1616,17 @@ func (r *ComposeRunner) RecreateServices(services ...string) error {
 	return r.compose(args...)
 }
 
+// RecreateServiceWithImage sets the service's image in the compose file, in
+// place, and replaces the service's container with one from that image. The
+// compose file then names the image the service runs now, so any later `up`
+// of the service keeps it.
+func (r *ComposeRunner) RecreateServiceWithImage(service, image string) error {
+	if err := setComposeServiceImage(r.composeFile, service, image); err != nil {
+		return err
+	}
+	return r.RecreateServices(service)
+}
+
 // resolveServiceAliases expands the logical names "generator" and "receiver"
 // to the concrete plural service names when the case uses the plural form.
 // Other names are passed through unchanged. Lets existing callers like
@@ -1935,6 +1954,19 @@ type clusterNode struct {
 	// size-limited tmpfs at DiskPath (cluster.scenario.node_disk).
 	DiskPath      string
 	DiskSizeBytes int64
+	// Image is the image the node starts on when it is not the image under
+	// test (cluster.scenario.start_image). Empty means the image under test.
+	Image string
+	// Volume names a Docker volume of the node's own, mounted at VolumePath
+	// (cluster.scenario.node_volume). It outlives the node's container.
+	Volume     string
+	VolumePath string
+}
+
+// NodeVolumeName is the compose name of node n's volume
+// (cluster.scenario.node_volume).
+func NodeVolumeName(n int) string {
+	return fmt.Sprintf("node-%d-data", n)
 }
 
 // nodeDependency is one depends_on entry of every cluster node service.
@@ -2349,6 +2381,13 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 				return fmt.Errorf("cluster.scenario.node_disk.size %q: %w", disk.Size, err)
 			}
 			node.DiskPath, node.DiskSizeBytes = disk.Path, size
+		}
+		if tc.Cluster != nil && tc.Cluster.Scenario != nil {
+			sc := tc.Cluster.Scenario
+			node.Image = sc.StartImage
+			if sc.NodeVolume != "" {
+				node.Volume, node.VolumePath = NodeVolumeName(i), sc.NodeVolume
+			}
 		}
 		clusterNodes = append(clusterNodes, node)
 	}

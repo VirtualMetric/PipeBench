@@ -223,6 +223,15 @@ type leadershipStats struct {
 	StreamSplits       []splitInterval `json:"stream_splits,omitempty"`
 	LeaderChanges      int             `json:"leader_changes"`
 	LeaderlessRoundsMs int64           `json:"leaderless_ms"`
+	// StreamLeaderlessMs is the longest time one stream of a cluster had no
+	// leader: every reachable node that reported the stream named none. It is
+	// measured like the split intervals, from the first round of a stretch to
+	// the round after its last. StreamLeaderless is that stretch.
+	StreamLeaderlessMs int64          `json:"stream_leaderless_ms"`
+	StreamLeaderless   *splitInterval `json:"stream_leaderless,omitempty"`
+	// StreamsReported is the most streams the clustered nodes reported in one
+	// round. Zero means the leaderless time measured nothing.
+	StreamsReported int `json:"streams_reported"`
 }
 
 // analyzeLeadership measures, over consecutive rounds, how long two or more
@@ -234,6 +243,7 @@ func analyzeLeadership(rounds []healthRound) leadershipStats {
 	st.Rounds = len(rounds)
 	var open *splitInterval
 	streamOpen := map[string]*splitInterval{}
+	leaderlessOpen := map[string]*splitInterval{}
 	prevLeader := 0
 
 	closeAt := func(iv *splitInterval, at time.Time) splitInterval {
@@ -292,6 +302,33 @@ func analyzeLeadership(rounds []healthRound) leadershipStats {
 				delete(streamOpen, stream)
 			}
 		}
+
+		reported, led := streamLeadership(r)
+		st.StreamsReported = max(st.StreamsReported, len(reported))
+		for stream := range reported {
+			if led[stream] {
+				if iv := leaderlessOpen[stream]; iv != nil {
+					st.noteLeaderless(closeAt(iv, r.At))
+					delete(leaderlessOpen, stream)
+				}
+				continue
+			}
+			if leaderlessOpen[stream] == nil {
+				leaderlessOpen[stream] = &splitInterval{From: r.At, Stream: stream}
+			}
+			leaderlessOpen[stream].Rounds++
+		}
+		// A stream no reachable node reports any more is not known to lack a
+		// leader: its stretch ends here.
+		for stream, iv := range leaderlessOpen {
+			if !reported[stream] {
+				st.noteLeaderless(closeAt(iv, r.At))
+				delete(leaderlessOpen, stream)
+			}
+		}
+	}
+	for _, iv := range leaderlessOpen {
+		st.noteLeaderless(closeAt(iv, rounds[len(rounds)-1].At))
 	}
 	if open != nil && len(rounds) > 0 {
 		iv := closeAt(open, rounds[len(rounds)-1].At)
@@ -305,6 +342,34 @@ func analyzeLeadership(rounds []healthRound) leadershipStats {
 	}
 	sort.Slice(st.StreamSplits, func(i, j int) bool { return st.StreamSplits[i].From.Before(st.StreamSplits[j].From) })
 	return st
+}
+
+// noteLeaderless keeps the longest stretch a stream had no leader.
+func (st *leadershipStats) noteLeaderless(iv splitInterval) {
+	if iv.LastsMs > st.StreamLeaderlessMs || st.StreamLeaderless == nil {
+		st.StreamLeaderlessMs = iv.LastsMs
+		st.StreamLeaderless = &iv
+	}
+}
+
+// streamLeadership returns the streams that the round's reachable clustered
+// nodes report, and those of them that at least one of those nodes names a
+// leader for. A director that is not in a cluster leads its streams itself
+// and names no leader, so it is left out.
+func streamLeadership(r healthRound) (reported, led map[string]bool) {
+	reported, led = map[string]bool{}, map[string]bool{}
+	for _, h := range r.Nodes {
+		if !h.Reachable || !h.Clustered {
+			continue
+		}
+		for stream, leader := range h.StreamLeaders {
+			reported[stream] = true
+			if leader != "" {
+				led[stream] = true
+			}
+		}
+	}
+	return reported, led
 }
 
 // clusterProbe reads every node's /health in rounds until stopped.

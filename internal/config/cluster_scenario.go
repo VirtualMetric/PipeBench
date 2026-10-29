@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"math"
+	"path"
 	"regexp"
 	"sort"
 	"strconv"
@@ -86,8 +87,50 @@ type ScenarioConfig struct {
 
 	// Rows compares the rows a database holds with the rows that reached the
 	// receiver, for a case whose data comes from a database device. A row
-	// that never arrives counts as missing.
+	// that never arrives counts as missing. A case with the http_ack load can
+	// have it too: the receiver then counts the load's lines and the rows
+	// apart, and the first receiver is the one whose rows are compared.
 	Rows *ScenarioRows `yaml:"rows"`
+
+	// StartImage is the image every node starts on, with its tag, such as an
+	// earlier release (vmetric/director:2.6.0). Empty means the image under
+	// test. A start or rolling_restart step with `image` moves nodes to
+	// another image later in the run.
+	StartImage string `yaml:"start_image"`
+
+	// NodeVolume keeps one directory of every node, such as the director's
+	// storage directory, on a Docker volume of the node's own. The volume
+	// outlives the node's container. A step that moves a node to another
+	// image gives it a new container, and the new container finds the node's
+	// data in the volume, as a director that an upgrade replaced on its
+	// machine finds its data on the machine's disk.
+	NodeVolume string `yaml:"node_volume"`
+}
+
+// SubjectImageKeyword is the value of a step's image that names the image
+// under test (the --image and --version of the run).
+const SubjectImageKeyword = "subject"
+
+// imageRefPattern is the form of an image reference a case may name: an
+// optional registry host, a repository, and a tag or a digest. The reference
+// goes into the compose file, so it allows no spaces, quotes or $.
+var imageRefPattern = regexp.MustCompile(`^(?:[a-z0-9][a-z0-9.-]*(?::[0-9]+)?/)?[a-z0-9]+(?:[._-]+[a-z0-9]+)*(?:/[a-z0-9]+(?:[._-]+[a-z0-9]+)*)*(?::[A-Za-z0-9_][A-Za-z0-9._-]{0,127})?(?:@sha256:[a-f0-9]{64})?$`)
+
+// checkImageRef says what is wrong with an image reference, or returns nil.
+// A reference must carry a tag or a digest: an image without one is
+// "latest", which moves, so the case would not say which build it ran.
+func checkImageRef(ref string) error {
+	if !imageRefPattern.MatchString(ref) {
+		return fmt.Errorf("is not an image reference such as vmetric/director:2.6.0")
+	}
+	name := ref
+	if i := strings.LastIndex(ref, "/"); i >= 0 {
+		name = ref[i+1:]
+	}
+	if !strings.Contains(name, ":") && !strings.Contains(ref, "@sha256:") {
+		return fmt.Errorf("names no tag; name the image with its tag, such as vmetric/director:2.6.0")
+	}
+	return nil
 }
 
 // ScenarioNodeDisk is the cluster.scenario.node_disk block.
@@ -162,6 +205,9 @@ type ScenarioExpect struct {
 	// MaxSplitBrainMs is how long two nodes may both name themselves the
 	// cluster's leader in the same round of /health reads.
 	MaxSplitBrainMs *int64 `yaml:"max_split_brain_ms"`
+	// MaxStreamLeaderlessMs is how long one stream of the cluster may go
+	// without a leader: every reachable node that reports it names none.
+	MaxStreamLeaderlessMs *int64 `yaml:"max_stream_leaderless_ms"`
 	// MinAcked is the fewest lines the generator must have had
 	// acknowledged, so a run that sent nothing cannot pass.
 	MinAcked int64 `yaml:"min_acked"`
@@ -268,6 +314,11 @@ type ScenarioStep struct {
 
 	// Nodes is the cluster size a scale_to step moves to.
 	Nodes int `yaml:"nodes"`
+	// Stage is the stage a set_stage step renders every member's config at:
+	// the config template reads it as {{@.Stage@}}, which is 1 at the start.
+	// A case changes a cluster setting at a stage, as the platform changes a
+	// setting on every member at once.
+	Stage int `yaml:"stage"`
 
 	// Log is the text wait_log waits for, or that expect_no_log must not see.
 	Log string `yaml:"log"`
@@ -329,9 +380,28 @@ type ScenarioStep struct {
 	// EmptyDisk makes a start step replace the node's container with a new
 	// one, which starts on an empty disk, as a node whose disk was replaced.
 	EmptyDisk bool `yaml:"empty_disk"`
+	// Image makes a start step start the node on another image, and a
+	// rolling_restart step move every node to it in turn: "subject" for the
+	// image under test, or an image reference with its tag. The node gets a
+	// new container from that image, on the data its volume keeps
+	// (cluster.scenario.node_volume). A start step with image starts a node
+	// that an earlier step stopped or killed, so the case says how the old
+	// version stopped.
+	Image string `yaml:"image"`
+	// PauseLoadAtStop makes a rolling_restart step pause the load from a few
+	// seconds before it stops each node until the node has stopped, as a
+	// pause_load step does. The node then holds no record it took in a
+	// moment before its stop: the case tests what the restart keeps, not
+	// what a version does with the records of its last moment.
+	PauseLoadAtStop bool `yaml:"pause_load_at_stop"`
 	// Leave is how much free space a fill_disk step leaves on the node's disk
 	// (default 1m).
 	Leave string `yaml:"leave"`
+	// DiskBPS and DiskIOPS are how fast a slow_disk step lets the node read
+	// and write the disk that holds its volume: bytes a second, such as 1m,
+	// and operations a second. A step sets one of them or both.
+	DiskBPS  string `yaml:"disk_bps"`
+	DiskIOPS int    `yaml:"disk_iops"`
 }
 
 // PeerList returns the peers a link step names: its peers, or its one peer.
@@ -366,6 +436,8 @@ func LossPercent(s string) (float64, error) {
 var scenarioActions = map[string]bool{
 	"wait_ready":                false,
 	"start_load":                false,
+	"pause_load":                false,
+	"resume_load":               false,
 	"sleep":                     false,
 	"mark":                      false,
 	"kill":                      true,
@@ -392,6 +464,7 @@ var scenarioActions = map[string]bool{
 	"receiver_pause":            false,
 	"receiver_unpause":          false,
 	"scale_to":                  false,
+	"set_stage":                 false,
 	"rolling_restart":           false,
 	"wait_log":                  false,
 	"expect_no_log":             true,
@@ -405,6 +478,68 @@ var scenarioActions = map[string]bool{
 	"split":        false,
 	"fill_disk":    true,
 	"free_disk":    true,
+	"slow_disk":    true,
+	"restore_disk": true,
+}
+
+// loadCountingSteps are the steps that count the load's lines or wait for
+// them. None may run while the load is paused, because no line is sent then.
+var loadCountingSteps = map[string]bool{
+	"expect_writes_continue": true, "expect_delivery_continues": true, "wait_delivery": true,
+	"expect_writes_stop": true,
+}
+
+// checkLoadPause follows the pause_load and resume_load steps in order: the
+// load must run to be paused, and be paused to be resumed.
+func checkLoadPause(do string, paused *bool) error {
+	switch do {
+	case "pause_load":
+		if *paused {
+			return fmt.Errorf("the load is paused already")
+		}
+		*paused = true
+	case "resume_load":
+		if !*paused {
+			return fmt.Errorf("no earlier pause_load step paused the load")
+		}
+		*paused = false
+	}
+	return nil
+}
+
+// pausedAtEnd reports whether the steps leave the load paused.
+func pausedAtEnd(steps []ScenarioStep) bool {
+	paused := false
+	for _, st := range steps {
+		switch st.Do {
+		case "pause_load":
+			paused = true
+		case "resume_load":
+			paused = false
+		}
+	}
+	return paused
+}
+
+// checkDiskLimit checks the limit of a slow_disk step: disk_bps, disk_iops,
+// or both, each above 0.
+func checkDiskLimit(st ScenarioStep) error {
+	if st.DiskBPS == "" && st.DiskIOPS == 0 {
+		return fmt.Errorf("needs disk_bps, disk_iops or both: how fast the node may use its disk")
+	}
+	if st.DiskBPS != "" {
+		bps, err := ParseByteSize(st.DiskBPS)
+		if err != nil {
+			return fmt.Errorf("disk_bps %q: %w", st.DiskBPS, err)
+		}
+		if bps <= 0 {
+			return fmt.Errorf("disk_bps must be above 0, got %q", st.DiskBPS)
+		}
+	}
+	if st.DiskIOPS < 0 {
+		return fmt.Errorf("disk_iops must be above 0, got %d", st.DiskIOPS)
+	}
+	return nil
 }
 
 // linkSteps are the actions that change the links between containers.
@@ -415,7 +550,7 @@ var linkSteps = map[string]bool{"cut_link": true, "shape_link": true, "restore_l
 var nodeActionSteps = map[string]bool{
 	"kill": true, "stop": true, "start": true, "restart": true,
 	"pause": true, "unpause": true, "disconnect": true, "connect": true,
-	"fill_disk": true, "free_disk": true,
+	"fill_disk": true, "free_disk": true, "slow_disk": true, "restore_disk": true,
 }
 
 // containerPeerPattern is the form of a link step's peer that names another
@@ -600,6 +735,9 @@ func (tc *TestCase) validateClusterScenario() error {
 	if sc.SpareNodes < 0 {
 		return fmt.Errorf("case %q: cluster.scenario.spare_nodes must be >= 0", tc.Name)
 	}
+	if err := tc.validateScenarioImages(); err != nil {
+		return err
+	}
 	proxies := map[string]bool{}
 	for _, p := range sc.Proxies {
 		if p.Name == "" || p.Listen <= 0 || p.Upstream == "" {
@@ -622,6 +760,9 @@ func (tc *TestCase) validateClusterScenario() error {
 		}
 	}
 
+	if pausedAtEnd(sc.Steps) {
+		return fmt.Errorf("case %q: a pause_load step pauses the load and no later resume_load step resumes it, so the run would wait for a load that never ends", tc.Name)
+	}
 	maxNodes := tc.Cluster.Nodes + sc.SpareNodes
 	if err := tc.validateScenarioDiskAndRows(maxNodes); err != nil {
 		return err
@@ -629,10 +770,16 @@ func (tc *TestCase) validateClusterScenario() error {
 	if err := tc.validateReceiverExpect(sc.Expect); err != nil {
 		return fmt.Errorf("case %q: %w", tc.Name, err)
 	}
+	if sc.Expect.MaxStreamLeaderlessMs != nil && tc.Cluster.Nodes+sc.SpareNodes < 2 {
+		return fmt.Errorf("case %q: expect.max_stream_leaderless_ms measures the leaders of a cluster's streams, and one director leads its streams itself", tc.Name)
+	}
 	names := map[string]bool{}
 	// marks holds the labels of the marks set so far: since and sent_before
 	// may only name a mark an earlier step sets.
 	marks := map[string]bool{}
+	// paused says whether a pause_load step has paused the load at this
+	// point of the steps.
+	paused := false
 	for i, st := range sc.Steps {
 		where := fmt.Sprintf("case %q: cluster.scenario.steps[%d] (%s)", tc.Name, i, st.Do)
 		needsNode, known := scenarioActions[st.Do]
@@ -665,6 +812,21 @@ func (tc *TestCase) validateClusterScenario() error {
 			if _, err := time.ParseDuration(v); err != nil {
 				return fmt.Errorf("%s: %s: %w", where, field, err)
 			}
+		}
+		if (st.Do == "pause_load" || st.Do == "resume_load") && !tc.HasGenerator() {
+			return fmt.Errorf("%s: pauses and resumes the load, and the case has no generator", where)
+		}
+		if st.PauseLoadAtStop && !tc.HasGenerator() {
+			return fmt.Errorf("%s: pause_load_at_stop pauses the load, and the case has no generator", where)
+		}
+		if st.PauseLoadAtStop && paused {
+			return fmt.Errorf("%s: pause_load_at_stop pauses the load, which a pause_load step has paused already", where)
+		}
+		if paused && loadCountingSteps[st.Do] {
+			return fmt.Errorf("%s: counts the load's lines while a pause_load step has paused the load; resume it first", where)
+		}
+		if err := checkLoadPause(st.Do, &paused); err != nil {
+			return fmt.Errorf("%s: %w", where, err)
 		}
 		if st.Do == "expect_delivery_continues" && !tc.HasGenerator() {
 			return fmt.Errorf("%s: counts the load's lines, and the case has no generator", where)
@@ -760,6 +922,15 @@ func (tc *TestCase) validateClusterScenario() error {
 					return fmt.Errorf("%s: leave %q: %w", where, st.Leave, err)
 				}
 			}
+		case "slow_disk", "restore_disk":
+			if sc.NodeVolume == "" {
+				return fmt.Errorf("%s: limits the disk that holds the node's volume, so it needs cluster.scenario.node_volume", where)
+			}
+			if st.Do == "slow_disk" {
+				if err := checkDiskLimit(st); err != nil {
+					return fmt.Errorf("%s: %w", where, err)
+				}
+			}
 		case "witness_down", "witness_up":
 			if sc.Witness == "" {
 				return fmt.Errorf("%s: the case has no witness", where)
@@ -767,6 +938,10 @@ func (tc *TestCase) validateClusterScenario() error {
 		case "proxy_latency", "proxy_down", "proxy_up":
 			if !proxies[st.Proxy] {
 				return fmt.Errorf("%s: proxy %q is not declared in cluster.scenario.proxies", where, st.Proxy)
+			}
+		case "set_stage":
+			if st.Stage < 1 {
+				return fmt.Errorf("%s: needs stage, 1 or more: the stage every member's config is rendered at", where)
 			}
 		case "scale_to":
 			if st.Nodes < 1 || st.Nodes > maxNodes {
@@ -796,6 +971,53 @@ func (tc *TestCase) validateClusterScenario() error {
 				}
 			}
 		}
+	}
+	return nil
+}
+
+// validateScenarioImages checks start_image, node_volume and the image of
+// every step that moves nodes to another image.
+func (tc *TestCase) validateScenarioImages() error {
+	sc := tc.Cluster.Scenario
+	if sc.StartImage != "" {
+		if err := checkImageRef(sc.StartImage); err != nil {
+			return fmt.Errorf("case %q: cluster.scenario.start_image %q %v", tc.Name, sc.StartImage, err)
+		}
+	}
+	if sc.NodeVolume != "" {
+		if err := checkWitnessDir(sc.NodeVolume); err != nil {
+			return fmt.Errorf("case %q: cluster.scenario.node_volume %q %v", tc.Name, sc.NodeVolume, err)
+		}
+		if sc.NodeDisk != nil && path.Clean(sc.NodeDisk.Path) == path.Clean(sc.NodeVolume) {
+			return fmt.Errorf("case %q: cluster.scenario.node_volume and node_disk.path are both %q; a directory is on a volume or on a small disk, not both", tc.Name, sc.NodeVolume)
+		}
+	}
+	testsSubject := false
+	for i, st := range sc.Steps {
+		where := fmt.Sprintf("case %q: cluster.scenario.steps[%d] (%s)", tc.Name, i, st.Do)
+		if st.Do == "start" && st.EmptyDisk && sc.NodeVolume != "" {
+			return fmt.Errorf("%s: empty_disk starts the node on an empty disk, but cluster.scenario.node_volume keeps the node's data in a volume; a case uses one of them", where)
+		}
+		if st.Image == "" {
+			continue
+		}
+		if st.Image == SubjectImageKeyword {
+			testsSubject = true
+		} else if err := checkImageRef(st.Image); err != nil {
+			return fmt.Errorf("%s: image %q %v, or subject for the image under test", where, st.Image, err)
+		}
+		if sc.NodeVolume == "" {
+			return fmt.Errorf("%s: image gives the node a new container, which would start on an empty disk; set cluster.scenario.node_volume to keep the node's data", where)
+		}
+		if st.EmptyDisk {
+			return fmt.Errorf("%s: names image and empty_disk; a start with image keeps the node's data", where)
+		}
+	}
+	// A case whose nodes start on another image must move them to the image
+	// under test at some step. Otherwise it would pass or fail whatever the
+	// build under test does.
+	if sc.StartImage != "" && !testsSubject {
+		return fmt.Errorf("case %q: cluster.scenario.start_image starts the nodes on %s, and no step moves a node to the image under test (image: subject), so the case would not test it", tc.Name, sc.StartImage)
 	}
 	return nil
 }
@@ -942,7 +1164,12 @@ var stepFieldOwners = []struct {
 	{"loss", func(s ScenarioStep) bool { return s.Loss != "" }, map[string]bool{"shape_link": true}},
 	{"groups", func(s ScenarioStep) bool { return s.Groups != nil }, map[string]bool{"split": true, "wait_leader": true}},
 	{"empty_disk", func(s ScenarioStep) bool { return s.EmptyDisk }, map[string]bool{"start": true}},
+	{"image", func(s ScenarioStep) bool { return s.Image != "" }, map[string]bool{"start": true, "rolling_restart": true}},
+	{"stage", func(s ScenarioStep) bool { return s.Stage != 0 }, map[string]bool{"set_stage": true}},
+	{"pause_load_at_stop", func(s ScenarioStep) bool { return s.PauseLoadAtStop }, map[string]bool{"rolling_restart": true}},
 	{"leave", func(s ScenarioStep) bool { return s.Leave != "" }, map[string]bool{"fill_disk": true}},
+	{"disk_bps", func(s ScenarioStep) bool { return s.DiskBPS != "" }, map[string]bool{"slow_disk": true}},
+	{"disk_iops", func(s ScenarioStep) bool { return s.DiskIOPS != 0 }, map[string]bool{"slow_disk": true}},
 	{"gap", func(s ScenarioStep) bool { return s.Gap != "" }, map[string]bool{"expect_delivery_continues": true, "expect_writes_continue": true}},
 	{"receiver", func(s ScenarioStep) bool { return s.Receiver != "" }, map[string]bool{"receiver_pause": true, "receiver_unpause": true, "expect_arrived": true}},
 	{"sent_after", func(s ScenarioStep) bool { return s.SentAfter != "" }, map[string]bool{"expect_arrived": true}},
@@ -1098,9 +1325,6 @@ func (tc *TestCase) validateScenarioDiskAndRows(maxNodes int) error {
 		// quotes and past compose's own $ handling.
 		if strings.ContainsAny(r.Key, "\"\\$") {
 			return fmt.Errorf("case %q: cluster.scenario.rows.key must not contain a backslash, a double quote or $; write [0-9] for \\d", tc.Name)
-		}
-		if tc.HasGenerator() {
-			return fmt.Errorf("case %q: cluster.scenario.rows is for a case whose data comes from a database device; this case has a generator", tc.Name)
 		}
 		if tc.Database == nil || tc.Database.Engine != "postgres" {
 			return fmt.Errorf("case %q: cluster.scenario.rows reads the case's database, which must use engine postgres", tc.Name)
