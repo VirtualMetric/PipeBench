@@ -1884,8 +1884,12 @@ type scenarioReport struct {
 	Windows    map[string]latencyStats `json:"latency_windows,omitempty"`
 	// AckMaxWindows is the slowest acknowledgement the client waited for in
 	// each window between marks, in milliseconds.
-	AckMaxWindows map[string]int64   `json:"ack_latency_max_ms_windows,omitempty"`
-	Measures      map[string]float64 `json:"measures_ms"`
+	AckMaxWindows map[string]int64 `json:"ack_latency_max_ms_windows,omitempty"`
+	// WindowRates is how many lines reached the receiver in each window
+	// between marks, a second, from the receiver's arrival timeline. The last
+	// mark's window has no end, so it has no rate.
+	WindowRates map[string]float64 `json:"window_rates,omitempty"`
+	Measures    map[string]float64 `json:"measures_ms"`
 	// Counts holds the numbers of lines that steps counted beside their
 	// times, such as <record>_lines_acked. They are lines, not milliseconds.
 	Counts map[string]int64 `json:"counts,omitempty"`
@@ -2202,6 +2206,14 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 	timeline, terr := sr.receiverTimeline()
 	if terr == nil {
 		rep.Timeline = &timeline
+		if len(sr.marks) > 0 {
+			rep.WindowRates = windowRates(sr.marks, timeline)
+			for _, m := range sr.marks {
+				if rate, ok := rep.WindowRates[m.Label]; ok {
+					fmt.Printf("    window %-16s %10.0f lines a second arrived\n", m.Label, rate)
+				}
+			}
+		}
 	}
 	for i := range sr.events {
 		ev := &sr.events[i]
@@ -2257,6 +2269,7 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 	if reason := judgeStreamLeaderless(rep.Leadership, ex.MaxStreamLeaderlessMs); reason != "" {
 		v.reasons = append(v.reasons, reason)
 	}
+	v.reasons = append(v.reasons, judgeThroughput(rep.WindowRates, ex.Throughput)...)
 	// A judged rows check that never ran fails here instead of passing
 	// unseen.
 	if reason, _ := judgeRows(rep.Rows, ex.MaxMissingRows, ex.MaxRowsTwice); reason != "" {
@@ -2266,6 +2279,59 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 	rep.Notes = sr.notes
 	v.passed = len(v.reasons) == 0
 	return rep, v, nil
+}
+
+// windowRates counts the lines that first reached the receiver in each
+// window between marks, from the receiver's arrival timeline, and divides
+// them by the window's length in seconds. A window runs from its mark to the
+// next one, so the last mark has no rate. It counts the buckets that start
+// in the window, and a bucket after the last one the receiver has counts as
+// one in which nothing arrived. While a cluster is behind its load, which a
+// throughput case makes sure of, the rate is how many lines a second the
+// cluster delivers.
+func windowRates(marks []scenarioMark, tl receiverTimeline) map[string]float64 {
+	rates := map[string]float64{}
+	if tl.BucketMs <= 0 {
+		return rates
+	}
+	for i := 0; i+1 < len(marks); i++ {
+		from, to := bucketAtOrAfter(tl, marks[i].At), bucketAtOrAfter(tl, marks[i+1].At)
+		if to <= from || !marks[i+1].At.After(marks[i].At) {
+			continue
+		}
+		var lines int64
+		for b := from; b < to && b < len(tl.Unique); b++ {
+			lines += int64(tl.Unique[b])
+		}
+		seconds := marks[i+1].At.Sub(marks[i].At).Seconds()
+		rates[marks[i].Label] = float64(lines) / seconds
+	}
+	return rates
+}
+
+// judgeThroughput compares the windows' rates as expect.throughput asks, and
+// returns a reason for each comparison that falls short.
+func judgeThroughput(rates map[string]float64, expects []config.ScenarioThroughputExpect) []string {
+	var reasons []string
+	for _, e := range expects {
+		window, okWindow := rates[e.Window]
+		over, okOver := rates[e.Over]
+		switch {
+		case !okWindow || !okOver:
+			reasons = append(reasons, fmt.Sprintf("windows %q and %q could not be compared: the receiver gave no count for one of them", e.Window, e.Over))
+		case over <= 0:
+			reasons = append(reasons, fmt.Sprintf("no line sent in window %q arrived, so window %q has nothing to compare with", e.Over, e.Window))
+		default:
+			ratio := window / over
+			fmt.Printf("  throughput: window %q took %.0f lines a second, %.2f times the %.0f of window %q (min_ratio %.2f)\n",
+				e.Window, window, ratio, over, e.Over, e.MinRatio)
+			if ratio < e.MinRatio {
+				reasons = append(reasons, fmt.Sprintf("window %q took %.0f lines a second, %.2f times the %.0f of window %q, less than min_ratio %.2f",
+					e.Window, window, ratio, over, e.Over, e.MinRatio))
+			}
+		}
+	}
+	return reasons
 }
 
 // receiverResult is what one receiver got. In a case with several receivers
