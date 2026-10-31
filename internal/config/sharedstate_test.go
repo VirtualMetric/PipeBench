@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func sharedStateCase() *TestCase {
@@ -328,5 +329,130 @@ func TestKillReceiverValidation(t *testing.T) {
 				t.Fatalf("Validate = %v, want an error that no generator sends to a replica", err)
 			}
 		})
+	}
+}
+
+// TestKillAllAndRevisionUpdateValidation: kill_all needs nothing more, and
+// replaces every replica, so a stream may count what the replicas took after
+// they rejoined. revision_update starts the standby replicas as the new
+// revision, so it needs one, and only it uses grace_seconds (VM-8792).
+func TestKillAllAndRevisionUpdateValidation(t *testing.T) {
+	tc := sharedStateCase()
+	tc.SharedState.Action = SharedStateActionKillAll
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("a kill_all case was refused: %v", err)
+	}
+
+	for _, action := range []string{SharedStateActionSlowStore, SharedStateActionSplitLeader} {
+		tc = sharedStateCase()
+		tc.SharedState.Action = action
+		tc.SharedState.OutageSeconds = 60
+		tc.SharedState.OutageStreams = []string{tc.SharedState.Streams[0].StreamName()}
+		if action == SharedStateActionSlowStore {
+			tc.SharedState.StoreDelayMs = 500
+		}
+		if err := tc.Validate(); err != nil {
+			t.Fatalf("a %s case with outage streams was refused: %v", action, err)
+		}
+	}
+	if got := (&SharedStateConfig{}).StoreDelayOrDefault(); got != 200*time.Millisecond {
+		t.Errorf("StoreDelayOrDefault without store_delay_ms = %v, want 200ms", got)
+	}
+
+	tc = sharedStateCase()
+	tc.SharedState.Action = SharedStateActionPauseReceivers
+	tc.SharedState.OutageSeconds = 120
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("a pause_receivers case was refused: %v", err)
+	}
+
+	tc = sharedStateCase()
+	tc.SharedState.Action = SharedStateActionRevisionUpdate
+	tc.SharedState.GraceSeconds = 30
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("a revision_update case with a standby replica was refused: %v", err)
+	}
+	if got := tc.SharedState.GraceOrDefault(); got != 30 {
+		t.Errorf("GraceOrDefault = %d, want 30", got)
+	}
+	tc.SharedState.GraceSeconds = 0
+	if got := tc.SharedState.GraceOrDefault(); got != 30 {
+		t.Errorf("GraceOrDefault without grace_seconds = %d, want the default of 30", got)
+	}
+
+	for name, c := range map[string]struct {
+		change func(*TestCase)
+		want   string
+	}{
+		"revision update without a standby": {func(tc *TestCase) {
+			tc.SharedState.Action = SharedStateActionRevisionUpdate
+			tc.SharedState.Standby = 0
+		}, "revision_update starts the standby replicas"},
+		"grace for another action": {func(tc *TestCase) {
+			tc.SharedState.Action = SharedStateActionKillLeader
+			tc.SharedState.GraceSeconds = 30
+		}, "grace_seconds is only used by the revision_update action"},
+		"store delay for another action": {func(tc *TestCase) {
+			tc.SharedState.Action = SharedStateActionPauseStore
+			tc.SharedState.StoreDelayMs = 500
+		}, "store_delay_ms is only used by the slow_store action"},
+		"negative store delay": {func(tc *TestCase) {
+			tc.SharedState.Action = SharedStateActionSlowStore
+			tc.SharedState.StoreDelayMs = -1
+		}, "store_delay_ms must not be negative"},
+		"slow store that is not Azurite": {func(tc *TestCase) {
+			tc.SharedState.Action = SharedStateActionSlowStore
+			tc.SharedState.Store = SharedStateStoreShare
+			tc.SharedState.SharePath = "/share"
+		}, "slow_store slows Azurite down"},
+		"copies for another action": {func(tc *TestCase) {
+			tc.SharedState.Mode = SharedStateModeStoreCluster
+			tc.SharedState.MinCopies = 2
+		}, "only used by the scale_out_in action"},
+		"copies without a store cluster": {func(tc *TestCase) {
+			tc.SharedState.Action = SharedStateActionScaleOutIn
+			tc.SharedState.ScaledOutCopies = 3
+		}, "they need mode store_cluster"},
+		"negative copies": {func(tc *TestCase) {
+			tc.SharedState.MinCopies = -1
+		}, "must not be negative"},
+		"negative grace": {func(tc *TestCase) {
+			tc.SharedState.Action = SharedStateActionRevisionUpdate
+			tc.SharedState.GraceSeconds = -1
+		}, "grace_seconds must not be negative"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tc := sharedStateCase()
+			c.change(tc)
+			if err := tc.Validate(); err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("Validate = %v, want an error that says %q", err, c.want)
+			}
+		})
+	}
+}
+
+// The store_cluster mode is valid, and expects what the embedded mode
+// expects of the shared_state component: no state bus (VM-8792).
+func TestStoreClusterMode(t *testing.T) {
+	tc := sharedStateCase()
+	tc.SharedState.Mode = SharedStateModeStoreCluster
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("a store_cluster case was refused: %v", err)
+	}
+	if got := tc.SharedState.ExpectHealthOrDefault(); got != "not_configured" {
+		t.Errorf("ExpectHealthOrDefault = %q, want not_configured", got)
+	}
+	if !tc.SharedState.SharesBus() {
+		t.Error("a store cluster shares a bus")
+	}
+	tc.SharedState.Action = SharedStateActionScaleOutIn
+	tc.SharedState.MinCopies = 2
+	tc.SharedState.ScaledOutCopies = 3
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("a store_cluster scale_out_in case with copies to judge was refused: %v", err)
+	}
+	tc.SharedState.Mode = "cluster"
+	if err := tc.Validate(); err == nil || !strings.Contains(err.Error(), "store_cluster") {
+		t.Fatalf("Validate of an unknown mode = %v, want an error that names store_cluster", err)
 	}
 }

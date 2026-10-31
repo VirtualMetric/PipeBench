@@ -644,7 +644,7 @@ func (run *ssRun) readyAt(container string, since time.Time) (time.Time, bool) {
 			return time.Time{}, false
 		}
 		return later(busReady, manager), true
-	case config.SharedStateModeEmbedded:
+	case config.SharedStateModeEmbedded, config.SharedStateModeStoreCluster:
 		return manager, !manager.IsZero()
 	default:
 		var last time.Time
@@ -864,6 +864,70 @@ func (run *ssRun) checkHealthAll(label string) {
 		fmt.Printf("    /health %s: shared_state %s (overall %s)\n", rep.Service, status, overall)
 	}
 	run.measures[label+"_health"] = got
+	if run.ss.ModeOrDefault() == config.SharedStateModeStoreCluster {
+		run.checkStoreClusterAll(label)
+	}
+}
+
+// checkStoreClusterAll waits up to a minute for the store_cluster component
+// of every running replica's /health to report ok: the replica is a member
+// of its cluster's generation and reaches a quorum of it. A replica that
+// just joined reports starting while it catches up, so the driver asks
+// again until the minute is over.
+func (run *ssRun) checkStoreClusterAll(label string) {
+	deadline := earliest(time.Now().Add(time.Minute), run.deadline)
+	got := map[string]string{}
+	for _, rep := range run.replicas {
+		if !run.running[rep.N] {
+			continue
+		}
+		var status, message string
+		for {
+			status, message = run.componentOf(rep.N, label, "store_cluster")
+			if status == "ok" || time.Now().After(deadline) || sleepCtx(run.r.ctx, 3*time.Second) != nil {
+				break
+			}
+		}
+		got[rep.Service] = status
+		if status != "ok" {
+			run.fail("%s: /health of %s reports store_cluster %q (%s), want \"ok\"", label, rep.Service, status, message)
+			continue
+		}
+		fmt.Printf("    /health %s: store_cluster ok (%s)\n", rep.Service, message)
+	}
+	run.measures[label+"_store_cluster"] = got
+}
+
+// componentOf returns the status and the message of one component of the
+// /health of replica n, or no status and the reason when /health did not
+// answer.
+func (run *ssRun) componentOf(n int, label, name string) (status, message string) {
+	rep := run.replica(n)
+	out, err := exec.Command("docker", "exec", rep.Container, "wget", "-qO-", "-T", "5", "http://127.0.0.1:15551/health").CombinedOutput()
+	run.health[fmt.Sprintf("%s-%s-%s", label, name, rep.Service)] = string(out)
+	if err != nil {
+		return "", strings.TrimSpace(string(out))
+	}
+	return healthComponent(out, name)
+}
+
+// healthComponent returns the status and the message of the component name
+// of a /health answer.
+func healthComponent(answer []byte, name string) (status, message string) {
+	var h struct {
+		Components map[string]struct {
+			Status  string `json:"status"`
+			Message string `json:"message"`
+		} `json:"components"`
+	}
+	if json.Unmarshal(answer, &h) != nil {
+		return "", "unreadable /health answer"
+	}
+	c, ok := h.Components[name]
+	if !ok {
+		return "", "/health has no " + name + " component"
+	}
+	return c.Status, c.Message
 }
 
 // waitBaseline waits until every stream's receiver holds its baseline.
@@ -946,6 +1010,16 @@ func (run *ssRun) act() {
 		run.rollingReplace("kill")
 	case config.SharedStateActionMoveAcrossCutLink:
 		run.moveAcrossCutLink()
+	case config.SharedStateActionKillAll:
+		run.killAll()
+	case config.SharedStateActionRevisionUpdate:
+		run.revisionUpdate()
+	case config.SharedStateActionPauseReceivers:
+		run.pauseReceivers()
+	case config.SharedStateActionSlowStore:
+		run.slowStore()
+	case config.SharedStateActionSplitLeader:
+		run.splitLeader()
 	}
 }
 

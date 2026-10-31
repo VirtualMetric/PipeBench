@@ -95,6 +95,32 @@ const (
 	// it across the cut link at once. The device must start on the second
 	// replica and must never run on both.
 	SharedStateActionMoveAcrossCutLink = "move_across_cut_link"
+	// SharedStateActionKillAll kills every replica at once with SIGKILL, as
+	// the loss of the host or the zone that runs them does, and then starts
+	// new containers for all of them, on empty disks. No replica passes on
+	// what it holds, so the store is the only place the queue is left in.
+	SharedStateActionKillAll = "kill_all"
+	// SharedStateActionRevisionUpdate does what a new revision of a container
+	// app does: it starts every standby replica, waits until each one is
+	// ready, and then stops every replica that ran before, all at once, each
+	// with grace_seconds to stop. The old replicas are not replaced: the new
+	// ones go on alone, as the new revision.
+	SharedStateActionRevisionUpdate = "revision_update"
+	// SharedStateActionPauseReceivers pauses every receiver for
+	// outage_seconds, as a target that is down does, while the senders go
+	// on. The replicas keep what they take in as a backlog, and must deliver
+	// all of it once the receivers go on.
+	SharedStateActionPauseReceivers = "pause_receivers"
+	// SharedStateActionSlowStore delays every answer of the store to the
+	// replicas by store_delay_ms for outage_seconds, as a store that is far
+	// away or under load does, and then lets the answers go at full speed
+	// again. Only Azurite can be slowed down.
+	SharedStateActionSlowStore = "slow_store"
+	// SharedStateActionSplitLeader cuts the links between the leader and
+	// every other replica, both ways, for outage_seconds, while every
+	// replica still reaches the store and the senders. The others must lead
+	// without it, and it must stop leading. Then the links come back.
+	SharedStateActionSplitLeader = "split_leader"
 )
 
 var sharedStateActions = []string{
@@ -116,6 +142,11 @@ var sharedStateActions = []string{
 	SharedStateActionRollingRestart,
 	SharedStateActionRollingKill,
 	SharedStateActionMoveAcrossCutLink,
+	SharedStateActionKillAll,
+	SharedStateActionRevisionUpdate,
+	SharedStateActionPauseReceivers,
+	SharedStateActionSlowStore,
+	SharedStateActionSplitLeader,
 }
 
 // replacingActions are the actions that replace a replica with a new
@@ -129,6 +160,7 @@ var replacingActions = []string{
 	SharedStateActionMoveThenKill,
 	SharedStateActionRollingRestart,
 	SharedStateActionRollingKill,
+	SharedStateActionKillAll,
 }
 
 // SharedStateConfig describes the replicas of one serverless director that
@@ -153,7 +185,9 @@ type SharedStateConfig struct {
 	// Mode is how the replicas share their state, which sets what the driver
 	// expects to see: "state_bus" (the default) when shared_state names a store
 	// and the pipeline bus is not embedded, "embedded" when the director's own
-	// bus runs shared on the store, and "memory" for shared_state.type memory.
+	// bus runs shared on the store, "store_cluster" when the director's own bus
+	// runs as a store cluster (vmmq.cluster.mode store), and "memory" for
+	// shared_state.type memory.
 	Mode string `yaml:"mode"`
 	// SecondStage renders every replica's config again, with {{@.Stage@}} set
 	// to 2, once every replica runs and every placed device the first stage
@@ -206,8 +240,10 @@ type SharedStateConfig struct {
 	Streams []SharedStateStream `yaml:"streams"`
 
 	// OutageSeconds is how long pause_store pauses the store, how long
-	// isolate_replica keeps the replica off the network, and how long
-	// scale_backlog pauses the receiver (default 30).
+	// isolate_replica keeps the replica off the network, how long
+	// scale_backlog and pause_receivers pause the receivers, how long
+	// slow_store slows the store down, and how long split_leader keeps the
+	// leader cut off from the others (default 30).
 	OutageSeconds int `yaml:"outage_seconds"`
 	// OutageStreams are streams that must go on arriving while the store is
 	// away: their senders feed devices that keep no shared state.
@@ -276,6 +312,23 @@ type SharedStateConfig struct {
 	// ExpectLogOnce are lines each replica must log exactly once for every
 	// time its director starts, matched as plain text.
 	ExpectLogOnce []string `yaml:"expect_log_once"`
+	// GraceSeconds is how long revision_update gives each old replica to
+	// stop before Docker kills it (default 30): a container app's
+	// terminationGracePeriodSeconds.
+	GraceSeconds int `yaml:"grace_seconds"`
+	// StoreDelayMs is how long slow_store delays each answer of the store
+	// (default 200).
+	StoreDelayMs int `yaml:"store_delay_ms"`
+	// MinCopies is the fewest current copies every stream must have, as its
+	// leader reports them on /health, at every read from the start of a
+	// scale_out_in to its end. A copy that is offline, or more than a few
+	// operations behind, does not count. 0: not judged.
+	MinCopies int `yaml:"min_copies"`
+	// ScaledOutCopies is how many current copies every stream must have
+	// once the standby replica of a scale_out_in has joined, within
+	// settle_seconds: the copies the director's rule gives a cluster of that
+	// size. 0: not judged.
+	ScaledOutCopies int `yaml:"scaled_out_copies"`
 }
 
 // StateWriteToleranceOrDefault returns StateWriteToleranceSeconds, or a tenth
@@ -285,6 +338,22 @@ func (s *SharedStateConfig) StateWriteToleranceOrDefault() time.Duration {
 		return time.Duration(s.StateWriteToleranceSeconds) * time.Second
 	}
 	return max(2*time.Second, time.Duration(s.StateWriteIntervalSeconds)*time.Second/10)
+}
+
+// StoreDelayOrDefault returns StoreDelayMs as a duration, or 200 ms.
+func (s *SharedStateConfig) StoreDelayOrDefault() time.Duration {
+	if s == nil || s.StoreDelayMs <= 0 {
+		return 200 * time.Millisecond
+	}
+	return time.Duration(s.StoreDelayMs) * time.Millisecond
+}
+
+// GraceOrDefault returns GraceSeconds, or 30.
+func (s *SharedStateConfig) GraceOrDefault() int {
+	if s == nil || s.GraceSeconds <= 0 {
+		return 30
+	}
+	return s.GraceSeconds
 }
 
 // CutHoldOrDefault returns CutHoldSeconds, or 10.
@@ -443,6 +512,13 @@ const (
 	SharedStateModeStateBus = "state_bus"
 	SharedStateModeEmbedded = "embedded"
 	SharedStateModeMemory   = "memory"
+	// SharedStateModeStoreCluster is a director whose own bus runs as a store
+	// cluster: every replica runs the queue and keeps copies of its streams,
+	// and the store keeps the members' records under cluster/members/ and a
+	// copy of every stream, which the leader of each stream writes. The driver
+	// expects what it does in embedded mode, and also that /health reports
+	// store_cluster ok on every replica once the replicas settle.
+	SharedStateModeStoreCluster = "store_cluster"
 )
 
 // ModeOrDefault returns Mode, or "state_bus".
@@ -640,9 +716,9 @@ func (tc *TestCase) validateSharedState() error {
 		return fmt.Errorf("case %q: unknown shared_state.action %q", tc.Name, s.Action)
 	}
 	switch s.ModeOrDefault() {
-	case SharedStateModeStateBus, SharedStateModeEmbedded, SharedStateModeMemory:
+	case SharedStateModeStateBus, SharedStateModeEmbedded, SharedStateModeStoreCluster, SharedStateModeMemory:
 	default:
-		return fmt.Errorf("case %q: shared_state.mode must be state_bus, embedded or memory, got %q", tc.Name, s.Mode)
+		return fmt.Errorf("case %q: shared_state.mode must be state_bus, embedded, store_cluster or memory, got %q", tc.Name, s.Mode)
 	}
 	switch s.StoreOrDefault() {
 	case SharedStateStoreAzureBlob:
@@ -782,7 +858,7 @@ func (tc *TestCase) validateSharedState() error {
 	}
 	if len(s.OutageStreams) > 0 {
 		switch s.Action {
-		case SharedStateActionPauseStore, SharedStateActionIsolateReplica:
+		case SharedStateActionPauseStore, SharedStateActionIsolateReplica, SharedStateActionSlowStore, SharedStateActionSplitLeader:
 			// The driver counts the outage streams first 15 seconds into the
 			// outage, and judges their growth from there to its end.
 			if s.OutageOrDefault() < MinOutageForStreamsSeconds {
@@ -800,6 +876,10 @@ func (tc *TestCase) validateSharedState() error {
 	case SharedStateActionScaleOutIn:
 		if s.Standby < 1 {
 			return fmt.Errorf("case %q: shared_state.action scale_out_in needs a standby replica (shared_state.standby)", tc.Name)
+		}
+	case SharedStateActionRevisionUpdate:
+		if s.Standby < 1 {
+			return fmt.Errorf("case %q: shared_state.action revision_update starts the standby replicas as the new revision: it needs at least one (shared_state.standby)", tc.Name)
 		}
 	case SharedStateActionScaleBacklog:
 		if !names[s.ScaleStream] {
@@ -827,6 +907,30 @@ func (tc *TestCase) validateSharedState() error {
 	}
 	if s.MoveDevice != 0 && s.Action != SharedStateActionMoveAcrossCutLink {
 		return fmt.Errorf("case %q: shared_state.move_device is only used by the move_across_cut_link action", tc.Name)
+	}
+	if s.MinCopies < 0 || s.ScaledOutCopies < 0 {
+		return fmt.Errorf("case %q: shared_state.min_copies and scaled_out_copies must not be negative", tc.Name)
+	}
+	if (s.MinCopies != 0 || s.ScaledOutCopies != 0) && s.Action != SharedStateActionScaleOutIn {
+		return fmt.Errorf("case %q: shared_state.min_copies and scaled_out_copies are only used by the scale_out_in action", tc.Name)
+	}
+	if (s.MinCopies != 0 || s.ScaledOutCopies != 0) && s.ModeOrDefault() != SharedStateModeStoreCluster {
+		return fmt.Errorf("case %q: shared_state.min_copies and scaled_out_copies read the copies a store cluster keeps on its replicas, so they need mode store_cluster", tc.Name)
+	}
+	if s.StoreDelayMs < 0 {
+		return fmt.Errorf("case %q: shared_state.store_delay_ms must not be negative", tc.Name)
+	}
+	if s.StoreDelayMs != 0 && s.Action != SharedStateActionSlowStore {
+		return fmt.Errorf("case %q: shared_state.store_delay_ms is only used by the slow_store action", tc.Name)
+	}
+	if s.Action == SharedStateActionSlowStore && s.StoreOrDefault() != SharedStateStoreAzureBlob {
+		return fmt.Errorf("case %q: shared_state.action slow_store slows Azurite down, and the store is %q", tc.Name, s.StoreOrDefault())
+	}
+	if s.GraceSeconds < 0 {
+		return fmt.Errorf("case %q: shared_state.grace_seconds must not be negative", tc.Name)
+	}
+	if s.GraceSeconds != 0 && s.Action != SharedStateActionRevisionUpdate {
+		return fmt.Errorf("case %q: shared_state.grace_seconds is only used by the revision_update action", tc.Name)
 	}
 	if s.CutHoldSeconds < 0 {
 		return fmt.Errorf("case %q: shared_state.cut_hold_seconds must not be negative", tc.Name)

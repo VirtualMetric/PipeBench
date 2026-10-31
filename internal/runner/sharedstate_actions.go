@@ -588,6 +588,18 @@ func (run *ssRun) daemonSkew() time.Duration {
 func (run *ssRun) scaleOutIn() {
 	n := run.ss.Replicas + 1
 	rep := run.replica(n)
+	// The streams' copies, from the scale-out to the end of the scale-in
+	if floor := run.ss.MinCopies; floor > 0 {
+		var containers []string
+		for m := 1; m <= n; m++ {
+			containers = append(containers, run.replica(m).Container)
+		}
+		sampler := startCopiesSampler(containers)
+		defer func() {
+			fewest, samples := sampler.finish()
+			run.judgeFewestCopies(fewest, samples, floor)
+		}()
+	}
 	fmt.Printf("  scaling out: starting %s…\n", rep.Service)
 	if err := run.orch.RestartServices(rep.Service); err != nil {
 		run.fail("starting %s: %v", rep.Service, err)
@@ -607,6 +619,13 @@ func (run *ssRun) scaleOutIn() {
 	}
 	run.checkSettled("scaled-out", earliest(time.Now().Add(30*time.Second), run.deadline))
 	run.checkHealthAll("scaled-out")
+	if want := run.ss.ScaledOutCopies; want > 0 {
+		if short := run.waitStreamCopies(want, earliest(time.Now().Add(time.Duration(run.ss.SettleOrDefault())*time.Second), run.deadline)); len(short) > 0 {
+			run.fail("after the scale-out the streams do not have %d current copies each: %s", want, strings.Join(short, "; "))
+		} else {
+			fmt.Printf("    every stream has %d current copies\n", want)
+		}
+	}
 	if sleepCtx(run.r.ctx, 20*time.Second) != nil {
 		return
 	}
@@ -717,7 +736,7 @@ func memberRecords(calls []ssStoreCall, container string) map[string]*ssMemberRe
 		if err != nil {
 			continue
 		}
-		_, member, ok := strings.Cut(path, "shared/members/")
+		member, ok := memberOfRecordPath(path)
 		if !ok {
 			continue
 		}
@@ -738,6 +757,19 @@ func memberRecords(calls []ssStoreCall, container string) map[string]*ssMemberRe
 		}
 	}
 	return records
+}
+
+// memberOfRecordPath returns the member whose record a store call's path
+// names: shared/members/<member> for a shared cluster, and
+// cluster/members/<member> for a store cluster, whose member records the
+// store keeps under the cluster's own name.
+func memberOfRecordPath(path string) (string, bool) {
+	for _, dir := range []string{"shared/members/", "cluster/members/"} {
+		if _, member, ok := strings.Cut(path, dir); ok {
+			return member, true
+		}
+	}
+	return "", false
 }
 
 // memberRecordWindow is how long a member record stays live after a replica
@@ -883,6 +915,308 @@ func (run *ssRun) coldRestart() {
 	run.checkHealthAll("after")
 }
 
+// caseReceiverContainers returns the container of each receiver of the case:
+// bench-receiver-<id> for each entry of `receivers:`, or bench-receiver for
+// the one `receiver:`.
+func caseReceiverContainers(tc *config.TestCase) []string {
+	if !tc.MultiReceiver() {
+		return []string{"bench-receiver"}
+	}
+	var out []string
+	for _, rc := range tc.AllReceivers() {
+		out = append(out, "bench-receiver-"+rc.ID)
+	}
+	return out
+}
+
+// pauseReceivers pauses every receiver for outage_seconds, as a target that
+// is down does, while the senders go on. The replicas keep what they take
+// in as a backlog, and must deliver all of it once the receivers go on. A
+// store cluster in containers keeps only part of such a backlog in memory,
+// and reads the rest back from its store.
+func (run *ssRun) pauseReceivers() {
+	outage := time.Duration(run.ss.OutageOrDefault()) * time.Second
+	var paused []string
+	for _, name := range caseReceiverContainers(run.tc) {
+		if err := exec.Command("docker", "pause", name).Run(); err != nil {
+			run.fail("docker pause %s: %v", name, err)
+			continue
+		}
+		paused = append(paused, name)
+	}
+	if len(paused) == 0 {
+		return
+	}
+	from := time.Now()
+	run.measures["receivers_paused_from"] = from.UTC()
+	fmt.Printf("  pausing %s for %s, so the replicas keep a backlog…\n", strings.Join(paused, ", "), outage)
+	// The receivers go on even when the run is stopped meanwhile.
+	_ = sleepCtx(run.r.ctx, outage)
+	for _, name := range paused {
+		if err := exec.Command("docker", "unpause", name).Run(); err != nil {
+			run.fail("docker unpause %s: %v", name, err)
+		}
+	}
+	run.measures["receivers_paused_seconds"] = time.Since(from).Seconds()
+	fmt.Printf("    the receivers go on after %.1fs\n", time.Since(from).Seconds())
+	if !run.checkSettled("after", earliest(time.Now().Add(time.Duration(run.ss.SettleOrDefault())*time.Second), run.deadline)) {
+		return
+	}
+	run.checkHealthAll("after")
+}
+
+// storeDelays are the link faults that delay every answer of store to the
+// replicas by delay.
+func storeDelays(store string, replicas []string, delay time.Duration) map[linkKey]linkFault {
+	out := map[linkKey]linkFault{}
+	for _, c := range replicas {
+		out[linkKey{From: store, To: c}] = linkFault{Delay: delay}
+	}
+	return out
+}
+
+// splitCuts are the link faults that cut leader off from each of others,
+// both ways.
+func splitCuts(leader string, others []string) map[linkKey]linkFault {
+	out := map[linkKey]linkFault{}
+	for _, c := range others {
+		out[linkKey{From: leader, To: c}] = linkFault{Cut: true}
+		out[linkKey{From: c, To: leader}] = linkFault{Cut: true}
+	}
+	return out
+}
+
+// runningContainers returns the containers of the replicas that run.
+func (run *ssRun) runningContainers(except int) []string {
+	var out []string
+	for _, rep := range run.replicas {
+		if run.running[rep.N] && rep.N != except {
+			out = append(out, rep.Container)
+		}
+	}
+	return out
+}
+
+// linkOutage puts faults in force for outage_seconds, samples /health of
+// every running replica meanwhile, and judges the outage streams. It returns
+// when the faults began and ended, and false when they could not be put in
+// force. The faults are taken away again whatever happens.
+func (run *ssRun) linkOutage(what string, faults map[linkKey]linkFault) (from, to time.Time, ok bool) {
+	var network string
+	for k := range faults {
+		if network = containerNetwork(k.To); network != "" {
+			break
+		}
+	}
+	if network == "" {
+		run.fail("%s: cannot find the run's network", what)
+		return time.Time{}, time.Time{}, false
+	}
+	links := newLinkFaults(run.r.opts.NettoolImage, network)
+	restored := false
+	restore := func() {
+		if restored {
+			return
+		}
+		restored = true
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if err := links.restoreAll(ctx); err != nil {
+			run.fail("%s: taking the faults away: %v", what, err)
+		}
+	}
+	defer restore()
+	if err := links.set(run.r.ctx, faults); err != nil {
+		run.fail("%s: %v (the outage did not happen)", what, err)
+		return time.Time{}, time.Time{}, false
+	}
+	from = time.Now()
+	run.measures["outage_from"] = from.UTC()
+	health := map[string]map[string]int{}
+	end := earliest(from.Add(time.Duration(run.ss.OutageOrDefault())*time.Second), run.deadline)
+	base := newOutageBaseline(from)
+	for time.Now().Before(end) {
+		base.take(run.streamCounts)
+		for _, rep := range run.replicas {
+			if !run.running[rep.N] {
+				continue
+			}
+			status, _, _, _ := run.healthOf(rep.N, "outage")
+			if health[rep.Service] == nil {
+				health[rep.Service] = map[string]int{}
+			}
+			health[rep.Service][status]++
+		}
+		if sleepCtx(run.r.ctx, 3*time.Second) != nil {
+			break
+		}
+	}
+	during := run.streamCounts()
+	restore()
+	to = time.Now()
+	run.measures["outage_to"] = to.UTC()
+	run.measures["outage_health"] = health
+	fmt.Printf("    /health during the outage: %v\n", health)
+	run.judgeOutageStreams(base, during, to)
+	return from, to, true
+}
+
+// slowStore delays every answer of Azurite to the replicas by
+// store_delay_ms for outage_seconds. The replicas must lose nothing they
+// confirmed, and settle once the store answers at full speed again.
+func (run *ssRun) slowStore() {
+	delay := run.ss.StoreDelayOrDefault()
+	fmt.Printf("  delaying every answer of the store by %s for %ds…\n", delay, run.ss.OutageOrDefault())
+	run.measures["store_delay_ms"] = delay.Milliseconds()
+	from, to, ok := run.linkOutage("slowing the store down", storeDelays("bench-azurite", run.runningContainers(0), delay))
+	if !ok {
+		return
+	}
+	run.recoverAfterOutage(from, to, "")
+}
+
+// splitLeader cuts the leader off from every other replica, both ways, for
+// outage_seconds, while every replica still reaches the store and the
+// senders. The others must lead without it, it must stop leading, and the
+// replicas must settle once the links are back.
+func (run *ssRun) splitLeader() {
+	leader, ok := run.oneLeader()
+	if !ok {
+		return
+	}
+	rep := run.replica(leader)
+	fmt.Printf("  cutting %s (the leader) off from the other replicas for %ds; every replica keeps the store…\n", rep.Service, run.ss.OutageOrDefault())
+	run.measures["victim"] = map[string]any{"replica": rep.Service, "leader": true, "how": "split"}
+	from, to, ok := run.linkOutage("cutting the leader off", splitCuts(rep.Container, run.runningContainers(leader)))
+	if !ok {
+		return
+	}
+	run.recoverAfterOutage(from, to, rep.Container)
+}
+
+// killAll kills every replica at once with SIGKILL, as the loss of the host
+// or the zone that runs them does, and then starts new containers for all
+// of them, on empty disks. No replica can pass on what it holds, so the
+// replicas must take their queue back from the store, with every record
+// that they confirmed.
+func (run *ssRun) killAll() {
+	var running []ssReplica
+	for _, rep := range run.replicas {
+		if run.running[rep.N] {
+			running = append(running, rep)
+		}
+	}
+	run.refreshAll()
+	fmt.Printf("  killing all %d replicas at once…\n", len(running))
+	errs := make(chan error, len(running))
+	for _, rep := range running {
+		go func() { errs <- exec.Command("docker", "kill", "-s", "KILL", rep.Container).Run() }()
+	}
+	for range running {
+		if err := <-errs; err != nil {
+			run.fail("killing a replica: %v", err)
+		}
+	}
+	for _, rep := range running {
+		run.endReplica(rep.N, containerFinishedAt(rep.Container, time.Now()), "kill of every replica", false)
+	}
+	var services []string
+	for _, rep := range running {
+		services = append(services, rep.Service)
+	}
+	fmt.Printf("    all killed; starting new containers on empty disks…\n")
+	started := time.Now()
+	if err := run.orch.RecreateServices(services...); err != nil {
+		run.fail("starting new containers: %v", err)
+		return
+	}
+	for _, rep := range running {
+		run.markStarted(rep.N)
+	}
+	ready := map[string]float64{}
+	for _, rep := range running {
+		since := containerStartedAt(rep.Container, started)
+		if at, ok := run.waitReady(rep.N, since, earliest(time.Now().Add(run.replicaWarmup()), run.deadline)); ok {
+			ready[rep.Service] = at.Sub(since).Seconds()
+			run.countConfirmedAtRejoin(rep.N, at)
+		} else {
+			run.fail("%s was not ready after every replica was killed: %s", rep.Service, run.readiness(rep.N, since))
+		}
+	}
+	run.measures["kill_all_ready_seconds"] = ready
+	if !run.checkSettled("after", earliest(time.Now().Add(time.Duration(run.ss.SettleOrDefault())*time.Second), run.deadline)) {
+		return
+	}
+	run.checkHealthAll("after")
+}
+
+// revisionUpdate does what a new revision of a container app does: it starts
+// every standby replica, waits until each one is ready, and then stops every
+// replica that ran before, all at once, each with grace_seconds to stop. The
+// old replicas are not replaced: the new ones go on alone. Every record
+// that the old replicas confirmed must reach the receivers through the new
+// ones, and no device may run on two replicas.
+func (run *ssRun) revisionUpdate() {
+	var old []ssReplica
+	for _, rep := range run.replicas {
+		if run.running[rep.N] {
+			old = append(old, rep)
+		}
+	}
+	var fresh []ssReplica
+	for n := run.ss.Replicas + 1; n <= run.ss.Replicas+run.ss.Standby; n++ {
+		fresh = append(fresh, run.replica(n))
+	}
+	fmt.Printf("  revision update: starting %d new replicas…\n", len(fresh))
+	var services []string
+	for _, rep := range fresh {
+		services = append(services, rep.Service)
+	}
+	started := time.Now()
+	if err := run.orch.RestartServices(services...); err != nil {
+		run.fail("starting the new replicas: %v", err)
+		return
+	}
+	for _, rep := range fresh {
+		run.markStarted(rep.N)
+	}
+	ready := map[string]float64{}
+	for _, rep := range fresh {
+		since := containerStartedAt(rep.Container, started)
+		at, ok := run.waitReady(rep.N, since, earliest(time.Now().Add(run.replicaWarmup()), run.deadline))
+		if !ok {
+			run.fail("%s of the new revision was not ready: %s", rep.Service, run.readiness(rep.N, since))
+			return
+		}
+		ready[rep.Service] = at.Sub(since).Seconds()
+	}
+	run.measures["revision_update_ready_seconds"] = ready
+	grace := run.ss.GraceOrDefault()
+	fmt.Printf("    the new replicas are ready; stopping all %d old ones at once, with %ds each to stop…\n", len(old), grace)
+	stopped := time.Now()
+	errs := make(chan error, len(old))
+	for _, rep := range old {
+		go func() { errs <- exec.Command("docker", "stop", "-t", strconv.Itoa(grace), rep.Container).Run() }()
+	}
+	for range old {
+		if err := <-errs; err != nil {
+			run.fail("stopping an old replica: %v", err)
+		}
+	}
+	for _, rep := range old {
+		run.endReplica(rep.N, containerFinishedAt(rep.Container, time.Now()), "revision update", true)
+	}
+	run.measures["revision_update_stop_seconds"] = time.Since(stopped).Seconds()
+	fmt.Printf("    the old replicas exited %.1fs after the stop began\n", time.Since(stopped).Seconds())
+	if got := run.waitStoreMembers(len(fresh), 60*time.Second); got != len(fresh) {
+		run.fail("after the revision update the store lists %d live members, want the %d new ones", got, len(fresh))
+	}
+	if !run.checkSettled("after", earliest(time.Now().Add(time.Duration(run.ss.SettleOrDefault())*time.Second), run.deadline)) {
+		return
+	}
+	run.checkHealthAll("after")
+}
+
 // measureIdle counts the store calls while no generator runs.
 func (run *ssRun) measureIdle() {
 	d := time.Duration(run.ss.IdleOrDefault()) * time.Second
@@ -937,7 +1271,10 @@ func (run *ssRun) storeCalls() {
 	for _, rep := range run.replicas {
 		events = append(events, run.events(rep.Container)...)
 	}
-	disturbed := windowDisturbances(events, calls, run.ss.StoreContainerOrDefault(), from.Add(skew), to.Add(skew))
+	// In a store cluster the leader of each stream writes its own part of the
+	// copy, so several writers are the steady state
+	oneWriter := run.ss.ModeOrDefault() != config.SharedStateModeStoreCluster
+	disturbed := windowDisturbances(events, calls, run.ss.StoreContainerOrDefault(), from.Add(skew), to.Add(skew), oneWriter)
 	run.measures["store_calls_load_disturbances"] = disturbed
 	for _, d := range disturbed {
 		run.fail("the load window was not steady, so its store calls are no evidence: %s", d)
@@ -958,7 +1295,7 @@ const ssStoreStall = 5 * time.Second
 // started, stopped or was placed, a bus or process that started or stopped,
 // the state bus writing as more than one writer, and Azurite serving no
 // request for ssStoreStall or longer.
-func windowDisturbances(events []ssEvent, calls []ssStoreCall, container string, from, to time.Time) []string {
+func windowDisturbances(events []ssEvent, calls []ssStoreCall, container string, from, to time.Time, oneWriter bool) []string {
 	var out []string
 	sorted := slices.Clone(events)
 	sortSSEvents(sorted)
@@ -971,7 +1308,7 @@ func windowDisturbances(events []ssEvent, calls []ssStoreCall, container string,
 		}
 	}
 	writers := slices.Sorted(maps.Keys(segmentWrites(calls, container, from, to)))
-	if len(writers) > 1 {
+	if oneWriter && len(writers) > 1 {
 		out = append(out, fmt.Sprintf("the state bus wrote its segments as %d writers (%s): it moved or started again", len(writers), strings.Join(writers, ", ")))
 	}
 	last := from
