@@ -40,10 +40,12 @@ type healthDoc struct {
 		Streams                int `json:"streams"`
 		StreamsUnderReplicated int `json:"streams_under_replicated"`
 		StreamDetail           []struct {
-			Name            string `json:"name"`
-			Leader          string `json:"leader"`
-			DesiredReplicas int    `json:"desired_replicas"`
-			ActualReplicas  int    `json:"actual_replicas"`
+			Name            string   `json:"name"`
+			Leader          string   `json:"leader"`
+			DesiredReplicas int      `json:"desired_replicas"`
+			ActualReplicas  int      `json:"actual_replicas"`
+			OfflinePeers    []string `json:"offline_peers"`
+			MaxLag          uint64   `json:"max_lag"`
 		} `json:"stream_detail"`
 	} `json:"jetstream"`
 }
@@ -65,6 +67,71 @@ type nodeHealth struct {
 	UnderRepl     int               `json:"under_replicated,omitempty"`
 	Reconfiguring bool              `json:"reconfiguring,omitempty"`
 	StreamLeaders map[string]string `json:"-"`
+	// Copies are the streams the node reports, by name, with their copies
+	// as the node sees them, and ExpectedCopies how many copies a stream
+	// should have in its cluster: one on every member, five at most
+	// (rolling_restart wait_copies).
+	Copies         map[string]streamCopies `json:"-"`
+	ExpectedCopies int                     `json:"-"`
+}
+
+// streamCopies is a stream's copies as one node reports them.
+type streamCopies struct {
+	Leader          string
+	Desired, Actual int
+	Offline         int    // copies offline or behind
+	MaxLag          uint64 // how far the furthest copy is behind, in operations
+}
+
+// copiesLagSlack is how far behind its leader a copy may be and still count
+// as caught up, in operations. Under load the leader commits an operation
+// once most copies have it, so the slowest copy is often an operation or two
+// behind, and the leader reports it as behind.
+const copiesLagSlack = 10
+
+// short reports whether the stream lacks a copy: fewer copies than expected,
+// or a copy offline or more than copiesLagSlack operations behind. Only the stream's leader tells this right: a
+// node that does not lead a stream does not follow the other copies, and
+// reports some of them as behind.
+func (s streamCopies) short(expected int) bool {
+	return s.Desired < expected || s.Actual < s.Desired || (s.Offline > 0 && s.MaxLag > copiesLagSlack)
+}
+
+// maxStreamCopies is the most copies of a stream the director's bus keeps.
+const maxStreamCopies = 5
+
+// copiesComplete reports whether every stream has all its copies back in the
+// round, as its leader reports them: every stream that a node reports has a
+// leader that answered, and that leader reports a copy on every member (five
+// at most) and every copy current. A round in which no node reports a stream
+// is not complete.
+func copiesComplete(r healthRound) bool {
+	streams := map[string]bool{}
+	led := map[string]bool{}
+	for _, h := range r.Nodes {
+		if !h.Reachable || !h.Clustered {
+			continue
+		}
+		for name, s := range h.Copies {
+			streams[name] = true
+			if s.Leader != h.Name {
+				continue
+			}
+			if s.short(h.ExpectedCopies) {
+				return false
+			}
+			led[name] = true
+		}
+	}
+	if len(streams) == 0 {
+		return false
+	}
+	for name := range streams {
+		if !led[name] {
+			return false
+		}
+	}
+	return true
 }
 
 // selfLeader reports whether the node names itself the leader.
@@ -223,17 +290,30 @@ type leadershipStats struct {
 	StreamSplits       []splitInterval `json:"stream_splits,omitempty"`
 	LeaderChanges      int             `json:"leader_changes"`
 	LeaderlessRoundsMs int64           `json:"leaderless_ms"`
+	// StreamLeaderlessMs is the longest time one stream of a cluster had no
+	// leader: every reachable node that reported the stream named none. It is
+	// measured like the split intervals, from the first round of a stretch to
+	// the round after its last. StreamLeaderless is that stretch.
+	StreamLeaderlessMs int64          `json:"stream_leaderless_ms"`
+	StreamLeaderless   *splitInterval `json:"stream_leaderless,omitempty"`
+	// StreamsReported is the most streams the clustered nodes reported in one
+	// round. Zero means the leaderless time measured nothing.
+	StreamsReported int `json:"streams_reported"`
 }
 
 // analyzeLeadership measures, over consecutive rounds, how long two or more
 // nodes named themselves the cluster's leader (and each stream's). A
 // stretch lasts from its first round to the round after its last, which is
-// the most the overlap can have lasted given one read per round.
-func analyzeLeadership(rounds []healthRound) leadershipStats {
+// the most the overlap can have lasted given one read per round. A stream
+// still without a leader in the last round has no round after it: its
+// stretch lasts until end, the time the rounds were read, or until the last
+// round when end is zero or earlier.
+func analyzeLeadership(rounds []healthRound, end time.Time) leadershipStats {
 	var st leadershipStats
 	st.Rounds = len(rounds)
 	var open *splitInterval
 	streamOpen := map[string]*splitInterval{}
+	leaderlessOpen := map[string]*splitInterval{}
 	prevLeader := 0
 
 	closeAt := func(iv *splitInterval, at time.Time) splitInterval {
@@ -292,6 +372,39 @@ func analyzeLeadership(rounds []healthRound) leadershipStats {
 				delete(streamOpen, stream)
 			}
 		}
+
+		reported, led := streamLeadership(r)
+		st.StreamsReported = max(st.StreamsReported, len(reported))
+		for stream := range reported {
+			if led[stream] {
+				if iv := leaderlessOpen[stream]; iv != nil {
+					st.noteLeaderless(closeAt(iv, r.At))
+					delete(leaderlessOpen, stream)
+				}
+				continue
+			}
+			if leaderlessOpen[stream] == nil {
+				leaderlessOpen[stream] = &splitInterval{From: r.At, Stream: stream}
+			}
+			leaderlessOpen[stream].Rounds++
+		}
+		// A stream no reachable node reports any more is not known to lack a
+		// leader: its stretch ends here.
+		for stream, iv := range leaderlessOpen {
+			if !reported[stream] {
+				st.noteLeaderless(closeAt(iv, r.At))
+				delete(leaderlessOpen, stream)
+			}
+		}
+	}
+	if len(rounds) > 0 {
+		until := rounds[len(rounds)-1].At
+		if end.After(until) {
+			until = end
+		}
+		for _, iv := range leaderlessOpen {
+			st.noteLeaderless(closeAt(iv, until))
+		}
 	}
 	if open != nil && len(rounds) > 0 {
 		iv := closeAt(open, rounds[len(rounds)-1].At)
@@ -305,6 +418,34 @@ func analyzeLeadership(rounds []healthRound) leadershipStats {
 	}
 	sort.Slice(st.StreamSplits, func(i, j int) bool { return st.StreamSplits[i].From.Before(st.StreamSplits[j].From) })
 	return st
+}
+
+// noteLeaderless keeps the longest stretch a stream had no leader.
+func (st *leadershipStats) noteLeaderless(iv splitInterval) {
+	if iv.LastsMs > st.StreamLeaderlessMs || st.StreamLeaderless == nil {
+		st.StreamLeaderlessMs = iv.LastsMs
+		st.StreamLeaderless = &iv
+	}
+}
+
+// streamLeadership returns the streams that the round's reachable clustered
+// nodes report, and those of them that at least one of those nodes names a
+// leader for. A director that is not in a cluster leads its streams itself
+// and names no leader, so it is left out.
+func streamLeadership(r healthRound) (reported, led map[string]bool) {
+	reported, led = map[string]bool{}, map[string]bool{}
+	for _, h := range r.Nodes {
+		if !h.Reachable || !h.Clustered {
+			continue
+		}
+		for stream, leader := range h.StreamLeaders {
+			reported[stream] = true
+			if leader != "" {
+				led[stream] = true
+			}
+		}
+	}
+	return reported, led
 }
 
 // clusterProbe reads every node's /health in rounds until stopped.
@@ -442,6 +583,12 @@ func readNodeHealth(ctx context.Context, n int, container string) nodeHealth {
 	if err != nil {
 		return h
 	}
+	return parseNodeHealth(n, raw)
+}
+
+// parseNodeHealth reads node n's /health answer.
+func parseNodeHealth(n int, raw []byte) nodeHealth {
+	h := nodeHealth{Node: n}
 	var doc healthDoc
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return h
@@ -465,8 +612,14 @@ func readNodeHealth(ctx context.Context, n int, container string) nodeHealth {
 	if doc.JetStream != nil {
 		h.UnderRepl = doc.JetStream.StreamsUnderReplicated
 		h.StreamLeaders = map[string]string{}
+		h.ExpectedCopies = 1
+		if doc.Cluster != nil {
+			h.ExpectedCopies = max(1, min(doc.Cluster.Size, maxStreamCopies))
+		}
+		h.Copies = map[string]streamCopies{}
 		for _, s := range doc.JetStream.StreamDetail {
 			h.StreamLeaders[s.Name] = s.Leader
+			h.Copies[s.Name] = streamCopies{Leader: s.Leader, Desired: s.DesiredReplicas, Actual: s.ActualReplicas, Offline: len(s.OfflinePeers), MaxLag: s.MaxLag}
 		}
 	}
 	return h
@@ -489,6 +642,34 @@ func describeRound(r healthRound) string {
 				ml = "-"
 			}
 			parts = append(parts, fmt.Sprintf("n%d:%s/leader=%s/q=%s/ur=%d", h.Node, h.Phase, ml, h.Quorum, h.UnderRepl))
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+// describeCopies renders, for each reachable node in a cluster, how many
+// streams it leads, and how many of those lack a copy (rolling_restart
+// wait_copies).
+func describeCopies(r healthRound) string {
+	parts := make([]string, 0, len(r.Nodes))
+	for _, h := range r.Nodes {
+		switch {
+		case !h.Reachable:
+			parts = append(parts, fmt.Sprintf("n%d:no-answer", h.Node))
+		case !h.Clustered:
+			parts = append(parts, fmt.Sprintf("n%d:standalone", h.Node))
+		default:
+			leads, short := 0, 0
+			for _, s := range h.Copies {
+				if s.Leader != h.Name {
+					continue
+				}
+				leads++
+				if s.short(h.ExpectedCopies) {
+					short++
+				}
+			}
+			parts = append(parts, fmt.Sprintf("n%d:leads %d streams, %d short of copies", h.Node, leads, short))
 		}
 	}
 	return strings.Join(parts, " ")

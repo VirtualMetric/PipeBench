@@ -57,7 +57,7 @@ func TestAnalyzeLeadershipMeasuresTwoLeaderTime(t *testing.T) {
 		{At: at(3), Nodes: []nodeHealth{h(1, "1", "1"), h(2, "2", "1"), h(3, "3", "3")}},
 		{At: at(4), Nodes: []nodeHealth{h(1, "1", "1"), h(2, "2", "1"), h(3, "3", "")}},
 	}
-	st := analyzeLeadership(rounds)
+	st := analyzeLeadership(rounds, time.Time{})
 	if st.MaxSelfClaimed != 2 {
 		t.Fatalf("MaxSelfClaimed = %d, want 2", st.MaxSelfClaimed)
 	}
@@ -80,7 +80,7 @@ func TestAnalyzeLeadershipStreams(t *testing.T) {
 	st := analyzeLeadership([]healthRound{
 		{At: t0, Nodes: []nodeHealth{a, b}},
 		{At: t0.Add(time.Second), Nodes: []nodeHealth{a, c}},
-	})
+	}, time.Time{})
 	if st.MaxStreamClaims != 2 || st.StreamSplitMs != 1000 {
 		t.Fatalf("stream split: max %d, %d ms", st.MaxStreamClaims, st.StreamSplitMs)
 	}
@@ -682,5 +682,24 @@ func TestLineCountsStayApartFromTimes(t *testing.T) {
 	}
 	if _, ok := doc.Measures["held_writes_lines_acked"]; ok || doc.Counts["held_writes_lines_acked"] != 820 {
 		t.Fatalf("report measures_ms = %v, counts = %v; want the count under counts only", doc.Measures, doc.Counts)
+	}
+}
+
+// A rolling restart notes the disruption before it stops a node. A round read
+// while the node was stopping can still show every node healthy, so the waits
+// after the restart count only a round that began once the node was back.
+func TestWaitRoundAfterCountsOnlyALaterRound(t *testing.T) {
+	read := time.Now()
+	sr := &scenarioRun{
+		ctx:   context.Background(),
+		probe: &clusterProbe{rounds: []healthRound{{At: read}}},
+	}
+	always := func(healthRound) bool { return true }
+
+	if _, ok, err := sr.waitRoundAfter(read, 700*time.Millisecond, always); err != nil || ok {
+		t.Fatalf("waitRoundAfter took a round that began at the time it waits from (ok %v, err %v)", ok, err)
+	}
+	if _, ok, err := sr.waitRoundAfter(read.Add(-time.Second), 700*time.Millisecond, always); err != nil || !ok {
+		t.Fatalf("waitRoundAfter refused a round that began after the time it waits from (ok %v, err %v)", ok, err)
 	}
 }

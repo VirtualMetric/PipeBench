@@ -15,6 +15,12 @@ package main
 // harness can ask for the latency of the lines sent in one window, such as
 // the seconds around a node kill (/latency).
 //
+// A sample takes 32 bytes, so a throughput case, which sends hundreds of
+// millions of lines, keeps the latency of one line in N only
+// (RECEIVER_LATENCY_SAMPLE_EVERY): the lines whose SEQ is a multiple of N.
+// Every line still counts as arrived, so the loss check and the timeline stay
+// exact.
+//
 // /timeline counts arrivals in 100 ms buckets, which shows when delivery
 // stalled and when it came back. /duplicates lists the lines that arrived
 // more than once, with the time of each copy.
@@ -73,10 +79,15 @@ type seqTracker struct {
 	samples  []latSample
 	buckets  []tlBucket
 	dupList  []dupSample
+	// sampleEvery keeps the latency of the lines whose SEQ is a multiple of
+	// it. 1 keeps every line's.
+	sampleEvery int64
 }
 
-func newSeqTracker() *seqTracker {
-	return &seqTracker{conns: map[int64]*seqConn{}}
+// newSeqTracker returns a tracker that keeps the latency of one line in
+// sampleEvery. A sampleEvery of 1 or less keeps every line's.
+func newSeqTracker(sampleEvery int64) *seqTracker {
+	return &seqTracker{conns: map[int64]*seqConn{}, sampleEvery: max(sampleEvery, 1)}
 }
 
 // parseSeqLine finds "CONN=<id> SEQ=<n>" and an optional " TS=<ns>" after it.
@@ -160,7 +171,7 @@ func (t *seqTracker) record(line []byte, now int64) {
 	}
 	t.unique++
 	b.unique++
-	if ts > 0 && now > ts {
+	if ts > 0 && now > ts && seq%t.sampleEvery == 0 {
 		t.samples = append(t.samples, latSample{sent: ts, lat: now - ts, seq: seq, conn: conn})
 	}
 }
@@ -261,6 +272,9 @@ type latencyStats struct {
 	P99Ms     float64 `json:"p99_ms"`
 	MaxMs     float64 `json:"max_ms"`
 	MaxSentNs int64   `json:"max_sent_ns,omitempty"`
+	// SampleEvery is set when the receiver keeps the latency of one line in
+	// SampleEvery only. Count is then the number of samples.
+	SampleEvery int64 `json:"sample_every,omitempty"`
 }
 
 // latency summarizes the first-arrival latency of the lines sent in
@@ -274,7 +288,11 @@ func (t *seqTracker) latency(from, to int64) latencyStats {
 		}
 	}
 	t.mu.Unlock()
-	return summarizeLatency(vals)
+	out := summarizeLatency(vals)
+	if t.sampleEvery > 1 {
+		out.SampleEvery = t.sampleEvery
+	}
+	return out
 }
 
 func summarizeLatency(vals []latSample) latencyStats {

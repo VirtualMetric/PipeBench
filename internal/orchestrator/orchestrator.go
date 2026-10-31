@@ -26,6 +26,13 @@ type Orchestrator interface {
 	// disk, as a node whose disk was replaced does.
 	RecreateServices(services ...string) error
 
+	// RecreateServiceWithImage replaces one service's container with a new
+	// container from another image, without touching its dependencies. The
+	// new container mounts the service's named volumes again, so a node that
+	// keeps its data in one (cluster.scenario.node_volume) starts on its old
+	// data, as a director that an upgrade replaced on its machine does.
+	RecreateServiceWithImage(service, image string) error
+
 	// StopServices sends SIGTERM to the named services and waits up to `timeout`
 	// for graceful exit before SIGKILL.
 	//   - persistence_restart_correctness: 30s timeout (subject must flush state to disk)

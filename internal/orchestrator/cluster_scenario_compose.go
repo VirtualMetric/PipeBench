@@ -24,17 +24,18 @@ func nodeIDs(n int) []int {
 }
 
 // RenderClusterNodeConfig renders a cluster case's config template for one
-// node, naming nodes 1..size as the cluster's members. It writes outPath in
-// place (truncate and write) so a running node's bind mount keeps seeing the
-// file: a rename would leave the container on the old inode. A scenario's
-// scale_to step calls it to grow or shrink the cluster.
-func RenderClusterNodeConfig(srcPath, outPath string, nodeID, size int) error {
+// node, naming nodes 1..size as the cluster's members, at the stage given
+// ({{@.Stage@}}). It writes outPath in place (truncate and write) so a running
+// node's bind mount keeps seeing the file: a rename would leave the container
+// on the old inode. A scenario's scale_to step calls it to grow or shrink the
+// cluster, and its set_stage step to change the cluster's settings.
+func RenderClusterNodeConfig(srcPath, outPath string, nodeID, size, stage int) error {
 	return renderConfigToFile(srcPath, outPath, configTemplateContext{
 		CPUs:           runtime.NumCPU(),
 		NodeID:         nodeID,
 		ClusterNodeIDs: nodeIDs(size),
 		T0:             time.Now().UTC(),
-		Stage:          1,
+		Stage:          stage,
 	})
 }
 
@@ -213,4 +214,42 @@ func mappingValue(m *yaml.Node, key string) *yaml.Node {
 		}
 	}
 	return nil
+}
+
+// setComposeServiceImage rewrites the image of one service in a compose file.
+// It writes the file in place (truncate and write), as the node configs are.
+func setComposeServiceImage(path, service, image string) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return fmt.Errorf("parsing compose file %s: %w", path, err)
+	}
+	if len(doc.Content) == 0 {
+		return fmt.Errorf("compose file %s is empty", path)
+	}
+	svc := mappingValue(mappingValue(doc.Content[0], "services"), service)
+	if svc == nil || svc.Kind != yaml.MappingNode {
+		return fmt.Errorf("compose file %s has no service %q", path, service)
+	}
+	if img := mappingValue(svc, "image"); img != nil {
+		img.Kind, img.Tag, img.Value, img.Style = yaml.ScalarNode, "!!str", image, yaml.DoubleQuotedStyle
+	} else {
+		svc.Content = append(svc.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Value: "image"},
+			&yaml.Node{Kind: yaml.ScalarNode, Value: image, Style: yaml.DoubleQuotedStyle},
+		)
+	}
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(2)
+	if err := enc.Encode(&doc); err != nil {
+		return err
+	}
+	if err := enc.Close(); err != nil {
+		return err
+	}
+	return os.WriteFile(path, buf.Bytes(), 0o644)
 }

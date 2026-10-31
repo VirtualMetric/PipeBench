@@ -45,6 +45,11 @@ type config struct {
 	// lines arrived, duplicates, first-arrival latency and an arrival
 	// timeline (seqtrack.go). Default off.
 	TrackSeq bool
+
+	// LatencySampleEvery keeps the latency of one tracked line in this many
+	// (RECEIVER_LATENCY_SAMPLE_EVERY), so that a throughput case does not
+	// fill the receiver's memory with samples. Default 1: every line.
+	LatencySampleEvery int64
 }
 
 // seqTrack is the sequence tracker when RECEIVER_TRACK_SEQ is on, else nil.
@@ -556,7 +561,7 @@ func main() {
 	cnt := &counters{recordTimes: cfg.RecordArrivalTimes}
 	val := newValidator()
 	if cfg.TrackSeq {
-		seqTrack = newSeqTracker()
+		seqTrack = newSeqTracker(cfg.LatencySampleEvery)
 	}
 	if expr := os.Getenv("RECEIVER_TRACK_KEYS"); expr != "" {
 		kt, err := newKeyTracker(expr)
@@ -1125,6 +1130,7 @@ func loadConfig() config {
 		ValidateJSON:       getEnvBool("RECEIVER_VALIDATE_JSON", false),
 		RecordArrivalTimes: getEnvBool("RECEIVER_RECORD_ARRIVAL_TIMES", false),
 		TrackSeq:           getEnvBool("RECEIVER_TRACK_SEQ", false),
+		LatencySampleEvery: int64(getEnvInt("RECEIVER_LATENCY_SAMPLE_EVERY", 1)),
 	}
 }
 

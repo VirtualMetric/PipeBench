@@ -119,6 +119,13 @@ func TestValidateRowsCheck(t *testing.T) {
 	if err := rowsScenarioCase().validateClusterScenario(); err != nil {
 		t.Fatalf("validateClusterScenario: %v", err)
 	}
+	// The rows check can run beside the http_ack load: the receiver counts
+	// the load's lines and the rows apart.
+	withLoad := rowsScenarioCase()
+	withLoad.Generator = GeneratorConfig{Mode: "http_ack", Target: "http://subject-1:9000/", Connections: 1, Rate: 10}
+	if err := withLoad.validateClusterScenario(); err != nil {
+		t.Fatalf("validateClusterScenario with the load: %v", err)
+	}
 	cases := map[string]struct {
 		edit func(tc *TestCase)
 		want string
@@ -127,7 +134,6 @@ func TestValidateRowsCheck(t *testing.T) {
 		"no key":             {func(tc *TestCase) { tc.Cluster.Scenario.Rows.Key = "" }, "needs key"},
 		"bad key":            {func(tc *TestCase) { tc.Cluster.Scenario.Rows.Key = "evt-(" }, "rows.key"},
 		"backslash in key":   {func(tc *TestCase) { tc.Cluster.Scenario.Rows.Key = `evt-\d+` }, "must not contain a backslash"},
-		"with a generator":   {func(tc *TestCase) { tc.Generator = GeneratorConfig{Mode: "http_ack", Connections: 1, Rate: 10} }, "has a generator"},
 		"not postgres":       {func(tc *TestCase) { tc.Database.Engine = "mysql" }, "engine postgres"},
 		"no database":        {func(tc *TestCase) { tc.Database = nil }, "engine postgres"},
 		"unknown writer":     {func(tc *TestCase) { tc.Cluster.Scenario.Rows.Writer = "ghost" }, `writer "ghost"`},

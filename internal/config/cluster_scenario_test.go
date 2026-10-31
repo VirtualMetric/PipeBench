@@ -429,3 +429,75 @@ expect:
 		t.Fatalf("expect.receivers.b = %+v", b)
 	}
 }
+
+// TestValidateLoadPause checks the pause_load and resume_load steps: the load
+// must run to be paused and be paused to be resumed, no step may count its
+// lines while it is paused, and a case may not end with it paused.
+func TestValidateLoadPause(t *testing.T) {
+	withSteps := func(steps ...ScenarioStep) *TestCase {
+		tc := validScenarioCase()
+		tc.Cluster.Scenario.Steps = append([]ScenarioStep{{Do: "wait_ready"}, {Do: "start_load"}}, steps...)
+		return tc
+	}
+	good := withSteps(
+		ScenarioStep{Do: "pause_load"},
+		ScenarioStep{Do: "sleep", For: "5s"},
+		ScenarioStep{Do: "stop", Node: "1"},
+		ScenarioStep{Do: "start", Node: "1"},
+		ScenarioStep{Do: "resume_load"},
+		ScenarioStep{Do: "expect_writes_continue", For: "30s", Gap: "10s"},
+	)
+	if err := good.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	bad := map[string]struct {
+		tc   *TestCase
+		want string
+	}{
+		"resume without a pause": {withSteps(ScenarioStep{Do: "resume_load"}), "no earlier pause_load"},
+		"two pauses":             {withSteps(ScenarioStep{Do: "pause_load"}, ScenarioStep{Do: "pause_load"}, ScenarioStep{Do: "resume_load"}), "paused already"},
+		"paused at the end":      {withSteps(ScenarioStep{Do: "pause_load"}), "never ends"},
+		"a count while paused": {withSteps(ScenarioStep{Do: "pause_load"}, ScenarioStep{Do: "wait_delivery"}, ScenarioStep{Do: "resume_load"}),
+			"while a pause_load step has paused the load"},
+		"a writes check while paused": {withSteps(ScenarioStep{Do: "pause_load"}, ScenarioStep{Do: "expect_writes_stop"}, ScenarioStep{Do: "resume_load"}),
+			"while a pause_load step has paused the load"},
+	}
+	for name, c := range bad {
+		err := c.tc.Validate()
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: Validate = %v, want an error with %q", name, err, c.want)
+		}
+	}
+	// A case without the load has nothing to pause.
+	noLoad := rowsScenarioCase()
+	noLoad.Cluster.Scenario.Steps = append(noLoad.Cluster.Scenario.Steps, ScenarioStep{Do: "pause_load"}, ScenarioStep{Do: "resume_load"})
+	if err := noLoad.validateClusterScenario(); err == nil || !strings.Contains(err.Error(), "has no generator") {
+		t.Errorf("Validate without a generator = %v, want the generator error", err)
+	}
+}
+
+// TestValidateSetStage checks the set_stage step: it needs a stage of 1 or
+// more, and only it takes one.
+func TestValidateSetStage(t *testing.T) {
+	withStep := func(st ScenarioStep) *TestCase {
+		tc := validScenarioCase()
+		tc.Cluster.Scenario.Steps = []ScenarioStep{{Do: "wait_ready"}, {Do: "start_load"}, st}
+		return tc
+	}
+	if err := withStep(ScenarioStep{Do: "set_stage", Stage: 2}).Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	for name, c := range map[string]struct {
+		st   ScenarioStep
+		want string
+	}{
+		"no stage":           {ScenarioStep{Do: "set_stage"}, "needs stage"},
+		"a stage on a sleep": {ScenarioStep{Do: "sleep", For: "1s", Stage: 2}, "stage only applies to set_stage"},
+		"a stage below one":  {ScenarioStep{Do: "set_stage", Stage: -1}, "needs stage"},
+	} {
+		err := withStep(c.st).Validate()
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: Validate = %v, want an error with %q", name, err, c.want)
+		}
+	}
+}

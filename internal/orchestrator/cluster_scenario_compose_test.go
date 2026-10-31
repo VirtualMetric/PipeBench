@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -180,7 +181,7 @@ func TestClusterScenarioComposeRendersTopology(t *testing.T) {
 	}
 	// A scale_to step rewrites node 1 for four members, in place.
 	before, _ := os.Stat(ClusterNodeConfigPath(tmp, 1))
-	if err := RenderClusterNodeConfig(filepath.Join(filepath.Dir(tmp), "missing.yml"), ClusterNodeConfigPath(tmp, 1), 1, 4); err == nil {
+	if err := RenderClusterNodeConfig(filepath.Join(filepath.Dir(tmp), "missing.yml"), ClusterNodeConfigPath(tmp, 1), 1, 4, 1); err == nil {
 		t.Fatalf("rendering a missing template must fail")
 	}
 	_ = before
@@ -374,5 +375,112 @@ func TestClusterScenarioComposeGeneratorWaitsForEachReceiver(t *testing.T) {
 	deps, _ = service(t, doc, "generator")["depends_on"].(map[string]any)
 	if _, ok := deps["receiver"]; !ok {
 		t.Fatalf("the generator of a case with one receiver must wait for it: %v", keys(deps))
+	}
+}
+
+// TestClusterScenarioComposeStartImageAndVolume covers start_image, which
+// starts every node on another image than the one under test, and
+// node_volume, which keeps a directory of every node on a volume of its own.
+func TestClusterScenarioComposeStartImageAndVolume(t *testing.T) {
+	src := "director:\n  id: {{@.NodeID@}}\n"
+	tc := scenarioCase(&config.ScenarioConfig{
+		Steps:      []config.ScenarioStep{{Do: "wait_ready"}},
+		StartImage: "vmetric/director:2.6.0",
+		NodeVolume: "/opt/vmetric/storage",
+		SpareNodes: 1,
+	})
+	doc, _, tmp := renderScenario(t, tc, src)
+
+	volumes, _ := doc["volumes"].(map[string]any)
+	for n := 1; n <= 4; n++ {
+		name := fmt.Sprintf("subject-%d", n)
+		svc := service(t, doc, name)
+		if svc["image"] != "vmetric/director:2.6.0" {
+			t.Errorf("%s starts on %v, want the start image", name, svc["image"])
+		}
+		vol := NodeVolumeName(n)
+		if _, ok := volumes[vol]; !ok {
+			t.Errorf("volume %s is not declared: %v", vol, volumes)
+		}
+		mounts, _ := svc["volumes"].([]any)
+		found := false
+		for _, m := range mounts {
+			if m == vol+":/opt/vmetric/storage" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%s does not mount %s at /opt/vmetric/storage: %v", name, vol, mounts)
+		}
+	}
+
+	// A step moves node 2 to the image under test: the compose file then
+	// names that image for node 2, and only for node 2.
+	path := filepath.Join(tmp, "compose.yaml")
+	if err := setComposeServiceImage(path, "subject-2", "vmetric/director-enterprise:dev"); err != nil {
+		t.Fatalf("setComposeServiceImage: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var after map[string]any
+	if err := yaml.Unmarshal(raw, &after); err != nil {
+		t.Fatalf("the rewritten compose file is not YAML: %v\n%s", err, raw)
+	}
+	for name, want := range map[string]string{
+		"subject-1": "vmetric/director:2.6.0",
+		"subject-2": "vmetric/director-enterprise:dev",
+		"subject-3": "vmetric/director:2.6.0",
+	} {
+		if got := service(t, after, name)["image"]; got != want {
+			t.Errorf("after the move, %s runs %v, want %s", name, got, want)
+		}
+	}
+	// The rest of the node's service is as it was.
+	if got, want := service(t, after, "subject-2")["volumes"], service(t, doc, "subject-2")["volumes"]; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("the move changed subject-2's volumes from %v to %v", want, got)
+	}
+	if err := setComposeServiceImage(path, "subject-9", "x:1"); err == nil || !strings.Contains(err.Error(), "no service") {
+		t.Errorf("setComposeServiceImage on a missing service = %v, want an error", err)
+	}
+
+	// Without start_image and node_volume, the nodes run the image under
+	// test and mount no volume of their own.
+	plain := scenarioCase(&config.ScenarioConfig{Steps: []config.ScenarioStep{{Do: "wait_ready"}}})
+	doc, _, _ = renderScenario(t, plain, src)
+	if got := service(t, doc, "subject-1")["image"]; got != "vmetric/director-enterprise:dev" {
+		t.Errorf("subject-1 runs %v, want the image under test", got)
+	}
+	if _, ok := doc["volumes"].(map[string]any)[NodeVolumeName(1)]; ok {
+		t.Errorf("a node volume was declared without node_volume")
+	}
+}
+
+// TestRenderClusterNodeConfigStage checks that a set_stage step's render
+// carries the stage into the config, with the member list.
+func TestRenderClusterNodeConfigStage(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "vmetric.yml")
+	tmpl := "node: {{@.NodeID@}}\nstage: {{@.Stage@}}\n{{@ if ge .Stage 2 @}}crash_resistance: true\n{{@ end @}}members:\n{{@- range .ClusterNodeIDs @}}\n  - {{@ . @}}\n{{@- end @}}\n"
+	if err := os.WriteFile(src, []byte(tmpl), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "node-2.yml")
+	if err := RenderClusterNodeConfig(src, out, 2, 3, 1); err != nil {
+		t.Fatal(err)
+	}
+	first, _ := os.ReadFile(out)
+	if strings.Contains(string(first), "crash_resistance") || !strings.Contains(string(first), "stage: 1") {
+		t.Fatalf("stage 1 render:\n%s", first)
+	}
+	if err := RenderClusterNodeConfig(src, out, 2, 3, 2); err != nil {
+		t.Fatal(err)
+	}
+	second, _ := os.ReadFile(out)
+	for _, want := range []string{"node: 2", "stage: 2", "crash_resistance: true", "  - 3"} {
+		if !strings.Contains(string(second), want) {
+			t.Fatalf("stage 2 render lacks %q:\n%s", want, second)
+		}
 	}
 }

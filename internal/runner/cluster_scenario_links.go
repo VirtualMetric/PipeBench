@@ -208,6 +208,7 @@ func (sr *scenarioRun) relink(n int) {
 	if err := sr.links.resync(sr.ctx, sr.containers[n-1]); err != nil {
 		sr.failures = append(sr.failures, fmt.Sprintf("could not put node %d's link faults back after its start: %v", n, err))
 	}
+	sr.reslow(n)
 }
 
 // restoreAtEnd puts every link and every disk back as it was, once the steps
@@ -234,6 +235,7 @@ func (sr *scenarioRun) restoreAtEnd(ctx context.Context) {
 		}
 		sr.notes = append(sr.notes, fmt.Sprintf("the steps left node %d's disk full, which the harness freed before the drain", n))
 	}
+	sr.restoreDisks(ctx)
 }
 
 // fillerName is the file fill_disk writes on a node's disk.

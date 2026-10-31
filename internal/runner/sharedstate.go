@@ -225,6 +225,11 @@ type ssRun struct {
 	// stream name and then replica. Only streams that set min_after_rejoin
 	// are counted.
 	confirmedAtRejoin map[string]map[int]int64
+	// confirmedAtResume is how many records each stream's sender had got
+	// confirmed through each replica it posts to when the store came back
+	// after a pause_store outage, by stream name and then replica. Only
+	// streams that set min_each_after_outage are counted.
+	confirmedAtResume map[string]map[int]int64
 }
 
 func newSSRun(r *Runner, tc *config.TestCase, subject config.Subject, orch *orchestrator.ComposeRunner) *ssRun {
@@ -240,6 +245,7 @@ func newSSRun(r *Runner, tc *config.TestCase, subject config.Subject, orch *orch
 
 		confirmedBefore:   map[string]int64{},
 		confirmedAtRejoin: map[string]map[int]int64{},
+		confirmedAtResume: map[string]map[int]int64{},
 	}
 	run.measures["evidence"] = run.evidence
 	if tc.SharedState.Action == config.SharedStateActionWrongCredentials {
@@ -1561,6 +1567,22 @@ func (run *ssRun) checkAckedStream(st config.SharedStateStream, genOut string, p
 		counts["confirmed_after_rejoin"] = byReplica
 		for _, why := range judgeAfterRejoin(st, after) {
 			run.fail("%s", why)
+		}
+	}
+	if st.MinEachAfterOutage > 0 {
+		// A sender whose counts at the store's return are missing already
+		// failed the run in countConfirmedAtResume
+		if atResume, ok := run.confirmedAtResume[st.StreamName()]; ok {
+			after := confirmedAfterRejoin(gen.Ack.AckedPerTarget, atResume)
+			byReplica := map[string]int64{}
+			for _, n := range slices.Sorted(maps.Keys(after)) {
+				byReplica[run.replica(n).Service] = after[n]
+				fmt.Printf("    %d records were confirmed through %s after the store came back\n", after[n], run.replica(n).Service)
+			}
+			counts["confirmed_after_outage"] = byReplica
+			for _, why := range judgeEachAfterOutage(st, after) {
+				run.fail("%s", why)
+			}
 		}
 	}
 	return counts
