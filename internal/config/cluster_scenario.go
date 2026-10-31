@@ -80,6 +80,13 @@ type ScenarioConfig struct {
 	// acknowledged line to arrive (default 180).
 	DrainSeconds int `yaml:"drain_seconds"`
 
+	// Throughput marks a case that measures how many lines a second the
+	// cluster delivers, under a load it cannot keep up with. Such a case may
+	// send more than MaxScenarioRate, which keeps the other cases at a load a
+	// shared machine can carry, so run it on a machine that does nothing
+	// else. Its expect.throughput compares the windows between its marks.
+	Throughput bool `yaml:"throughput"`
+
 	// NodeDisk gives chosen nodes a small disk of their own at a path: a
 	// size-limited tmpfs, which a fill_disk step can fill.
 	NodeDisk *ScenarioNodeDisk `yaml:"node_disk"`
@@ -174,6 +181,13 @@ type ScenarioExpect struct {
 	// the receiver's hash-based duplicate count does not see.
 	MaxRowsTwice *int64 `yaml:"max_rows_twice"`
 
+	// Throughput compares the rates of two windows between marks. A window's
+	// rate is the number of lines that first reached the receiver in it,
+	// divided by its length in seconds. A case that measures how the
+	// cluster's throughput grows with its size names the window at the larger
+	// size, the window to compare it with, and the least ratio between them.
+	Throughput []ScenarioThroughputExpect `yaml:"throughput"`
+
 	// Receivers judges chosen receivers of a case with several on their own,
 	// keyed by the receiver's id. A limit set for a receiver here replaces
 	// the case's own for that receiver, and the other receivers keep the
@@ -181,6 +195,16 @@ type ScenarioExpect struct {
 	// (at a size limit, for one) names that target's receiver here, while
 	// every other receiver must still get every line.
 	Receivers map[string]ScenarioReceiverExpect `yaml:"receivers"`
+}
+
+// ScenarioThroughputExpect is one entry of cluster.scenario.expect.throughput.
+type ScenarioThroughputExpect struct {
+	// Window and Over name marks. A mark's window runs from the mark to the
+	// next mark, so neither may name the last mark.
+	Window string `yaml:"window"`
+	Over   string `yaml:"over"`
+	// MinRatio is the least that Window's rate divided by Over's rate may be.
+	MinRatio float64 `yaml:"min_ratio"`
 }
 
 // ScenarioReceiverExpect is how one receiver is judged
@@ -573,7 +597,7 @@ func (tc *TestCase) validateClusterScenario() error {
 	case tc.Generator.Connections < 1 || tc.Generator.Rate < 1:
 		return fmt.Errorf("case %q: a scenario case sets generator.connections and generator.rate explicitly", tc.Name)
 	}
-	if total := tc.Generator.Connections * tc.Generator.Rate; tc.HasGenerator() && total > MaxScenarioRate {
+	if total := tc.Generator.Connections * tc.Generator.Rate; tc.HasGenerator() && total > MaxScenarioRate && !sc.Throughput {
 		return fmt.Errorf("case %q: generator.connections × generator.rate is %d lines a second, more than the %d a scenario case may send", tc.Name, total, MaxScenarioRate)
 	}
 	// With several receivers, the driver checks the load's acknowledged lines
@@ -627,6 +651,9 @@ func (tc *TestCase) validateClusterScenario() error {
 		return err
 	}
 	if err := tc.validateReceiverExpect(sc.Expect); err != nil {
+		return fmt.Errorf("case %q: %w", tc.Name, err)
+	}
+	if err := validateThroughputExpect(sc); err != nil {
 		return fmt.Errorf("case %q: %w", tc.Name, err)
 	}
 	names := map[string]bool{}
@@ -795,6 +822,52 @@ func (tc *TestCase) validateClusterScenario() error {
 					return fmt.Errorf("%s: logs has an empty line, which every log line contains", where)
 				}
 			}
+		}
+	}
+	return nil
+}
+
+// validateThroughputExpect checks cluster.scenario.expect.throughput: each
+// entry compares two windows that the steps' marks open and close, by a ratio
+// above zero. Only a case that sets throughput loads the cluster beyond what
+// it keeps up with, and only that load says how much it can take.
+func validateThroughputExpect(sc *ScenarioConfig) error {
+	if len(sc.Expect.Throughput) == 0 {
+		return nil
+	}
+	if !sc.Throughput {
+		return fmt.Errorf("expect.throughput compares how much the cluster takes under a load it cannot keep up with, so it needs cluster.scenario.throughput: true")
+	}
+	// closed holds the marks whose window a later mark closes
+	closed := map[string]bool{}
+	last := ""
+	for _, st := range sc.Steps {
+		if st.Do != "mark" {
+			continue
+		}
+		if last != "" {
+			closed[last] = true
+		}
+		last = st.Label
+	}
+	for i, e := range sc.Expect.Throughput {
+		where := fmt.Sprintf("expect.throughput[%d]", i)
+		if e.Window == "" || e.Over == "" {
+			return fmt.Errorf("%s needs window and over, the marks of the two windows it compares", where)
+		}
+		if e.Window == e.Over {
+			return fmt.Errorf("%s compares window %q with itself", where, e.Window)
+		}
+		for _, m := range []string{e.Window, e.Over} {
+			if !closed[m] {
+				if m == last {
+					return fmt.Errorf("%s names mark %q, the last mark, whose window no later mark closes", where, m)
+				}
+				return fmt.Errorf("%s names mark %q, which no step sets", where, m)
+			}
+		}
+		if math.IsNaN(e.MinRatio) || e.MinRatio <= 0 {
+			return fmt.Errorf("%s: min_ratio must be more than 0, got %v", where, e.MinRatio)
 		}
 	}
 	return nil
