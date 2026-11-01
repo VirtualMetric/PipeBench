@@ -854,3 +854,24 @@ func TestHealthComponent(t *testing.T) {
 		t.Errorf("an unreadable answer gave the status %q", status)
 	}
 }
+
+// A replica that still wants the store cluster reports store_cluster ok, as a
+// member does. Only a member's message says that it is a member, so a switch is
+// done only once every replica's message says so.
+func TestStoreClusterMemberReadsTheMessage(t *testing.T) {
+	for _, tc := range []struct {
+		name, status, message string
+		want                  bool
+	}{
+		{"a member", "ok", "This director is member m-1 of generation 3 of its cluster. It counts 1 other member as live: m-2.", true},
+		{"a replica that wants the store cluster", "ok", "This director is set to the store cluster, and runs in the shared cluster that holds its store until every replica wants the store cluster, and has for 2 minutes.", false},
+		{"a member without a quorum", "degraded", "This director is member m-1 of generation 3, but it cannot reach a quorum of its cluster.", false},
+		{"a switch that runs", "starting", "Switching: the store of this director's queue switches from the shared cluster to the store cluster.", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := storeClusterMember(tc.status, tc.message); got != tc.want {
+				t.Fatalf("storeClusterMember = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

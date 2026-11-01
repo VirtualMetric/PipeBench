@@ -324,6 +324,17 @@ type SharedStateConfig struct {
 	// stop before Docker kills it (default 30): a container app's
 	// terminationGracePeriodSeconds.
 	GraceSeconds int `yaml:"grace_seconds"`
+	// BacklogSeconds makes revision_update pause every receiver this long before
+	// it starts the new replicas, as a target that is down does. The replicas
+	// then hold a backlog all through the update. The receivers go on once the
+	// update is over.
+	BacklogSeconds int `yaml:"backlog_seconds"`
+	// StoreClusterWithinSeconds says that the new revision moves the director
+	// from shared mode to the store cluster. The old replicas run mode embedded,
+	// and the new ones are set to the store cluster in their config. After it
+	// stops the old replicas, revision_update waits this long for /health of
+	// every new replica to report store_cluster ok.
+	StoreClusterWithinSeconds int `yaml:"store_cluster_within_seconds"`
 	// StoreDelayMs is how long slow_store delays each answer of the store
 	// (default 200).
 	StoreDelayMs int `yaml:"store_delay_ms"`
@@ -986,6 +997,17 @@ func (tc *TestCase) validateSharedState() error {
 	}
 	if s.GraceSeconds != 0 && s.Action != SharedStateActionRevisionUpdate {
 		return fmt.Errorf("case %q: shared_state.grace_seconds is only used by the revision_update action", tc.Name)
+	}
+	if s.BacklogSeconds != 0 && s.Action != SharedStateActionRevisionUpdate {
+		return fmt.Errorf("case %q: shared_state.backlog_seconds is only used by the revision_update action", tc.Name)
+	}
+	if s.StoreClusterWithinSeconds != 0 {
+		if s.Action != SharedStateActionRevisionUpdate {
+			return fmt.Errorf("case %q: shared_state.store_cluster_within_seconds is only used by the revision_update action", tc.Name)
+		}
+		if s.ModeOrDefault() != SharedStateModeEmbedded {
+			return fmt.Errorf("case %q: shared_state.store_cluster_within_seconds needs mode embedded, which is what the old replicas run", tc.Name)
+		}
 	}
 	if s.CutHoldSeconds < 0 {
 		return fmt.Errorf("case %q: shared_state.cut_hold_seconds must not be negative", tc.Name)

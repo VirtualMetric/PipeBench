@@ -938,29 +938,13 @@ func caseReceiverContainers(tc *config.TestCase) []string {
 // and reads the rest back from its store.
 func (run *ssRun) pauseReceivers() {
 	outage := time.Duration(run.ss.OutageOrDefault()) * time.Second
-	var paused []string
-	for _, name := range caseReceiverContainers(run.tc) {
-		if err := exec.Command("docker", "pause", name).Run(); err != nil {
-			run.fail("docker pause %s: %v", name, err)
-			continue
-		}
-		paused = append(paused, name)
-	}
-	if len(paused) == 0 {
+	goOn, ok := run.pauseAllReceivers()
+	if !ok {
 		return
 	}
-	from := time.Now()
-	run.measures["receivers_paused_from"] = from.UTC()
-	fmt.Printf("  pausing %s for %s, so the replicas keep a backlog…\n", strings.Join(paused, ", "), outage)
 	// The receivers go on even when the run is stopped meanwhile.
 	_ = sleepCtx(run.r.ctx, outage)
-	for _, name := range paused {
-		if err := exec.Command("docker", "unpause", name).Run(); err != nil {
-			run.fail("docker unpause %s: %v", name, err)
-		}
-	}
-	run.measures["receivers_paused_seconds"] = time.Since(from).Seconds()
-	fmt.Printf("    the receivers go on after %.1fs\n", time.Since(from).Seconds())
+	goOn()
 	if !run.checkSettled("after", earliest(time.Now().Add(time.Duration(run.ss.SettleOrDefault())*time.Second), run.deadline)) {
 		return
 	}
@@ -1158,7 +1142,23 @@ func (run *ssRun) killAll() {
 // old replicas are not replaced: the new ones go on alone. Every record
 // that the old replicas confirmed must reach the receivers through the new
 // ones, and no device may run on two replicas.
+//
+// With backlog_seconds, it first pauses every receiver, so that the replicas
+// hold a backlog all through the update. With store_cluster_within_seconds, the
+// new revision moves the director from shared mode to the store cluster, and the
+// update is over only once every new replica reports that it is a member.
 func (run *ssRun) revisionUpdate() {
+	if d := time.Duration(run.ss.BacklogSeconds) * time.Second; d > 0 {
+		goOn, ok := run.pauseAllReceivers()
+		if !ok {
+			return
+		}
+		defer goOn()
+		fmt.Printf("  the replicas build a backlog for %s…\n", d)
+		if sleepCtx(run.r.ctx, d) != nil {
+			return
+		}
+	}
 	var old []ssReplica
 	for _, rep := range run.replicas {
 		if run.running[rep.N] {
@@ -1213,10 +1213,86 @@ func (run *ssRun) revisionUpdate() {
 	if got := run.waitStoreMembers(len(fresh), 60*time.Second); got != len(fresh) {
 		run.fail("after the revision update the store lists %d live members, want the %d new ones", got, len(fresh))
 	}
+	if !run.waitSwitchToStoreCluster(len(fresh)) {
+		return
+	}
 	if !run.checkSettled("after", earliest(time.Now().Add(time.Duration(run.ss.SettleOrDefault())*time.Second), run.deadline)) {
 		return
 	}
 	run.checkHealthAll("after")
+}
+
+// waitSwitchToStoreCluster waits until a revision update that moves the director
+// from shared mode to the store cluster is done: /health of every running replica
+// says that it is a member of the store cluster, and the store lists the members.
+// A replica that still wants the store cluster reports store_cluster ok too, so
+// the status alone does not tell. It reports whether the run goes on, and does
+// nothing for an update that does not move the director.
+func (run *ssRun) waitSwitchToStoreCluster(members int) bool {
+	within := time.Duration(run.ss.StoreClusterWithinSeconds) * time.Second
+	if within == 0 {
+		return true
+	}
+	fmt.Printf("  waiting up to %s for the new replicas to switch to the store cluster…\n", within)
+	from := time.Now()
+	deadline := earliest(from.Add(within), run.deadline)
+	for _, rep := range run.replicas {
+		if !run.running[rep.N] {
+			continue
+		}
+		var status, message string
+		for {
+			status, message = run.componentOf(rep.N, "switched", "store_cluster")
+			if storeClusterMember(status, message) || time.Now().After(deadline) || sleepCtx(run.r.ctx, 2*time.Second) != nil {
+				break
+			}
+		}
+		if !storeClusterMember(status, message) {
+			run.fail("%s did not switch to the store cluster within %s: /health reports store_cluster %q (%s)", rep.Service, within, status, message)
+			return false
+		}
+	}
+	run.measures["store_cluster_switch_seconds"] = time.Since(from).Seconds()
+	fmt.Printf("    the replicas are members of the store cluster after %.1fs\n", time.Since(from).Seconds())
+	if got := run.waitStoreMembers(members, 60*time.Second); got != members {
+		run.fail("after the switch to the store cluster the store lists %d live members, want %d", got, members)
+		return false
+	}
+	return true
+}
+
+// storeClusterMember reports whether the store_cluster component of a replica's
+// /health says that the replica is a member of its cluster.
+func storeClusterMember(status, message string) bool {
+	return status == "ok" && strings.Contains(message, "is member ")
+}
+
+// pauseAllReceivers pauses every receiver, as a target that is down does, and
+// returns the call that lets them go on. It reports whether any was paused.
+func (run *ssRun) pauseAllReceivers() (goOn func(), ok bool) {
+	var paused []string
+	for _, name := range caseReceiverContainers(run.tc) {
+		if err := exec.Command("docker", "pause", name).Run(); err != nil {
+			run.fail("docker pause %s: %v", name, err)
+			continue
+		}
+		paused = append(paused, name)
+	}
+	if len(paused) == 0 {
+		return nil, false
+	}
+	from := time.Now()
+	run.measures["receivers_paused_from"] = from.UTC()
+	fmt.Printf("  pausing %s, so the replicas keep a backlog…\n", strings.Join(paused, ", "))
+	return func() {
+		for _, name := range paused {
+			if err := exec.Command("docker", "unpause", name).Run(); err != nil {
+				run.fail("docker unpause %s: %v", name, err)
+			}
+		}
+		run.measures["receivers_paused_seconds"] = time.Since(from).Seconds()
+		fmt.Printf("    the receivers go on after %.1fs\n", time.Since(from).Seconds())
+	}, true
 }
 
 // measureIdle counts the store calls while no generator runs.

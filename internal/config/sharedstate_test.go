@@ -491,3 +491,47 @@ func TestStoreClusterMode(t *testing.T) {
 		t.Fatalf("Validate of an unknown mode = %v, want an error that names store_cluster", err)
 	}
 }
+
+// TestRevisionUpdateBacklogAndSwitchValidation: backlog_seconds and
+// store_cluster_within_seconds belong to revision_update, and the switch starts
+// from mode embedded, which is what the old replicas run.
+func TestRevisionUpdateBacklogAndSwitchValidation(t *testing.T) {
+	base := func() *TestCase {
+		tc := sharedStateCase()
+		tc.SharedState.Mode = SharedStateModeEmbedded
+		tc.SharedState.Action = SharedStateActionRevisionUpdate
+		tc.SharedState.Standby = 2
+		return tc
+	}
+	tc := base()
+	tc.SharedState.BacklogSeconds = 30
+	tc.SharedState.StoreClusterWithinSeconds = 240
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("a revision_update case that switches to the store cluster with a backlog was refused: %v", err)
+	}
+	for name, c := range map[string]struct {
+		edit func(*TestCase)
+		want string
+	}{
+		"a backlog without the update": {func(tc *TestCase) {
+			tc.SharedState.Action = SharedStateActionKillLeader
+			tc.SharedState.BacklogSeconds = 30
+		}, "backlog_seconds is only used by the revision_update action"},
+		"a switch without the update": {func(tc *TestCase) {
+			tc.SharedState.Action = SharedStateActionKillLeader
+			tc.SharedState.StoreClusterWithinSeconds = 240
+		}, "store_cluster_within_seconds is only used by the revision_update action"},
+		"a switch from another mode": {func(tc *TestCase) {
+			tc.SharedState.Mode = SharedStateModeStoreCluster
+			tc.SharedState.StoreClusterWithinSeconds = 240
+		}, "needs mode embedded"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tc := base()
+			c.edit(tc)
+			if err := tc.Validate(); err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("Validate = %v, want an error that says %q", err, c.want)
+			}
+		})
+	}
+}
