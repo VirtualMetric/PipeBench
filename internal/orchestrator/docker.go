@@ -170,6 +170,29 @@ volumes:
   shared-data:
 {{- if .WitnessDirMount }}
   witness-dir:
+{{- if eq .ShareServer "smb" }}
+    # The share on the Samba server, mounted by Docker in the host's kernel
+    # over SMB 3.1.1, for the director's user (uid 100, gid 101). The server
+    # has a fixed address, because the host's kernel cannot resolve a
+    # service's name. The password is the harness's constant, not a secret.
+    driver: local
+    driver_opts:
+      type: cifs
+      device: "//{{ .ShareServerIP }}/share"
+      o: "addr={{ .ShareServerIP }},username=bench,password=bench,vers=3.1.1,uid=100,gid=101,file_mode=0660,dir_mode=0770,nobrl"
+{{- else if eq .ShareServer "nfs" }}
+    # The share on the NFS server, mounted by Docker in the host's kernel over
+    # NFS 4.2, at the server's fixed address
+    driver: local
+    driver_opts:
+      type: nfs
+      device: ":/"
+      o: "addr={{ .ShareServerIP }},nfsvers=4.2,rw,hard"
+{{- end }}
+{{- end }}
+{{- if eq .ShareServer "nfs" }}
+  # The NFS server's export: the kernel exports no overlay file system
+  share-export:
 {{- end }}
 {{- range .Subjects }}
 {{- if .Volume }}
@@ -728,7 +751,7 @@ services:
       COLLECTOR_OUTPUT: "/results/metrics.csv"
 {{- template "helperLimits" $ }}
     restart: "no"
-{{- if .WitnessDirMount }}
+{{- if and .WitnessDirMount (not .ShareServer) }}
 
   # One-shot: make the shared witness directory writable for the director,
   # which runs as a non-root user, before any node starts. Reuses the subject
@@ -748,6 +771,35 @@ services:
       WITNESS_DIR: "{{ .WitnessDirMount }}"
     volumes:
       - "witness-dir:{{ .WitnessDirMount }}"
+    restart: "no"
+{{- end }}
+{{- if .ShareServer }}
+
+  # The server of the replicas' share: Samba, or the kernel's NFS server. It
+  # has a fixed address, because Docker mounts the share in the host's kernel,
+  # which cannot resolve a service's name. It is privileged to load the
+  # kernel's cifs, nfs and nfsd modules from the host's /lib/modules, and the
+  # NFS server also runs in the host's kernel. The share mounts with the
+  # director's user and modes, so it needs no witness-init.
+  share-server:
+    image: "{{ .ShareServerImage }}"
+    container_name: "bench-share-server"
+    hostname: "share-server"
+    privileged: true
+    networks:
+      bench:
+        ipv4_address: "{{ .ShareServerIP }}"
+    volumes:
+      - "/lib/modules:/lib/modules:ro"
+{{- if eq .ShareServer "nfs" }}
+      - "share-export:/export"
+{{- end }}
+    healthcheck:
+      test: ["CMD", "test", "-f", "/run/share-ready"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+{{- template "helperLimits" $ }}
     restart: "no"
 {{- end }}
 {{- if .ToxiproxyEnabled }}
@@ -2042,8 +2094,15 @@ type composeVars struct {
 	// and adds witness-init. NodeArgsEntrypoint replaces each node's
 	// entrypoint with the one-start-arguments wrapper. GenDeferred keeps the
 	// generator out of the initial `up` (profile "load").
-	NodeDependsOn       []nodeDependency
-	WitnessDirMount     string
+	NodeDependsOn   []nodeDependency
+	WitnessDirMount string
+	// ShareServer, when set, serves the witness-dir volume from a Samba
+	// ("smb") or an NFS ("nfs") server, the share-server service at
+	// ShareServerIP, instead of keeping it on the host's disk
+	// (sharedstate_compose.go). The volume then needs no witness-init.
+	ShareServer         string
+	ShareServerImage    string
+	ShareServerIP       string
 	NodeArgsEntrypoint  string
 	GenDeferred         bool
 	ToxiproxyEnabled    bool

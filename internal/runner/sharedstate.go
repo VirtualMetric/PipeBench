@@ -401,10 +401,16 @@ func (run *ssRun) startInfrastructure() bool {
 	if run.tc.UsesMinio() {
 		services, inits, names = append(services, "minio", "minio-init"), append(inits, "minio-init"), append(names, "MinIO")
 	}
-	if run.ss.StoreOrDefault() == config.SharedStateStoreShare {
-		services, inits = append(services, "witness-init"), append(inits, "witness-init")
-	}
 	var healthy []string
+	switch {
+	case run.ss.ShareInVolume():
+		services, inits = append(services, "witness-init"), append(inits, "witness-init")
+	case run.ss.StoreOrDefault() == config.SharedStateStoreShare:
+		// The share's server: the replicas can mount the share once it is
+		// healthy
+		services, names = append(services, config.ShareServerService), append(names, "the server of "+run.ss.StoreName())
+		healthy = append(healthy, config.ShareServerService)
+	}
 	for _, e := range run.tc.Endpoints {
 		services, names = append(services, e.Name), append(names, e.Name)
 		if e.Healthcheck != nil {

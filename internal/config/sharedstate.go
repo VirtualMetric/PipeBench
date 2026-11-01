@@ -231,6 +231,14 @@ type SharedStateConfig struct {
 	Store string `yaml:"store"`
 	// SharePath is where every replica mounts the share (store "share").
 	SharePath string `yaml:"share_path"`
+	// ShareServer is what serves the share (store "share"). Empty keeps it in
+	// one Docker volume on the host's disk. "smb" puts it on a Samba server,
+	// which Docker mounts over SMB 3.1.1, as Container Apps mounts Azure Files.
+	// "nfs" puts it on the kernel's NFS server, which Docker mounts over NFS
+	// 4.2. Either way the replicas see one directory, and pause_store pauses
+	// the server. The host's kernel needs the cifs or nfs module, which the
+	// server's container loads when it starts.
+	ShareServer string `yaml:"share_server"`
 	// SecretValues must never appear in a replica's log or in its /health
 	// answer: the store's account key, for one. The driver also looks for
 	// three 16-character pieces of each, from its start, its middle and its
@@ -564,8 +572,37 @@ func (s *SharedStateConfig) StoreOrDefault() string {
 	return s.Store
 }
 
+// The servers a share can sit on (ShareServer).
+const (
+	SharedStateShareServerSMB = "smb"
+	SharedStateShareServerNFS = "nfs"
+)
+
+// ShareServerService is the compose service of the server that serves the
+// share (ShareServer).
+const ShareServerService = "share-server"
+
+// ShareInVolume reports whether the replicas keep their state in a share that
+// is one Docker volume on the host's disk, with no server in front of it.
+func (s *SharedStateConfig) ShareInVolume() bool {
+	return s.StoreOrDefault() == SharedStateStoreShare && s.ShareServer == ""
+}
+
+// ShareServerImage returns the harness's image of the share's server, or ""
+// when the share is a Docker volume. make build-containers builds both.
+func (s *SharedStateConfig) ShareServerImage() string {
+	switch s.ShareServer {
+	case SharedStateShareServerSMB:
+		return "vmetric/bench-share-smb:latest"
+	case SharedStateShareServerNFS:
+		return "vmetric/bench-share-nfs:latest"
+	}
+	return ""
+}
+
 // StoreService returns the compose service that serves the store, which
-// pause_store pauses: azurite, minio or redis. A share has none.
+// pause_store pauses: azurite, minio, redis or the share's server. A share in
+// a Docker volume has none.
 func (s *SharedStateConfig) StoreService() string {
 	switch s.StoreOrDefault() {
 	case SharedStateStoreAzureBlob:
@@ -574,6 +611,10 @@ func (s *SharedStateConfig) StoreService() string {
 		return "minio"
 	case SharedStateStoreRedis:
 		return "redis"
+	case SharedStateStoreShare:
+		if s.ShareServer != "" {
+			return ShareServerService
+		}
 	}
 	return ""
 }
@@ -587,6 +628,12 @@ func (s *SharedStateConfig) StoreName() string {
 		return "MinIO"
 	case SharedStateStoreRedis:
 		return "Redis"
+	}
+	switch s.ShareServer {
+	case SharedStateShareServerSMB:
+		return "the SMB share"
+	case SharedStateShareServerNFS:
+		return "the NFS share"
 	}
 	return "the share"
 }
@@ -739,6 +786,14 @@ func (tc *TestCase) validateSharedState() error {
 	}
 	if s.SharePath != "" && s.StoreOrDefault() != SharedStateStoreShare {
 		return fmt.Errorf("case %q: shared_state.share_path is only used by shared_state.store share", tc.Name)
+	}
+	switch s.ShareServer {
+	case "", SharedStateShareServerSMB, SharedStateShareServerNFS:
+	default:
+		return fmt.Errorf("case %q: shared_state.share_server must be smb or nfs, or be left out for a Docker volume, got %q", tc.Name, s.ShareServer)
+	}
+	if s.ShareServer != "" && s.StoreOrDefault() != SharedStateStoreShare {
+		return fmt.Errorf("case %q: shared_state.share_server is only used by shared_state.store share", tc.Name)
 	}
 	if !s.CountsStoreCalls() && (s.Action == SharedStateActionStoreCalls || s.Action == SharedStateActionScaleOutIn) {
 		return fmt.Errorf("case %q: shared_state.action %s counts store calls in Azurite's access log, so it needs shared_state.store azure_blob", tc.Name, s.Action)

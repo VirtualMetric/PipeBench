@@ -654,6 +654,18 @@ func TestStoreOutageArgs(t *testing.T) {
 	if back := storeOutageArgs(share, false, "bench-subject-vmetric-1", "img"); back[len(back)-2] != "0777" {
 		t.Errorf("share, back: %q, want mode 0777", back)
 	}
+
+	// A share on a server goes away with its server, as a network share that
+	// is cut off
+	for _, server := range []string{config.SharedStateShareServerSMB, config.SharedStateShareServerNFS} {
+		ss := &config.SharedStateConfig{Store: config.SharedStateStoreShare, SharePath: "/mnt/vm-state", ShareServer: server}
+		if got := strings.Join(storeOutageArgs(ss, true, "", "img"), " "); got != "pause bench-share-server" {
+			t.Errorf("share on %s, away: %q", server, got)
+		}
+		if got := strings.Join(storeOutageArgs(ss, false, "", "img"), " "); got != "unpause bench-share-server" {
+			t.Errorf("share on %s, back: %q", server, got)
+		}
+	}
 }
 
 // TestStoreCallsNotCountedOutsideAzurite: the store calls of another store

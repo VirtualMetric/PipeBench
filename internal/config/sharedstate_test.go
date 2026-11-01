@@ -91,6 +91,33 @@ func TestSharedStateStores(t *testing.T) {
 	}
 }
 
+// TestSharedStateShareServers: a share on an SMB or an NFS server names the
+// server's service for pause_store and its image, and a share in a Docker
+// volume has neither.
+func TestSharedStateShareServers(t *testing.T) {
+	for server, want := range map[string]struct {
+		service, name, image string
+		inVolume             bool
+	}{
+		"":                        {"", "the share", "", true},
+		SharedStateShareServerSMB: {ShareServerService, "the SMB share", "vmetric/bench-share-smb:latest", false},
+		SharedStateShareServerNFS: {ShareServerService, "the NFS share", "vmetric/bench-share-nfs:latest", false},
+	} {
+		tc := sharedStateCase()
+		tc.SharedState.Store = SharedStateStoreShare
+		tc.SharedState.SharePath = "/mnt/vm-state"
+		tc.SharedState.ShareServer = server
+		if err := tc.Validate(); err != nil {
+			t.Errorf("share server %q: %v", server, err)
+		}
+		ss := tc.SharedState
+		if ss.StoreService() != want.service || ss.StoreName() != want.name || ss.ShareServerImage() != want.image || ss.ShareInVolume() != want.inVolume {
+			t.Errorf("share server %q: service %q, name %q, image %q, in a volume %v; want %q, %q, %q, %v", server,
+				ss.StoreService(), ss.StoreName(), ss.ShareServerImage(), ss.ShareInVolume(), want.service, want.name, want.image, want.inVolume)
+		}
+	}
+}
+
 // The driver counts loss from unique lines, so a shared-state case tracks
 // them even when its file does not turn on dedup validation. Without them,
 // every line sent would count as lost.
@@ -194,6 +221,14 @@ func TestSharedStateRefusals(t *testing.T) {
 			tc.SharedState.SharePath = "/"
 		}, "needs shared_state.share_path"},
 		"share path, other store": {func(tc *TestCase) { tc.SharedState.SharePath = "/mnt/vm-state" }, "only used by shared_state.store share"},
+		"share server, other store": {func(tc *TestCase) {
+			tc.SharedState.ShareServer = SharedStateShareServerSMB
+		}, "share_server is only used by shared_state.store share"},
+		"unknown share server": {func(tc *TestCase) {
+			tc.SharedState.Store = SharedStateStoreShare
+			tc.SharedState.SharePath = "/mnt/vm-state"
+			tc.SharedState.ShareServer = "webdav"
+		}, "share_server must be smb or nfs"},
 		"store calls on s3": {func(tc *TestCase) {
 			tc.Minio = &MinioConfig{Buckets: []string{"director-state"}}
 			tc.SharedState.Store = SharedStateStoreS3

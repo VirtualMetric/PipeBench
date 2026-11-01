@@ -38,7 +38,7 @@ func (run *ssRun) pauseStore() {
 			return
 		}
 	}
-	if run.ss.StoreOrDefault() == config.SharedStateStoreShare {
+	if run.ss.ShareInVolume() {
 		what := fmt.Sprintf("The share refuses access for %d s (chmod 000). This fails fast, unlike a network share that stops answering.", run.ss.OutageOrDefault())
 		run.measures["outage_kind"] = what
 		fmt.Printf("  %s\n", what)
@@ -49,7 +49,7 @@ func (run *ssRun) pauseStore() {
 		run.fail("%v (the outage did not happen)", err)
 		return
 	}
-	if run.ss.StoreOrDefault() == config.SharedStateStoreShare {
+	if run.ss.ShareInVolume() {
 		if err := run.confirmShareRefused(); err != nil {
 			run.fail("%v", err)
 			if back := run.takeStore(false); back != nil {
@@ -133,7 +133,7 @@ func (run *ssRun) pauseStore() {
 // takeStore takes the store away (away) or gives it back.
 func (run *ssRun) takeStore(away bool) error {
 	via := ""
-	if run.ss.StoreOrDefault() == config.SharedStateStoreShare {
+	if run.ss.ShareInVolume() {
 		via = run.replicas[0].Container
 	}
 	args := storeOutageArgs(run.ss, away, via, run.subject.ImageRef())
@@ -182,12 +182,14 @@ var shareOpens = func(container, dir string) (bool, error) {
 }
 
 // storeOutageArgs returns the docker arguments that take the store away, or
-// give it back. A paused container stops answering. A share that is chmod 000
-// refuses every access at once: a short container of the subject's image,
-// with the volumes of replica via (running, paused or stopped), changes the
-// mode as root, so the replicas' own user can no longer reach the share.
+// give it back. A paused container stops answering: so does a share on an
+// SMB or an NFS server whose server is paused, as a network share that is cut
+// off does. A share in a Docker volume that is chmod 000 refuses every access
+// at once: a short container of the subject's image, with the volumes of
+// replica via (running, paused or stopped), changes the mode as root, so the
+// replicas' own user can no longer reach the share.
 func storeOutageArgs(ss *config.SharedStateConfig, away bool, via, image string) []string {
-	if ss.StoreOrDefault() == config.SharedStateStoreShare {
+	if ss.ShareInVolume() {
 		mode := "0777"
 		if away {
 			mode = "000"
