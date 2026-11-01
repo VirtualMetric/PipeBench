@@ -229,6 +229,37 @@ func TestValidateStreamLeaderlessLimit(t *testing.T) {
 	}
 }
 
+// TestValidateScenarioClusterIP checks that a scenario case may set cluster.ip
+// inside the bench's subnet, and that the step that checks it needs one.
+func TestValidateScenarioClusterIP(t *testing.T) {
+	tc := linkScenarioCase()
+	tc.Cluster.Scenario.Steps = append(tc.Cluster.Scenario.Steps, ScenarioStep{Do: "expect_cluster_ip"})
+	if err := tc.Validate(); err == nil || !strings.Contains(err.Error(), "needs cluster.ip") {
+		t.Errorf("Validate with no cluster.ip = %v, want an error that the step needs one", err)
+	}
+
+	tc.Cluster.IP = "172.30.0.250"
+	if err := tc.Validate(); err != nil {
+		t.Errorf("Validate with a cluster.ip: %v", err)
+	}
+
+	tc.Cluster.IP = "10.0.0.1"
+	if err := tc.Validate(); err == nil || !strings.Contains(err.Error(), "pinned bench subnet") {
+		t.Errorf("Validate outside the subnet = %v, want it refused", err)
+	}
+
+	tc.Cluster.IP = "not an address"
+	if err := tc.Validate(); err == nil || !strings.Contains(err.Error(), "IPv4") {
+		t.Errorf("Validate with a bad address = %v, want it refused", err)
+	}
+
+	tc.Cluster.IP = "172.30.0.250"
+	tc.Cluster.Action = "cluster_ip_failover"
+	if err := tc.Validate(); err == nil || !strings.Contains(err.Error(), "cluster.action belongs") {
+		t.Errorf("Validate with an action = %v, want it refused", err)
+	}
+}
+
 // TestValidateWaitCopies checks rolling_restart's wait_copies: a rolling
 // restart takes it, and no other step does.
 func TestValidateWaitCopies(t *testing.T) {

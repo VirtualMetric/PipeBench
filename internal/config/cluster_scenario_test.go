@@ -60,7 +60,7 @@ func TestValidateClusterScenarioRejects(t *testing.T) {
 		"undeclared proxy": {func(tc *TestCase) {
 			tc.Cluster.Scenario.Steps = append(tc.Cluster.Scenario.Steps, ScenarioStep{Do: "proxy_latency", Proxy: "witness", Latency: "200ms"})
 		}, "not declared"},
-		"action from the other driver": {func(tc *TestCase) { tc.Cluster.Action = "restart_leader" }, "belong to director_cluster_correctness"},
+		"action from the other driver": {func(tc *TestCase) { tc.Cluster.Action = "restart_leader" }, "belongs to director_cluster_correctness"},
 		"relative witness dir":         {func(tc *TestCase) { tc.Cluster.Scenario.WitnessDir = "witness" }, "absolute path"},
 		"witness dir with a space":     {func(tc *TestCase) { tc.Cluster.Scenario.WitnessDir = "/wit ness" }, "absolute path"},
 		"witness dir with a colon":     {func(tc *TestCase) { tc.Cluster.Scenario.WitnessDir = "/witness:rw" }, "absolute path"},

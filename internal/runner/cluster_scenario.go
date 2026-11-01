@@ -719,6 +719,30 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		leader, _ := agreedLeader(round)
 		return true, fmt.Sprintf("healthy after %s, leader node %d", fmtMs(ms), leader), nil
 
+	case "expect_cluster_ip":
+		// The node that leads holds the cluster IP, and no other member does.
+		within := st.DurationOr("within", 60*time.Second)
+		waited := time.Now()
+		ip := sr.tc.Cluster.IP
+		var holders []int
+		round, ok, err := sr.waitRound(within, func(r healthRound) bool {
+			leader, agreed := agreedLeader(r)
+			if !agreed {
+				return false
+			}
+			holders = sr.clusterIPHolders(ip)
+			return len(holders) == 1 && holders[0] == leader
+		})
+		if err != nil {
+			return false, "", err
+		}
+		if !ok {
+			return false, fmt.Sprintf("the leader alone did not hold the cluster IP %s within %s: nodes %v hold it, %s", ip, within, holders, describeRound(round)), nil
+		}
+		ms := time.Since(waited).Milliseconds()
+		sr.record(st.Record, float64(ms))
+		return true, fmt.Sprintf("the leader, node %d, alone holds the cluster IP %s, after %s", holders[0], ip, fmtMs(ms)), nil
+
 	case "wait_copies":
 		// Every stream has all its copies, as its leader reports them
 		within := st.DurationOr("within", 120*time.Second)
@@ -1521,6 +1545,19 @@ func (sr *scenarioRun) healthy(r healthRound) bool {
 		}
 	}
 	return checked > 0 && len(leaders) <= 1
+}
+
+// clusterIPHolders lists the cluster's members that hold ip now. A member that a
+// step took out of service holds nothing that a client can reach.
+func (sr *scenarioRun) clusterIPHolders(ip string) []int {
+	var holders []int
+	for n := range sr.active {
+		if !sr.down[n] && nodeHasClusterIP(sr.containers[n-1], ip) {
+			holders = append(holders, n)
+		}
+	}
+	sort.Ints(holders)
+	return holders
 }
 
 // waitRound waits for a round that satisfies ok, reading the prober's

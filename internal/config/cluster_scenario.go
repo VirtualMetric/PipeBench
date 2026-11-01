@@ -528,6 +528,7 @@ var scenarioActions = map[string]bool{
 	"expect_no_log":             true,
 	"wait_stable":               false,
 	"wait_copies":               false,
+	"expect_cluster_ip":         false,
 	"count_pending":             false,
 	"expect_arrived":            false,
 	// The link steps check their node themselves: it may be "all".
@@ -744,8 +745,13 @@ func (tc *TestCase) validateClusterScenario() error {
 	if tc.Cluster.Nodes < 1 {
 		return fmt.Errorf("case %q: cluster.nodes must be >= 1, got %d", tc.Name, tc.Cluster.Nodes)
 	}
-	if tc.Cluster.Action != "" || tc.Cluster.IP != "" {
-		return fmt.Errorf("case %q: cluster.action and cluster.ip belong to director_cluster_correctness; a scenario case uses cluster.scenario.steps", tc.Name)
+	if tc.Cluster.Action != "" {
+		return fmt.Errorf("case %q: cluster.action belongs to director_cluster_correctness; a scenario case uses cluster.scenario.steps", tc.Name)
+	}
+	if tc.Cluster.IP != "" {
+		if err := tc.validateClusterIP(); err != nil {
+			return err
+		}
 	}
 	sc := tc.Cluster.Scenario
 	if sc == nil || len(sc.Steps) == 0 {
@@ -858,6 +864,9 @@ func (tc *TestCase) validateClusterScenario() error {
 		needsNode, known := scenarioActions[st.Do]
 		if !known {
 			return fmt.Errorf("case %q: cluster.scenario.steps[%d]: unknown action %q", tc.Name, i, st.Do)
+		}
+		if st.Do == "expect_cluster_ip" && tc.Cluster.IP == "" {
+			return fmt.Errorf("%s: needs cluster.ip", where)
 		}
 		// A step that acts on a node must name it. A wait that may name one
 		// (wait_leader, wait_log) must name it the same way when it does. A
