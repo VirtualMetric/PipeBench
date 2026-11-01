@@ -422,6 +422,10 @@ type ScenarioStep struct {
 
 	// EmptyDisk makes a start step replace the node's container with a new
 	// one, which starts on an empty disk, as a node whose disk was replaced.
+	// With image, on a start or a rolling_restart step, the new container comes
+	// from that image: a container platform moves a replica to a new image that
+	// way, and the replica's old disk is gone. A case without
+	// cluster.scenario.node_volume says so with this.
 	EmptyDisk bool `yaml:"empty_disk"`
 	// Image makes a start step start the node on another image, and a
 	// rolling_restart step move every node to it in turn: "subject" for the
@@ -1068,7 +1072,10 @@ func (tc *TestCase) validateScenarioImages() error {
 	testsSubject := false
 	for i, st := range sc.Steps {
 		where := fmt.Sprintf("case %q: cluster.scenario.steps[%d] (%s)", tc.Name, i, st.Do)
-		if st.Do == "start" && st.EmptyDisk && sc.NodeVolume != "" {
+		if st.Do == "rolling_restart" && st.EmptyDisk && st.Image == "" {
+			return fmt.Errorf("%s: empty_disk needs image: a restart without one keeps the node's container and its disk", where)
+		}
+		if st.EmptyDisk && sc.NodeVolume != "" {
 			return fmt.Errorf("%s: empty_disk starts the node on an empty disk, but cluster.scenario.node_volume keeps the node's data in a volume; a case uses one of them", where)
 		}
 		if st.Image == "" {
@@ -1079,11 +1086,8 @@ func (tc *TestCase) validateScenarioImages() error {
 		} else if err := checkImageRef(st.Image); err != nil {
 			return fmt.Errorf("%s: image %q %v, or subject for the image under test", where, st.Image, err)
 		}
-		if sc.NodeVolume == "" {
-			return fmt.Errorf("%s: image gives the node a new container, which would start on an empty disk; set cluster.scenario.node_volume to keep the node's data", where)
-		}
-		if st.EmptyDisk {
-			return fmt.Errorf("%s: names image and empty_disk; a start with image keeps the node's data", where)
+		if sc.NodeVolume == "" && !st.EmptyDisk {
+			return fmt.Errorf("%s: image gives the node a new container, which would start on an empty disk; say empty_disk: true when the case means that, or set cluster.scenario.node_volume to keep the node's data", where)
 		}
 	}
 	// A case whose nodes start on another image must move them to the image
@@ -1282,7 +1286,7 @@ var stepFieldOwners = []struct {
 	{"one_way", func(s ScenarioStep) bool { return s.OneWay }, map[string]bool{"cut_link": true, "shape_link": true, "restore_link": true}},
 	{"loss", func(s ScenarioStep) bool { return s.Loss != "" }, map[string]bool{"shape_link": true}},
 	{"groups", func(s ScenarioStep) bool { return s.Groups != nil }, map[string]bool{"split": true, "wait_leader": true}},
-	{"empty_disk", func(s ScenarioStep) bool { return s.EmptyDisk }, map[string]bool{"start": true}},
+	{"empty_disk", func(s ScenarioStep) bool { return s.EmptyDisk }, map[string]bool{"start": true, "rolling_restart": true}},
 	{"image", func(s ScenarioStep) bool { return s.Image != "" }, map[string]bool{"start": true, "rolling_restart": true}},
 	{"stage", func(s ScenarioStep) bool { return s.Stage != 0 }, map[string]bool{"set_stage": true}},
 	{"version", func(s ScenarioStep) bool { return s.Version != "" }, map[string]bool{"wait_version": true}},

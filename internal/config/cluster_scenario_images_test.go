@@ -41,6 +41,20 @@ func TestValidateScenarioImagesAcceptsAnUpgrade(t *testing.T) {
 	if err := rolling.Validate(); err != nil {
 		t.Fatalf("Validate a rolling move: %v", err)
 	}
+	// A container platform moves a replica to a new image on an empty disk. A
+	// case without a volume says so on the step.
+	emptied := upgradeScenarioCase()
+	emptied.Cluster.Nodes = 3
+	emptied.Cluster.Scenario.NodeVolume = ""
+	emptied.Cluster.Scenario.Steps = []ScenarioStep{
+		{Do: "wait_ready"},
+		{Do: "stop", Node: "1"},
+		{Do: "start", Node: "1", Image: "subject", EmptyDisk: true},
+		{Do: "rolling_restart", Image: "subject", EmptyDisk: true},
+	}
+	if err := emptied.Validate(); err != nil {
+		t.Fatalf("Validate a move to an empty disk: %v", err)
+	}
 	// Without start_image the nodes start on the image under test, and a
 	// step may still move them to another one.
 	down := upgradeScenarioCase()
@@ -82,6 +96,13 @@ func TestValidateScenarioImagesRejects(t *testing.T) {
 		"an image with empty_disk": {func(tc *TestCase) {
 			tc.Cluster.Scenario.Steps[4].EmptyDisk = true
 		}, "a case uses one of them"},
+		"a rolling move onto an empty disk beside a volume": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Steps = append(tc.Cluster.Scenario.Steps, ScenarioStep{Do: "rolling_restart", Image: "subject", EmptyDisk: true})
+		}, "a case uses one of them"},
+		"a rolling restart with empty_disk and no image": {func(tc *TestCase) {
+			tc.Cluster.Scenario.NodeVolume = ""
+			tc.Cluster.Scenario.Steps = []ScenarioStep{{Do: "wait_ready"}, {Do: "rolling_restart", EmptyDisk: true}}
+		}, "empty_disk needs image"},
 		"empty_disk beside a volume": {func(tc *TestCase) {
 			tc.Cluster.Scenario.Steps = append(tc.Cluster.Scenario.Steps, ScenarioStep{Do: "stop", Node: "1"}, ScenarioStep{Do: "start", Node: "1", EmptyDisk: true})
 		}, "a case uses one of them"},

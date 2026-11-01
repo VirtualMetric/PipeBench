@@ -226,5 +226,8 @@ func (sr *scenarioRun) moveNodeToImage(step, n int, image string) (detail, failu
 	sr.nodeImage[n] = ref
 	_, labels := imageIdentity(ref)
 	sr.images = append(sr.images, scenarioImage{Node: n, Step: step, Image: ref, ImageID: shortImageID(wantID), Labels: labels, At: time.Now()})
+	if sr.sc.NodeVolume == "" {
+		return fmt.Sprintf("started node %d on %s (%s), on an empty disk", n, ref, shortImageID(wantID)), ""
+	}
 	return fmt.Sprintf("started node %d on %s (%s), on the data %s left in its volume", n, ref, shortImageID(wantID), from), ""
 }
