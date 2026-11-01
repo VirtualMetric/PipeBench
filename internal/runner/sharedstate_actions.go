@@ -7,6 +7,7 @@ import (
 	"maps"
 	"net/url"
 	"os/exec"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -656,12 +657,58 @@ func (run *ssRun) scaleOutIn() {
 	run.checkHealthAll("scaled-in")
 }
 
+// storeClusterOthers finds the other members a replica counts as live in its
+// /health message: "It counts 2 other members as live: a, b." or "It counts no
+// other member as live."
+var storeClusterOthers = regexp.MustCompile(`It counts (?:no other member|\d+ other members?) as live(?:: ([^.]*))?\.`)
+
+// countedMembers returns how many live members a replica's /health message counts,
+// the replica itself included. ok is false when the message counts nothing.
+func countedMembers(message string) (members int, ok bool) {
+	m := storeClusterOthers.FindStringSubmatch(message)
+	if m == nil {
+		return 0, false
+	}
+	if m[1] == "" {
+		return 1, true
+	}
+	return len(strings.Split(m[1], ", ")) + 1, true
+}
+
+// membersOnHealth returns the fewest live members that a running replica counts,
+// and 0 when a replica is not yet a member or counts nothing.
+func (run *ssRun) membersOnHealth() int {
+	fewest := 0
+	for _, rep := range run.replicas {
+		if !run.running[rep.N] {
+			continue
+		}
+		status, message := run.componentOf(rep.N, "members", "store_cluster")
+		n, ok := countedMembers(message)
+		if !ok || !storeClusterMember(status, message) {
+			return 0
+		}
+		if fewest == 0 || n < fewest {
+			fewest = n
+		}
+	}
+	return fewest
+}
+
 // waitStoreMembers waits up to d for the store to list want live members, and
-// returns how many it lists at the end.
+// returns how many it lists at the end. On a store whose calls the bench cannot
+// read, it goes by what the replicas count on /health.
 func (run *ssRun) waitStoreMembers(want int, d time.Duration) int {
 	deadline := time.Now().Add(d)
 	got := 0
 	for {
+		if !run.ss.CountsStoreCalls() {
+			got = run.membersOnHealth()
+			if got == want || time.Now().After(deadline) || sleepCtx(run.r.ctx, 2*time.Second) != nil {
+				return got
+			}
+			continue
+		}
 		if err := run.book.refresh("bench-azurite"); err != nil {
 			run.fail("reading Azurite's access log: %v", err)
 			return got

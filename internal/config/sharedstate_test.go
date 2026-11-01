@@ -236,11 +236,6 @@ func TestSharedStateRefusals(t *testing.T) {
 			tc.SharedState.Store = SharedStateStoreS3
 			tc.SharedState.Action = SharedStateActionStoreCalls
 		}, "store_calls counts store calls in Azurite's access log"},
-		"scale out on redis": {func(tc *TestCase) {
-			tc.Endpoints = []Endpoint{{Name: "redis", Image: "redis:7-alpine"}}
-			tc.SharedState.Store = SharedStateStoreRedis
-			tc.SharedState.Action = SharedStateActionScaleOutIn
-		}, "scale_out_in counts store calls in Azurite's access log"},
 		"isolate on a share": {func(tc *TestCase) {
 			tc.SharedState.Store = SharedStateStoreShare
 			tc.SharedState.SharePath = "/mnt/vm-state"

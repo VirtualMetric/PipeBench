@@ -875,3 +875,23 @@ func TestStoreClusterMemberReadsTheMessage(t *testing.T) {
 		})
 	}
 }
+
+// On a store whose calls the bench cannot read, the scale-out case counts the live
+// members from what a replica says on /health, with the replica itself.
+func TestCountedMembers(t *testing.T) {
+	for _, tc := range []struct {
+		message string
+		want    int
+		ok      bool
+	}{
+		{"This director is member a of generation 1 of its cluster. It counts no other member as live.", 1, true},
+		{"This director is member a of generation 1 of its cluster. It counts 1 other member as live: b.", 2, true},
+		{"This director is member a of generation 1 of its cluster. It counts 2 other members as live: b, c. 1 server is joining: d.", 3, true},
+		{"This director is waiting to join.", 0, false},
+		{"", 0, false},
+	} {
+		if got, ok := countedMembers(tc.message); got != tc.want || ok != tc.ok {
+			t.Errorf("countedMembers(%q) = %d, %v, want %d, %v", tc.message, got, ok, tc.want, tc.ok)
+		}
+	}
+}

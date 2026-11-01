@@ -815,7 +815,7 @@ func (tc *TestCase) validateSharedState() error {
 	if s.ShareServer != "" && s.StoreOrDefault() != SharedStateStoreShare {
 		return fmt.Errorf("case %q: shared_state.share_server is only used by shared_state.store share", tc.Name)
 	}
-	if !s.CountsStoreCalls() && (s.Action == SharedStateActionStoreCalls || s.Action == SharedStateActionScaleOutIn) {
+	if !s.CountsStoreCalls() && s.Action == SharedStateActionStoreCalls {
 		return fmt.Errorf("case %q: shared_state.action %s counts store calls in Azurite's access log, so it needs shared_state.store azure_blob", tc.Name, s.Action)
 	}
 	if s.StoreOrDefault() == SharedStateStoreShare && s.Action == SharedStateActionIsolateReplica {
