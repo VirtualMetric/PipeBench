@@ -484,3 +484,25 @@ func TestRenderClusterNodeConfigStage(t *testing.T) {
 		}
 	}
 }
+
+// The broker of a pipeline bus starts only with the memory that its case gives it,
+// so the cap on the harness's helpers leaves it alone.
+func TestLimitHelperServicesLeavesThePipelineBrokerItsMemory(t *testing.T) {
+	in := []byte("services:\n  pipeline-broker:\n    image: broker\n  receiver:\n    image: receiver\n")
+	out, err := limitHelperServices(in, "1", "512m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Services map[string]map[string]any `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(out, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if _, capped := doc.Services["pipeline-broker"]["mem_limit"]; capped {
+		t.Fatalf("the broker must keep its memory: %v", doc.Services["pipeline-broker"])
+	}
+	if doc.Services["receiver"]["mem_limit"] != "512m" {
+		t.Fatalf("a helper must stay capped: %v", doc.Services["receiver"])
+	}
+}

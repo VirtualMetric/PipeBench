@@ -153,7 +153,9 @@ func shellQuote(s string) string {
 // and memory cap, unless it already has a deploy block or caps of its own.
 // Each cap applies on its own: an empty cpu or mem leaves that cap off.
 // Director nodes (the services named subject or subject-<n>) keep the
-// limits the case set for them.
+// limits the case set for them. The pipeline broker takes what its case's
+// pipeline_broker.memory says, and it refuses to start on less, so a helper's
+// cap would stop it.
 func limitHelperServices(composeYAML []byte, cpu, mem string) ([]byte, error) {
 	if cpu == "" && mem == "" {
 		return composeYAML, nil
@@ -173,7 +175,7 @@ func limitHelperServices(composeYAML []byte, cpu, mem string) ([]byte, error) {
 	for i := 0; i+1 < len(services.Content); i += 2 {
 		name := services.Content[i].Value
 		svc := services.Content[i+1]
-		if svc.Kind != yaml.MappingNode || name == "subject" || strings.HasPrefix(name, "subject-") {
+		if svc.Kind != yaml.MappingNode || name == "subject" || strings.HasPrefix(name, "subject-") || name == "pipeline-broker" {
 			continue
 		}
 		if mappingValue(svc, "deploy") != nil || mappingValue(svc, "cpus") != nil || mappingValue(svc, "mem_limit") != nil {
