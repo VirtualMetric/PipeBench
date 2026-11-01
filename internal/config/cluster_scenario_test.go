@@ -476,6 +476,31 @@ func TestValidateLoadPause(t *testing.T) {
 	}
 }
 
+// TestValidateWaitVersion checks the wait_version step: it needs a version, and
+// only it takes one.
+func TestValidateWaitVersion(t *testing.T) {
+	withStep := func(st ScenarioStep) *TestCase {
+		tc := validScenarioCase()
+		tc.Cluster.Scenario.Steps = []ScenarioStep{{Do: "wait_ready"}, {Do: "start_load"}, st}
+		return tc
+	}
+	if err := withStep(ScenarioStep{Do: "wait_version", Version: "2.7.0", Within: "600s"}).Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	for name, c := range map[string]struct {
+		st   ScenarioStep
+		want string
+	}{
+		"no version":           {ScenarioStep{Do: "wait_version"}, "needs version"},
+		"a version on a sleep": {ScenarioStep{Do: "sleep", For: "1s", Version: "2.7.0"}, "version only applies to wait_version"},
+	} {
+		err := withStep(c.st).Validate()
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: Validate = %v, want an error with %q", name, err, c.want)
+		}
+	}
+}
+
 // TestValidateSetStage checks the set_stage step: it needs a stage of 1 or
 // more, and only it takes one.
 func TestValidateSetStage(t *testing.T) {

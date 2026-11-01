@@ -3737,12 +3737,34 @@ func agentlessDeviceOwner(containers []string) string {
 	return owner
 }
 
+// agentlessDeliveryWait is how long the agentless failover waits, after the
+// old owner is back, for the receiver to get a new line.
+const agentlessDeliveryWait = 180 * time.Second
+
+// waitCountGrows polls count until it returns more than before, or until the
+// deadline. It returns the last count it read, and whether it grew. A count
+// that cannot be read does not grow.
+func waitCountGrows(ctx context.Context, count func() (int64, error), before int64, deadline time.Time, poll time.Duration) (int64, bool) {
+	last := before
+	for {
+		if n, err := count(); err == nil {
+			last = n
+			if n > before {
+				return n, true
+			}
+		}
+		if !time.Now().Before(deadline) || sleepCtx(ctx, poll) != nil {
+			return last, false
+		}
+	}
+}
+
 // agentlessCollectingNow reports whether a node is ACTIVELY collecting from an
 // agentless device right now: its recent logs show the collector forwarding
 // records to the router ("Forwarded N log entries from device ... to router").
 // This is the director-level proof that a deployed agent is delivering data to
 // its owning node — independent of the downstream receiver (cluster E2E delivery
-// has a separate gap; see runDirectorClusterCorrectness agentless_failover).
+// is judged apart; see runDirectorClusterCorrectness agentless_failover).
 func agentlessCollectingNow(container string) bool {
 	return strings.Contains(dockerLogsSince(container, "30s"), "entries from device")
 }
@@ -4345,6 +4367,9 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 				// machine gets restarted").
 				fmt.Printf("  agentless device owner = node %s (%s); stopping it to force a failover…\n", owner, ownerContainer)
 				preFailover := finalCount
+				if rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second); qerr == nil {
+					preFailover = rm.LinesReceived
+				}
 				if serr := exec.Command("docker", "stop", "-t", "10", ownerContainer).Run(); serr != nil {
 					actionOK = false
 					errs = append(errs, fmt.Sprintf("docker stop %s failed: %v (disruption did not happen)", ownerContainer, serr))
@@ -4374,11 +4399,6 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 					actionOK = false
 					errs = append(errs, fmt.Sprintf("docker start %s failed: %v", ownerContainer, serr))
 				}
-				// SOFT: a survivor resuming collection, and end-to-end receiver delivery, are
-				//   logged but NOT asserted. Cluster agentless data-plane recovery after a node
-				//   loss is a known gap: the degraded 2/3 window can stall the new owner's ingest,
-				//   and cross-node payload object-store reads can return NotFound → "payload
-				//   evicted". The hard verdict is the automatic ownership failover above.
 				collectDeadline := time.Now().Add(settle + 90*time.Second)
 				if collectDeadline.After(runDeadline) {
 					collectDeadline = runDeadline
@@ -4386,9 +4406,29 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 				if newOwner, _, ok := waitAgentlessCollectingExcluding(r.ctx, nodes, owner, collectDeadline); ok {
 					fmt.Printf("  (soft) a surviving node (%s) is collecting the device after failover ✓\n", newOwner)
 				} else {
-					fmt.Println("  (soft) no survivor observed collecting within the window — known cluster data-plane gap")
+					fmt.Println("  (soft) no survivor observed collecting within the window")
 				}
-				r.sampleDelivery(metricsPort, preFailover)
+				// HARD 3: delivery resumes. The endpoint goes on adding lines to the
+				//   file that the agent reads, so the receiver must get more lines than
+				//   it had when the owner stopped. A device that moved but delivers
+				//   nothing is a failed failover.
+				deliveryDeadline := time.Now().Add(agentlessDeliveryWait)
+				if deliveryDeadline.After(runDeadline) {
+					deliveryDeadline = runDeadline
+				}
+				count := func() (int64, error) {
+					rm, err := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+					if err != nil {
+						return 0, err
+					}
+					return rm.LinesReceived, nil
+				}
+				if got, ok := waitCountGrows(r.ctx, count, preFailover, deliveryDeadline, 5*time.Second); ok {
+					fmt.Printf("  delivery resumed after the failover: %s lines, %s when the owner stopped ✓\n", formatCount(got), formatCount(preFailover))
+				} else {
+					actionOK = false
+					errs = append(errs, fmt.Sprintf("delivery did not resume after the failover: the receiver has %s lines, and it had %s when the owner stopped", formatCount(got), formatCount(preFailover)))
+				}
 			}
 		case "device_failover":
 			// Generalized placement-device failover (DB / file). The baseline branch

@@ -23,6 +23,7 @@ import (
 // healthDoc is the part of the director's /health answer the prober reads.
 type healthDoc struct {
 	Status       string `json:"status"`
+	Version      string `json:"version"`
 	Node         string `json:"node"`
 	StartupPhase string `json:"startup_phase"`
 	Components   map[string]struct {
@@ -57,6 +58,7 @@ type nodeHealth struct {
 	Reachable bool   `json:"reachable"`
 	Name      string `json:"name,omitempty"`
 	Phase     string `json:"phase,omitempty"`
+	Version   string `json:"version,omitempty"`
 	VMMQ      string `json:"vmmq,omitempty"`
 	// Clustered is false for a director that is not in a cluster: it leads
 	// itself.
@@ -599,6 +601,7 @@ func parseNodeHealth(n int, raw []byte) nodeHealth {
 		h.Name = strconv.Itoa(n)
 	}
 	h.Phase = doc.StartupPhase
+	h.Version = doc.Version
 	if c, ok := doc.Components["vmmq"]; ok {
 		h.VMMQ = c.Status
 	}

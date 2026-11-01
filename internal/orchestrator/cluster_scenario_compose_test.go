@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -381,6 +382,48 @@ func TestClusterScenarioComposeGeneratorWaitsForEachReceiver(t *testing.T) {
 // TestClusterScenarioComposeStartImageAndVolume covers start_image, which
 // starts every node on another image than the one under test, and
 // node_volume, which keeps a directory of every node on a volume of its own.
+// A shared directory is one volume on every node, and on each endpoint that
+// asks for it.
+func TestClusterScenarioComposeSharedDir(t *testing.T) {
+	src := "director:\n  id: {{@.NodeID@}}\n"
+	tc := scenarioCase(&config.ScenarioConfig{
+		Steps:     []config.ScenarioStep{{Do: "wait_ready"}},
+		SharedDir: "/mnt/share",
+	})
+	tc.Endpoints = []config.Endpoint{
+		{Name: "file-writer", Image: "alpine:3.22", MountsSharedDir: true},
+		{Name: "other", Image: "alpine:3.22"},
+	}
+	doc, _, _ := renderScenario(t, tc, src)
+
+	volumes, _ := doc["volumes"].(map[string]any)
+	if _, ok := volumes["shared-dir"]; !ok {
+		t.Errorf("the shared directory's volume is not declared: %v", volumes)
+	}
+	mounts := func(name string) []any {
+		m, _ := service(t, doc, name)["volumes"].([]any)
+		return m
+	}
+	const want = "shared-dir:/mnt/share"
+	for _, name := range []string{"subject-1", "subject-2", "subject-3", "file-writer"} {
+		if !slices.Contains(mounts(name), any(want)) {
+			t.Errorf("%s does not mount the shared directory: %v", name, mounts(name))
+		}
+	}
+	if slices.Contains(mounts("other"), any(want)) {
+		t.Errorf("an endpoint that did not ask for it mounts the shared directory: %v", mounts("other"))
+	}
+
+	// A case with no shared directory has no such volume.
+	plain, _, _ := renderScenario(t, scenarioCase(&config.ScenarioConfig{Steps: []config.ScenarioStep{{Do: "wait_ready"}}}), src)
+	if plainVolumes, _ := plain["volumes"].(map[string]any); plainVolumes["shared-dir"] != nil {
+		t.Errorf("a case with no shared directory declares its volume: %v", plainVolumes)
+	}
+	if _, ok := plain["volumes"].(map[string]any)["shared-dir"]; ok {
+		t.Errorf("a case with no shared directory declares its volume")
+	}
+}
+
 func TestClusterScenarioComposeStartImageAndVolume(t *testing.T) {
 	src := "director:\n  id: {{@.NodeID@}}\n"
 	tc := scenarioCase(&config.ScenarioConfig{

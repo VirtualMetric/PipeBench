@@ -50,6 +50,11 @@ type ScenarioConfig struct {
 	Witness    string `yaml:"witness"`
 	WitnessDir string `yaml:"witness_dir"`
 
+	// SharedDir mounts one volume at this path on every node, and on each
+	// endpoint that sets mounts_shared_dir: a directory that they all see, as
+	// they see a network share. Empty means none.
+	SharedDir string `yaml:"shared_dir"`
+
 	// Proxies put Toxiproxy between the nodes and a service, so a step can
 	// slow the connection down or cut it (the witness store, for example).
 	// The node config then names "toxiproxy:<listen>" instead of the service.
@@ -92,9 +97,9 @@ type ScenarioConfig struct {
 	// size-limited tmpfs, which a fill_disk step can fill.
 	NodeDisk *ScenarioNodeDisk `yaml:"node_disk"`
 
-	// Rows compares the rows a database holds with the rows that reached the
-	// receiver, for a case whose data comes from a database device. A row
-	// that never arrives counts as missing. A case with the http_ack load can
+	// Rows compares the rows a database holds, or the lines of a file, with
+	// the rows that reached the receiver, for a case whose data comes from a
+	// database or a file device. A row that never arrives counts as missing. A case with the http_ack load can
 	// have it too: the receiver then counts the load's lines and the rows
 	// apart, and the first receiver is the one whose rows are compared.
 	Rows *ScenarioRows `yaml:"rows"`
@@ -173,6 +178,11 @@ type ScenarioRows struct {
 	// Query returns the key of every row the device should deliver, one per
 	// row, such as SELECT message FROM events.
 	Query string `yaml:"query"`
+	// File names a file under cluster.scenario.shared_dir that the device
+	// reads, in place of Query. The harness reads it from a node that runs, and
+	// finds a row's key in each of its lines with Key. A line without a key is
+	// no row.
+	File string `yaml:"file"`
 	// Key is a regular expression that finds a row's key in a line the
 	// receiver gets. With a group, the first group is the key.
 	Key string `yaml:"key"`
@@ -342,6 +352,11 @@ type ScenarioStep struct {
 
 	// Nodes is the cluster size a scale_to step moves to.
 	Nodes int `yaml:"nodes"`
+	// Version is what every node must report on /health for a wait_version
+	// step to end. A node that updates itself reports it once the new binary
+	// runs.
+	Version string `yaml:"version"`
+
 	// Stage is the stage a set_stage step renders every member's config at:
 	// the config template reads it as {{@.Stage@}}, which is 1 at the start.
 	// A case changes a cluster setting at a stage, as the platform changes a
@@ -505,6 +520,7 @@ var scenarioActions = map[string]bool{
 	"set_stage":                 false,
 	"rolling_restart":           false,
 	"wait_log":                  false,
+	"wait_version":              false,
 	"expect_no_log":             true,
 	"wait_stable":               false,
 	"wait_copies":               false,
@@ -996,6 +1012,10 @@ func (tc *TestCase) validateClusterScenario() error {
 			if st.Stage < 1 {
 				return fmt.Errorf("%s: needs stage, 1 or more: the stage every member's config is rendered at", where)
 			}
+		case "wait_version":
+			if st.Version == "" {
+				return fmt.Errorf("%s: needs version, the version every node must report", where)
+			}
 		case "scale_to":
 			if st.Nodes < 1 || st.Nodes > maxNodes {
 				return fmt.Errorf("%s: nodes must be between 1 and %d (cluster.nodes + spare_nodes), got %d", where, maxNodes, st.Nodes)
@@ -1265,6 +1285,7 @@ var stepFieldOwners = []struct {
 	{"empty_disk", func(s ScenarioStep) bool { return s.EmptyDisk }, map[string]bool{"start": true}},
 	{"image", func(s ScenarioStep) bool { return s.Image != "" }, map[string]bool{"start": true, "rolling_restart": true}},
 	{"stage", func(s ScenarioStep) bool { return s.Stage != 0 }, map[string]bool{"set_stage": true}},
+	{"version", func(s ScenarioStep) bool { return s.Version != "" }, map[string]bool{"wait_version": true}},
 	{"pause_load_at_stop", func(s ScenarioStep) bool { return s.PauseLoadAtStop }, map[string]bool{"rolling_restart": true}},
 	{"wait_copies", func(s ScenarioStep) bool { return s.WaitCopies }, map[string]bool{"rolling_restart": true}},
 	{"leave", func(s ScenarioStep) bool { return s.Leave != "" }, map[string]bool{"fill_disk": true}},
@@ -1411,9 +1432,22 @@ func (tc *TestCase) validateScenarioDiskAndRows(maxNodes int) error {
 			}
 		}
 	}
+	if sc.SharedDir != "" {
+		if err := checkWitnessDir(sc.SharedDir); err != nil {
+			return fmt.Errorf("case %q: cluster.scenario.shared_dir %q %v", tc.Name, sc.SharedDir, err)
+		}
+	}
+	for _, ep := range tc.Endpoints {
+		if ep.MountsSharedDir && sc.SharedDir == "" {
+			return fmt.Errorf("case %q: endpoint %q sets mounts_shared_dir, but the case has no cluster.scenario.shared_dir", tc.Name, ep.Name)
+		}
+	}
 	if r := sc.Rows; r != nil {
-		if strings.TrimSpace(r.Query) == "" {
-			return fmt.Errorf("case %q: cluster.scenario.rows needs query, which returns the key of every row", tc.Name)
+		if (strings.TrimSpace(r.Query) == "") == (r.File == "") {
+			return fmt.Errorf("case %q: cluster.scenario.rows needs either query, which returns the key of every row, or file", tc.Name)
+		}
+		if r.File != "" && (sc.SharedDir == "" || !strings.HasPrefix(r.File, strings.TrimRight(sc.SharedDir, "/")+"/")) {
+			return fmt.Errorf("case %q: cluster.scenario.rows.file %q must be under cluster.scenario.shared_dir", tc.Name, r.File)
 		}
 		if r.Key == "" {
 			return fmt.Errorf("case %q: cluster.scenario.rows needs key, the expression that finds a row's key in a received line", tc.Name)
@@ -1426,7 +1460,7 @@ func (tc *TestCase) validateScenarioDiskAndRows(maxNodes int) error {
 		if strings.ContainsAny(r.Key, "\"\\$") {
 			return fmt.Errorf("case %q: cluster.scenario.rows.key must not contain a backslash, a double quote or $; write [0-9] for \\d", tc.Name)
 		}
-		if tc.Database == nil || tc.Database.Engine != "postgres" {
+		if r.File == "" && (tc.Database == nil || tc.Database.Engine != "postgres") {
 			return fmt.Errorf("case %q: cluster.scenario.rows reads the case's database, which must use engine postgres", tc.Name)
 		}
 		if r.Writer != "" && !tc.hasEndpoint(r.Writer) {

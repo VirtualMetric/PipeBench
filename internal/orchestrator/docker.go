@@ -168,6 +168,9 @@ networks:
 
 volumes:
   shared-data:
+{{- if .SharedDirMount }}
+  shared-dir:
+{{- end }}
 {{- if .WitnessDirMount }}
   witness-dir:
 {{- if eq .ShareServer "smb" }}
@@ -244,6 +247,9 @@ services:
 {{- end }}
 {{- if $.WitnessDirMount }}
       - "witness-dir:{{ $.WitnessDirMount }}"
+{{- end }}
+{{- if $.SharedDirMount }}
+      - "shared-dir:{{ $.SharedDirMount }}"
 {{- end }}
 {{- if .DiskPath }}
       - type: tmpfs
@@ -891,6 +897,10 @@ services:
     container_name: "bench-{{ .Name }}"
     hostname: "{{ .Name }}"
     networks: [bench]
+{{- if .MountsSharedDir }}
+    volumes:
+      - "shared-dir:{{ $.SharedDirMount }}"
+{{- end }}
 {{- if .Command }}
     command: {{ .Command }}
 {{- end }}
@@ -1977,6 +1987,8 @@ type endpointTpl struct {
 	Image   string
 	Env     map[string]string
 	Command string // pre-formatted YAML list, empty = use the image's default
+	// MountsSharedDir mounts the shared directory of a cluster scenario.
+	MountsSharedDir bool
 	// Healthcheck (optional): when HasHealthcheck is set, the endpoint gets a
 	// compose healthcheck and the subject gates on it (service_healthy).
 	HasHealthcheck bool
@@ -2096,6 +2108,9 @@ type composeVars struct {
 	// generator out of the initial `up` (profile "load").
 	NodeDependsOn   []nodeDependency
 	WitnessDirMount string
+	// SharedDirMount mounts one volume at this path on every node and on each
+	// endpoint that asks for it (cluster.scenario.shared_dir).
+	SharedDirMount string
 	// ShareServer, when set, serves the witness-dir volume from a Samba
 	// ("smb") or an NFS ("nfs") server, the share-server service at
 	// ShareServerIP, instead of keeping it on the host's disk
@@ -3052,10 +3067,11 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 			env[k] = strings.ReplaceAll(v, "$", "$$")
 		}
 		et := endpointTpl{
-			Name:    ep.Name,
-			Image:   ep.Image,
-			Env:     env,
-			Command: formatYAMLList(cmd),
+			Name:            ep.Name,
+			Image:           ep.Image,
+			Env:             env,
+			Command:         formatYAMLList(cmd),
+			MountsSharedDir: ep.MountsSharedDir,
 		}
 		if hc := ep.Healthcheck; hc != nil && hc.Test != "" {
 			et.HasHealthcheck = true

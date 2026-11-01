@@ -1183,6 +1183,9 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 			}
 		}
 
+	case "wait_version":
+		return sr.waitVersion(st)
+
 	case "wait_log":
 		within := st.DurationOr("within", 120*time.Second)
 		since := sr.lastDisruption
@@ -1717,6 +1720,37 @@ func (sr *scenarioRun) scaleTo(i int, st config.ScenarioStep) (bool, string, err
 	prev := sr.size
 	sr.size = target
 	return true, fmt.Sprintf("cluster %d → %d nodes (started %v, stopped %v)", prev, target, started, stopped), nil
+}
+
+// waitVersion waits until every node reports st.Version on /health, as nodes
+// that update themselves do one at a time. It records when each node first did,
+// so that the report shows the order and the gaps.
+func (sr *scenarioRun) waitVersion(st config.ScenarioStep) (bool, string, error) {
+	within := st.DurationOr("within", 600*time.Second)
+	start := time.Now()
+	first := map[int]time.Duration{}
+	round, ok, err := sr.waitRound(within, func(r healthRound) bool {
+		for _, h := range r.Nodes {
+			if _, seen := first[h.Node]; !seen && h.Reachable && h.Version == st.Version {
+				first[h.Node] = r.At.Sub(start)
+			}
+		}
+		return len(first) == len(sr.containers)
+	})
+	if err != nil {
+		return false, "", err
+	}
+	parts := make([]string, 0, len(first))
+	for n := 1; n <= len(sr.containers); n++ {
+		if d, seen := first[n]; seen {
+			sr.record(fmt.Sprintf("%s_node%d", defaultStr(st.Record, "version"), n), float64(d.Milliseconds()))
+			parts = append(parts, fmt.Sprintf("node %d after %s", n, fmtMs(d.Milliseconds())))
+		}
+	}
+	if !ok {
+		return false, fmt.Sprintf("%d of %d nodes reported version %s within %s (%s): %s", len(first), len(sr.containers), st.Version, within, strings.Join(parts, ", "), describeRound(round)), nil
+	}
+	return true, fmt.Sprintf("every node reports version %s: %s", st.Version, strings.Join(parts, ", ")), nil
 }
 
 // setStage renders every member's config again at another stage

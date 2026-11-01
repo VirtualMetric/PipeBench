@@ -737,6 +737,10 @@ type Endpoint struct {
 	// otel-collector clickhouse exporter creates its schema on start, so the
 	// clickhouse endpoint declares a healthcheck and otel waits for it.
 	Healthcheck *EndpointHealthcheck `yaml:"healthcheck"`
+	// MountsSharedDir mounts the cluster scenario's shared directory
+	// (cluster.scenario.shared_dir) on the endpoint, at the same path as on the
+	// nodes, so that the endpoint can write a file that every node reads.
+	MountsSharedDir bool `yaml:"mounts_shared_dir"`
 }
 
 // EndpointHealthcheck is a compose healthcheck for an Endpoint. Only Test is

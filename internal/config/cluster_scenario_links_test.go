@@ -130,21 +130,45 @@ func TestValidateRowsCheck(t *testing.T) {
 		edit func(tc *TestCase)
 		want string
 	}{
-		"no query":           {func(tc *TestCase) { tc.Cluster.Scenario.Rows.Query = " " }, "needs query"},
-		"no key":             {func(tc *TestCase) { tc.Cluster.Scenario.Rows.Key = "" }, "needs key"},
-		"bad key":            {func(tc *TestCase) { tc.Cluster.Scenario.Rows.Key = "evt-(" }, "rows.key"},
-		"backslash in key":   {func(tc *TestCase) { tc.Cluster.Scenario.Rows.Key = `evt-\d+` }, "must not contain a backslash"},
-		"not postgres":       {func(tc *TestCase) { tc.Database.Engine = "mysql" }, "engine postgres"},
-		"no database":        {func(tc *TestCase) { tc.Database = nil }, "engine postgres"},
-		"unknown writer":     {func(tc *TestCase) { tc.Cluster.Scenario.Rows.Writer = "ghost" }, `writer "ghost"`},
-		"negative drain":     {func(tc *TestCase) { tc.Cluster.Scenario.Rows.DrainSeconds = -1 }, "drain_seconds"},
-		"judge without rows": {func(tc *TestCase) { tc.Cluster.Scenario.Rows = nil }, "max_missing_rows needs"},
+		"no query": {func(tc *TestCase) { tc.Cluster.Scenario.Rows.Query = " " }, "either query"},
+		"query and file": {func(tc *TestCase) {
+			tc.Cluster.Scenario.SharedDir = "/mnt/share"
+			tc.Cluster.Scenario.Rows.File = "/mnt/share/app.log"
+		}, "either query"},
+		"a file outside the shared directory": {func(tc *TestCase) {
+			tc.Cluster.Scenario.SharedDir = "/mnt/share"
+			tc.Cluster.Scenario.Rows.Query = ""
+			tc.Cluster.Scenario.Rows.File = "/mnt/other/app.log"
+		}, "must be under"},
+		"a file and no shared directory": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Rows.Query = ""
+			tc.Cluster.Scenario.Rows.File = "/mnt/share/app.log"
+		}, "must be under"},
+		"a bad shared directory":               {func(tc *TestCase) { tc.Cluster.Scenario.SharedDir = "relative/path" }, "shared_dir"},
+		"an endpoint that mounts no directory": {func(tc *TestCase) { tc.Endpoints[0].MountsSharedDir = true }, "mounts_shared_dir"},
+		"no key":                               {func(tc *TestCase) { tc.Cluster.Scenario.Rows.Key = "" }, "needs key"},
+		"bad key":                              {func(tc *TestCase) { tc.Cluster.Scenario.Rows.Key = "evt-(" }, "rows.key"},
+		"backslash in key":                     {func(tc *TestCase) { tc.Cluster.Scenario.Rows.Key = `evt-\d+` }, "must not contain a backslash"},
+		"not postgres":                         {func(tc *TestCase) { tc.Database.Engine = "mysql" }, "engine postgres"},
+		"no database":                          {func(tc *TestCase) { tc.Database = nil }, "engine postgres"},
+		"unknown writer":                       {func(tc *TestCase) { tc.Cluster.Scenario.Rows.Writer = "ghost" }, `writer "ghost"`},
+		"negative drain":                       {func(tc *TestCase) { tc.Cluster.Scenario.Rows.DrainSeconds = -1 }, "drain_seconds"},
+		"judge without rows":                   {func(tc *TestCase) { tc.Cluster.Scenario.Rows = nil }, "max_missing_rows needs"},
 		"twice without rows": {func(tc *TestCase) {
 			tc.Cluster.Scenario.Rows = nil
 			tc.Cluster.Scenario.Expect.MaxMissingRows = nil
 			zero := int64(0)
 			tc.Cluster.Scenario.Expect.MaxRowsTwice = &zero
 		}, "max_rows_twice needs"},
+	}
+	// The rows can come from a file of the shared directory, with no database.
+	fromFile := rowsScenarioCase()
+	fromFile.Database = nil
+	fromFile.Endpoints = []Endpoint{{Name: "file-writer", Image: "alpine:3.22", MountsSharedDir: true}}
+	fromFile.Cluster.Scenario.SharedDir = "/mnt/share"
+	fromFile.Cluster.Scenario.Rows = &ScenarioRows{File: "/mnt/share/app.log", Key: "evt-[0-9]+", Writer: "file-writer"}
+	if err := fromFile.validateClusterScenario(); err != nil {
+		t.Fatalf("validateClusterScenario with rows from a file: %v", err)
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
