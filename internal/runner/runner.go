@@ -3737,8 +3737,8 @@ func agentlessDeviceOwner(containers []string) string {
 	return owner
 }
 
-// agentlessDeliveryWait is how long the agentless failover waits, after the
-// old owner is back, for the receiver to get a new line.
+// agentlessDeliveryWait is how long the agentless failover waits for the
+// receiver to get a new line, while the old owner is still down.
 const agentlessDeliveryWait = 180 * time.Second
 
 // waitCountGrows polls count until it returns more than before, or until the
@@ -4393,12 +4393,6 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 					actionOK = false
 					errs = append(errs, "no leader after the owning node went down")
 				}
-				// Bring the owner back so the cluster returns to full strength.
-				fmt.Printf("  starting node %s again to restore the cluster…\n", ownerContainer)
-				if serr := exec.Command("docker", "start", ownerContainer).Run(); serr != nil {
-					actionOK = false
-					errs = append(errs, fmt.Sprintf("docker start %s failed: %v", ownerContainer, serr))
-				}
 				collectDeadline := time.Now().Add(settle + 90*time.Second)
 				if collectDeadline.After(runDeadline) {
 					collectDeadline = runDeadline
@@ -4408,10 +4402,11 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 				} else {
 					fmt.Println("  (soft) no survivor observed collecting within the window")
 				}
-				// HARD 3: delivery resumes. The endpoint goes on adding lines to the
-				//   file that the agent reads, so the receiver must get more lines than
-				//   it had when the owner stopped. A device that moved but delivers
-				//   nothing is a failed failover.
+				// HARD 3: delivery resumes, while the old owner is still down. The
+				//   endpoint goes on adding lines to the file that the agent reads, so
+				//   the receiver must get more lines than it had when the owner stopped.
+				//   A device that moved but delivers nothing is a failed failover, and
+				//   the old owner's return must not be what brings the lines.
 				deliveryDeadline := time.Now().Add(agentlessDeliveryWait)
 				if deliveryDeadline.After(runDeadline) {
 					deliveryDeadline = runDeadline
@@ -4428,6 +4423,12 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 				} else {
 					actionOK = false
 					errs = append(errs, fmt.Sprintf("delivery did not resume after the failover: the receiver has %s lines, and it had %s when the owner stopped", formatCount(got), formatCount(preFailover)))
+				}
+				// Bring the owner back so the cluster returns to full strength.
+				fmt.Printf("  starting node %s again to restore the cluster…\n", ownerContainer)
+				if serr := exec.Command("docker", "start", ownerContainer).Run(); serr != nil {
+					actionOK = false
+					errs = append(errs, fmt.Sprintf("docker start %s failed: %v", ownerContainer, serr))
 				}
 			}
 		case "device_failover":
