@@ -210,6 +210,8 @@ func TestSharedStateRefusals(t *testing.T) {
 			tc.SharedState.Action = SharedStateActionStopOwner
 			tc.SharedState.PlacedDevices = nil
 		}, "stop_owner needs shared_state.placed_devices"},
+		"negative cut lines":    {func(tc *TestCase) { tc.SharedState.Streams[0].MaxCutLines = -1 }, "must not be negative"},
+		"cut lines, no pause":   {func(tc *TestCase) { tc.SharedState.Streams[0].MaxCutLines = 5 }, "max_cut_lines is only for a case that pauses its receivers"},
 		"negative action delay": {func(tc *TestCase) { tc.SharedState.ActionDelaySeconds = -1 }, "must not be negative"},
 		"short expected line":   {func(tc *TestCase) { tc.SharedState.ExpectLogOnce = []string{"ignores"} }, "expect_log_once[0] is shorter than 8"},
 		"unknown store":         {func(tc *TestCase) { tc.SharedState.Store = "nfs" }, "store must be azure_blob, s3, redis or share"},

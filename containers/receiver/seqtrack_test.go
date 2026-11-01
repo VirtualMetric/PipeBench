@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -185,6 +186,53 @@ func TestSeqTrackerSkipsACutLine(t *testing.T) {
 	got := tr.check(map[int64]int64{0: 3}, 5)
 	if got.Unique != 2 || got.Missing != 1 || got.Unparsed != 1 {
 		t.Errorf("tracker: unique %d missing %d unparsed %d, want 2 1 1", got.Unique, got.Missing, got.Unparsed)
+	}
+}
+
+// TestACutPieceIsNotTheRecord: a connection that ends inside a line leaves a piece of
+// it. The piece carries the record's number here, and still the record has not arrived:
+// it counts as missing until it arrives whole. A line that has its newline and no
+// number is not a piece, and stays on the count of garbled lines.
+func TestACutPieceIsNotTheRecord(t *testing.T) {
+	old := seqTrack
+	seqTrack = newSeqTracker(1)
+	t.Cleanup(func() { seqTrack = old })
+
+	receive := func(data string) {
+		t.Helper()
+		sender, conn := net.Pipe()
+		done := make(chan struct{})
+		cnt := &counters{}
+		go func() {
+			defer close(done)
+			handleConn(conn, cnt.newShard(), newValidator(), config{})
+		}()
+		if _, err := sender.Write([]byte(data)); err != nil {
+			t.Fatal(err)
+		}
+		sender.Close()
+		<-done
+	}
+	state := func() seqCheck { return seqTrack.check(map[int64]int64{7: 2}, 5) }
+
+	receive("CONN=7 SEQ=0 TS=1 aaaa\nCONN=7 SEQ=1 TS=2 bb")
+	if got := state(); got.Unique != 1 || got.Missing != 1 || got.Cut != 1 || got.Unparsed != 0 {
+		t.Fatalf("after the piece: unique %d missing %d cut %d unparsed %d, want 1 1 1 0: the record's only trace is a piece", got.Unique, got.Missing, got.Cut, got.Unparsed)
+	}
+
+	receive("CONN=7 SEQ=1 TS=2 bbbb\n")
+	if got := state(); got.Unique != 2 || got.Missing != 0 || got.Duplicates != 0 || got.Cut != 1 {
+		t.Fatalf("after the whole record: unique %d missing %d duplicates %d cut %d, want 2 0 0 1", got.Unique, got.Missing, got.Duplicates, got.Cut)
+	}
+
+	receive("CONN=")
+	if got := state(); got.Cut != 2 || got.Unparsed != 0 {
+		t.Fatalf("after a piece with no number: cut %d unparsed %d, want 2 0", got.Cut, got.Unparsed)
+	}
+
+	receive("no number, with its newline\n")
+	if got := state(); got.Cut != 2 || got.Unparsed != 1 {
+		t.Fatalf("after a garbled line: cut %d unparsed %d, want 2 1", got.Cut, got.Unparsed)
 	}
 }
 

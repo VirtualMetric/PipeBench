@@ -731,6 +731,8 @@ func handleConn(conn net.Conn, shard *connStats, val *validator, cfg config) {
 	// time, inflating the receive window when the sender idles before closing.
 	scanner := bufio.NewScanner(&stampingReader{r: conn, shard: shard})
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	cut := false
+	scanner.Split(scanWholeLines(&cut))
 	needsValidation := cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.RequiredSubstring != "" || cfg.ForbiddenSubstring != ""
 	// Pass the scanner's internal slice directly. shard.recordLine + validator
 	// only read len() and copy via `string(line)` / hash when they need to
@@ -743,6 +745,10 @@ func handleConn(conn net.Conn, shard *connStats, val *validator, cfg config) {
 		if needsValidation {
 			val.recordLine(b, cfg)
 		}
+		if cut {
+			trackCut()
+			continue
+		}
 		trackSeq(b)
 	}
 	// A scan error (oversized line, connection reset) silently truncates the
@@ -750,6 +756,18 @@ func handleConn(conn net.Conn, shard *connStats, val *validator, cfg config) {
 	// diagnosable from the receiver log. EOF is not reported by Err().
 	if err := scanner.Err(); err != nil {
 		fmt.Fprintf(os.Stderr, "receiver: conn %s: %v\n", conn.RemoteAddr(), err)
+	}
+}
+
+// scanWholeLines splits a connection into lines, as bufio.ScanLines does, and
+// sets *cut for what came last when no newline ended it. Every sender here ends
+// each record with a newline, so that is a piece of a line: the connection ended
+// inside it, because a write deadline cut it or the sender stopped.
+func scanWholeLines(cut *bool) bufio.SplitFunc {
+	return func(data []byte, atEOF bool) (int, []byte, error) {
+		advance, token, err := bufio.ScanLines(data, atEOF)
+		*cut = atEOF && token != nil && bytes.IndexByte(data, '\n') < 0
+		return advance, token, err
 	}
 }
 
@@ -808,6 +826,14 @@ func trackSeq(line []byte) {
 	}
 	if keyTrack != nil {
 		keyTrack.record(line)
+	}
+}
+
+// trackCut tells the sequence tracker about a piece of a line. The key tracker
+// does not hear of it: a piece is not a record.
+func trackCut() {
+	if seqTrack != nil {
+		seqTrack.recordCut(time.Now().UnixNano())
 	}
 }
 

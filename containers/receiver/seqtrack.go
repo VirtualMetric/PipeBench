@@ -76,6 +76,7 @@ type seqTracker struct {
 	unique   int64
 	dups     int64
 	unparsed int64
+	cut      int64
 	samples  []latSample
 	buckets  []tlBucket
 	dupList  []dupSample
@@ -129,6 +130,21 @@ func leadingInt(s string) (int64, string, bool) {
 		return 0, s, false
 	}
 	return v, s[n:], true
+}
+
+// recordCut notes a piece of a line, which arrived at now (unix nanos): what a
+// connection held of its last line when it ended inside that line. A piece is
+// never the record, even when it carries the record's number. The record has
+// arrived only when it arrives whole, so a record whose only trace is a piece
+// counts as missing.
+func (t *seqTracker) recordCut(now int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.start == 0 {
+		t.start = now
+	}
+	t.bucket(now).all++
+	t.cut++
 }
 
 // record notes one received line that arrived at now (unix nanos).
@@ -212,6 +228,7 @@ type seqCheck struct {
 	Unique         int64                `json:"unique"`
 	Duplicates     int64                `json:"duplicates"`
 	Unparsed       int64                `json:"unparsed"`
+	Cut            int64                `json:"cut"`
 	Conns          map[string]connCheck `json:"conns"`
 	UnexpectedConn []string             `json:"unexpected_conns,omitempty"`
 }
@@ -222,7 +239,7 @@ type seqCheck struct {
 func (t *seqTracker) check(acked map[int64]int64, maxRanges int) seqCheck {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	out := seqCheck{Conns: map[string]connCheck{}, Unique: t.unique, Duplicates: t.dups, Unparsed: t.unparsed}
+	out := seqCheck{Conns: map[string]connCheck{}, Unique: t.unique, Duplicates: t.dups, Unparsed: t.unparsed, Cut: t.cut}
 	for conn, n := range acked {
 		cc := connCheck{Acked: n}
 		c := t.conns[conn]

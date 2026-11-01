@@ -191,6 +191,7 @@ type seqCheckResult struct {
 	Unique         int64    `json:"unique"`
 	Duplicates     int64    `json:"duplicates"`
 	Unparsed       int64    `json:"unparsed"`
+	Cut            int64    `json:"cut"`
 	UnexpectedConn []string `json:"unexpected_conns,omitempty"`
 	Conns          map[string]struct {
 		Acked         int64      `json:"acked"`

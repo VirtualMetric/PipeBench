@@ -1474,20 +1474,20 @@ func (run *ssRun) checkStreams() {
 			run.fail("stream %s: the receiver did not count the records' sequence numbers (%v); these cases need the receiver of PipeBench v0.4.7 or later", st.StreamName(), err)
 			continue
 		}
-		got := ssStreamCounts{Received: m.LinesReceived, Unique: seq.Unique, Duplicates: seq.Duplicates, Unparsed: seq.Unparsed}
+		got := ssStreamCounts{Received: m.LinesReceived, Unique: seq.Unique, Duplicates: seq.Duplicates, Unparsed: seq.Unparsed, Cut: seq.Cut}
 		loss := max(sent-got.Unique, 0)
 		dupPct := got.duplicatePct()
 		streams[st.StreamName()] = map[string]any{
 			"sent": sent, "received": got.Received, "unique": got.Unique,
 			"duplicates": got.Duplicates, "duplicate_pct": dupPct, "lost": loss,
-			"unnumbered": got.Unparsed,
+			"unnumbered": got.Unparsed, "cut_lines": got.Cut,
 		}
 		run.linesIn += sent
 		run.linesOut += got.Received
 		run.uniqueOut += got.Unique
 		run.perReceiver[st.Receiver] = got.Received
-		fmt.Printf("  stream %s: sent %d, received %d (%d distinct, %d repeated, %.2f%%, %d without a number), lost %d\n",
-			st.StreamName(), sent, got.Received, got.Unique, got.Duplicates, dupPct, got.Unparsed, loss)
+		fmt.Printf("  stream %s: sent %d, received %d (%d distinct, %d repeated, %.2f%%, %d without a number, %d cut), lost %d\n",
+			st.StreamName(), sent, got.Received, got.Unique, got.Duplicates, dupPct, got.Unparsed, got.Cut, loss)
 		for _, why := range judgeStream(st, sent, got) {
 			run.fail("%s", why)
 		}
@@ -1499,7 +1499,7 @@ func (run *ssRun) checkStreams() {
 // arrived, the distinct records among them by their sequence numbers, the
 // copies of records that arrived before, and the lines that carry no number.
 type ssStreamCounts struct {
-	Received, Unique, Duplicates, Unparsed int64
+	Received, Unique, Duplicates, Unparsed, Cut int64
 }
 
 func (c ssStreamCounts) duplicatePct() float64 {
@@ -1557,6 +1557,9 @@ func numberingProblems(st config.SharedStateStream, sent int64, got ssStreamCoun
 	if got.Unparsed > 0 {
 		out = append(out, fmt.Sprintf("stream %s: %d lines arrived without a record's sequence number, so they arrived cut or garbled", st.StreamName(), got.Unparsed))
 	}
+	if got.Cut > st.MaxCutLines {
+		out = append(out, fmt.Sprintf("stream %s: %d pieces of a line arrived, from connections that ended inside a line, above max_cut_lines %d", st.StreamName(), got.Cut, st.MaxCutLines))
+	}
 	if got.Unique > sent {
 		out = append(out, fmt.Sprintf("stream %s: %d distinct records arrived, %d more than the generator sent", st.StreamName(), got.Unique, got.Unique-sent))
 	}
@@ -1606,11 +1609,11 @@ func (run *ssRun) checkAckedStream(st config.SharedStateStream, genOut string, p
 		run.fail("stream %s: the receiver did not answer the sequence check, so the loss is unknown: %v", st.StreamName(), err)
 		return nil
 	}
-	got := ssStreamCounts{Received: received, Unique: check.Unique, Duplicates: check.Duplicates, Unparsed: check.Unparsed}
+	got := ssStreamCounts{Received: received, Unique: check.Unique, Duplicates: check.Duplicates, Unparsed: check.Unparsed, Cut: check.Cut}
 	counts := map[string]any{
 		"sent": sent, "confirmed": gen.Ack.LinesAcked, "unconfirmed": gen.Ack.LinesUnacked,
 		"received": got.Received, "unique": got.Unique, "duplicates": got.Duplicates, "duplicate_pct": got.duplicatePct(),
-		"lost": check.Missing, "unnumbered": got.Unparsed,
+		"lost": check.Missing, "unnumbered": got.Unparsed, "cut_lines": got.Cut,
 		"requests": gen.Ack.Requests, "failed_requests": gen.Ack.Failures, "status_counts": gen.Ack.StatusCounts,
 	}
 	if lat := gen.Ack.AckLatency; lat != nil {
@@ -1620,8 +1623,8 @@ func (run *ssRun) checkAckedStream(st config.SharedStateStream, genOut string, p
 	run.linesOut += got.Received
 	run.uniqueOut += check.ReceivedAcked
 	run.perReceiver[st.Receiver] = got.Received
-	fmt.Printf("  stream %s: sent %d, %d confirmed and %d not, received %d (%d distinct, %d repeated, %.2f%%, %d without a number), %d confirmed records lost\n",
-		st.StreamName(), sent, gen.Ack.LinesAcked, gen.Ack.LinesUnacked, got.Received, got.Unique, got.Duplicates, got.duplicatePct(), got.Unparsed, check.Missing)
+	fmt.Printf("  stream %s: sent %d, %d confirmed and %d not, received %d (%d distinct, %d repeated, %.2f%%, %d without a number, %d cut), %d confirmed records lost\n",
+		st.StreamName(), sent, gen.Ack.LinesAcked, gen.Ack.LinesUnacked, got.Received, got.Unique, got.Duplicates, got.duplicatePct(), got.Unparsed, got.Cut, check.Missing)
 	if lat := gen.Ack.AckLatency; lat != nil {
 		fmt.Printf("    a confirmation took %d ms at the median, %d ms at p95, %d ms at p99 and %d ms at most\n", lat.P50, lat.P95, lat.P99, lat.Max)
 	}

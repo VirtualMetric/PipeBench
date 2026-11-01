@@ -496,6 +496,15 @@ type SharedStateStream struct {
 	// set, it replaces max_duplicate_pct: a bound such as "no more than one
 	// write interval of records" is a number of records, not a share.
 	MaxDuplicates *int64 `yaml:"max_duplicates"`
+	// MaxCutLines is how many pieces of a line may arrive (default 0). Only a
+	// case that pauses its receivers may set it. While a receiver reads nothing,
+	// the sender's write deadline cuts its connection, and once the receiver goes
+	// on it reads what it holds of the last line, with no newline. It forgives the
+	// piece and nothing else: the piece never counts as the record, so a record
+	// must still arrive whole, or it counts as lost. A line that has its newline
+	// and no record's number is garbled, and always fails. Every run reports the
+	// count as cut_lines, so a jump is visible.
+	MaxCutLines int64 `yaml:"max_cut_lines"`
 	// ExpectNothing says that no record of the stream may arrive: its devices
 	// must not run at all, as on a director that keeps its shared state in
 	// memory. Loss is not judged then.
@@ -862,9 +871,12 @@ func (tc *TestCase) validateSharedState() error {
 			return fmt.Errorf("case %q: shared_state.streams has two streams named %q", tc.Name, st.StreamName())
 		}
 		names[st.StreamName()] = true
-		if st.MaxLoss < 0 || st.MaxDuplicatePct < 0 || st.MinBaseline < 0 || st.MinAfterAction < 0 || st.MinAfterRejoin < 0 || st.MinEachAfterOutage < 0 ||
+		if st.MaxLoss < 0 || st.MaxCutLines < 0 || st.MaxDuplicatePct < 0 || st.MinBaseline < 0 || st.MinAfterAction < 0 || st.MinAfterRejoin < 0 || st.MinEachAfterOutage < 0 ||
 			(st.MaxDuplicates != nil && *st.MaxDuplicates < 0) || (st.MaxConfirmedDuringOutage != nil && *st.MaxConfirmedDuringOutage < 0) {
-			return fmt.Errorf("case %q: shared_state.streams[%d]: max_loss, max_duplicates, max_duplicate_pct, min_baseline, min_after_action, min_after_rejoin, min_each_after_outage and max_confirmed_during_outage must not be negative", tc.Name, i)
+			return fmt.Errorf("case %q: shared_state.streams[%d]: max_loss, max_cut_lines, max_duplicates, max_duplicate_pct, min_baseline, min_after_action, min_after_rejoin, min_each_after_outage and max_confirmed_during_outage must not be negative", tc.Name, i)
+		}
+		if st.MaxCutLines > 0 && s.Action != SharedStateActionPauseReceivers && s.Action != SharedStateActionScaleBacklog && s.BacklogSeconds == 0 {
+			return fmt.Errorf("case %q: shared_state.streams[%d]: max_cut_lines is only for a case that pauses its receivers: the pause_receivers or scale_backlog action, or backlog_seconds", tc.Name, i)
 		}
 		if st.MinEachAfterOutage > 0 || st.MaxConfirmedDuringOutage != nil {
 			field := "min_each_after_outage"
