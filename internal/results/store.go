@@ -316,6 +316,7 @@ func (s *Store) Save(r RunResult, _unusedMetricsCSVSrc string) (string, error) {
 		LastReceivedNs:  r.LastReceivedNs,
 		LinesIn:         r.LinesIn,
 		LinesOut:        r.LinesOut,
+		CutLines:        r.CutLines,
 		BytesIn:         r.BytesIn,
 		BytesOut:        r.BytesOut,
 		LinesPerSec:     r.LinesPerSec,
