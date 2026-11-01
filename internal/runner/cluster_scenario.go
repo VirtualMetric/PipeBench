@@ -720,19 +720,22 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		return true, fmt.Sprintf("healthy after %s, leader node %d", fmtMs(ms), leader), nil
 
 	case "expect_cluster_ip":
-		// The node that leads holds the cluster IP, and no other member does.
+		// The node that leads holds the cluster IP, and no other member does. With
+		// for, that has to last, so that a member that takes it up late fails.
 		within := st.DurationOr("within", 60*time.Second)
+		hold := st.DurationOr("for", 0)
 		waited := time.Now()
 		ip := sr.tc.Cluster.IP
 		var holders []int
-		round, ok, err := sr.waitRound(within, func(r healthRound) bool {
+		leaderAlone := func(r healthRound) bool {
 			leader, agreed := agreedLeader(r)
 			if !agreed {
 				return false
 			}
 			holders = sr.clusterIPHolders(ip)
 			return len(holders) == 1 && holders[0] == leader
-		})
+		}
+		round, ok, err := sr.waitRound(within, leaderAlone)
 		if err != nil {
 			return false, "", err
 		}
@@ -741,6 +744,15 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		}
 		ms := time.Since(waited).Milliseconds()
 		sr.record(st.Record, float64(ms))
+		for end := time.Now().Add(hold); time.Now().Before(end); {
+			if err := sleepCtx(sr.ctx, time.Second); err != nil {
+				return false, "", fmt.Errorf("interrupted: %w", err)
+			}
+			r, have := sr.probe.latest()
+			if have && !leaderAlone(r) {
+				return false, fmt.Sprintf("the leader alone held the cluster IP %s after %s, but not for %s: nodes %v hold it, %s", ip, fmtMs(ms), hold, holders, describeRound(r)), nil
+			}
+		}
 		return true, fmt.Sprintf("the leader, node %d, alone holds the cluster IP %s, after %s", holders[0], ip, fmtMs(ms)), nil
 
 	case "wait_copies":

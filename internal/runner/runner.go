@@ -3759,6 +3759,15 @@ func waitCountGrows(ctx context.Context, count func() (int64, error), before int
 	}
 }
 
+const (
+	// agentlessStopQuiet is how long the lines that a stopped owner had handed on take
+	// to arrive.
+	agentlessStopQuiet = 5 * time.Second
+	// agentlessResumeLines is how many new lines show that delivery resumed. One could be
+	// the last of what the old owner handed on.
+	agentlessResumeLines = 3
+)
+
 // agentlessCollectingNow reports whether a node is ACTIVELY collecting from an
 // agentless device right now: its recent logs show the collector forwarding
 // records to the router ("Forwarded N log entries from device ... to router").
@@ -4366,13 +4375,19 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 				// strength afterwards (matching "the node that starts the agentless
 				// machine gets restarted").
 				fmt.Printf("  agentless device owner = node %s (%s); stopping it to force a failover…\n", owner, ownerContainer)
-				preFailover := finalCount
-				if rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second); qerr == nil {
-					preFailover = rm.LinesReceived
-				}
 				if serr := exec.Command("docker", "stop", "-t", "10", ownerContainer).Run(); serr != nil {
 					actionOK = false
 					errs = append(errs, fmt.Sprintf("docker stop %s failed: %v (disruption did not happen)", ownerContainer, serr))
+				}
+				// Lines the owner had handed on still arrive for a moment after it stops,
+				// and they would pass for a new owner's lines. So the count that delivery
+				// must grow past is read once they have arrived.
+				if err := sleepCtx(r.ctx, agentlessStopQuiet); err != nil {
+					return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+				}
+				preFailover := finalCount
+				if rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second); qerr == nil {
+					preFailover = rm.LinesReceived
 				}
 				fmt.Printf("  waiting %s for the leader to detect the down node and reassign the device…\n", settle)
 				if err := sleepCtx(r.ctx, settle); err != nil {
@@ -4418,7 +4433,7 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 					}
 					return rm.LinesReceived, nil
 				}
-				if got, ok := waitCountGrows(r.ctx, count, preFailover, deliveryDeadline, 5*time.Second); ok {
+				if got, ok := waitCountGrows(r.ctx, count, preFailover+agentlessResumeLines-1, deliveryDeadline, 5*time.Second); ok {
 					fmt.Printf("  delivery resumed after the failover: %s lines, %s when the owner stopped ✓\n", formatCount(got), formatCount(preFailover))
 				} else {
 					actionOK = false
