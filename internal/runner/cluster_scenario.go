@@ -1348,6 +1348,16 @@ func (sr *scenarioRun) nodeAction(i int, st config.ScenarioStep, rep *scenarioSt
 			// no volume, so its storage lives in the container. The step checks
 			// that the container really is a new one: the old one would start
 			// on its old disk.
+			//
+			// Docker drops the old container's log with the container, and that
+			// log is the only record of what the node did up to its kill. So the
+			// step fails rather than go on without it.
+			out, logErr := exec.Command("docker", "logs", "-t", c).CombinedOutput()
+			if logErr != nil {
+				_ = os.Remove(argsFile)
+				return false, fmt.Sprintf("could not keep node %d's log before replacing its container: %v: %s", n, logErr, strings.TrimSpace(string(out))), nil
+			}
+			replacedLogs.keep(c, keptLog{Step: i, Image: sr.nodeImage[n], Text: string(out)})
 			oldID := containerID(sr.ctx, c)
 			if err := sr.orch.RecreateServices(fmt.Sprintf("subject-%d", n)); err != nil {
 				_ = os.Remove(argsFile)
@@ -2517,6 +2527,16 @@ func (sr *scenarioRun) finishWithoutLoad(rep scenarioReport) (scenarioReport, sc
 // judged max_duplicates over a count that the receiver's sequence tracker had
 // replaced with zero, so rows that arrived twice went unseen.
 func withoutLoadVerdict(rep scenarioReport, ex config.ScenarioExpect, dedup bool, metricsErr error) (reasons, notes []string) {
+	if ex.MinReceived > 0 {
+		switch {
+		case !dedup:
+			reasons = append(reasons, "min_received needs correctness.validate_dedup: without it, the receiver counts no distinct lines")
+		case metricsErr != nil:
+			reasons = append(reasons, "the receiver's counts could not be read, so min_received was not checked: "+metricsErr.Error())
+		case rep.Unique < ex.MinReceived:
+			reasons = append(reasons, fmt.Sprintf("%d distinct lines arrived, fewer than min_received %d", rep.Unique, ex.MinReceived))
+		}
+	}
 	if ex.MaxDuplicates != nil {
 		switch {
 		case !dedup:

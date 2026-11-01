@@ -218,6 +218,10 @@ type ScenarioExpect struct {
 	// MinAcked is the fewest lines the generator must have had
 	// acknowledged, so a run that sent nothing cannot pass.
 	MinAcked int64 `yaml:"min_acked"`
+	// MinReceived is the fewest distinct lines that must reach the receiver in
+	// a run without a generator, whose lines nobody acknowledges: those of an
+	// agent, for one. It needs correctness.validate_dedup, which counts them.
+	MinReceived int64 `yaml:"min_received"`
 	// MaxMissingRows is how many database rows (cluster.scenario.rows) may
 	// never arrive.
 	MaxMissingRows *int64 `yaml:"max_missing_rows"`
@@ -735,6 +739,14 @@ func (tc *TestCase) validateClusterScenario() error {
 		if sc.Expect.MaxLoss != nil || sc.Expect.MinAcked > 0 {
 			return fmt.Errorf("case %q: expect.max_loss and expect.min_acked need the http_ack generator", tc.Name)
 		}
+		if sc.Expect.MinReceived < 0 {
+			return fmt.Errorf("case %q: expect.min_received cannot be negative", tc.Name)
+		}
+		if sc.Expect.MinReceived > 0 && !tc.Correctness.ValidateDedup {
+			return fmt.Errorf("case %q: expect.min_received needs correctness.validate_dedup, which counts the distinct lines", tc.Name)
+		}
+	case sc.Expect.MinReceived != 0:
+		return fmt.Errorf("case %q: expect.min_received is for a case without a generator", tc.Name)
 	case tc.Generator.Mode != "http_ack":
 		return fmt.Errorf("case %q: a scenario case counts acknowledged lines, so its generator must use mode http_ack (got %q)", tc.Name, tc.Generator.Mode)
 	// The rate is per worker, and an unset worker count means three per CPU
