@@ -55,6 +55,14 @@ func TestValidateScenarioImagesAcceptsAnUpgrade(t *testing.T) {
 	if err := emptied.Validate(); err != nil {
 		t.Fatalf("Validate a move to an empty disk: %v", err)
 	}
+	// Nodes that update themselves move to the build under test without a step
+	// that names it, and a wait_version step waits for that.
+	selfUpdate := upgradeScenarioCase()
+	selfUpdate.Cluster.Scenario.NodeVolume = ""
+	selfUpdate.Cluster.Scenario.Steps = []ScenarioStep{{Do: "wait_ready"}, {Do: "start_load"}, {Do: "wait_version", Version: "2.7.0"}}
+	if err := selfUpdate.Validate(); err != nil {
+		t.Fatalf("Validate nodes that update themselves: %v", err)
+	}
 	// Without start_image the nodes start on the image under test, and a
 	// step may still move them to another one.
 	down := upgradeScenarioCase()

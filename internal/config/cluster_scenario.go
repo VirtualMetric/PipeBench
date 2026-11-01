@@ -1078,6 +1078,11 @@ func (tc *TestCase) validateScenarioImages() error {
 		if st.EmptyDisk && sc.NodeVolume != "" {
 			return fmt.Errorf("%s: empty_disk starts the node on an empty disk, but cluster.scenario.node_volume keeps the node's data in a volume; a case uses one of them", where)
 		}
+		// Nodes that update themselves move to the build under test without a
+		// step that gives them an image: wait_version waits for that.
+		if st.Do == "wait_version" {
+			testsSubject = true
+		}
 		if st.Image == "" {
 			continue
 		}
@@ -1090,7 +1095,7 @@ func (tc *TestCase) validateScenarioImages() error {
 			return fmt.Errorf("%s: image gives the node a new container, which would start on an empty disk; say empty_disk: true when the case means that, or set cluster.scenario.node_volume to keep the node's data", where)
 		}
 	}
-	// A case whose nodes start on another image must move them to the image
+	// A case whose nodes start on another image must move them to the build
 	// under test at some step. Otherwise it would pass or fail whatever the
 	// build under test does.
 	if sc.StartImage != "" && !testsSubject {
