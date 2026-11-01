@@ -52,6 +52,9 @@ type config struct {
 	LatencySampleEvery int64
 }
 
+// cutLines counts the pieces of a line that arrived, on every connection.
+var cutLines atomic.Int64
+
 // seqTrack is the sequence tracker when RECEIVER_TRACK_SEQ is on, else nil.
 var seqTrack *seqTracker
 
@@ -650,6 +653,7 @@ func main() {
 	summary := map[string]any{
 		"lines_received": totalLines,
 		"bytes_received": totalBytes,
+		"cut_lines":      cutLines.Load(),
 	}
 	if cfg.ValidateDedup || cfg.ExpectedLines > 0 {
 		summary["passed"] = passed
@@ -741,13 +745,16 @@ func handleConn(conn net.Conn, shard *connStats, val *validator, cfg config) {
 	// multi-million-lines/s was the receiver's hot ceiling.
 	for scanner.Scan() {
 		b := scanner.Bytes()
-		shard.recordLine(int64(len(b)) + 1)
-		if needsValidation {
-			val.recordLine(b, cfg)
-		}
+		// A piece of a line counts as nothing but a piece: not as a line, which
+		// would hide a lost record from a count of lines, and not as a distinct
+		// line or a record.
 		if cut {
 			trackCut()
 			continue
+		}
+		shard.recordLine(int64(len(b)) + 1)
+		if needsValidation {
+			val.recordLine(b, cfg)
 		}
 		trackSeq(b)
 	}
@@ -829,9 +836,10 @@ func trackSeq(line []byte) {
 	}
 }
 
-// trackCut tells the sequence tracker about a piece of a line. The key tracker
-// does not hear of it: a piece is not a record.
+// trackCut counts a piece of a line, and tells the sequence tracker about it. The
+// key tracker does not hear of it: a piece is not a record.
 func trackCut() {
+	cutLines.Add(1)
 	if seqTrack != nil {
 		seqTrack.recordCut(time.Now().UnixNano())
 	}
@@ -1049,6 +1057,7 @@ func serveMetrics(port string, cnt *counters, val *validator, cfg config) {
 		resp := map[string]any{
 			"lines_received":    totalLines,
 			"bytes_received":    totalBytes,
+			"cut_lines":         cutLines.Load(),
 			"done":              cnt.Done.Load(),
 			"first_received_ns": firstNs,
 			"last_received_ns":  lastNs,

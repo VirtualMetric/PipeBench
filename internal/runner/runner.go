@@ -91,6 +91,7 @@ func (o *Options) applyDefaults() {
 // ReceiverMetrics is the JSON response from the receiver's /metrics endpoint.
 type ReceiverMetrics struct {
 	LinesReceived    int64    `json:"lines_received"`
+	CutLines         int64    `json:"cut_lines,omitempty"`
 	BytesReceived    int64    `json:"bytes_received"`
 	Done             bool     `json:"done"`
 	FirstReceivedNs  int64    `json:"first_received_ns"`
@@ -839,6 +840,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		LastReceivedNs:  recvMetrics.LastReceivedNs,
 		LinesIn:         genStats.LinesSent,
 		LinesOut:        recvMetrics.LinesReceived,
+		CutLines:        recvMetrics.CutLines,
 		BytesIn:         genStats.BytesSent,
 		BytesOut:        recvMetrics.BytesReceived,
 		LinesPerSec:     linesPerSec,
@@ -1394,6 +1396,7 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 		LastReceivedNs:  recvMetrics.LastReceivedNs,
 		LinesIn:         genStats.LinesSent,
 		LinesOut:        recvMetrics.LinesReceived,
+		CutLines:        recvMetrics.CutLines,
 		BytesIn:         genStats.BytesSent,
 		BytesOut:        recvMetrics.BytesReceived,
 		LinesPerSec:     receiveWindowRate(recvMetrics),
@@ -1717,6 +1720,7 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 		LastReceivedNs:  recvMetrics.LastReceivedNs,
 		LinesIn:         genStats.LinesSent,
 		LinesOut:        recvMetrics.LinesReceived,
+		CutLines:        recvMetrics.CutLines,
 		BytesIn:         genStats.BytesSent,
 		BytesOut:        recvMetrics.BytesReceived,
 		LinesPerSec:     receiveWindowRate(recvMetrics),
@@ -2073,6 +2077,7 @@ func (r *Runner) runDiskPressureCorrectness(tc *config.TestCase, subject config.
 		LastReceivedNs:  recvMetrics.LastReceivedNs,
 		LinesIn:         genStats.LinesSent,
 		LinesOut:        recvMetrics.LinesReceived,
+		CutLines:        recvMetrics.CutLines,
 		BytesIn:         genStats.BytesSent,
 		BytesOut:        recvMetrics.BytesReceived,
 		LinesPerSec:     receiveWindowRate(recvMetrics),
@@ -2527,6 +2532,7 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 		LastReceivedNs:  recvMetrics.LastReceivedNs,
 		LinesIn:         expectedSent,
 		LinesOut:        recvMetrics.LinesReceived,
+		CutLines:        recvMetrics.CutLines,
 		UniqueOut:       recvMetrics.UniqueLines,
 		BytesIn:         genStats.BytesSent,
 		BytesOut:        recvMetrics.BytesReceived,
@@ -3209,6 +3215,7 @@ func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject confi
 		FirstReceivedNs: recvMetrics.FirstReceivedNs,
 		LastReceivedNs:  recvMetrics.LastReceivedNs,
 		LinesOut:        recvMetrics.LinesReceived,
+		CutLines:        recvMetrics.CutLines,
 		BytesOut:        recvMetrics.BytesReceived,
 		Passed:          &passed,
 	}
@@ -8142,6 +8149,7 @@ func (r *Runner) runKafkaOffsetCommitRestart(tc *config.TestCase, subject config
 		LastReceivedNs:  recvMetrics.LastReceivedNs,
 		LinesIn:         sent,
 		LinesOut:        recvMetrics.LinesReceived,
+		CutLines:        recvMetrics.CutLines,
 		BytesIn:         genStats.BytesSent,
 		BytesOut:        recvMetrics.BytesReceived,
 		LossPercent:     lossPct,
@@ -8385,6 +8393,7 @@ func (r *Runner) runPersistenceFileRestartCorrectness(tc *config.TestCase, subje
 		LastReceivedNs:  recvMetrics.LastReceivedNs,
 		LinesIn:         genStats.LinesSent,
 		LinesOut:        recvMetrics.LinesReceived,
+		CutLines:        recvMetrics.CutLines,
 		BytesIn:         genStats.BytesSent,
 		BytesOut:        recvMetrics.BytesReceived,
 		LinesPerSec:     receiveWindowRate(recvMetrics),

@@ -191,21 +191,28 @@ func TestSeqTrackerSkipsACutLine(t *testing.T) {
 
 // TestACutPieceIsNotTheRecord: a connection that ends inside a line leaves a piece of
 // it. The piece carries the record's number here, and still the record has not arrived:
-// it counts as missing until it arrives whole. A line that has its newline and no
-// number is not a piece, and stays on the count of garbled lines.
+// it counts as missing until it arrives whole, and it is on no count that a case with
+// no sequence numbers reads either: the lines received and the distinct lines. A line
+// that has its newline and no number is not a piece, and stays on the count of garbled
+// lines.
 func TestACutPieceIsNotTheRecord(t *testing.T) {
 	old := seqTrack
 	seqTrack = newSeqTracker(1)
-	t.Cleanup(func() { seqTrack = old })
+	cutLines.Store(0)
+	t.Cleanup(func() {
+		seqTrack = old
+		cutLines.Store(0)
+	})
 
+	cnt := &counters{}
+	val := newValidator()
 	receive := func(data string) {
 		t.Helper()
 		sender, conn := net.Pipe()
 		done := make(chan struct{})
-		cnt := &counters{}
 		go func() {
 			defer close(done)
-			handleConn(conn, cnt.newShard(), newValidator(), config{})
+			handleConn(conn, cnt.newShard(), val, config{ValidateDedup: true})
 		}()
 		if _, err := sender.Write([]byte(data)); err != nil {
 			t.Fatal(err)
@@ -219,10 +226,20 @@ func TestACutPieceIsNotTheRecord(t *testing.T) {
 	if got := state(); got.Unique != 1 || got.Missing != 1 || got.Cut != 1 || got.Unparsed != 0 {
 		t.Fatalf("after the piece: unique %d missing %d cut %d unparsed %d, want 1 1 1 0: the record's only trace is a piece", got.Unique, got.Missing, got.Cut, got.Unparsed)
 	}
+	lines, _, _, _ := cnt.totals()
+	unique, _ := val.dedupStats()
+	if lines != 1 || unique != 1 || cutLines.Load() != 1 {
+		t.Fatalf("after the piece: %d lines, %d distinct lines, %d cut lines, want 1 1 1: counted as a line, the piece would hide the lost record", lines, unique, cutLines.Load())
+	}
 
 	receive("CONN=7 SEQ=1 TS=2 bbbb\n")
 	if got := state(); got.Unique != 2 || got.Missing != 0 || got.Duplicates != 0 || got.Cut != 1 {
 		t.Fatalf("after the whole record: unique %d missing %d duplicates %d cut %d, want 2 0 0 1", got.Unique, got.Missing, got.Duplicates, got.Cut)
+	}
+	lines, _, _, _ = cnt.totals()
+	unique, _ = val.dedupStats()
+	if lines != 2 || unique != 2 {
+		t.Fatalf("after the whole record: %d lines, %d distinct lines, want 2 2", lines, unique)
 	}
 
 	receive("CONN=")

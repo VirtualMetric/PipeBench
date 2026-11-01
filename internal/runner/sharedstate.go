@@ -138,6 +138,7 @@ func (r *Runner) runDirectorSharedStateCorrectness(tc *config.TestCase, subject 
 		DurationSec:     time.Since(run.started).Seconds(),
 		LinesIn:         run.linesIn,
 		LinesOut:        run.linesOut,
+		CutLines:        run.cutLines,
 		UniqueOut:       run.uniqueOut,
 		PerReceiver:     run.perReceiver,
 		AvgCPUPercent:   metrics.CPUAvg,
@@ -214,6 +215,7 @@ type ssRun struct {
 	measures map[string]any
 
 	linesIn, linesOut, uniqueOut int64
+	cutLines                     int64
 	perReceiver                  map[string]int64
 
 	// confirmedBefore is how many records each stream's sender had got
@@ -1484,6 +1486,7 @@ func (run *ssRun) checkStreams() {
 		}
 		run.linesIn += sent
 		run.linesOut += got.Received
+		run.cutLines += got.Cut
 		run.uniqueOut += got.Unique
 		run.perReceiver[st.Receiver] = got.Received
 		fmt.Printf("  stream %s: sent %d, received %d (%d distinct, %d repeated, %.2f%%, %d without a number, %d cut), lost %d\n",
@@ -1621,6 +1624,7 @@ func (run *ssRun) checkAckedStream(st config.SharedStateStream, genOut string, p
 	}
 	run.linesIn += gen.Ack.LinesAcked
 	run.linesOut += got.Received
+	run.cutLines += got.Cut
 	run.uniqueOut += check.ReceivedAcked
 	run.perReceiver[st.Receiver] = got.Received
 	fmt.Printf("  stream %s: sent %d, %d confirmed and %d not, received %d (%d distinct, %d repeated, %.2f%%, %d without a number, %d cut), %d confirmed records lost\n",

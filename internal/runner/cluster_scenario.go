@@ -570,6 +570,7 @@ func (r *Runner) runClusterScenario(tc *config.TestCase, subject config.Subject)
 		DurationSec:     time.Since(startTime).Seconds(),
 		LinesIn:         report.Acked,
 		LinesOut:        report.Received,
+		CutLines:        report.CutLines,
 		UniqueOut:       report.Unique,
 		LatencyP50Ms:    report.Latency.P50Ms,
 		LatencyP95Ms:    report.Latency.P95Ms,
@@ -1887,6 +1888,7 @@ type scenarioReport struct {
 	// counts. With several receivers they are the counts of the receiver
 	// that missed the most lines, and Receivers lists each one.
 	Received   int64                   `json:"received"`
+	CutLines   int64                   `json:"cut_lines"`
 	Unique     int64                   `json:"unique"`
 	Missing    int64                   `json:"missing"`
 	Duplicates int64                   `json:"duplicates"`
@@ -1943,6 +1945,7 @@ func (rep scenarioReport) summary() map[string]any {
 		"acked":                    rep.Acked,
 		"missing":                  rep.Missing,
 		"duplicates":               rep.Duplicates,
+		"cut_lines":                rep.CutLines,
 		"latency_max_ms":           rep.Latency.MaxMs,
 		"split_brain_ms":           rep.Leadership.SplitBrainMs,
 		"max_self_claimed_leaders": rep.Leadership.MaxSelfClaimed,
@@ -2096,6 +2099,9 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 	rep.Unique = worst.Unique
 	rep.Received = worst.Received
 	rep.DuplicateRanges = worst.DuplicateRanges
+	for _, res := range recvResults {
+		rep.CutLines += res.CutLines
+	}
 	if sr.tc.MultiReceiver() {
 		rep.Receivers = recvResults
 	}
@@ -2354,6 +2360,7 @@ type receiverResult struct {
 	// so that its loss is unknown.
 	Checked    bool            `json:"checked"`
 	Received   int64           `json:"received"`
+	CutLines   int64           `json:"cut_lines"`
 	Unique     int64           `json:"unique"`
 	Missing    int64           `json:"missing"`
 	Duplicates int64           `json:"duplicates"`
@@ -2382,7 +2389,7 @@ func (sr *scenarioRun) checkReceiver(rc scenarioReceiver, acked map[string]int64
 		return receiverResult{}, fmt.Errorf("interrupted: %w", sr.ctx.Err())
 	}
 	res := receiverResult{ID: rc.ID, Checked: checked, SeqCheck: &check,
-		Unique: check.Unique, Missing: check.Missing, Duplicates: check.Duplicates, Extra: check.Extra}
+		Unique: check.Unique, Missing: check.Missing, Duplicates: check.Duplicates, Extra: check.Extra, CutLines: check.Cut}
 	if !checked {
 		sr.failures = append(sr.failures, fmt.Sprintf("%s never answered the sequence check, so loss is unknown: %v", rc.describe(), err))
 	}
@@ -2393,8 +2400,8 @@ func (sr *scenarioRun) checkReceiver(rc scenarioReceiver, acked map[string]int64
 	if rc.ID != "" {
 		at = " at receiver " + rc.ID
 	}
-	fmt.Printf("  delivery%s: %d acknowledged, %d of them arrived, %d missing, %d duplicates, %d extra\n",
-		at, check.Acked, check.ReceivedAcked, check.Missing, check.Duplicates, check.Extra)
+	fmt.Printf("  delivery%s: %d acknowledged, %d of them arrived, %d missing, %d duplicates, %d extra, %d cut lines\n",
+		at, check.Acked, check.ReceivedAcked, check.Missing, check.Duplicates, check.Extra, check.Cut)
 	for conn, cc := range check.Conns {
 		if cc.Missing > 0 {
 			fmt.Printf("    conn %s: missing %d, first ranges %v\n", conn, cc.Missing, cc.MissingRanges)

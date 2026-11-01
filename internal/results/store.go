@@ -39,6 +39,7 @@ type RunResult struct {
 	// Throughput
 	LinesIn     int64   `json:"lines_in"`
 	LinesOut    int64   `json:"lines_out"`
+	CutLines    int64   `json:"cut_lines,omitempty"`
 	BytesIn     int64   `json:"bytes_in"`
 	BytesOut    int64   `json:"bytes_out"`
 	LinesPerSec float64 `json:"lines_per_sec"`
@@ -150,6 +151,7 @@ type ResultEntry struct {
 
 	LinesIn     int64   `json:"lines_in"`
 	LinesOut    int64   `json:"lines_out"`
+	CutLines    int64   `json:"cut_lines,omitempty"`
 	BytesIn     int64   `json:"bytes_in"`
 	BytesOut    int64   `json:"bytes_out"`
 	LinesPerSec float64 `json:"lines_per_sec"`
