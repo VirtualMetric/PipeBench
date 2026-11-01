@@ -393,9 +393,9 @@ func (run *ssRun) drive() bool {
 
 // startInfrastructure starts what the replicas need before they start:
 // Azurite and its init, the store when it is another (MinIO and its init, an
-// endpoint such as Redis, or the share's init), the receivers and the
-// collector. It waits for every init to finish and for every endpoint with a
-// healthcheck to be healthy.
+// endpoint such as Redis, or the share's init), the broker of their pipeline
+// bus when the case has one, the receivers and the collector. It waits for
+// every init to finish and for every endpoint with a healthcheck to be healthy.
 func (run *ssRun) startInfrastructure() bool {
 	services, inits, names := []string{"azurite", "azure-init"}, []string{"azure-init"}, []string{"Azurite"}
 	if run.tc.UsesMinio() {
@@ -415,6 +415,14 @@ func (run *ssRun) startInfrastructure() bool {
 		services, names = append(services, e.Name), append(names, e.Name)
 		if e.Healthcheck != nil {
 			healthy = append(healthy, e.Name)
+		}
+	}
+	// The replicas start with --no-deps, so nothing else starts their broker
+	if broker := run.tc.PipelineBroker; broker != nil {
+		services, names = append(services, "pipeline-broker"), append(names, "the pipeline broker")
+		healthy = append(healthy, "pipeline-broker")
+		if len(broker.Topics) > 0 {
+			services, inits = append(services, "pipeline-broker-init"), append(inits, "pipeline-broker-init")
 		}
 	}
 	services = append(services, "receiver", "collector")
