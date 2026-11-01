@@ -70,7 +70,7 @@ func TestValidateRejectsBadLinkAndDiskSteps(t *testing.T) {
 		"loss on a cut":             {func(tc *TestCase) { step(tc, cutRecv).Loss = "10%" }, "loss only applies to shape_link"},
 		"one_way on a split":        {func(tc *TestCase) { step(tc, split).OneWay = true }, "one_way only applies to"},
 		"groups on a cut":           {func(tc *TestCase) { step(tc, cut).Groups = [][]string{{"1"}, {"2"}} }, "groups only applies to split"},
-		"empty_disk on a stop":      {func(tc *TestCase) { tc.Cluster.Scenario.Steps[2].EmptyDisk = true }, "empty_disk only applies to start"},
+		"empty_disk on a stop":      {func(tc *TestCase) { tc.Cluster.Scenario.Steps[2].EmptyDisk = true }, "empty_disk only applies to rolling_restart, start"},
 		"leave on free_disk":        {func(tc *TestCase) { step(tc, -2).Leave = "1m" }, "leave only applies to fill_disk"},
 		"fill without a disk":       {func(tc *TestCase) { tc.Cluster.Scenario.NodeDisk = nil }, "needs cluster.scenario.node_disk"},
 		"fill on a node without":    {func(tc *TestCase) { step(tc, fill).Node = "2" }, "node 2 has no disk of its own"},
