@@ -1600,6 +1600,15 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 		}
 	}
 
+	// A platform that replaces a container gives the new one an empty disk, so
+	// only what the stop handed on comes back.
+	if tc.EmptyDiskOnRestart {
+		fmt.Println("  removing the subject and its disk (the container that comes back is a new one)…")
+		if err := orch.RemoveServices("subject"); err != nil {
+			return results.RunResult{}, fmt.Errorf("removing subject: %w", err)
+		}
+	}
+
 	// PHASE 4: Start receiver while subject is stopped
 	fmt.Println("  phase 4: starting receiver (subject still stopped)…")
 	if err := orch.UpServices("receiver"); err != nil {

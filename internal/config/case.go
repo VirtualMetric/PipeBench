@@ -168,6 +168,13 @@ type TestCase struct {
 	SubjectMemLimit string `yaml:"subject_mem_limit"`
 	SubjectVersion  string `yaml:"subject_version"`
 
+	// EmptyDiskOnRestart, in a persistence_restart_correctness case, removes the
+	// subject's container between the stop and the start, as a platform that
+	// replaces a container does. The container that comes back has none of the old
+	// one's disk, so the case shows what a clean stop hands on to something that
+	// outlives the container.
+	EmptyDiskOnRestart bool `yaml:"empty_disk_on_restart"`
+
 	// SubjectEntrypoint replaces the registry's entrypoint for this case, with
 	// the registry Command still appended as arguments. Same precedence and the
 	// same non-strict-decode tolerance as SubjectImage.

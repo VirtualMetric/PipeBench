@@ -1739,6 +1739,17 @@ func (r *ComposeRunner) KillServices(services ...string) error {
 	return r.composeCtx(ctx, args...)
 }
 
+// RemoveServices removes the containers of the services, with their anonymous
+// volumes and whatever they wrote to their own filesystem. The next UpServices
+// creates new ones, on an empty disk.
+func (r *ComposeRunner) RemoveServices(services ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	resolved := r.resolveServiceAliases(services)
+	args := append([]string{"rm", "--force", "--stop", "--volumes"}, resolved...)
+	return r.composeCtx(ctx, args...)
+}
+
 // Down stops and removes all containers and anonymous volumes. It is the
 // deferred teardown for every flow, so it runs on a fresh bounded context:
 // it must proceed after the run context is cancelled by an interrupt, and
