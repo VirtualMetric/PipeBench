@@ -505,6 +505,31 @@ func TestExpectNoLogSkipsASpareThatNeverStarted(t *testing.T) {
 	}
 }
 
+// A witness restart kills the store with SIGKILL and starts the same container
+// again, so the store keeps what is on its disk.
+func TestWitnessRestartKillsAndStartsTheStore(t *testing.T) {
+	var ran []string
+	origCmd := dockerCmd
+	dockerCmd = func(_ context.Context, _ time.Duration, args ...string) error {
+		ran = append(ran, strings.Join(args, " "))
+		return nil
+	}
+	t.Cleanup(func() { dockerCmd = origCmd })
+	for store, container := range map[string]string{"redis": "bench-redis", "s3": "bench-minio", "azure": "bench-azurite"} {
+		ran = nil
+		sr := &scenarioRun{ctx: context.Background(), sc: &config.ScenarioConfig{Witness: store}}
+		var rep scenarioStepReport
+		ok, detail, err := sr.doStep(0, config.ScenarioStep{Do: "witness_restart"}, &rep)
+		if err != nil || !ok {
+			t.Fatalf("%s: ok %v, detail %q, err %v", store, ok, detail, err)
+		}
+		want := []string{"kill -s KILL " + container, "start " + container}
+		if strings.Join(ran, ",") != strings.Join(want, ",") {
+			t.Fatalf("%s: docker commands = %v, want %v", store, ran, want)
+		}
+	}
+}
+
 // docker stop sends SIGTERM and, when the grace period runs out, SIGKILL. A
 // node that needed the SIGKILL did not stop gracefully, and the stop step
 // used to pass all the same.

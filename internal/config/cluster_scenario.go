@@ -5,6 +5,7 @@ import (
 	"math"
 	"path"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -45,8 +46,9 @@ type ScenarioConfig struct {
 	// Witness wires a witness store into every node. "dir" mounts a shared
 	// volume at WitnessDir (default /witness), writable by the director.
 	// "azure" and "s3" only add the start-up order: the case declares the
-	// `azure:` or `minio:` block and names the store in its config. Empty
-	// means no witness.
+	// `azure:` or `minio:` block and names the store in its config. "redis"
+	// does the same for an endpoint named redis, which needs a healthcheck.
+	// Empty means no witness.
 	Witness    string `yaml:"witness"`
 	WitnessDir string `yaml:"witness_dir"`
 
@@ -515,6 +517,7 @@ var scenarioActions = map[string]bool{
 	"wait_healthy":              false,
 	"witness_down":              false,
 	"witness_up":                false,
+	"witness_restart":           false,
 	"proxy_latency":             false,
 	"proxy_down":                false,
 	"proxy_up":                  false,
@@ -790,9 +793,9 @@ func (tc *TestCase) validateClusterScenario() error {
 		return fmt.Errorf("case %q: a scenario case with several receivers checks the load's lines at each of them, so it needs the http_ack generator", tc.Name)
 	}
 	switch sc.Witness {
-	case "", "dir", "azure", "s3":
+	case "", "dir", "azure", "s3", "redis":
 	default:
-		return fmt.Errorf("case %q: cluster.scenario.witness must be dir, azure or s3, got %q", tc.Name, sc.Witness)
+		return fmt.Errorf("case %q: cluster.scenario.witness must be dir, azure, s3 or redis, got %q", tc.Name, sc.Witness)
 	}
 	if sc.WitnessDir != "" {
 		if err := checkWitnessDir(sc.WitnessDir); err != nil {
@@ -804,6 +807,11 @@ func (tc *TestCase) validateClusterScenario() error {
 	}
 	if sc.Witness == "s3" && !tc.UsesMinio() {
 		return fmt.Errorf("case %q: cluster.scenario.witness s3 needs the case's `minio:` block", tc.Name)
+	}
+	if sc.Witness == "redis" && !slices.ContainsFunc(tc.Endpoints, func(e Endpoint) bool {
+		return e.Name == "redis" && e.Healthcheck != nil && e.Healthcheck.Test != ""
+	}) {
+		return fmt.Errorf("case %q: cluster.scenario.witness redis needs an endpoint named redis, with a healthcheck", tc.Name)
 	}
 	if sc.SpareNodes < 0 {
 		return fmt.Errorf("case %q: cluster.scenario.spare_nodes must be >= 0", tc.Name)
@@ -1013,9 +1021,12 @@ func (tc *TestCase) validateClusterScenario() error {
 					return fmt.Errorf("%s: %w", where, err)
 				}
 			}
-		case "witness_down", "witness_up":
+		case "witness_down", "witness_up", "witness_restart":
 			if sc.Witness == "" {
 				return fmt.Errorf("%s: the case has no witness", where)
+			}
+			if st.Do == "witness_restart" && sc.Witness == "dir" {
+				return fmt.Errorf("%s: a witness on a directory has no store to restart", where)
 			}
 		case "proxy_latency", "proxy_down", "proxy_up":
 			if !proxies[st.Proxy] {

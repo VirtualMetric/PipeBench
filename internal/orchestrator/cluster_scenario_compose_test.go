@@ -92,6 +92,21 @@ func keys(m map[string]any) []string {
 // node under a profile with a longer member list, the witness directory and
 // its init, Toxiproxy, the one-start-arguments wrapper, a deferred
 // generator, and caps on every other container.
+// A node starts only when the Redis that holds the witness answers.
+func TestClusterScenarioComposeWaitsForARedisWitness(t *testing.T) {
+	tc := scenarioCase(&config.ScenarioConfig{Steps: []config.ScenarioStep{{Do: "wait_ready"}}, Witness: "redis"})
+	tc.Endpoints = []config.Endpoint{{Name: "redis", Image: "redis:7-alpine", Healthcheck: &config.EndpointHealthcheck{Test: "redis-cli ping"}}}
+	doc, _, _ := renderScenario(t, tc, "director:\n  id: {{@.NodeID@}}\n")
+	deps := service(t, doc, "subject-1")["depends_on"].(map[string]any)
+	dep, ok := deps["redis"].(map[string]any)
+	if !ok || dep["condition"] != "service_healthy" {
+		t.Fatalf("subject-1 must wait until redis is healthy: %v", deps)
+	}
+	if service(t, doc, "redis")["image"] != "redis:7-alpine" {
+		t.Fatalf("the redis service: %v", service(t, doc, "redis"))
+	}
+}
+
 func TestClusterScenarioComposeRendersTopology(t *testing.T) {
 	sc := &config.ScenarioConfig{
 		Steps:      []config.ScenarioStep{{Do: "wait_ready"}},

@@ -1047,6 +1047,9 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 	case "witness_down", "witness_up":
 		return sr.witnessAction(i, st)
 
+	case "witness_restart":
+		return sr.witnessRestart(i, st)
+
 	case "proxy_latency", "proxy_down", "proxy_up":
 		return sr.proxyAction(i, st)
 
@@ -1683,10 +1686,7 @@ func (sr *scenarioRun) witnessAction(i int, st config.ScenarioStep) (bool, strin
 				return true, "the witness proxy accepts connections again", nil
 			}
 		}
-		container := "bench-azurite"
-		if sr.sc.Witness == "s3" {
-			container = "bench-minio"
-		}
+		container := sr.witnessContainer()
 		verb := "unpause"
 		if down {
 			verb = "pause"
@@ -1696,6 +1696,32 @@ func (sr *scenarioRun) witnessAction(i int, st config.ScenarioStep) (bool, strin
 		}
 		return true, fmt.Sprintf("%sd %s", verb, container), nil
 	}
+}
+
+// witnessContainer names the container of the store that holds the witness.
+func (sr *scenarioRun) witnessContainer() string {
+	switch sr.sc.Witness {
+	case "s3":
+		return "bench-minio"
+	case "redis":
+		return "bench-redis"
+	}
+	return "bench-azurite"
+}
+
+// witnessRestart kills the witness store with SIGKILL and starts it again, as
+// in a crash of the store. The store keeps only what it had written to its disk,
+// so a later step that needs the record shows whether the record survived.
+func (sr *scenarioRun) witnessRestart(i int, st config.ScenarioStep) (bool, string, error) {
+	sr.disrupt(i, st.Do, 0)
+	container := sr.witnessContainer()
+	if err := dockerCmd(sr.ctx, 30*time.Second, "kill", "-s", "KILL", container); err != nil {
+		return false, fmt.Sprintf("docker kill %s: %v", container, err), nil
+	}
+	if err := dockerCmd(sr.ctx, 60*time.Second, "start", container); err != nil {
+		return false, fmt.Sprintf("docker start %s: %v", container, err), nil
+	}
+	return true, fmt.Sprintf("killed %s with SIGKILL and started it again", container), nil
 }
 
 func (sr *scenarioRun) proxyAction(i int, st config.ScenarioStep) (bool, string, error) {

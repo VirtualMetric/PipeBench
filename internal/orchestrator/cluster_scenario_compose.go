@@ -88,6 +88,9 @@ func applyClusterScenarioTopology(vars *composeVars, cfg RunConfig) error {
 		vars.WitnessDirMount = sc.WitnessDirOrDefault()
 		vars.NodeDependsOn = append(vars.NodeDependsOn, nodeDependency{"witness-init", "service_completed_successfully"})
 	}
+	if sc.Witness == "redis" {
+		vars.NodeDependsOn = append(vars.NodeDependsOn, nodeDependency{"redis", "service_healthy"})
+	}
 	vars.SharedDirMount = sc.SharedDir
 
 	if len(sc.Proxies) > 0 {

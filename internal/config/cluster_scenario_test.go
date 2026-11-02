@@ -39,24 +39,46 @@ func TestValidateClusterScenarioAcceptsAValidCase(t *testing.T) {
 	}
 }
 
+func TestValidateClusterScenarioAcceptsARedisWitness(t *testing.T) {
+	tc := validScenarioCase()
+	tc.Cluster.Scenario.Witness = "redis"
+	tc.Endpoints = []Endpoint{{Name: "redis", Image: "redis:7-alpine", Healthcheck: &EndpointHealthcheck{Test: "redis-cli ping"}}}
+	tc.Cluster.Scenario.Steps = append(tc.Cluster.Scenario.Steps, ScenarioStep{Do: "witness_restart"})
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+}
+
 func TestValidateClusterScenarioRejects(t *testing.T) {
 	cases := map[string]struct {
 		edit func(tc *TestCase)
 		want string
 	}{
-		"unknown action":          {func(tc *TestCase) { tc.Cluster.Scenario.Steps[0].Do = "explode" }, "unknown action"},
-		"forgotten node name":     {func(tc *TestCase) { tc.Cluster.Scenario.Steps[4].Node = "@ghost" }, "was not remembered"},
-		"node out of range":       {func(tc *TestCase) { tc.Cluster.Scenario.Steps[2].Node = "9" }, "node must be"},
-		"recover without wrapper": {func(tc *TestCase) { tc.Cluster.Scenario.NodeArgs = false }, "node_args"},
-		"bad recover":             {func(tc *TestCase) { tc.Cluster.Scenario.Steps[4].Recover = "maybe" }, "recover must be"},
-		"bad duration":            {func(tc *TestCase) { tc.Cluster.Scenario.Steps[0].Within = "soon" }, "within"},
-		"scale past spares":       {func(tc *TestCase) { tc.Cluster.Scenario.Steps[5].Nodes = 5 }, "nodes must be between"},
-		"sleep without for":       {func(tc *TestCase) { tc.Cluster.Scenario.Steps[6].For = "" }, "needs for"},
-		"wrong generator":         {func(tc *TestCase) { tc.Generator.Mode = "tcp" }, "http_ack"},
-		"too much load":           {func(tc *TestCase) { tc.Generator.Connections = 3 }, "lines a second"},
-		"implicit workers":        {func(tc *TestCase) { tc.Generator.Connections = 0 }, "explicitly"},
-		"no steps":                {func(tc *TestCase) { tc.Cluster.Scenario.Steps = nil }, "requires cluster.scenario.steps"},
-		"witness without store":   {func(tc *TestCase) { tc.Cluster.Scenario.Witness = "azure" }, "azure:"},
+		"unknown action":                     {func(tc *TestCase) { tc.Cluster.Scenario.Steps[0].Do = "explode" }, "unknown action"},
+		"forgotten node name":                {func(tc *TestCase) { tc.Cluster.Scenario.Steps[4].Node = "@ghost" }, "was not remembered"},
+		"node out of range":                  {func(tc *TestCase) { tc.Cluster.Scenario.Steps[2].Node = "9" }, "node must be"},
+		"recover without wrapper":            {func(tc *TestCase) { tc.Cluster.Scenario.NodeArgs = false }, "node_args"},
+		"bad recover":                        {func(tc *TestCase) { tc.Cluster.Scenario.Steps[4].Recover = "maybe" }, "recover must be"},
+		"bad duration":                       {func(tc *TestCase) { tc.Cluster.Scenario.Steps[0].Within = "soon" }, "within"},
+		"scale past spares":                  {func(tc *TestCase) { tc.Cluster.Scenario.Steps[5].Nodes = 5 }, "nodes must be between"},
+		"sleep without for":                  {func(tc *TestCase) { tc.Cluster.Scenario.Steps[6].For = "" }, "needs for"},
+		"wrong generator":                    {func(tc *TestCase) { tc.Generator.Mode = "tcp" }, "http_ack"},
+		"too much load":                      {func(tc *TestCase) { tc.Generator.Connections = 3 }, "lines a second"},
+		"implicit workers":                   {func(tc *TestCase) { tc.Generator.Connections = 0 }, "explicitly"},
+		"no steps":                           {func(tc *TestCase) { tc.Cluster.Scenario.Steps = nil }, "requires cluster.scenario.steps"},
+		"witness without store":              {func(tc *TestCase) { tc.Cluster.Scenario.Witness = "azure" }, "azure:"},
+		"redis witness without its endpoint": {func(tc *TestCase) { tc.Cluster.Scenario.Witness = "redis" }, "endpoint named redis"},
+		"redis witness with no healthcheck": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Witness = "redis"
+			tc.Endpoints = []Endpoint{{Name: "redis", Image: "redis:7-alpine"}}
+		}, "endpoint named redis"},
+		"witness restart with no witness": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Steps = append(tc.Cluster.Scenario.Steps, ScenarioStep{Do: "witness_restart"})
+		}, "no witness"},
+		"witness restart of a directory": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Witness = "dir"
+			tc.Cluster.Scenario.Steps = append(tc.Cluster.Scenario.Steps, ScenarioStep{Do: "witness_restart"})
+		}, "no store to restart"},
 		"undeclared proxy": {func(tc *TestCase) {
 			tc.Cluster.Scenario.Steps = append(tc.Cluster.Scenario.Steps, ScenarioStep{Do: "proxy_latency", Proxy: "witness", Latency: "200ms"})
 		}, "not declared"},
