@@ -675,5 +675,34 @@ func describeCopies(r healthRound) string {
 			parts = append(parts, fmt.Sprintf("n%d:leads %d streams, %d short of copies", h.Node, leads, short))
 		}
 	}
+	if unled := streamsWithoutLeader(r); len(unled) > 0 {
+		parts = append(parts, "no node leads "+strings.Join(unled, ", "))
+	}
 	return strings.Join(parts, " ")
+}
+
+// streamsWithoutLeader names, in order, the streams that a node reports in the
+// round and that no node that answered says it leads.
+func streamsWithoutLeader(r healthRound) []string {
+	led := map[string]bool{}
+	seen := map[string]bool{}
+	for _, h := range r.Nodes {
+		if !h.Reachable || !h.Clustered {
+			continue
+		}
+		for name, s := range h.Copies {
+			seen[name] = true
+			if s.Leader == h.Name {
+				led[name] = true
+			}
+		}
+	}
+	var unled []string
+	for name := range seen {
+		if !led[name] {
+			unled = append(unled, name)
+		}
+	}
+	sort.Strings(unled)
+	return unled
 }

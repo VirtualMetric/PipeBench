@@ -71,3 +71,18 @@ func TestCopiesComplete(t *testing.T) {
 		}
 	}
 }
+
+// A failed wait_copies names the stream that no node leads, which is what a reader needs.
+func TestDescribeCopiesNamesTheStreamsWithoutALeader(t *testing.T) {
+	r := healthRound{Nodes: []nodeHealth{
+		{Node: 1, Name: "a", Reachable: true, Clustered: true, Copies: map[string]streamCopies{"KV_cache": {}, "led": {Leader: "a"}}},
+		{Node: 2, Name: "b", Reachable: true, Clustered: true, Copies: map[string]streamCopies{"KV_cache": {}, "led": {Leader: "a"}, "OBJ_x": {}}},
+	}}
+	got := describeCopies(r)
+	if !strings.Contains(got, "no node leads KV_cache, OBJ_x") {
+		t.Fatalf("describeCopies = %q, want it to name the two streams without a leader", got)
+	}
+	if strings.Contains(got, "OBJ_x, led") {
+		t.Fatalf("describeCopies = %q, and it named a stream that has a leader", got)
+	}
+}
