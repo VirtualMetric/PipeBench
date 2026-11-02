@@ -337,6 +337,15 @@ func TestValidateClusterScenarioAcceptsExpectArrived(t *testing.T) {
 	if err := shared.Validate(); err != nil {
 		t.Fatalf("Validate with a share: %v", err)
 	}
+	// A count judged on each side apart.
+	counted := expectArrivedCase()
+	counted.Cluster.Scenario.Expect.Receivers["a"] = ScenarioReceiverExpect{
+		MaxLoss:     int64p(2000),
+		CountedLoss: &CountedLoss{Pattern: `\((\d+) records`, MaxUnderPct: float64p(1), MaxOver: int64p(2500)},
+	}
+	if err := counted.Validate(); err != nil {
+		t.Fatalf("Validate with a count judged on each side: %v", err)
+	}
 	// A case with one receiver counts at it without naming it.
 	tc := validScenarioCase()
 	tc.Cluster.Scenario.Steps = append(tc.Cluster.Scenario.Steps,
@@ -381,6 +390,18 @@ func TestValidateClusterScenarioRejectsBadReceiverExpectations(t *testing.T) {
 		"an entry without a limit": {func(tc *TestCase) {
 			tc.Cluster.Scenario.Expect.Receivers["a"] = ScenarioReceiverExpect{}
 		}, "expect.receivers.a sets no limit"},
+		"max_under_pct without max_over": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Expect.Receivers["b"] = ScenarioReceiverExpect{CountedLoss: &CountedLoss{Pattern: `(\d+)`, MaxUnderPct: float64p(1)}}
+		}, "max_under_pct and max_over go together"},
+		"max_gap_pct beside the two sides": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Expect.Receivers["b"] = ScenarioReceiverExpect{CountedLoss: &CountedLoss{Pattern: `(\d+)`, MaxGapPct: 10, MaxUnderPct: float64p(1), MaxOver: int64p(5)}}
+		}, "set max_gap_pct, or max_under_pct and max_over, not both"},
+		"max_under_pct above 100": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Expect.Receivers["b"] = ScenarioReceiverExpect{CountedLoss: &CountedLoss{Pattern: `(\d+)`, MaxUnderPct: float64p(101), MaxOver: int64p(0)}}
+		}, "max_under_pct must be between 0 and 100"},
+		"a negative max_over": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Expect.Receivers["b"] = ScenarioReceiverExpect{CountedLoss: &CountedLoss{Pattern: `(\d+)`, MaxUnderPct: float64p(1), MaxOver: int64p(-1)}}
+		}, "max_over must be 0 or more"},
 		"expect_arrived without a window":       {func(tc *TestCase) { last(tc).SentAfter = "" }, "needs sent_after and sent_before"},
 		"expect_arrived naming an unknown mark": {func(tc *TestCase) { last(tc).SentBefore = "later" }, `names mark "later", which no earlier step sets`},
 		"expect_arrived with one mark twice":    {func(tc *TestCase) { last(tc).SentAfter = "early_end" }, "the window is empty"},
@@ -438,6 +459,10 @@ expect:
     b:
       max_loss: 200000
       min_loss: 1
+      counted_loss:
+        pattern: '\((\d+) records'
+        max_under_pct: 1
+        max_over: 2500
 `), &sc)
 	if err != nil {
 		t.Fatalf("Unmarshal: %v", err)
@@ -449,6 +474,9 @@ expect:
 	b := sc.Expect.Receivers["b"]
 	if b.MaxLoss == nil || *b.MaxLoss != 200000 || b.MinLoss == nil || *b.MinLoss != 1 || b.MaxDuplicates != nil {
 		t.Fatalf("expect.receivers.b = %+v", b)
+	}
+	if c := b.CountedLoss; c == nil || !c.OneSided() || *c.MaxUnderPct != 1 || *c.MaxOver != 2500 || c.MaxGapPct != 0 {
+		t.Fatalf("expect.receivers.b.counted_loss = %+v", c)
 	}
 }
 

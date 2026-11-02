@@ -2651,11 +2651,37 @@ func (sr *scenarioRun) countedLossVerdict(rs []receiverResult, ex config.Scenari
 				}
 			}
 		}
-		if reason := judgeCountedLoss(r.ID, counted, r.Missing, own.CountedLoss.MaxGapPct); reason != "" {
+		reason := ""
+		if c := own.CountedLoss; c.OneSided() {
+			reason = judgeCountedLossSides(r.ID, counted, r.Missing, *c.MaxUnderPct, *c.MaxOver)
+		} else {
+			reason = judgeCountedLoss(r.ID, counted, r.Missing, c.MaxGapPct)
+		}
+		if reason != "" {
 			reasons = append(reasons, reason)
 		}
 	}
 	return reasons
+}
+
+// judgeCountedLossSides judges each side of a count apart. Below the missing
+// lines, it may be off by maxUnderPct of them at most, because a count that is
+// too low hides a loss. Above them, it may be off by maxOver lines at most, the
+// records that a subject can count as lost while it still delivers them.
+func judgeCountedLossSides(id string, counted, missing int64, maxUnderPct float64, maxOver int64) string {
+	if counted < missing {
+		pct := float64(missing-counted) * 100 / float64(missing)
+		if pct <= maxUnderPct {
+			return ""
+		}
+		return fmt.Sprintf("the nodes counted %d lost lines for receiver %s, and %d are missing there: %.1f%% too few (counted_loss.max_under_pct %v)",
+			counted, id, missing, pct, maxUnderPct)
+	}
+	if over := counted - missing; over > maxOver {
+		return fmt.Sprintf("the nodes counted %d lost lines for receiver %s, and %d are missing there: %d too many (counted_loss.max_over %d)",
+			counted, id, missing, over, maxOver)
+	}
+	return ""
 }
 
 // judgeCountedLoss compares what the nodes counted for a receiver with the lines

@@ -248,3 +248,58 @@ func TestCountedLossVerdict(t *testing.T) {
 		t.Fatalf("a receiver without counted_loss was judged: %v", got)
 	}
 }
+
+// With max_under_pct and max_over, a count may be a little above what is missing,
+// by records the subject counted while it still delivered them, but not below it,
+// which would hide a loss. The log is a bench run's: the last warning names three
+// queues, and the pattern finds each item of the list.
+func TestCountedLossVerdictJudgesEachSide(t *testing.T) {
+	orig := nodeLogText
+	t.Cleanup(func() { nodeLogText = orig })
+	const warn = "so the director dropped the oldest data: "
+	logs := map[string]string{
+		"node-2": warn + "64 batches of records (6190 records, 12.18 MB) that waited for target \"http-b\". The records in them are lost.\n" +
+			warn + "1858 batches of records (187040 records, 367.42 MB) that waited for target \"http-b\". The records in them are lost.\n" +
+			warn + "54 batches of records (5660 records, 11.12 MB) that waited for target \"http-b\"; 3 batches of records (310 records, 624.54 KB) " +
+			"that waited for target \"http-a\"; 2 batches of records (300 records, 603.73 KB) in the router queue. The records in them are lost.\n",
+	}
+	nodeLogText = func(c string) (string, error) { return logs[c], nil }
+	sr := &scenarioRun{containers: []string{"node-2"}}
+	item := func(target string) string {
+		return `(?:dropped the oldest data: |; )(?:\d+ batches|1 batch) of records \((\d+) records, [^)]*\) (?:that waited for target "` + target + `"|in the (?:ingester|router) queue)`
+	}
+	sides := func(maxUnderPct float64, maxOver int64) config.ScenarioExpect {
+		return config.ScenarioExpect{Receivers: map[string]config.ScenarioReceiverExpect{
+			"a": {CountedLoss: &config.CountedLoss{Pattern: item("http-a"), MaxUnderPct: &maxUnderPct, MaxOver: &maxOver}},
+			"b": {CountedLoss: &config.CountedLoss{Pattern: item("http-b"), MaxUnderPct: &maxUnderPct, MaxOver: &maxOver}},
+		}}
+	}
+	for _, tc := range []struct {
+		name    string
+		id      string
+		missing int64
+		ex      config.ScenarioExpect
+		want    string // "" when the count passes
+	}{
+		// 199,190 counted for b, and 610 for a: each item, the router queue's for both
+		{"b counted 2,090 above what is missing", "b", 197100, sides(1, 2500), ""},
+		{"b counted more above than max_over", "b", 197100, sides(1, 2000), "counted 199190 lost lines for receiver b, and 197100 are missing there: 2090 too many"},
+		{"b counted 1.1% below", "b", 201450, sides(2, 2500), ""},
+		{"b counted further below than max_under_pct", "b", 201450, sides(1, 2500), "1.1% too few"},
+		{"b counted a tenth", "b", 1991900, sides(1, 2500), "90.0% too few"},
+		{"a counted batches that still arrived", "a", 100, sides(1, 2500), ""},
+		{"a lost nothing, and counted what still arrived", "a", 0, sides(1, 2500), ""},
+		{"a counted more than max_over", "a", 0, sides(1, 500), "610 too many"},
+		{"a lost more than it counted", "a", 1000, sides(1, 2500), "39.0% too few"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sr.countedLossVerdict([]receiverResult{{ID: tc.id, Checked: true, Missing: tc.missing}}, tc.ex)
+			switch {
+			case tc.want == "" && len(got) != 0:
+				t.Fatalf("the count failed: %v", got)
+			case tc.want != "" && (len(got) != 1 || !strings.Contains(got[0], tc.want)):
+				t.Fatalf("got %v, want one reason containing %q", got, tc.want)
+			}
+		})
+	}
+}

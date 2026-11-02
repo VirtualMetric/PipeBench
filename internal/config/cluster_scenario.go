@@ -301,6 +301,19 @@ type CountedLoss struct {
 	// MaxGapPct is how far that sum may be from the lines missing at the
 	// receiver, in percent of the missing lines.
 	MaxGapPct float64 `yaml:"max_gap_pct"`
+	// MaxUnderPct and MaxOver judge the two sides apart, in place of
+	// MaxGapPct. A sum below the missing lines hides a loss, so MaxUnderPct is
+	// how far below them it may be, in percent of them. A sum above them says
+	// that more was lost than was, as when a subject counts records that it was
+	// still delivering. MaxOver is how many lines above them it may be.
+	MaxUnderPct *float64 `yaml:"max_under_pct"`
+	MaxOver     *int64   `yaml:"max_over"`
+}
+
+// OneSided reports whether the count is judged on each side apart
+// (max_under_pct and max_over) rather than by max_gap_pct.
+func (c CountedLoss) OneSided() bool {
+	return c.MaxUnderPct != nil || c.MaxOver != nil
 }
 
 // ReceiverLimits returns the limits receiver id is judged by: the case's
@@ -1235,6 +1248,15 @@ func (tc *TestCase) validateReceiverExpect(ex ScenarioExpect) error {
 				return fmt.Errorf("expect.receivers.%s.counted_loss.pattern must have one group, which captures a number; it has %d", id, re.NumSubexp())
 			case c.MaxGapPct < 0 || c.MaxGapPct > 100:
 				return fmt.Errorf("expect.receivers.%s.counted_loss.max_gap_pct must be between 0 and 100, got %v", id, c.MaxGapPct)
+			case !c.OneSided():
+			case c.MaxUnderPct == nil || c.MaxOver == nil:
+				return fmt.Errorf("expect.receivers.%s.counted_loss: max_under_pct and max_over go together", id)
+			case c.MaxGapPct != 0:
+				return fmt.Errorf("expect.receivers.%s.counted_loss: set max_gap_pct, or max_under_pct and max_over, not both", id)
+			case *c.MaxUnderPct < 0 || *c.MaxUnderPct > 100:
+				return fmt.Errorf("expect.receivers.%s.counted_loss.max_under_pct must be between 0 and 100, got %v", id, *c.MaxUnderPct)
+			case *c.MaxOver < 0:
+				return fmt.Errorf("expect.receivers.%s.counted_loss.max_over must be 0 or more, got %d", id, *c.MaxOver)
 			}
 		}
 	}
