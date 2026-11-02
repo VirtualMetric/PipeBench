@@ -227,6 +227,13 @@ type ScenarioExpect struct {
 	// MaxStreamLeaderlessMs is how long one stream of the cluster may go
 	// without a leader: every reachable node that reports it names none.
 	MaxStreamLeaderlessMs *int64 `yaml:"max_stream_leaderless_ms"`
+	// MaxStreamSplitMs is the longest that two nodes may both name themselves
+	// the leader of one stream, without a break. It judges each stretch of
+	// each stream on its own, never their sum. With a witness, a leader that a
+	// takeover replaced still names itself the leader until its next check of
+	// the witness, while it commits nothing, so a stretch up to that check is
+	// expected.
+	MaxStreamSplitMs *int64 `yaml:"max_stream_split_ms"`
 	// MinAcked is the fewest lines the generator must have had
 	// acknowledged, so a run that sent nothing cannot pass.
 	MinAcked int64 `yaml:"min_acked"`
@@ -853,6 +860,9 @@ func (tc *TestCase) validateClusterScenario() error {
 	}
 	if sc.Expect.MaxStreamLeaderlessMs != nil && *sc.Expect.MaxStreamLeaderlessMs < 0 {
 		return fmt.Errorf("case %q: expect.max_stream_leaderless_ms must not be negative, got %d", tc.Name, *sc.Expect.MaxStreamLeaderlessMs)
+	}
+	if sc.Expect.MaxStreamSplitMs != nil && *sc.Expect.MaxStreamSplitMs < 0 {
+		return fmt.Errorf("case %q: expect.max_stream_split_ms must not be negative, got %d", tc.Name, *sc.Expect.MaxStreamSplitMs)
 	}
 	if sc.Expect.MaxStreamLeaderlessMs != nil && tc.Cluster.Nodes+sc.SpareNodes < 2 {
 		return fmt.Errorf("case %q: expect.max_stream_leaderless_ms measures the leaders of a cluster's streams, and one director leads its streams itself", tc.Name)

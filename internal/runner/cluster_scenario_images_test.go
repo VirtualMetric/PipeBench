@@ -90,6 +90,9 @@ func TestAnalyzeLeadershipStreamLeaderless(t *testing.T) {
 	if reason := judgeStreamLeaderless(st, &limit); !strings.Contains(reason, "vm-pipeline-sender had no leader for 4.0 s") {
 		t.Fatalf("4 s over a 3 s limit: %q", reason)
 	}
+	if reason := judgeStreamSplit(st, nil); reason != "" {
+		t.Fatalf("judgeStreamSplit without a limit = %q, want nothing judged", reason)
+	}
 	if reason := judgeStreamLeaderless(st, nil); reason != "" {
 		t.Fatalf("no limit judged: %q", reason)
 	}
@@ -134,5 +137,31 @@ func TestAnalyzeLeadershipLeaderlessAtTheEnd(t *testing.T) {
 	negative := int64(-1)
 	if reason := judgeStreamLeaderless(none, &negative); !strings.Contains(reason, "must not be negative") {
 		t.Fatalf("a negative limit: %q", reason)
+	}
+}
+
+// The two-leader judge reads the longest stretch of one stream, never the sum
+// of the stretches. Seven streams of up to 10.6 s each made 43.5 s in a run
+// with a witness, and none of them was a split.
+func TestJudgeStreamSplitReadsTheLongestStretch(t *testing.T) {
+	at := time.Date(2026, 11, 2, 4, 59, 47, 0, time.UTC)
+	st := leadershipStats{StreamsReported: 17, StreamSplitMs: 13000, StreamSplits: []splitInterval{
+		{From: at, Nodes: []int{2, 4}, Stream: "KV_trustedkeys", LastsMs: 10574},
+		{From: at, Nodes: []int{1, 3}, Stream: "KV_persistent", LastsMs: 2426},
+	}}
+	limit := int64(15000)
+	if reason := judgeStreamSplit(st, &limit); reason != "" {
+		t.Fatalf("10.6 s within a 15 s limit failed, although the sum of 13 s is under it too: %s", reason)
+	}
+	limit = 10000
+	if reason := judgeStreamSplit(st, &limit); !strings.Contains(reason, "nodes [2 4] both named themselves the leader of stream KV_trustedkeys for 10.6 s") {
+		t.Fatalf("10.6 s over a 10 s limit: %q", reason)
+	}
+	limit = 11000
+	if reason := judgeStreamSplit(st, &limit); reason != "" {
+		t.Fatalf("the sum of 13 s was judged instead of the longest stretch: %q", reason)
+	}
+	if reason := judgeStreamSplit(leadershipStats{}, &limit); !strings.Contains(reason, "not known") {
+		t.Fatalf("a run in which no stream was reported: %q", reason)
 	}
 }

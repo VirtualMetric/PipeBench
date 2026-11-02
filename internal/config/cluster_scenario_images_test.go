@@ -229,6 +229,21 @@ func TestValidateStreamLeaderlessLimit(t *testing.T) {
 	}
 }
 
+// A negative max_stream_split_ms is refused: no stretch is shorter.
+func TestValidateStreamSplitLimit(t *testing.T) {
+	tc := upgradeScenarioCase()
+	tc.Cluster.Nodes = 3
+	limit := int64(-1)
+	tc.Cluster.Scenario.Expect.MaxStreamSplitMs = &limit
+	if err := tc.Validate(); err == nil || !strings.Contains(err.Error(), "max_stream_split_ms must not be negative") {
+		t.Fatalf("Validate = %v, want the negative limit refused", err)
+	}
+	limit = 15000
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("Validate with a limit of 15000: %v", err)
+	}
+}
+
 // TestValidateScenarioClusterIP checks that a scenario case may set cluster.ip
 // inside the bench's subnet, and that the step that checks it needs one.
 func TestValidateScenarioClusterIP(t *testing.T) {

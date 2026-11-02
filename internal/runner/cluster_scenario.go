@@ -2128,6 +2128,29 @@ func judgeStreamLeaderless(l leadershipStats, limit *int64) string {
 		iv.Stream, fmtMs(l.StreamLeaderlessMs), iv.From.UTC().Format("15:04:05.000"), *limit)
 }
 
+// judgeStreamSplit fails a run in which two nodes both named themselves the
+// leader of one stream for longer than the limit without a break. It judges the
+// longest stretch, never the sum of the stretches. A nil limit judges nothing.
+func judgeStreamSplit(l leadershipStats, limit *int64) string {
+	if limit == nil {
+		return ""
+	}
+	if l.StreamsReported == 0 {
+		return "no clustered node reported a stream, so it is not known whether a stream had two leaders"
+	}
+	var longest *splitInterval
+	for i := range l.StreamSplits {
+		if longest == nil || l.StreamSplits[i].LastsMs > longest.LastsMs {
+			longest = &l.StreamSplits[i]
+		}
+	}
+	if longest == nil || longest.LastsMs <= *limit {
+		return ""
+	}
+	return fmt.Sprintf("nodes %v both named themselves the leader of stream %s for %s from %s (max_stream_split_ms %d)",
+		longest.Nodes, longest.Stream, fmtMs(longest.LastsMs), longest.From.UTC().Format("15:04:05.000"), *limit)
+}
+
 type scenarioVerdict struct {
 	passed  bool
 	reasons []string
@@ -2393,6 +2416,9 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 			fmtMs(rep.Leadership.SplitBrainMs), *ex.MaxSplitBrainMs))
 	}
 	if reason := judgeStreamLeaderless(rep.Leadership, ex.MaxStreamLeaderlessMs); reason != "" {
+		v.reasons = append(v.reasons, reason)
+	}
+	if reason := judgeStreamSplit(rep.Leadership, ex.MaxStreamSplitMs); reason != "" {
 		v.reasons = append(v.reasons, reason)
 	}
 	v.reasons = append(v.reasons, judgeThroughput(rep.WindowRates, ex.Throughput)...)
@@ -2671,6 +2697,9 @@ func withoutLoadVerdict(rep scenarioReport, ex config.ScenarioExpect, dedup bool
 			fmtMs(rep.Leadership.SplitBrainMs), *ex.MaxSplitBrainMs))
 	}
 	if reason := judgeStreamLeaderless(rep.Leadership, ex.MaxStreamLeaderlessMs); reason != "" {
+		reasons = append(reasons, reason)
+	}
+	if reason := judgeStreamSplit(rep.Leadership, ex.MaxStreamSplitMs); reason != "" {
 		reasons = append(reasons, reason)
 	}
 	// The rows are judged here, in the only verdict a case with rows reaches.
