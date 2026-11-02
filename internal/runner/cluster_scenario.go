@@ -2420,6 +2420,7 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 	}
 	if len(rep.Receivers) > 0 {
 		v.reasons = append(v.reasons, receiverVerdict(rep.Receivers, ex)...)
+		v.reasons = append(v.reasons, sr.countedLossVerdict(rep.Receivers, ex)...)
 	} else {
 		if ex.MaxLoss != nil && rep.Missing > *ex.MaxLoss {
 			v.reasons = append(v.reasons, fmt.Sprintf("%d acknowledged lines never arrived (max_loss %d)", rep.Missing, *ex.MaxLoss))
@@ -2609,6 +2610,73 @@ func receiverVerdict(rs []receiverResult, ex config.ScenarioExpect) []string {
 		}
 	}
 	return reasons
+}
+
+// nodeLogText returns a node container's whole log. A variable, so that tests can
+// stand in for docker.
+var nodeLogText = func(container string) (string, error) {
+	out, err := exec.Command("docker", "logs", container).CombinedOutput()
+	if err != nil && len(out) == 0 {
+		return "", err
+	}
+	return string(out), nil
+}
+
+// countedLossVerdict judges each receiver that expect.receivers gives a
+// counted_loss: the numbers that the nodes' logs report must add up to the lines
+// missing at the receiver, within max_gap_pct of them. A subject that loses
+// records on purpose must say how many, or its reader learns less than happened.
+func (sr *scenarioRun) countedLossVerdict(rs []receiverResult, ex config.ScenarioExpect) []string {
+	var reasons []string
+	for _, r := range rs {
+		own, ok := ex.Receivers[r.ID]
+		if !ok || own.CountedLoss == nil {
+			continue
+		}
+		if !r.Checked {
+			reasons = append(reasons, fmt.Sprintf("receiver %s never answered the sequence check, so its loss cannot be compared with what the nodes counted", r.ID))
+			continue
+		}
+		re := regexp.MustCompile(own.CountedLoss.Pattern)
+		var counted int64
+		for _, c := range sr.containers {
+			text, err := nodeLogText(c)
+			if err != nil {
+				reasons = append(reasons, fmt.Sprintf("the log of %s could not be read, so what it counted for receiver %s is not known: %v", c, r.ID, err))
+				continue
+			}
+			for _, m := range re.FindAllStringSubmatch(text, -1) {
+				if n, err := strconv.ParseInt(m[1], 10, 64); err == nil {
+					counted += n
+				}
+			}
+		}
+		if reason := judgeCountedLoss(r.ID, counted, r.Missing, own.CountedLoss.MaxGapPct); reason != "" {
+			reasons = append(reasons, reason)
+		}
+	}
+	return reasons
+}
+
+// judgeCountedLoss compares what the nodes counted for a receiver with the lines
+// missing there.
+func judgeCountedLoss(id string, counted, missing int64, maxGapPct float64) string {
+	gap := counted - missing
+	if gap < 0 {
+		gap = -gap
+	}
+	if missing == 0 {
+		if counted == 0 {
+			return ""
+		}
+		return fmt.Sprintf("the nodes counted %d lost lines for receiver %s, and none is missing there", counted, id)
+	}
+	pct := float64(gap) * 100 / float64(missing)
+	if pct <= maxGapPct {
+		return ""
+	}
+	return fmt.Sprintf("the nodes counted %d lost lines for receiver %s, and %d are missing there: %.0f%% apart (counted_loss.max_gap_pct %v)",
+		counted, id, missing, pct, maxGapPct)
 }
 
 // judgeRows judges the rows check of a case whose data came from a database

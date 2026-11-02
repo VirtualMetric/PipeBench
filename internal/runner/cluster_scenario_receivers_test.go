@@ -216,3 +216,35 @@ func TestSummaryListsEachArrivedCount(t *testing.T) {
 		t.Fatalf("a window that could not be counted is listed: %v", s)
 	}
 }
+
+// A receiver's counted loss must add up to what is missing there. The numbers come
+// from every node's log.
+func TestCountedLossVerdict(t *testing.T) {
+	orig := nodeLogText
+	t.Cleanup(func() { nodeLogText = orig })
+	logs := map[string]string{
+		"node-1": "x\nso the director dropped the oldest data: 680 batches of records (6744 records, 132.52 MB) that waited for target \"http-b\".\n",
+		"node-2": "so the director dropped the oldest data: 67 batches of records (648 records, 12.73 MB) that waited for target \"http-b\".\n" +
+			"so the director dropped the oldest data: 5 batches of records (50 records, 1 MB) that waited for target \"http-a\".\n",
+	}
+	nodeLogText = func(c string) (string, error) { return logs[c], nil }
+	sr := &scenarioRun{containers: []string{"node-1", "node-2"}}
+	pattern := `dropped the oldest data: \d+ batches of records \((\d+) records[^"]*target "http-b"`
+	ex := config.ScenarioExpect{Receivers: map[string]config.ScenarioReceiverExpect{"b": {CountedLoss: &config.CountedLoss{Pattern: pattern, MaxGapPct: 10}}}}
+
+	// 7,392 counted for b, against 7,500 missing: 1.4% apart
+	if got := sr.countedLossVerdict([]receiverResult{{ID: "b", Checked: true, Missing: 7500}}, ex); len(got) != 0 {
+		t.Fatalf("a count within the margin failed: %v", got)
+	}
+	// The bench run of 2 November 2026: 201,450 missing
+	got := sr.countedLossVerdict([]receiverResult{{ID: "b", Checked: true, Missing: 201450}}, ex)
+	if len(got) != 1 || !strings.Contains(got[0], "counted 7392 lost lines for receiver b, and 201450 are missing") {
+		t.Fatalf("an undercount passed or was described wrongly: %v", got)
+	}
+	if got := sr.countedLossVerdict([]receiverResult{{ID: "b", Missing: 7500}}, ex); len(got) != 1 || !strings.Contains(got[0], "never answered") {
+		t.Fatalf("an unknown loss was judged: %v", got)
+	}
+	if got := sr.countedLossVerdict([]receiverResult{{ID: "a", Checked: true, Missing: 9}}, ex); len(got) != 0 {
+		t.Fatalf("a receiver without counted_loss was judged: %v", got)
+	}
+}

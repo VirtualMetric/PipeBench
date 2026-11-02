@@ -286,6 +286,21 @@ type ScenarioReceiverExpect struct {
 	// receiver. A case that tests a loss the subject makes on purpose fails
 	// when nothing was lost, because it then tested nothing.
 	MinLoss *int64 `yaml:"min_loss"`
+	// CountedLoss checks that the subject counted the loss at this receiver:
+	// the numbers its nodes logged must add up to the lines missing here.
+	CountedLoss *CountedLoss `yaml:"counted_loss"`
+}
+
+// CountedLoss is what the subject says it lost for a receiver, read from its
+// nodes' logs after the run.
+type CountedLoss struct {
+	// Pattern is a regular expression with one group, which captures a number.
+	// The numbers of every matching line of every node's log add up to what
+	// the subject counted.
+	Pattern string `yaml:"pattern"`
+	// MaxGapPct is how far that sum may be from the lines missing at the
+	// receiver, in percent of the missing lines.
+	MaxGapPct float64 `yaml:"max_gap_pct"`
 }
 
 // ReceiverLimits returns the limits receiver id is judged by: the case's
@@ -1208,8 +1223,19 @@ func (tc *TestCase) validateReceiverExpect(ex ScenarioExpect) error {
 		if minLoss != nil && maxLoss != nil && *minLoss > *maxLoss {
 			return fmt.Errorf("expect.receivers.%s: min_loss %d is more than max_loss %d", id, *minLoss, *maxLoss)
 		}
-		if own.MaxLoss == nil && own.MaxDuplicates == nil && own.MinLoss == nil {
+		if own.MaxLoss == nil && own.MaxDuplicates == nil && own.MinLoss == nil && own.CountedLoss == nil {
 			return fmt.Errorf("expect.receivers.%s sets no limit", id)
+		}
+		if c := own.CountedLoss; c != nil {
+			re, err := regexp.Compile(c.Pattern)
+			switch {
+			case err != nil:
+				return fmt.Errorf("expect.receivers.%s.counted_loss.pattern: %w", id, err)
+			case re.NumSubexp() != 1:
+				return fmt.Errorf("expect.receivers.%s.counted_loss.pattern must have one group, which captures a number; it has %d", id, re.NumSubexp())
+			case c.MaxGapPct < 0 || c.MaxGapPct > 100:
+				return fmt.Errorf("expect.receivers.%s.counted_loss.max_gap_pct must be between 0 and 100, got %v", id, c.MaxGapPct)
+			}
 		}
 	}
 	return nil
