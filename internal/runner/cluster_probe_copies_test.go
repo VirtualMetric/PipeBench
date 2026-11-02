@@ -1,6 +1,9 @@
 package runner
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // A node's /health answer gives each stream's copies as the node sees them,
 // and how many copies a stream should have in its cluster: one on every
