@@ -2124,8 +2124,8 @@ func judgeStreamLeaderless(l leadershipStats, limit *int64) string {
 		// Validation refuses a negative limit, the only way to get here.
 		return fmt.Sprintf("max_stream_leaderless_ms must not be negative, got %d", *limit)
 	}
-	return fmt.Sprintf("stream %s had no leader for %s from %s (max_stream_leaderless_ms %d)",
-		iv.Stream, fmtMs(l.StreamLeaderlessMs), iv.From.UTC().Format("15:04:05.000"), *limit)
+	return fmt.Sprintf("stream %s had no leader for %s from %s (max_stream_leaderless_ms %d)%s",
+		iv.Stream, fmtMs(l.StreamLeaderlessMs), iv.From.UTC().Format("15:04:05.000"), *limit, describeCopiesReports(iv.Copies))
 }
 
 // judgeStreamSplit fails a run in which two nodes both named themselves the
@@ -2149,6 +2149,23 @@ func judgeStreamSplit(l leadershipStats, limit *int64) string {
 	}
 	return fmt.Sprintf("nodes %v both named themselves the leader of stream %s for %s from %s (max_stream_split_ms %d)",
 		longest.Nodes, longest.Stream, fmtMs(longest.LastsMs), longest.From.UTC().Format("15:04:05.000"), *limit)
+}
+
+// describeCopiesReports says, after a stream without a leader, which nodes reported
+// it and which copies they saw down, or that no node did.
+func describeCopiesReports(reports []copiesReport) string {
+	if len(reports) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(reports))
+	for _, c := range reports {
+		part := fmt.Sprintf("n%d: %d of %d copies", c.Node, c.Actual, c.Desired)
+		if len(c.OfflinePeers) > 0 {
+			part += ", down or behind " + strings.Join(c.OfflinePeers, " ")
+		}
+		parts = append(parts, part)
+	}
+	return "; " + strings.Join(parts, "; ")
 }
 
 type scenarioVerdict struct {

@@ -82,6 +82,13 @@ func TestAnalyzeLeadershipStreamLeaderless(t *testing.T) {
 	if st.StreamsReported != 2 {
 		t.Fatalf("StreamsReported = %d, want 2", st.StreamsReported)
 	}
+	// The stretch names the copies that were up: the nodes that reported the stream.
+	if got := fmt.Sprint(st.StreamLeaderless.Nodes); got != "[1 3]" {
+		t.Fatalf("the stretch names nodes %s, want [1 3]", got)
+	}
+	if len(st.StreamLeaderless.Copies) != 2 || st.StreamLeaderless.Copies[0].Node != 1 {
+		t.Fatalf("the stretch's copies: %+v", st.StreamLeaderless.Copies)
+	}
 	limit := int64(5000)
 	if reason := judgeStreamLeaderless(st, &limit); reason != "" {
 		t.Fatalf("4 s within a 5 s limit failed: %s", reason)

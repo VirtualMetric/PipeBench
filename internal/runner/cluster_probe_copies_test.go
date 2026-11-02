@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -21,7 +22,7 @@ func TestParseNodeHealthReadsTheStreamsCopies(t *testing.T) {
 	if h.ExpectedCopies != 3 {
 		t.Fatalf("expected copies %d, want 3", h.ExpectedCopies)
 	}
-	if got := h.Copies["b"]; got != (streamCopies{Leader: "1", Desired: 3, Actual: 2, Offline: 1, MaxLag: 42}) {
+	if got := h.Copies["b"]; !reflect.DeepEqual(got, streamCopies{Leader: "1", Desired: 3, Actual: 2, Offline: 1, OfflinePeers: []string{"3"}, MaxLag: 42}) {
 		t.Fatalf("stream b: %+v", got)
 	}
 

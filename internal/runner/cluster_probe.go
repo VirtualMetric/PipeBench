@@ -81,8 +81,18 @@ type nodeHealth struct {
 type streamCopies struct {
 	Leader          string
 	Desired, Actual int
-	Offline         int    // copies offline or behind
-	MaxLag          uint64 // how far the furthest copy is behind, in operations
+	Offline         int      // copies offline or behind
+	OfflinePeers    []string // the names of those copies' servers
+	MaxLag          uint64   // how far the furthest copy is behind, in operations
+}
+
+// copiesReport is what one node says of a stream's copies, kept with a stretch in
+// which the stream had no leader, so that a failed run says where its copies were.
+type copiesReport struct {
+	Node         int      `json:"node"`
+	Desired      int      `json:"desired"`
+	Actual       int      `json:"actual"`
+	OfflinePeers []string `json:"offline_peers,omitempty"`
 }
 
 // copiesLagSlack is how far behind its leader a copy may be and still count
@@ -280,6 +290,10 @@ type splitInterval struct {
 	Rounds  int       `json:"rounds"`
 	Stream  string    `json:"stream,omitempty"`
 	LastsMs int64     `json:"lasts_ms"`
+	// Copies is, for a stretch in which a stream had no leader, what each node that
+	// reported the stream said of its copies when the stretch began. Those nodes are
+	// the stream's copies that were up.
+	Copies []copiesReport `json:"copies,omitempty"`
 }
 
 type leadershipStats struct {
@@ -386,9 +400,16 @@ func analyzeLeadership(rounds []healthRound, end time.Time) leadershipStats {
 				continue
 			}
 			if leaderlessOpen[stream] == nil {
-				leaderlessOpen[stream] = &splitInterval{From: r.At, Stream: stream}
+				leaderlessOpen[stream] = &splitInterval{From: r.At, Stream: stream, Copies: streamReports(r, stream)}
 			}
-			leaderlessOpen[stream].Rounds++
+			iv := leaderlessOpen[stream]
+			iv.Rounds++
+			for _, n := range streamReporters(r, stream) {
+				if !slices.Contains(iv.Nodes, n) {
+					iv.Nodes = append(iv.Nodes, n)
+				}
+			}
+			slices.Sort(iv.Nodes)
 		}
 		// A stream no reachable node reports any more is not known to lack a
 		// leader: its stretch ends here.
@@ -448,6 +469,42 @@ func streamLeadership(r healthRound) (reported, led map[string]bool) {
 		}
 	}
 	return reported, led
+}
+
+// streamReporters returns the reachable clustered nodes that report the stream in
+// the round, in order.
+func streamReporters(r healthRound, stream string) []int {
+	var nodes []int
+	for _, h := range r.Nodes {
+		if !h.Reachable || !h.Clustered {
+			continue
+		}
+		if _, ok := h.StreamLeaders[stream]; ok {
+			nodes = append(nodes, h.Node)
+		}
+	}
+	slices.Sort(nodes)
+	return nodes
+}
+
+// streamReports returns what each reachable clustered node that reports the stream
+// in the round says of its copies, in the order of the nodes.
+func streamReports(r healthRound, stream string) []copiesReport {
+	var out []copiesReport
+	for _, h := range r.Nodes {
+		if !h.Reachable || !h.Clustered {
+			continue
+		}
+		c, ok := h.Copies[stream]
+		if !ok {
+			if _, reports := h.StreamLeaders[stream]; !reports {
+				continue
+			}
+		}
+		out = append(out, copiesReport{Node: h.Node, Desired: c.Desired, Actual: c.Actual, OfflinePeers: c.OfflinePeers})
+	}
+	slices.SortFunc(out, func(a, b copiesReport) int { return a.Node - b.Node })
+	return out
 }
 
 // clusterProbe reads every node's /health in rounds until stopped.
@@ -622,7 +679,8 @@ func parseNodeHealth(n int, raw []byte) nodeHealth {
 		h.Copies = map[string]streamCopies{}
 		for _, s := range doc.JetStream.StreamDetail {
 			h.StreamLeaders[s.Name] = s.Leader
-			h.Copies[s.Name] = streamCopies{Leader: s.Leader, Desired: s.DesiredReplicas, Actual: s.ActualReplicas, Offline: len(s.OfflinePeers), MaxLag: s.MaxLag}
+			h.Copies[s.Name] = streamCopies{Leader: s.Leader, Desired: s.DesiredReplicas, Actual: s.ActualReplicas, Offline: len(s.OfflinePeers),
+				OfflinePeers: s.OfflinePeers, MaxLag: s.MaxLag}
 		}
 	}
 	return h
