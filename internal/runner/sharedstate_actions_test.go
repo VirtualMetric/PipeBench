@@ -600,7 +600,7 @@ func TestWindowDisturbances(t *testing.T) {
 		t.Fatalf("old check: writer %s, problems %v, judged %d; want subject-2-a passing on 2 gaps", writer, problems, judged)
 	}
 
-	got := windowDisturbances(events, calls, "director-state", at(0), at(900))
+	got := windowDisturbances(events, calls, "director-state", at(0), at(900), true)
 	want := []string{
 		"bench-subject-vmetric-2 stopped leading at 23:10:20.200",
 		"bench-subject-vmetric-2 became the leader at 23:10:24.200",
@@ -611,12 +611,19 @@ func TestWindowDisturbances(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("disturbances:\n got %q\nwant %q", got, want)
 	}
+	// In a store cluster the leader of each stream writes its own part of the
+	// copy: several writers are no disturbance there (VM-8792).
+	for _, d := range windowDisturbances(events, calls, "director-state", at(0), at(900), false) {
+		if strings.Contains(d, "writers") {
+			t.Errorf("a store cluster's writers counted as a disturbance: %q", d)
+		}
+	}
 	// A steady window has none.
-	if got := windowDisturbances(events, calls, "director-state", at(0), at(600)); len(got) != 0 {
+	if got := windowDisturbances(events, calls, "director-state", at(0), at(600), true); len(got) != 0 {
 		t.Errorf("a steady window: %q, want none", got)
 	}
 	// A store that goes quiet at the end of the window counts too.
-	if got := windowDisturbances(nil, calls[:10], "director-state", at(0), at(30)); len(got) != 1 || !strings.Contains(got[0], "no request for 22.0s from 23:00:08.000") {
+	if got := windowDisturbances(nil, calls[:10], "director-state", at(0), at(30), true); len(got) != 1 || !strings.Contains(got[0], "no request for 22.0s from 23:00:08.000") {
 		t.Errorf("a store quiet at the end: %q", got)
 	}
 }
@@ -646,6 +653,18 @@ func TestStoreOutageArgs(t *testing.T) {
 	}
 	if back := storeOutageArgs(share, false, "bench-subject-vmetric-1", "img"); back[len(back)-2] != "0777" {
 		t.Errorf("share, back: %q, want mode 0777", back)
+	}
+
+	// A share on a server goes away with its server, as a network share that
+	// is cut off
+	for _, server := range []string{config.SharedStateShareServerSMB, config.SharedStateShareServerNFS} {
+		ss := &config.SharedStateConfig{Store: config.SharedStateStoreShare, SharePath: "/mnt/vm-state", ShareServer: server}
+		if got := strings.Join(storeOutageArgs(ss, true, "", "img"), " "); got != "pause bench-share-server" {
+			t.Errorf("share on %s, away: %q", server, got)
+		}
+		if got := strings.Join(storeOutageArgs(ss, false, "", "img"), " "); got != "unpause bench-share-server" {
+			t.Errorf("share on %s, back: %q", server, got)
+		}
 	}
 }
 
@@ -750,5 +769,129 @@ func TestWaitContainerFailsAtOnceOnAnExitedEndpoint(t *testing.T) {
 	containerInspect = func(string, string) (string, error) { return "exited|exited 1", nil }
 	if run.waitContainer("bench-minio-init", "{{.State.Status}} {{.State.ExitCode}}", "exited 0", time.Now().Add(time.Minute)) {
 		t.Error("an init that exited 1 counted as done")
+	}
+}
+
+// A store cluster keeps its member records under cluster/members/, beside the
+// shared cluster's shared/members/ (VM-8792). Both count as member records.
+func TestLiveStoreMembersOfAStoreCluster(t *testing.T) {
+	t0 := time.Date(2026, 10, 31, 15, 0, 0, 0, time.UTC)
+	const clusterMembers = "/statestore/director-state/bench%2F7001%2Fstate%2Fcluster%2Fmembers%2F"
+	var calls []ssStoreCall
+	for _, s := range []float64{0, 30, 60} {
+		calls = append(calls,
+			ssStoreCall{At: t0.Add(durSecs(s)), Method: "PUT", Path: clusterMembers + "subject-1-a1", Status: 201},
+			ssStoreCall{At: t0.Add(durSecs(s + 0.2)), Method: "PUT", Path: clusterMembers + "subject-2-b2", Status: 201},
+		)
+	}
+	// subject-2 stops cleanly and removes its record
+	calls = append(calls, ssStoreCall{At: t0.Add(durSecs(61)), Method: "DELETE", Path: clusterMembers + "subject-2-b2", Status: 202})
+	calls = inOrder(calls, leaseReads(t0, 0, 62))
+	if got, want := liveStoreMembers(calls, "director-state"), []string{"subject-1-a1"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("live members = %v, want %v: a store cluster's record counts, and a removed one does not", got, want)
+	}
+	for path, want := range map[string]string{
+		"/statestore/director-state/bench/7001/state/cluster/members/subject-3-c3": "subject-3-c3",
+		"/statestore/director-state/bench/7001/state/r/shared/members/subject-4":   "subject-4",
+	} {
+		if got, ok := memberOfRecordPath(path); !ok || got != want {
+			t.Errorf("memberOfRecordPath(%q) = %q, %v; want %q", path, got, ok, want)
+		}
+	}
+	if _, ok := memberOfRecordPath("/statestore/director-state/bench/7001/state/cluster/generation"); ok {
+		t.Error("the generation register is not a member record")
+	}
+}
+
+// pause_receivers pauses each receiver's own container: bench-receiver-<id>
+// for the plural `receivers:`, and bench-receiver for the one `receiver:`
+// (VM-8792).
+func TestReceiverContainers(t *testing.T) {
+	plural := &config.TestCase{Receivers: []config.ReceiverConfig{{ID: "http"}, {ID: "syslog"}}}
+	if got, want := caseReceiverContainers(plural), []string{"bench-receiver-http", "bench-receiver-syslog"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("caseReceiverContainers of two receivers = %v, want %v", got, want)
+	}
+	if got, want := caseReceiverContainers(&config.TestCase{}), []string{"bench-receiver"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("caseReceiverContainers of one receiver = %v, want %v", got, want)
+	}
+}
+
+// slow_store delays only the store's answers to the replicas, and
+// split_leader cuts the leader off from each other replica both ways, and
+// from nothing else: the store and the senders stay reachable (VM-8792).
+func TestSlowStoreAndSplitFaults(t *testing.T) {
+	delays := storeDelays("bench-azurite", []string{"bench-subject-1", "bench-subject-2"}, 300*time.Millisecond)
+	want := map[linkKey]linkFault{
+		{From: "bench-azurite", To: "bench-subject-1"}: {Delay: 300 * time.Millisecond},
+		{From: "bench-azurite", To: "bench-subject-2"}: {Delay: 300 * time.Millisecond},
+	}
+	if !reflect.DeepEqual(delays, want) {
+		t.Errorf("storeDelays = %v, want %v", delays, want)
+	}
+	cuts := splitCuts("bench-subject-1", []string{"bench-subject-2", "bench-subject-3"})
+	want = map[linkKey]linkFault{
+		{From: "bench-subject-1", To: "bench-subject-2"}: {Cut: true},
+		{From: "bench-subject-2", To: "bench-subject-1"}: {Cut: true},
+		{From: "bench-subject-1", To: "bench-subject-3"}: {Cut: true},
+		{From: "bench-subject-3", To: "bench-subject-1"}: {Cut: true},
+	}
+	if !reflect.DeepEqual(cuts, want) {
+		t.Errorf("splitCuts = %v, want %v", cuts, want)
+	}
+}
+
+// In the store_cluster mode the driver reads the store_cluster component of
+// each replica's /health (VM-8792).
+func TestHealthComponent(t *testing.T) {
+	answer := []byte(`{"status":"ok","components":{"shared_state":{"status":"not_configured"},"store_cluster":{"status":"ok","message":"member of generation 2, 3 live members"}}}`)
+	if status, message := healthComponent(answer, "store_cluster"); status != "ok" || message != "member of generation 2, 3 live members" {
+		t.Errorf("store_cluster = %q, %q", status, message)
+	}
+	if status, message := healthComponent(answer, "queue_store"); status != "" || !strings.Contains(message, "no queue_store component") {
+		t.Errorf("a missing component = %q, %q", status, message)
+	}
+	if status, _ := healthComponent([]byte("not json"), "store_cluster"); status != "" {
+		t.Errorf("an unreadable answer gave the status %q", status)
+	}
+}
+
+// A replica that still wants the store cluster reports store_cluster ok, as a
+// member does. Only a member's message says that it is a member, so a switch is
+// done only once every replica's message says so.
+func TestStoreClusterMemberReadsTheMessage(t *testing.T) {
+	for _, tc := range []struct {
+		name, status, message string
+		want                  bool
+	}{
+		{"a member", "ok", "This director is member m-1 of generation 3 of its cluster. It counts 1 other member as live: m-2.", true},
+		{"a replica that wants the store cluster", "ok", "This director is set to the store cluster, and runs in the shared cluster that holds its store until every replica wants the store cluster, and has for 2 minutes.", false},
+		{"a member without a quorum", "degraded", "This director is member m-1 of generation 3, but it cannot reach a quorum of its cluster.", false},
+		{"a switch that runs", "starting", "Switching: the store of this director's queue switches from the shared cluster to the store cluster.", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := storeClusterMember(tc.status, tc.message); got != tc.want {
+				t.Fatalf("storeClusterMember = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// On a store whose calls the bench cannot read, the scale-out case counts the live
+// members from what a replica says on /health, with the replica itself.
+func TestCountedMembers(t *testing.T) {
+	for _, tc := range []struct {
+		message string
+		want    int
+		ok      bool
+	}{
+		{"This director is member a of generation 1 of its cluster. It counts no other member as live.", 1, true},
+		{"This director is member a of generation 1 of its cluster. It counts 1 other member as live: b.", 2, true},
+		{"This director is member a of generation 1 of its cluster. It counts 2 other members as live: b, c. 1 server is joining: d.", 3, true},
+		{"This director is waiting to join.", 0, false},
+		{"", 0, false},
+	} {
+		if got, ok := countedMembers(tc.message); got != tc.want || ok != tc.ok {
+			t.Errorf("countedMembers(%q) = %d, %v, want %d, %v", tc.message, got, ok, tc.want, tc.ok)
+		}
 	}
 }

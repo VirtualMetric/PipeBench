@@ -15,6 +15,12 @@ package main
 // harness can ask for the latency of the lines sent in one window, such as
 // the seconds around a node kill (/latency).
 //
+// A sample takes 32 bytes, so a throughput case, which sends hundreds of
+// millions of lines, keeps the latency of one line in N only
+// (RECEIVER_LATENCY_SAMPLE_EVERY): the lines whose SEQ is a multiple of N.
+// Every line still counts as arrived, so the loss check and the timeline stay
+// exact.
+//
 // /timeline counts arrivals in 100 ms buckets, which shows when delivery
 // stalled and when it came back. /duplicates lists the lines that arrived
 // more than once, with the time of each copy.
@@ -70,13 +76,19 @@ type seqTracker struct {
 	unique   int64
 	dups     int64
 	unparsed int64
+	cut      int64
 	samples  []latSample
 	buckets  []tlBucket
 	dupList  []dupSample
+	// sampleEvery keeps the latency of the lines whose SEQ is a multiple of
+	// it. 1 keeps every line's.
+	sampleEvery int64
 }
 
-func newSeqTracker() *seqTracker {
-	return &seqTracker{conns: map[int64]*seqConn{}}
+// newSeqTracker returns a tracker that keeps the latency of one line in
+// sampleEvery. A sampleEvery of 1 or less keeps every line's.
+func newSeqTracker(sampleEvery int64) *seqTracker {
+	return &seqTracker{conns: map[int64]*seqConn{}, sampleEvery: max(sampleEvery, 1)}
 }
 
 // parseSeqLine finds "CONN=<id> SEQ=<n>" and an optional " TS=<ns>" after it.
@@ -120,6 +132,21 @@ func leadingInt(s string) (int64, string, bool) {
 	return v, s[n:], true
 }
 
+// recordCut notes a piece of a line, which arrived at now (unix nanos): what a
+// connection held of its last line when it ended inside that line. A piece is
+// never the record, even when it carries the record's number. The record has
+// arrived only when it arrives whole, so a record whose only trace is a piece
+// counts as missing.
+func (t *seqTracker) recordCut(now int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.start == 0 {
+		t.start = now
+	}
+	t.bucket(now).all++
+	t.cut++
+}
+
 // record notes one received line that arrived at now (unix nanos).
 func (t *seqTracker) record(line []byte, now int64) {
 	conn, seq, ts, ok := parseSeqLine(line)
@@ -160,7 +187,7 @@ func (t *seqTracker) record(line []byte, now int64) {
 	}
 	t.unique++
 	b.unique++
-	if ts > 0 && now > ts {
+	if ts > 0 && now > ts && seq%t.sampleEvery == 0 {
 		t.samples = append(t.samples, latSample{sent: ts, lat: now - ts, seq: seq, conn: conn})
 	}
 }
@@ -201,6 +228,7 @@ type seqCheck struct {
 	Unique         int64                `json:"unique"`
 	Duplicates     int64                `json:"duplicates"`
 	Unparsed       int64                `json:"unparsed"`
+	Cut            int64                `json:"cut"`
 	Conns          map[string]connCheck `json:"conns"`
 	UnexpectedConn []string             `json:"unexpected_conns,omitempty"`
 }
@@ -211,7 +239,7 @@ type seqCheck struct {
 func (t *seqTracker) check(acked map[int64]int64, maxRanges int) seqCheck {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	out := seqCheck{Conns: map[string]connCheck{}, Unique: t.unique, Duplicates: t.dups, Unparsed: t.unparsed}
+	out := seqCheck{Conns: map[string]connCheck{}, Unique: t.unique, Duplicates: t.dups, Unparsed: t.unparsed, Cut: t.cut}
 	for conn, n := range acked {
 		cc := connCheck{Acked: n}
 		c := t.conns[conn]
@@ -261,6 +289,9 @@ type latencyStats struct {
 	P99Ms     float64 `json:"p99_ms"`
 	MaxMs     float64 `json:"max_ms"`
 	MaxSentNs int64   `json:"max_sent_ns,omitempty"`
+	// SampleEvery is set when the receiver keeps the latency of one line in
+	// SampleEvery only. Count is then the number of samples.
+	SampleEvery int64 `json:"sample_every,omitempty"`
 }
 
 // latency summarizes the first-arrival latency of the lines sent in
@@ -274,7 +305,11 @@ func (t *seqTracker) latency(from, to int64) latencyStats {
 		}
 	}
 	t.mu.Unlock()
-	return summarizeLatency(vals)
+	out := summarizeLatency(vals)
+	if t.sampleEvery > 1 {
+		out.SampleEvery = t.sampleEvery
+	}
+	return out
 }
 
 func summarizeLatency(vals []latSample) latencyStats {
