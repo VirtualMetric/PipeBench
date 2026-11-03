@@ -1671,10 +1671,12 @@ func (r *ComposeRunner) RestartServices(services ...string) error {
 // RecreateServices replaces the named services with new containers, without
 // touching their dependencies. A container platform that replaces a replica
 // starts it on an empty disk, which `docker start` of the old container would
-// not do: whatever the replica keeps must come back from elsewhere.
+// not do: whatever the replica keeps must come back from elsewhere. Compose
+// hands a recreated container its old anonymous volumes unless it is told not to,
+// so --renew-anon-volumes is what makes that disk empty.
 func (r *ComposeRunner) RecreateServices(services ...string) error {
 	resolved := r.resolveServiceAliases(services)
-	args := append([]string{"up", "-d", "--quiet-pull", "--no-deps", "--force-recreate"}, resolved...)
+	args := append([]string{"up", "-d", "--quiet-pull", "--no-deps", "--force-recreate", "--renew-anon-volumes"}, resolved...)
 	return r.compose(args...)
 }
 

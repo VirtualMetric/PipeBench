@@ -1585,7 +1585,7 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 	genStats := r.parseGeneratorStats(orch.GeneratorStdout())
 	fmt.Printf("  generator sent %s lines\n", formatCount(genStats.LinesSent))
 
-	if delay, err := time.ParseDuration(tc.StopDelay); err == nil && delay > 0 {
+	if delay := tc.StopDelayOrZero(); delay > 0 {
 		fmt.Printf("  giving the subject %s to read what is in its socket…\n", delay)
 		if err := sleepCtx(r.ctx, delay); err != nil {
 			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
@@ -1604,6 +1604,15 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 		fmt.Println("  phase 3: stopping subject immediately (SIGTERM)…")
 		if err := orch.StopServices(30*time.Second, "subject"); err != nil {
 			return results.RunResult{}, fmt.Errorf("stopping subject: %w", err)
+		}
+	}
+
+	// The log goes with the container that the next step removes
+	var stoppedLog string
+	if tc.EmptyDiskOnRestart || len(tc.Correctness.RequireStopLog) > 0 {
+		stoppedLog, err = r.keepStoppedSubjectLog(tc, orch.SubjectContainer())
+		if err != nil {
+			return results.RunResult{}, fmt.Errorf("keeping the stopped subject's log: %w", err)
 		}
 	}
 
@@ -1677,49 +1686,12 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 
 	elapsed := time.Since(startTime).Seconds()
 
-	lossPct := 0.0
-	if genStats.LinesSent > 0 {
-		lossPct = 100.0 * (1.0 - float64(recvMetrics.LinesReceived)/float64(genStats.LinesSent))
-		if lossPct < 0 {
-			lossPct = 0
-		}
-	}
-
-	passed := lossPct <= tc.Correctness.ExpectedLossPct
-	var errors []string
-	if !passed {
-		errors = append(errors, fmt.Sprintf("expected loss <= %.2f%%, got %.2f%% (%s of %s lines lost)",
-			tc.Correctness.ExpectedLossPct, lossPct,
-			formatCount(genStats.LinesSent-recvMetrics.LinesReceived), formatCount(genStats.LinesSent)))
-	}
-	if recvMetrics.LinesReceived > genStats.LinesSent {
-		extra := recvMetrics.LinesReceived - genStats.LinesSent
-		if tc.IsKafkaType() || tc.Correctness.AllowOverDelivery {
-			// At-least-once transports (Kafka, S3-via-SQS notifications, SQS,
-			// Kinesis): crash/restart recovery may re-deliver records already
-			// buffered. That is correct behavior — duplicates, never loss —
-			// so over-delivery is informational here, not a failure.
-			fmt.Printf("  note: over-delivery of %s lines (at-least-once duplicates from recovery — not a failure)\n", formatCount(extra))
-		} else {
-			passed = false
-			errors = append(errors, fmt.Sprintf("over-delivery: received %s lines but only %s were sent (%s extra/duplicate lines)",
-				formatCount(recvMetrics.LinesReceived), formatCount(genStats.LinesSent), formatCount(extra)))
-		}
-	}
-	if tc.Correctness.ValidateDedup && recvMetrics.Duplicates > 0 {
-		passed = false
-		errors = append(errors, fmt.Sprintf("expected 0 duplicates, got %s",
-			formatCount(recvMetrics.Duplicates)))
-	}
-	if tc.Correctness.ValidateContent && recvMetrics.MalformedLines > 0 {
-		passed = false
-		errors = append(errors, fmt.Sprintf("expected 0 malformed lines, got %s (memory corruption)",
-			formatCount(recvMetrics.MalformedLines)))
-	}
-	if tc.Correctness.ValidateJSON && recvMetrics.InvalidJSONLines > 0 {
-		passed = false
-		errors = append(errors, fmt.Sprintf("expected 0 invalid-JSON lines, got %s",
-			formatCount(recvMetrics.InvalidJSONLines)))
+	verdict := judgeRestart(tc, genStats.LinesSent, recvMetrics, stoppedLog)
+	lossPct := verdict.LossPct
+	passed := len(verdict.Errors) == 0
+	errors := verdict.Errors
+	for _, note := range verdict.Notes {
+		fmt.Printf("  note: %s\n", note)
 	}
 
 	result := results.RunResult{

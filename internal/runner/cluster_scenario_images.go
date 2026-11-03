@@ -216,8 +216,14 @@ func (sr *scenarioRun) moveNodeToImage(step, n int, image string) (detail, failu
 		return "", fmt.Sprintf("could not keep node %d's log before replacing its container: %v: %s", n, err, strings.TrimSpace(string(out)))
 	}
 	replacedLogs.keep(c, keptLog{Step: step, Image: sr.nodeImage[n], Text: string(out)})
+	oldContainer := containerID(sr.ctx, c)
 	if err := sr.orch.RecreateServiceWithImage(fmt.Sprintf("subject-%d", n), ref); err != nil {
 		return "", fmt.Sprintf("starting node %d on %s: %v", n, ref, err)
+	}
+	// A node that kept its container kept its disk, which voids every case that
+	// counts on an empty one
+	if now := containerID(sr.ctx, c); now == "" || now == oldContainer {
+		return "", fmt.Sprintf("node %d did not get a new container: it was %s, and is %s now", n, shortImageID(oldContainer), shortImageID(now))
 	}
 	if got := containerImageID(c); got != wantID {
 		return "", fmt.Sprintf("node %d's new container runs image %s, not %s (%s)", n, shortImageID(got), ref, shortImageID(wantID))
