@@ -175,6 +175,13 @@ type TestCase struct {
 	// outlives the container.
 	EmptyDiskOnRestart bool `yaml:"empty_disk_on_restart"`
 
+	// StopDelay, in a persistence_restart_correctness case, is how long the harness
+	// waits between the generator's exit and the stop. A sender's last lines can
+	// still be in the subject's socket when the sender exits, and a subject that
+	// stops at that moment never reads them. A case about what the subject does with
+	// the records it took in gives it time to read them.
+	StopDelay string `yaml:"stop_delay"`
+
 	// SubjectEntrypoint replaces the registry's entrypoint for this case, with
 	// the registry Command still appended as arguments. Same precedence and the
 	// same non-strict-decode tolerance as SubjectImage.

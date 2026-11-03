@@ -1585,6 +1585,13 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 	genStats := r.parseGeneratorStats(orch.GeneratorStdout())
 	fmt.Printf("  generator sent %s lines\n", formatCount(genStats.LinesSent))
 
+	if delay, err := time.ParseDuration(tc.StopDelay); err == nil && delay > 0 {
+		fmt.Printf("  giving the subject %s to read what is in its socket…\n", delay)
+		if err := sleepCtx(r.ctx, delay); err != nil {
+			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+		}
+	}
+
 	// PHASE 3: stop subject. SIGTERM (restart variant) lets the subject flush
 	// state to disk gracefully; SIGKILL (crash variant) gives no chance for
 	// cleanup — only writes already persisted before the kill are recoverable.
