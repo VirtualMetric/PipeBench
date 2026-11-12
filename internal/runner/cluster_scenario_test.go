@@ -57,7 +57,7 @@ func TestAnalyzeLeadershipMeasuresTwoLeaderTime(t *testing.T) {
 		{At: at(3), Nodes: []nodeHealth{h(1, "1", "1"), h(2, "2", "1"), h(3, "3", "3")}},
 		{At: at(4), Nodes: []nodeHealth{h(1, "1", "1"), h(2, "2", "1"), h(3, "3", "")}},
 	}
-	st := analyzeLeadership(rounds)
+	st := analyzeLeadership(rounds, time.Time{})
 	if st.MaxSelfClaimed != 2 {
 		t.Fatalf("MaxSelfClaimed = %d, want 2", st.MaxSelfClaimed)
 	}
@@ -80,7 +80,7 @@ func TestAnalyzeLeadershipStreams(t *testing.T) {
 	st := analyzeLeadership([]healthRound{
 		{At: t0, Nodes: []nodeHealth{a, b}},
 		{At: t0.Add(time.Second), Nodes: []nodeHealth{a, c}},
-	})
+	}, time.Time{})
 	if st.MaxStreamClaims != 2 || st.StreamSplitMs != 1000 {
 		t.Fatalf("stream split: max %d, %d ms", st.MaxStreamClaims, st.StreamSplitMs)
 	}
@@ -505,6 +505,31 @@ func TestExpectNoLogSkipsASpareThatNeverStarted(t *testing.T) {
 	}
 }
 
+// A witness restart kills the store with SIGKILL and starts the same container
+// again, so the store keeps what is on its disk.
+func TestWitnessRestartKillsAndStartsTheStore(t *testing.T) {
+	var ran []string
+	origCmd := dockerCmd
+	dockerCmd = func(_ context.Context, _ time.Duration, args ...string) error {
+		ran = append(ran, strings.Join(args, " "))
+		return nil
+	}
+	t.Cleanup(func() { dockerCmd = origCmd })
+	for store, container := range map[string]string{"redis": "bench-redis", "s3": "bench-minio", "azure": "bench-azurite"} {
+		ran = nil
+		sr := &scenarioRun{ctx: context.Background(), sc: &config.ScenarioConfig{Witness: store}}
+		var rep scenarioStepReport
+		ok, detail, err := sr.doStep(0, config.ScenarioStep{Do: "witness_restart"}, &rep)
+		if err != nil || !ok {
+			t.Fatalf("%s: ok %v, detail %q, err %v", store, ok, detail, err)
+		}
+		want := []string{"kill -s KILL " + container, "start " + container}
+		if strings.Join(ran, ",") != strings.Join(want, ",") {
+			t.Fatalf("%s: docker commands = %v, want %v", store, ran, want)
+		}
+	}
+}
+
 // docker stop sends SIGTERM and, when the grace period runs out, SIGKILL. A
 // node that needed the SIGKILL did not stop gracefully, and the stop step
 // used to pass all the same.
@@ -682,5 +707,24 @@ func TestLineCountsStayApartFromTimes(t *testing.T) {
 	}
 	if _, ok := doc.Measures["held_writes_lines_acked"]; ok || doc.Counts["held_writes_lines_acked"] != 820 {
 		t.Fatalf("report measures_ms = %v, counts = %v; want the count under counts only", doc.Measures, doc.Counts)
+	}
+}
+
+// A rolling restart notes the disruption before it stops a node. A round read
+// while the node was stopping can still show every node healthy, so the waits
+// after the restart count only a round that began once the node was back.
+func TestWaitRoundAfterCountsOnlyALaterRound(t *testing.T) {
+	read := time.Now()
+	sr := &scenarioRun{
+		ctx:   context.Background(),
+		probe: &clusterProbe{rounds: []healthRound{{At: read}}},
+	}
+	always := func(healthRound) bool { return true }
+
+	if _, ok, err := sr.waitRoundAfter(read, 700*time.Millisecond, always); err != nil || ok {
+		t.Fatalf("waitRoundAfter took a round that began at the time it waits from (ok %v, err %v)", ok, err)
+	}
+	if _, ok, err := sr.waitRoundAfter(read.Add(-time.Second), 700*time.Millisecond, always); err != nil || !ok {
+		t.Fatalf("waitRoundAfter refused a round that began after the time it waits from (ok %v, err %v)", ok, err)
 	}
 }

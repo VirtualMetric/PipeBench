@@ -45,7 +45,15 @@ type config struct {
 	// lines arrived, duplicates, first-arrival latency and an arrival
 	// timeline (seqtrack.go). Default off.
 	TrackSeq bool
+
+	// LatencySampleEvery keeps the latency of one tracked line in this many
+	// (RECEIVER_LATENCY_SAMPLE_EVERY), so that a throughput case does not
+	// fill the receiver's memory with samples. Default 1: every line.
+	LatencySampleEvery int64
 }
+
+// cutLines counts the pieces of a line that arrived, on every connection.
+var cutLines atomic.Int64
 
 // seqTrack is the sequence tracker when RECEIVER_TRACK_SEQ is on, else nil.
 var seqTrack *seqTracker
@@ -556,7 +564,7 @@ func main() {
 	cnt := &counters{recordTimes: cfg.RecordArrivalTimes}
 	val := newValidator()
 	if cfg.TrackSeq {
-		seqTrack = newSeqTracker()
+		seqTrack = newSeqTracker(cfg.LatencySampleEvery)
 	}
 	if expr := os.Getenv("RECEIVER_TRACK_KEYS"); expr != "" {
 		kt, err := newKeyTracker(expr)
@@ -645,6 +653,7 @@ func main() {
 	summary := map[string]any{
 		"lines_received": totalLines,
 		"bytes_received": totalBytes,
+		"cut_lines":      cutLines.Load(),
 	}
 	if cfg.ValidateDedup || cfg.ExpectedLines > 0 {
 		summary["passed"] = passed
@@ -726,6 +735,8 @@ func handleConn(conn net.Conn, shard *connStats, val *validator, cfg config) {
 	// time, inflating the receive window when the sender idles before closing.
 	scanner := bufio.NewScanner(&stampingReader{r: conn, shard: shard})
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	cut := false
+	scanner.Split(scanWholeLines(&cut))
 	needsValidation := cfg.ValidateDedup || cfg.ValidateContent || cfg.ValidateJSON || cfg.RequiredSubstring != "" || cfg.ForbiddenSubstring != ""
 	// Pass the scanner's internal slice directly. shard.recordLine + validator
 	// only read len() and copy via `string(line)` / hash when they need to
@@ -734,6 +745,13 @@ func handleConn(conn net.Conn, shard *connStats, val *validator, cfg config) {
 	// multi-million-lines/s was the receiver's hot ceiling.
 	for scanner.Scan() {
 		b := scanner.Bytes()
+		// A piece of a line counts as nothing but a piece: not as a line, which
+		// would hide a lost record from a count of lines, and not as a distinct
+		// line or a record.
+		if cut {
+			trackCut()
+			continue
+		}
 		shard.recordLine(int64(len(b)) + 1)
 		if needsValidation {
 			val.recordLine(b, cfg)
@@ -745,6 +763,18 @@ func handleConn(conn net.Conn, shard *connStats, val *validator, cfg config) {
 	// diagnosable from the receiver log. EOF is not reported by Err().
 	if err := scanner.Err(); err != nil {
 		fmt.Fprintf(os.Stderr, "receiver: conn %s: %v\n", conn.RemoteAddr(), err)
+	}
+}
+
+// scanWholeLines splits a connection into lines, as bufio.ScanLines does, and
+// sets *cut for what came last when no newline ended it. Every sender here ends
+// each record with a newline, so that is a piece of a line: the connection ended
+// inside it, because a write deadline cut it or the sender stopped.
+func scanWholeLines(cut *bool) bufio.SplitFunc {
+	return func(data []byte, atEOF bool) (int, []byte, error) {
+		advance, token, err := bufio.ScanLines(data, atEOF)
+		*cut = atEOF && token != nil && bytes.IndexByte(data, '\n') < 0
+		return advance, token, err
 	}
 }
 
@@ -803,6 +833,15 @@ func trackSeq(line []byte) {
 	}
 	if keyTrack != nil {
 		keyTrack.record(line)
+	}
+}
+
+// trackCut counts a piece of a line, and tells the sequence tracker about it. The
+// key tracker does not hear of it: a piece is not a record.
+func trackCut() {
+	cutLines.Add(1)
+	if seqTrack != nil {
+		seqTrack.recordCut(time.Now().UnixNano())
 	}
 }
 
@@ -1018,6 +1057,7 @@ func serveMetrics(port string, cnt *counters, val *validator, cfg config) {
 		resp := map[string]any{
 			"lines_received":    totalLines,
 			"bytes_received":    totalBytes,
+			"cut_lines":         cutLines.Load(),
 			"done":              cnt.Done.Load(),
 			"first_received_ns": firstNs,
 			"last_received_ns":  lastNs,
@@ -1125,6 +1165,7 @@ func loadConfig() config {
 		ValidateJSON:       getEnvBool("RECEIVER_VALIDATE_JSON", false),
 		RecordArrivalTimes: getEnvBool("RECEIVER_RECORD_ARRIVAL_TIMES", false),
 		TrackSeq:           getEnvBool("RECEIVER_TRACK_SEQ", false),
+		LatencySampleEvery: int64(getEnvInt("RECEIVER_LATENCY_SAMPLE_EVERY", 1)),
 	}
 }
 

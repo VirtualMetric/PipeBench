@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -32,7 +33,7 @@ func TestParseSeqLine(t *testing.T) {
 // arrived are missing, a line seen twice is a duplicate, and lines past the
 // acknowledged count are extra, not loss.
 func TestSeqTrackerCheck(t *testing.T) {
-	tr := newSeqTracker()
+	tr := newSeqTracker(1)
 	now := time.Now().UnixNano()
 	sent := now - int64(50*time.Millisecond)
 	for seq := 0; seq < 100; seq++ {
@@ -64,7 +65,7 @@ func TestSeqTrackerCheck(t *testing.T) {
 // TestSeqTrackerLatencyWindow checks that latency counts first arrivals only
 // and can be limited to the lines sent in a window.
 func TestSeqTrackerLatencyWindow(t *testing.T) {
-	tr := newSeqTracker()
+	tr := newSeqTracker(1)
 	base := time.Now().UnixNano()
 	for i := range 10 {
 		sent := base + int64(i)*int64(time.Second)
@@ -98,7 +99,7 @@ func TestSeqTrackerLatencyWindow(t *testing.T) {
 // TestSeqTrackerDuplicates checks that a line that arrives again is listed
 // with its send time, its first arrival and the arrival of the copy.
 func TestSeqTrackerDuplicates(t *testing.T) {
-	tr := newSeqTracker()
+	tr := newSeqTracker(1)
 	sent := time.Unix(1000, 0).UnixNano()
 	first := sent + int64(200*time.Millisecond)
 	again := sent + int64(2*time.Minute)
@@ -140,7 +141,7 @@ func TestHTTPInputsTrackSequences(t *testing.T) {
 		"data endpoint": func() http.Handler { return newHTTPDataHandler(config{}, &counters{}, newValidator()) },
 	} {
 		t.Run(name, func(t *testing.T) {
-			seqTrack = newSeqTracker()
+			seqTrack = newSeqTracker(1)
 			handler := h()
 			post(handler, "/", line(0, 0)+"\n"+line(0, 1)+"\n")
 			post(handler, "/logs/_bulk", `{"create":{}}`+"\n"+line(0, 2)+"\n"+`{"create":{}}`+"\n"+line(0, 3)+"\n")
@@ -173,7 +174,7 @@ func TestSeqTrackerSkipsACutLine(t *testing.T) {
 		"cccccccccccc", // the tail of SEQ=2, whose head never arrived
 	}
 	val := newValidator()
-	tr := newSeqTracker()
+	tr := newSeqTracker(1)
 	now := time.Now().UnixNano()
 	for _, l := range lines {
 		val.recordLine([]byte(l), config{ValidateDedup: true})
@@ -188,13 +189,77 @@ func TestSeqTrackerSkipsACutLine(t *testing.T) {
 	}
 }
 
+// TestACutPieceIsNotTheRecord: a connection that ends inside a line leaves a piece of
+// it. The piece carries the record's number here, and still the record has not arrived:
+// it counts as missing until it arrives whole, and it is on no count that a case with
+// no sequence numbers reads either: the lines received and the distinct lines. A line
+// that has its newline and no number is not a piece, and stays on the count of garbled
+// lines.
+func TestACutPieceIsNotTheRecord(t *testing.T) {
+	old := seqTrack
+	seqTrack = newSeqTracker(1)
+	cutLines.Store(0)
+	t.Cleanup(func() {
+		seqTrack = old
+		cutLines.Store(0)
+	})
+
+	cnt := &counters{}
+	val := newValidator()
+	receive := func(data string) {
+		t.Helper()
+		sender, conn := net.Pipe()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			handleConn(conn, cnt.newShard(), val, config{ValidateDedup: true})
+		}()
+		if _, err := sender.Write([]byte(data)); err != nil {
+			t.Fatal(err)
+		}
+		sender.Close()
+		<-done
+	}
+	state := func() seqCheck { return seqTrack.check(map[int64]int64{7: 2}, 5) }
+
+	receive("CONN=7 SEQ=0 TS=1 aaaa\nCONN=7 SEQ=1 TS=2 bb")
+	if got := state(); got.Unique != 1 || got.Missing != 1 || got.Cut != 1 || got.Unparsed != 0 {
+		t.Fatalf("after the piece: unique %d missing %d cut %d unparsed %d, want 1 1 1 0: the record's only trace is a piece", got.Unique, got.Missing, got.Cut, got.Unparsed)
+	}
+	lines, _, _, _ := cnt.totals()
+	unique, _ := val.dedupStats()
+	if lines != 1 || unique != 1 || cutLines.Load() != 1 {
+		t.Fatalf("after the piece: %d lines, %d distinct lines, %d cut lines, want 1 1 1: counted as a line, the piece would hide the lost record", lines, unique, cutLines.Load())
+	}
+
+	receive("CONN=7 SEQ=1 TS=2 bbbb\n")
+	if got := state(); got.Unique != 2 || got.Missing != 0 || got.Duplicates != 0 || got.Cut != 1 {
+		t.Fatalf("after the whole record: unique %d missing %d duplicates %d cut %d, want 2 0 0 1", got.Unique, got.Missing, got.Duplicates, got.Cut)
+	}
+	lines, _, _, _ = cnt.totals()
+	unique, _ = val.dedupStats()
+	if lines != 2 || unique != 2 {
+		t.Fatalf("after the whole record: %d lines, %d distinct lines, want 2 2", lines, unique)
+	}
+
+	receive("CONN=")
+	if got := state(); got.Cut != 2 || got.Unparsed != 0 {
+		t.Fatalf("after a piece with no number: cut %d unparsed %d, want 2 0", got.Cut, got.Unparsed)
+	}
+
+	receive("no number, with its newline\n")
+	if got := state(); got.Cut != 2 || got.Unparsed != 1 {
+		t.Fatalf("after a garbled line: cut %d unparsed %d, want 2 1", got.Cut, got.Unparsed)
+	}
+}
+
 // TestSeqCountsKeepTheHashCountsForLinesWithoutASequence: the tracker is on
 // for every scenario case. Rows from a database carry no sequence number, so
 // the tracker counts no line, and its zeros must not replace the hash-based
 // counts, which see a row that arrived twice.
 func TestSeqCountsKeepTheHashCountsForLinesWithoutASequence(t *testing.T) {
 	val := newValidator()
-	tr := newSeqTracker()
+	tr := newSeqTracker(1)
 	now := time.Now().UnixNano()
 	for _, l := range []string{"evt-1 collected", "evt-2 collected", "evt-1 collected"} {
 		val.recordLine([]byte(l), config{ValidateDedup: true})
@@ -215,5 +280,40 @@ func TestSeqCountsKeepTheHashCountsForLinesWithoutASequence(t *testing.T) {
 	// Without the hash-based check there is nothing else to report.
 	if !seqCountsWin(0, false) {
 		t.Fatalf("the tracker's counts must be reported when no hash-based check runs")
+	}
+}
+
+// A tracker that samples keeps the latency of one line in N, the lines whose
+// SEQ is a multiple of N, and still counts every line as arrived, so that the
+// loss check stays exact (RECEIVER_LATENCY_SAMPLE_EVERY).
+func TestSeqTrackerKeepsOneLatencySampleInN(t *testing.T) {
+	tr := newSeqTracker(10)
+	now := time.Now().UnixNano()
+	sent := now - int64(20*time.Millisecond)
+	for seq := 0; seq < 100; seq++ {
+		tr.record([]byte(fmt.Sprintf("CONN=0 SEQ=%d TS=%d pad", seq, sent)), now)
+	}
+
+	if unique, dups := tr.counts(); unique != 100 || dups != 0 {
+		t.Fatalf("counts = %d unique, %d duplicates, want 100 and 0", unique, dups)
+	}
+	if got := tr.check(map[int64]int64{0: 100}, 20); got.Missing != 0 || got.ReceivedAcked != 100 {
+		t.Fatalf("check: received %d, missing %d, want 100 and 0", got.ReceivedAcked, got.Missing)
+	}
+	ls := tr.latency(0, 0)
+	if ls.Count != 10 || ls.SampleEvery != 10 {
+		t.Fatalf("latency: %d samples, sample_every %d, want 10 and 10", ls.Count, ls.SampleEvery)
+	}
+	if ls.P50Ms != 20 {
+		t.Fatalf("latency p50 = %v ms, want 20", ls.P50Ms)
+	}
+
+	// Without sampling, every line has a sample and the answer names none
+	every := newSeqTracker(1)
+	for seq := 0; seq < 100; seq++ {
+		every.record([]byte(fmt.Sprintf("CONN=0 SEQ=%d TS=%d pad", seq, sent)), now)
+	}
+	if ls := every.latency(0, 0); ls.Count != 100 || ls.SampleEvery != 0 {
+		t.Fatalf("latency without sampling: %d samples, sample_every %d, want 100 and 0", ls.Count, ls.SampleEvery)
 	}
 }

@@ -67,6 +67,7 @@ func (r *Runner) aggregateReceivers(ports map[string]int, timeout time.Duration)
 			InvalidJSON:     m.InvalidJSONLines,
 		})
 		combined.LinesReceived += m.LinesReceived
+		combined.CutLines += m.CutLines
 		combined.BytesReceived += m.BytesReceived
 		combined.Duplicates += m.Duplicates
 		combined.MalformedLines += m.MalformedLines
