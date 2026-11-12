@@ -1,5 +1,6 @@
 name: tcp_to_sqs_performance
 type: performance
+hidden: true
 description: "Measures throughput of a TCP-in to SQS-out pipeline (LocalStack emulator). The receiver drains the queue with parallel pollers. Fixed generator rate — LocalStack's SQS is the known ceiling, not the subject."
 
 duration: 60s

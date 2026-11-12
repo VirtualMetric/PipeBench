@@ -1,5 +1,6 @@
 name: azure_blob_to_tcp_performance
 type: performance
+hidden: true
 description: "Measures throughput ingesting from Azure Blob Storage (Azurite emulator) to a TCP sink. The generator uploads blobs and enqueues synthetic EventGrid BlobCreated messages to the container-named storage queue (Azurite never emits them itself) — the consumption model vmetric's azblob listener uses. Most pipeline tools have no blob *input*, so the roster is thin by reality. Numbers are comparable across subjects, not against non-emulator cases."
 
 duration: 60s

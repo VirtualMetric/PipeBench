@@ -1,5 +1,6 @@
 name: tcp_to_minio_performance
 type: performance
+hidden: true
 description: "Measures throughput of a TCP-in to S3-out pipeline against MinIO (a multi-core, Go S3-compatible store) instead of LocalStack. Unlimited generator rate — pushes peak. Unlike LocalStack's single-core S3, MinIO is not the ceiling, so this exposes the subject's true delivery rate (note: the single-poller bench receiver, ~2.4M lines/s, can become the limit — surplus shows as uncounted-at-cutoff 'loss'). The receiver polls the output bucket, counts lines, and deletes drained objects."
 
 duration: 60s

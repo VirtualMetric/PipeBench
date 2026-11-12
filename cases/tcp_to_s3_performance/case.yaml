@@ -1,5 +1,6 @@
 name: tcp_to_s3_performance
 type: performance
+hidden: true
 description: "Measures throughput of a TCP-in to S3-out pipeline (LocalStack emulator). The receiver polls the output bucket, counts lines, and deletes drained objects. Numbers are comparable across subjects, not against non-emulator cases — LocalStack itself caps throughput."
 
 duration: 60s

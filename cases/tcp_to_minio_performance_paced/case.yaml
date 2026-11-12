@@ -1,5 +1,6 @@
 name: tcp_to_minio_performance_paced
 type: performance
+hidden: true
 description: "TCP-in to S3-out against MinIO with the generator paced below the bench receiver's counting ceiling (~2.4M lines/s). Pacing the input throttles every subject uniformly, so delivery stays countable within the window and loss is ~0% — the clean, directly-comparable delivery number (the unthrottled peak is in tcp_to_minio_performance). The receiver polls the output bucket, counts lines, and deletes drained objects."
 
 duration: 60s
