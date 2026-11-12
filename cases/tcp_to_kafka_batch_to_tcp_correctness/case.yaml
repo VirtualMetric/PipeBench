@@ -1,5 +1,6 @@
 name: tcp_to_kafka_batch_to_tcp_correctness
 type: correctness
+hidden: true
 description: "Round-trips records through Kafka with the TARGET in json_array batch mode (up to 100 events packed into one Kafka message) and the DEVICE splitting arrays back into individual events. Exercises Kafka target batching + device array-splitting + multi-route in one director."
 
 duration: 30s

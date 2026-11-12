@@ -1,5 +1,6 @@
 name: kafka_to_tcp_correctness
 type: kafka_correctness
+hidden: true
 description: "Every JSON record produced to Kafka must be consumed by the subject and forwarded to TCP (no loss)"
 
 duration: 120s

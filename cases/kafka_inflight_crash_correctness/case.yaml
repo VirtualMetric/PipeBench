@@ -1,5 +1,6 @@
 name: kafka_inflight_crash_correctness
 type: kafka_inflight_crash_correctness
+hidden: true
 description: "Hard-crash (SIGKILL) the subject WHILE it is delivering consumed Kafka records to a LIVE receiver; verify no loss. Exercises the at-least-once over-delivery window (duplicates allowed, measured)."
 
 duration: 30s

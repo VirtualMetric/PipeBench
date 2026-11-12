@@ -87,6 +87,9 @@ type CatalogEntry struct {
 	Name        string
 	Type        string
 	Description string
+	// Hidden cases are left out of the index, so the results page doesn't
+	// show them (case.yaml's hidden).
+	Hidden bool
 }
 
 // HardwareIndex is the list of subjects present for one hardware tier.
@@ -184,6 +187,9 @@ func BuildIndex(resultsDir string, catalog []CatalogEntry) (*IndexData, error) {
 	}
 	for t := range testSet {
 		ce := catalogByName[t]
+		if ce.Hidden {
+			continue
+		}
 		idx.Tests = append(idx.Tests, IndexEntry{
 			Test:        t,
 			Type:        ce.Type,
