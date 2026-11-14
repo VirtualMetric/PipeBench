@@ -39,28 +39,50 @@ func TestValidateClusterScenarioAcceptsAValidCase(t *testing.T) {
 	}
 }
 
+func TestValidateClusterScenarioAcceptsARedisWitness(t *testing.T) {
+	tc := validScenarioCase()
+	tc.Cluster.Scenario.Witness = "redis"
+	tc.Endpoints = []Endpoint{{Name: "redis", Image: "redis:7-alpine", Healthcheck: &EndpointHealthcheck{Test: "redis-cli ping"}}}
+	tc.Cluster.Scenario.Steps = append(tc.Cluster.Scenario.Steps, ScenarioStep{Do: "witness_restart"})
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+}
+
 func TestValidateClusterScenarioRejects(t *testing.T) {
 	cases := map[string]struct {
 		edit func(tc *TestCase)
 		want string
 	}{
-		"unknown action":          {func(tc *TestCase) { tc.Cluster.Scenario.Steps[0].Do = "explode" }, "unknown action"},
-		"forgotten node name":     {func(tc *TestCase) { tc.Cluster.Scenario.Steps[4].Node = "@ghost" }, "was not remembered"},
-		"node out of range":       {func(tc *TestCase) { tc.Cluster.Scenario.Steps[2].Node = "9" }, "node must be"},
-		"recover without wrapper": {func(tc *TestCase) { tc.Cluster.Scenario.NodeArgs = false }, "node_args"},
-		"bad recover":             {func(tc *TestCase) { tc.Cluster.Scenario.Steps[4].Recover = "maybe" }, "recover must be"},
-		"bad duration":            {func(tc *TestCase) { tc.Cluster.Scenario.Steps[0].Within = "soon" }, "within"},
-		"scale past spares":       {func(tc *TestCase) { tc.Cluster.Scenario.Steps[5].Nodes = 5 }, "nodes must be between"},
-		"sleep without for":       {func(tc *TestCase) { tc.Cluster.Scenario.Steps[6].For = "" }, "needs for"},
-		"wrong generator":         {func(tc *TestCase) { tc.Generator.Mode = "tcp" }, "http_ack"},
-		"too much load":           {func(tc *TestCase) { tc.Generator.Connections = 3 }, "lines a second"},
-		"implicit workers":        {func(tc *TestCase) { tc.Generator.Connections = 0 }, "explicitly"},
-		"no steps":                {func(tc *TestCase) { tc.Cluster.Scenario.Steps = nil }, "requires cluster.scenario.steps"},
-		"witness without store":   {func(tc *TestCase) { tc.Cluster.Scenario.Witness = "azure" }, "azure:"},
+		"unknown action":                     {func(tc *TestCase) { tc.Cluster.Scenario.Steps[0].Do = "explode" }, "unknown action"},
+		"forgotten node name":                {func(tc *TestCase) { tc.Cluster.Scenario.Steps[4].Node = "@ghost" }, "was not remembered"},
+		"node out of range":                  {func(tc *TestCase) { tc.Cluster.Scenario.Steps[2].Node = "9" }, "node must be"},
+		"recover without wrapper":            {func(tc *TestCase) { tc.Cluster.Scenario.NodeArgs = false }, "node_args"},
+		"bad recover":                        {func(tc *TestCase) { tc.Cluster.Scenario.Steps[4].Recover = "maybe" }, "recover must be"},
+		"bad duration":                       {func(tc *TestCase) { tc.Cluster.Scenario.Steps[0].Within = "soon" }, "within"},
+		"scale past spares":                  {func(tc *TestCase) { tc.Cluster.Scenario.Steps[5].Nodes = 5 }, "nodes must be between"},
+		"sleep without for":                  {func(tc *TestCase) { tc.Cluster.Scenario.Steps[6].For = "" }, "needs for"},
+		"wrong generator":                    {func(tc *TestCase) { tc.Generator.Mode = "tcp" }, "http_ack"},
+		"too much load":                      {func(tc *TestCase) { tc.Generator.Connections = 3 }, "lines a second"},
+		"implicit workers":                   {func(tc *TestCase) { tc.Generator.Connections = 0 }, "explicitly"},
+		"no steps":                           {func(tc *TestCase) { tc.Cluster.Scenario.Steps = nil }, "requires cluster.scenario.steps"},
+		"witness without store":              {func(tc *TestCase) { tc.Cluster.Scenario.Witness = "azure" }, "azure:"},
+		"redis witness without its endpoint": {func(tc *TestCase) { tc.Cluster.Scenario.Witness = "redis" }, "endpoint named redis"},
+		"redis witness with no healthcheck": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Witness = "redis"
+			tc.Endpoints = []Endpoint{{Name: "redis", Image: "redis:7-alpine"}}
+		}, "endpoint named redis"},
+		"witness restart with no witness": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Steps = append(tc.Cluster.Scenario.Steps, ScenarioStep{Do: "witness_restart"})
+		}, "no witness"},
+		"witness restart of a directory": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Witness = "dir"
+			tc.Cluster.Scenario.Steps = append(tc.Cluster.Scenario.Steps, ScenarioStep{Do: "witness_restart"})
+		}, "no store to restart"},
 		"undeclared proxy": {func(tc *TestCase) {
 			tc.Cluster.Scenario.Steps = append(tc.Cluster.Scenario.Steps, ScenarioStep{Do: "proxy_latency", Proxy: "witness", Latency: "200ms"})
 		}, "not declared"},
-		"action from the other driver": {func(tc *TestCase) { tc.Cluster.Action = "restart_leader" }, "belong to director_cluster_correctness"},
+		"action from the other driver": {func(tc *TestCase) { tc.Cluster.Action = "restart_leader" }, "belongs to director_cluster_correctness"},
 		"relative witness dir":         {func(tc *TestCase) { tc.Cluster.Scenario.WitnessDir = "witness" }, "absolute path"},
 		"witness dir with a space":     {func(tc *TestCase) { tc.Cluster.Scenario.WitnessDir = "/wit ness" }, "absolute path"},
 		"witness dir with a colon":     {func(tc *TestCase) { tc.Cluster.Scenario.WitnessDir = "/witness:rw" }, "absolute path"},
@@ -315,6 +337,15 @@ func TestValidateClusterScenarioAcceptsExpectArrived(t *testing.T) {
 	if err := shared.Validate(); err != nil {
 		t.Fatalf("Validate with a share: %v", err)
 	}
+	// A count judged on each side apart.
+	counted := expectArrivedCase()
+	counted.Cluster.Scenario.Expect.Receivers["a"] = ScenarioReceiverExpect{
+		MaxLoss:     int64p(2000),
+		CountedLoss: &CountedLoss{Pattern: `\((\d+) records`, MaxUnderPct: float64p(1), MaxOver: int64p(2500)},
+	}
+	if err := counted.Validate(); err != nil {
+		t.Fatalf("Validate with a count judged on each side: %v", err)
+	}
 	// A case with one receiver counts at it without naming it.
 	tc := validScenarioCase()
 	tc.Cluster.Scenario.Steps = append(tc.Cluster.Scenario.Steps,
@@ -359,6 +390,18 @@ func TestValidateClusterScenarioRejectsBadReceiverExpectations(t *testing.T) {
 		"an entry without a limit": {func(tc *TestCase) {
 			tc.Cluster.Scenario.Expect.Receivers["a"] = ScenarioReceiverExpect{}
 		}, "expect.receivers.a sets no limit"},
+		"max_under_pct without max_over": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Expect.Receivers["b"] = ScenarioReceiverExpect{CountedLoss: &CountedLoss{Pattern: `(\d+)`, MaxUnderPct: float64p(1)}}
+		}, "max_under_pct and max_over go together"},
+		"max_gap_pct beside the two sides": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Expect.Receivers["b"] = ScenarioReceiverExpect{CountedLoss: &CountedLoss{Pattern: `(\d+)`, MaxGapPct: 10, MaxUnderPct: float64p(1), MaxOver: int64p(5)}}
+		}, "set max_gap_pct, or max_under_pct and max_over, not both"},
+		"max_under_pct above 100": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Expect.Receivers["b"] = ScenarioReceiverExpect{CountedLoss: &CountedLoss{Pattern: `(\d+)`, MaxUnderPct: float64p(101), MaxOver: int64p(0)}}
+		}, "max_under_pct must be between 0 and 100"},
+		"a negative max_over": {func(tc *TestCase) {
+			tc.Cluster.Scenario.Expect.Receivers["b"] = ScenarioReceiverExpect{CountedLoss: &CountedLoss{Pattern: `(\d+)`, MaxUnderPct: float64p(1), MaxOver: int64p(-1)}}
+		}, "max_over must be 0 or more"},
 		"expect_arrived without a window":       {func(tc *TestCase) { last(tc).SentAfter = "" }, "needs sent_after and sent_before"},
 		"expect_arrived naming an unknown mark": {func(tc *TestCase) { last(tc).SentBefore = "later" }, `names mark "later", which no earlier step sets`},
 		"expect_arrived with one mark twice":    {func(tc *TestCase) { last(tc).SentAfter = "early_end" }, "the window is empty"},
@@ -416,6 +459,10 @@ expect:
     b:
       max_loss: 200000
       min_loss: 1
+      counted_loss:
+        pattern: '\((\d+) records'
+        max_under_pct: 1
+        max_over: 2500
 `), &sc)
 	if err != nil {
 		t.Fatalf("Unmarshal: %v", err)
@@ -427,5 +474,105 @@ expect:
 	b := sc.Expect.Receivers["b"]
 	if b.MaxLoss == nil || *b.MaxLoss != 200000 || b.MinLoss == nil || *b.MinLoss != 1 || b.MaxDuplicates != nil {
 		t.Fatalf("expect.receivers.b = %+v", b)
+	}
+	if c := b.CountedLoss; c == nil || !c.OneSided() || *c.MaxUnderPct != 1 || *c.MaxOver != 2500 || c.MaxGapPct != 0 {
+		t.Fatalf("expect.receivers.b.counted_loss = %+v", c)
+	}
+}
+
+// TestValidateLoadPause checks the pause_load and resume_load steps: the load
+// must run to be paused and be paused to be resumed, no step may count its
+// lines while it is paused, and a case may not end with it paused.
+func TestValidateLoadPause(t *testing.T) {
+	withSteps := func(steps ...ScenarioStep) *TestCase {
+		tc := validScenarioCase()
+		tc.Cluster.Scenario.Steps = append([]ScenarioStep{{Do: "wait_ready"}, {Do: "start_load"}}, steps...)
+		return tc
+	}
+	good := withSteps(
+		ScenarioStep{Do: "pause_load"},
+		ScenarioStep{Do: "sleep", For: "5s"},
+		ScenarioStep{Do: "stop", Node: "1"},
+		ScenarioStep{Do: "start", Node: "1"},
+		ScenarioStep{Do: "resume_load"},
+		ScenarioStep{Do: "expect_writes_continue", For: "30s", Gap: "10s"},
+	)
+	if err := good.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	bad := map[string]struct {
+		tc   *TestCase
+		want string
+	}{
+		"resume without a pause": {withSteps(ScenarioStep{Do: "resume_load"}), "no earlier pause_load"},
+		"two pauses":             {withSteps(ScenarioStep{Do: "pause_load"}, ScenarioStep{Do: "pause_load"}, ScenarioStep{Do: "resume_load"}), "paused already"},
+		"paused at the end":      {withSteps(ScenarioStep{Do: "pause_load"}), "never ends"},
+		"a count while paused": {withSteps(ScenarioStep{Do: "pause_load"}, ScenarioStep{Do: "wait_delivery"}, ScenarioStep{Do: "resume_load"}),
+			"while a pause_load step has paused the load"},
+		"a writes check while paused": {withSteps(ScenarioStep{Do: "pause_load"}, ScenarioStep{Do: "expect_writes_stop"}, ScenarioStep{Do: "resume_load"}),
+			"while a pause_load step has paused the load"},
+	}
+	for name, c := range bad {
+		err := c.tc.Validate()
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: Validate = %v, want an error with %q", name, err, c.want)
+		}
+	}
+	// A case without the load has nothing to pause.
+	noLoad := rowsScenarioCase()
+	noLoad.Cluster.Scenario.Steps = append(noLoad.Cluster.Scenario.Steps, ScenarioStep{Do: "pause_load"}, ScenarioStep{Do: "resume_load"})
+	if err := noLoad.validateClusterScenario(); err == nil || !strings.Contains(err.Error(), "has no generator") {
+		t.Errorf("Validate without a generator = %v, want the generator error", err)
+	}
+}
+
+// TestValidateWaitVersion checks the wait_version step: it needs a version, and
+// only it takes one.
+func TestValidateWaitVersion(t *testing.T) {
+	withStep := func(st ScenarioStep) *TestCase {
+		tc := validScenarioCase()
+		tc.Cluster.Scenario.Steps = []ScenarioStep{{Do: "wait_ready"}, {Do: "start_load"}, st}
+		return tc
+	}
+	if err := withStep(ScenarioStep{Do: "wait_version", Version: "2.7.0", Within: "600s"}).Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	for name, c := range map[string]struct {
+		st   ScenarioStep
+		want string
+	}{
+		"no version":           {ScenarioStep{Do: "wait_version"}, "needs version"},
+		"a version on a sleep": {ScenarioStep{Do: "sleep", For: "1s", Version: "2.7.0"}, "version only applies to wait_version"},
+	} {
+		err := withStep(c.st).Validate()
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: Validate = %v, want an error with %q", name, err, c.want)
+		}
+	}
+}
+
+// TestValidateSetStage checks the set_stage step: it needs a stage of 1 or
+// more, and only it takes one.
+func TestValidateSetStage(t *testing.T) {
+	withStep := func(st ScenarioStep) *TestCase {
+		tc := validScenarioCase()
+		tc.Cluster.Scenario.Steps = []ScenarioStep{{Do: "wait_ready"}, {Do: "start_load"}, st}
+		return tc
+	}
+	if err := withStep(ScenarioStep{Do: "set_stage", Stage: 2}).Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	for name, c := range map[string]struct {
+		st   ScenarioStep
+		want string
+	}{
+		"no stage":           {ScenarioStep{Do: "set_stage"}, "needs stage"},
+		"a stage on a sleep": {ScenarioStep{Do: "sleep", For: "1s", Stage: 2}, "stage only applies to set_stage"},
+		"a stage below one":  {ScenarioStep{Do: "set_stage", Stage: -1}, "needs stage"},
+	} {
+		err := withStep(c.st).Validate()
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: Validate = %v, want an error with %q", name, err, c.want)
+		}
 	}
 }

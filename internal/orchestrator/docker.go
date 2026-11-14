@@ -168,8 +168,39 @@ networks:
 
 volumes:
   shared-data:
+{{- if .SharedDirMount }}
+  shared-dir:
+{{- end }}
 {{- if .WitnessDirMount }}
   witness-dir:
+{{- if eq .ShareServer "smb" }}
+    # The share on the Samba server, mounted by Docker in the host's kernel
+    # over SMB 3.1.1, for the director's user (uid 100, gid 101). The server
+    # has a fixed address, because the host's kernel cannot resolve a
+    # service's name. The password is the harness's constant, not a secret.
+    driver: local
+    driver_opts:
+      type: cifs
+      device: "//{{ .ShareServerIP }}/share"
+      o: "addr={{ .ShareServerIP }},username=bench,password=bench,vers=3.1.1,uid=100,gid=101,file_mode=0660,dir_mode=0770,nobrl"
+{{- else if eq .ShareServer "nfs" }}
+    # The share on the NFS server, mounted by Docker in the host's kernel over
+    # NFS 4.2, at the server's fixed address
+    driver: local
+    driver_opts:
+      type: nfs
+      device: ":/"
+      o: "addr={{ .ShareServerIP }},nfsvers=4.2,rw,hard"
+{{- end }}
+{{- end }}
+{{- if eq .ShareServer "nfs" }}
+  # The NFS server's export: the kernel exports no overlay file system
+  share-export:
+{{- end }}
+{{- range .Subjects }}
+{{- if .Volume }}
+  {{ .Volume }}:
+{{- end }}
 {{- end }}
 
 services:
@@ -177,7 +208,7 @@ services:
 {{- if .Subjects }}
 {{- range .Subjects }}
   {{ .Hostname }}:
-    image: "{{ $.SubjectImage }}"
+    image: "{{ if .Image }}{{ .Image }}{{ else }}{{ $.SubjectImage }}{{ end }}"
     container_name: "{{ .Container }}"
     hostname: "{{ .Hostname }}"
     networks: [bench]
@@ -217,12 +248,18 @@ services:
 {{- if $.WitnessDirMount }}
       - "witness-dir:{{ $.WitnessDirMount }}"
 {{- end }}
+{{- if $.SharedDirMount }}
+      - "shared-dir:{{ $.SharedDirMount }}"
+{{- end }}
 {{- if .DiskPath }}
       - type: tmpfs
         target: "{{ .DiskPath }}"
         tmpfs:
           size: {{ .DiskSizeBytes }}
           mode: 01777
+{{- end }}
+{{- if .Volume }}
+      - "{{ .Volume }}:{{ .VolumePath }}"
 {{- end }}
 {{- if $.SubjectUser }}
     user: "{{ $.SubjectUser }}"
@@ -720,7 +757,7 @@ services:
       COLLECTOR_OUTPUT: "/results/metrics.csv"
 {{- template "helperLimits" $ }}
     restart: "no"
-{{- if .WitnessDirMount }}
+{{- if and .WitnessDirMount (not .ShareServer) }}
 
   # One-shot: make the shared witness directory writable for the director,
   # which runs as a non-root user, before any node starts. Reuses the subject
@@ -740,6 +777,35 @@ services:
       WITNESS_DIR: "{{ .WitnessDirMount }}"
     volumes:
       - "witness-dir:{{ .WitnessDirMount }}"
+    restart: "no"
+{{- end }}
+{{- if .ShareServer }}
+
+  # The server of the replicas' share: Samba, or the kernel's NFS server. It
+  # has a fixed address, because Docker mounts the share in the host's kernel,
+  # which cannot resolve a service's name. It is privileged to load the
+  # kernel's cifs, nfs and nfsd modules from the host's /lib/modules, and the
+  # NFS server also runs in the host's kernel. The share mounts with the
+  # director's user and modes, so it needs no witness-init.
+  share-server:
+    image: "{{ .ShareServerImage }}"
+    container_name: "bench-share-server"
+    hostname: "share-server"
+    privileged: true
+    networks:
+      bench:
+        ipv4_address: "{{ .ShareServerIP }}"
+    volumes:
+      - "/lib/modules:/lib/modules:ro"
+{{- if eq .ShareServer "nfs" }}
+      - "share-export:/export"
+{{- end }}
+    healthcheck:
+      test: ["CMD", "test", "-f", "/run/share-ready"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+{{- template "helperLimits" $ }}
     restart: "no"
 {{- end }}
 {{- if .ToxiproxyEnabled }}
@@ -831,6 +897,10 @@ services:
     container_name: "bench-{{ .Name }}"
     hostname: "{{ .Name }}"
     networks: [bench]
+{{- if .MountsSharedDir }}
+    volumes:
+      - "shared-dir:{{ $.SharedDirMount }}"
+{{- end }}
 {{- if .Command }}
     command: {{ .Command }}
 {{- end }}
@@ -1601,11 +1671,24 @@ func (r *ComposeRunner) RestartServices(services ...string) error {
 // RecreateServices replaces the named services with new containers, without
 // touching their dependencies. A container platform that replaces a replica
 // starts it on an empty disk, which `docker start` of the old container would
-// not do: whatever the replica keeps must come back from elsewhere.
+// not do: whatever the replica keeps must come back from elsewhere. Compose
+// hands a recreated container its old anonymous volumes unless it is told not to,
+// so --renew-anon-volumes is what makes that disk empty.
 func (r *ComposeRunner) RecreateServices(services ...string) error {
 	resolved := r.resolveServiceAliases(services)
-	args := append([]string{"up", "-d", "--quiet-pull", "--no-deps", "--force-recreate"}, resolved...)
+	args := append([]string{"up", "-d", "--quiet-pull", "--no-deps", "--force-recreate", "--renew-anon-volumes"}, resolved...)
 	return r.compose(args...)
+}
+
+// RecreateServiceWithImage sets the service's image in the compose file, in
+// place, and replaces the service's container with one from that image. The
+// compose file then names the image the service runs now, so any later `up`
+// of the service keeps it.
+func (r *ComposeRunner) RecreateServiceWithImage(service, image string) error {
+	if err := setComposeServiceImage(r.composeFile, service, image); err != nil {
+		return err
+	}
+	return r.RecreateServices(service)
 }
 
 // resolveServiceAliases expands the logical names "generator" and "receiver"
@@ -1655,6 +1738,17 @@ func (r *ComposeRunner) KillServices(services ...string) error {
 	defer cancel()
 	resolved := r.resolveServiceAliases(services)
 	args := append([]string{"kill", "-s", "SIGKILL"}, resolved...)
+	return r.composeCtx(ctx, args...)
+}
+
+// RemoveServices removes the containers of the services, with their anonymous
+// volumes and whatever they wrote to their own filesystem. The next UpServices
+// creates new ones, on an empty disk.
+func (r *ComposeRunner) RemoveServices(services ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	resolved := r.resolveServiceAliases(services)
+	args := append([]string{"rm", "--force", "--stop", "--volumes"}, resolved...)
 	return r.composeCtx(ctx, args...)
 }
 
@@ -1906,6 +2000,8 @@ type endpointTpl struct {
 	Image   string
 	Env     map[string]string
 	Command string // pre-formatted YAML list, empty = use the image's default
+	// MountsSharedDir mounts the shared directory of a cluster scenario.
+	MountsSharedDir bool
 	// Healthcheck (optional): when HasHealthcheck is set, the endpoint gets a
 	// compose healthcheck and the subject gates on it (service_healthy).
 	HasHealthcheck bool
@@ -1935,6 +2031,19 @@ type clusterNode struct {
 	// size-limited tmpfs at DiskPath (cluster.scenario.node_disk).
 	DiskPath      string
 	DiskSizeBytes int64
+	// Image is the image the node starts on when it is not the image under
+	// test (cluster.scenario.start_image). Empty means the image under test.
+	Image string
+	// Volume names a Docker volume of the node's own, mounted at VolumePath
+	// (cluster.scenario.node_volume). It outlives the node's container.
+	Volume     string
+	VolumePath string
+}
+
+// NodeVolumeName is the compose name of node n's volume
+// (cluster.scenario.node_volume).
+func NodeVolumeName(n int) string {
+	return fmt.Sprintf("node-%d-data", n)
 }
 
 // nodeDependency is one depends_on entry of every cluster node service.
@@ -2010,8 +2119,18 @@ type composeVars struct {
 	// and adds witness-init. NodeArgsEntrypoint replaces each node's
 	// entrypoint with the one-start-arguments wrapper. GenDeferred keeps the
 	// generator out of the initial `up` (profile "load").
-	NodeDependsOn       []nodeDependency
-	WitnessDirMount     string
+	NodeDependsOn   []nodeDependency
+	WitnessDirMount string
+	// SharedDirMount mounts one volume at this path on every node and on each
+	// endpoint that asks for it (cluster.scenario.shared_dir).
+	SharedDirMount string
+	// ShareServer, when set, serves the witness-dir volume from a Samba
+	// ("smb") or an NFS ("nfs") server, the share-server service at
+	// ShareServerIP, instead of keeping it on the host's disk
+	// (sharedstate_compose.go). The volume then needs no witness-init.
+	ShareServer         string
+	ShareServerImage    string
+	ShareServerIP       string
 	NodeArgsEntrypoint  string
 	GenDeferred         bool
 	ToxiproxyEnabled    bool
@@ -2349,6 +2468,13 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 				return fmt.Errorf("cluster.scenario.node_disk.size %q: %w", disk.Size, err)
 			}
 			node.DiskPath, node.DiskSizeBytes = disk.Path, size
+		}
+		if tc.Cluster != nil && tc.Cluster.Scenario != nil {
+			sc := tc.Cluster.Scenario
+			node.Image = sc.StartImage
+			if sc.NodeVolume != "" {
+				node.Volume, node.VolumePath = NodeVolumeName(i), sc.NodeVolume
+			}
 		}
 		clusterNodes = append(clusterNodes, node)
 	}
@@ -2954,10 +3080,11 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 			env[k] = strings.ReplaceAll(v, "$", "$$")
 		}
 		et := endpointTpl{
-			Name:    ep.Name,
-			Image:   ep.Image,
-			Env:     env,
-			Command: formatYAMLList(cmd),
+			Name:            ep.Name,
+			Image:           ep.Image,
+			Env:             env,
+			Command:         formatYAMLList(cmd),
+			MountsSharedDir: ep.MountsSharedDir,
 		}
 		if hc := ep.Healthcheck; hc != nil && hc.Test != "" {
 			et.HasHealthcheck = true

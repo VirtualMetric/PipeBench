@@ -191,6 +191,7 @@ type seqCheckResult struct {
 	Unique         int64    `json:"unique"`
 	Duplicates     int64    `json:"duplicates"`
 	Unparsed       int64    `json:"unparsed"`
+	Cut            int64    `json:"cut"`
 	UnexpectedConn []string `json:"unexpected_conns,omitempty"`
 	Conns          map[string]struct {
 		Acked         int64      `json:"acked"`
@@ -281,6 +282,8 @@ type scenarioRun struct {
 	// the nodes whose disk a fill_disk step filled.
 	links  *linkFaults
 	filled map[int]bool
+	// slowed holds the disk limits slow_disk steps put in force, by node.
+	slowed map[int]diskLimit
 
 	names        map[string]int
 	disconnected map[int]bool
@@ -309,6 +312,17 @@ type scenarioRun struct {
 
 	imageID     string
 	imageLabels map[string]string
+
+	// loadPaused says whether a pause_load step froze the load.
+	loadPaused bool
+	// stage is the stage the members' configs are rendered at
+	// ({{@.Stage@}}): 1 at the start, then what a set_stage step sets.
+	stage int
+
+	// nodeImage is the image each node runs now, and images every image a
+	// node ran, with the step that moved it there (start_image and image).
+	nodeImage map[int]string
+	images    []scenarioImage
 }
 
 // scenarioReceiver is one receiver of a scenario run: the case's one
@@ -463,7 +477,11 @@ func (r *Runner) runClusterScenario(tc *config.TestCase, subject config.Subject)
 		tmpDir: tmpDir, configSrc: srcCfg, receivers: recvs, recvPort: recvs[0].Port,
 		names: map[string]int{}, disconnected: map[int]bool{}, down: map[int]bool{}, measures: map[string]float64{},
 		counts: map[string]int64{}, imageID: imageID, imageLabels: imageLabels, filled: map[int]bool{},
+		nodeImage: map[int]string{}, slowed: map[int]diskLimit{}, stage: 1,
 	}
+	// The logs of the containers a step replaces belong to this run only.
+	replacedLogs.reset()
+	defer replacedLogs.reset()
 	for i := 1; i <= tc.Cluster.Nodes; i++ {
 		sr.active[i] = true
 	}
@@ -475,6 +493,7 @@ func (r *Runner) runClusterScenario(tc *config.TestCase, subject config.Subject)
 	}
 	sr.upAt = time.Now()
 	sr.lastDisruption = sr.upAt
+	sr.noteStartImages()
 	sr.network = containerNetwork(containers[0])
 	sr.links = newLinkFaults(r.opts.NettoolImage, sr.network)
 	// Whatever happens, no link fault or full disk outlives the run: with
@@ -551,6 +570,7 @@ func (r *Runner) runClusterScenario(tc *config.TestCase, subject config.Subject)
 		DurationSec:     time.Since(startTime).Seconds(),
 		LinesIn:         report.Acked,
 		LinesOut:        report.Received,
+		CutLines:        report.CutLines,
 		UniqueOut:       report.Unique,
 		LatencyP50Ms:    report.Latency.P50Ms,
 		LatencyP95Ms:    report.Latency.P95Ms,
@@ -646,6 +666,11 @@ func describeStepArgs(st config.ScenarioStep) string {
 	add("loss", st.Loss)
 	add("jitter", st.Jitter)
 	add("leave", st.Leave)
+	add("image", st.Image)
+	add("disk_bps", st.DiskBPS)
+	if st.DiskIOPS != 0 {
+		add("disk_iops", strconv.Itoa(st.DiskIOPS))
+	}
 	if st.OneWay {
 		add("one_way", "true")
 	}
@@ -661,6 +686,9 @@ func describeStepArgs(st config.ScenarioStep) string {
 	}
 	if st.Nodes > 0 {
 		add("nodes", strconv.Itoa(st.Nodes))
+	}
+	if st.Stage > 0 {
+		add("stage", strconv.Itoa(st.Stage))
 	}
 	if len(parts) == 0 {
 		return ""
@@ -691,11 +719,65 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		leader, _ := agreedLeader(round)
 		return true, fmt.Sprintf("healthy after %s, leader node %d", fmtMs(ms), leader), nil
 
+	case "expect_cluster_ip":
+		// The node that leads holds the cluster IP, and no other member does. With
+		// for, that has to last, so that a member that takes it up late fails.
+		within := st.DurationOr("within", 60*time.Second)
+		hold := st.DurationOr("for", 0)
+		waited := time.Now()
+		ip := sr.tc.Cluster.IP
+		var holders []int
+		leaderAlone := func(r healthRound) bool {
+			leader, agreed := agreedLeader(r)
+			if !agreed {
+				return false
+			}
+			holders = sr.clusterIPHolders(ip)
+			return len(holders) == 1 && holders[0] == leader
+		}
+		round, ok, err := sr.waitRound(within, leaderAlone)
+		if err != nil {
+			return false, "", err
+		}
+		if !ok {
+			return false, fmt.Sprintf("the leader alone did not hold the cluster IP %s within %s: nodes %v hold it, %s", ip, within, holders, describeRound(round)), nil
+		}
+		ms := time.Since(waited).Milliseconds()
+		sr.record(st.Record, float64(ms))
+		for end := time.Now().Add(hold); time.Now().Before(end); {
+			if err := sleepCtx(sr.ctx, time.Second); err != nil {
+				return false, "", fmt.Errorf("interrupted: %w", err)
+			}
+			r, have := sr.probe.latest()
+			if have && !leaderAlone(r) {
+				return false, fmt.Sprintf("the leader alone held the cluster IP %s after %s, but not for %s: nodes %v hold it, %s", ip, fmtMs(ms), hold, holders, describeRound(r)), nil
+			}
+		}
+		return true, fmt.Sprintf("the leader, node %d, alone holds the cluster IP %s, after %s", holders[0], ip, fmtMs(ms)), nil
+
+	case "wait_copies":
+		// Every stream has all its copies, as its leader reports them
+		within := st.DurationOr("within", 120*time.Second)
+		waited := time.Now()
+		round, ok, err := sr.waitRound(within, func(r healthRound) bool { return sr.healthy(r) && copiesComplete(r) })
+		if err != nil {
+			return false, "", err
+		}
+		if !ok {
+			return false, fmt.Sprintf("the streams did not have all their copies within %s: %s", within, describeCopies(round)), nil
+		}
+		ms := time.Since(waited).Milliseconds()
+		sr.record(st.Record, float64(ms))
+		return true, fmt.Sprintf("every stream has all its copies, after %s", fmtMs(ms)), nil
+
 	case "start_load":
 		if err := sr.startLoad(); err != nil {
 			return false, "", err
 		}
 		return true, "load started", nil
+
+	case "pause_load", "resume_load":
+		return sr.pauseLoad(st.Do == "pause_load")
 
 	case "sleep":
 		if err := sleepCtx(sr.ctx, st.DurationOr("for", 0)); err != nil {
@@ -712,6 +794,9 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 
 	case "cut_link", "shape_link", "restore_link", "split":
 		return sr.linkAction(i, st, rep)
+
+	case "slow_disk", "restore_disk":
+		return sr.slowDiskAction(i, st, rep)
 
 	case "fill_disk", "free_disk":
 		return sr.diskAction(i, st, rep)
@@ -962,6 +1047,9 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 	case "witness_down", "witness_up":
 		return sr.witnessAction(i, st)
 
+	case "witness_restart":
+		return sr.witnessRestart(i, st)
+
 	case "proxy_latency", "proxy_down", "proxy_up":
 		return sr.proxyAction(i, st)
 
@@ -984,6 +1072,9 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 
 	case "scale_to":
 		return sr.scaleTo(i, st)
+
+	case "set_stage":
+		return sr.setStage(i, st)
 
 	case "rolling_restart":
 		return sr.rollingRestart(i, st)
@@ -1130,6 +1221,9 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 				return false, "", fmt.Errorf("interrupted: %w", err)
 			}
 		}
+
+	case "wait_version":
+		return sr.waitVersion(st)
 
 	case "wait_log":
 		within := st.DurationOr("within", 120*time.Second)
@@ -1279,12 +1373,35 @@ func (sr *scenarioRun) nodeAction(i int, st config.ScenarioStep, rep *scenarioSt
 		}
 		sr.disrupt(i, "start", n)
 		delete(sr.down, n)
-		if st.EmptyDisk {
+		if st.Image != "" {
+			detail, failure := sr.moveNodeToImage(i, n, st.Image)
+			if failure != "" {
+				_ = os.Remove(argsFile)
+				return false, failure, nil
+			}
+			sr.active[n] = true
+			sr.relink(n)
+			if st.Recover == "" {
+				return true, detail, nil
+			}
+			// A start with image and recover goes on below, to check that the
+			// node took -recover.
+		} else if st.EmptyDisk {
 			// A new container from the same service starts on an empty disk, as
 			// a node whose disk was replaced does. The director image declares
 			// no volume, so its storage lives in the container. The step checks
 			// that the container really is a new one: the old one would start
 			// on its old disk.
+			//
+			// Docker drops the old container's log with the container, and that
+			// log is the only record of what the node did up to its kill. So the
+			// step fails rather than go on without it.
+			out, logErr := exec.Command("docker", "logs", "-t", c).CombinedOutput()
+			if logErr != nil {
+				_ = os.Remove(argsFile)
+				return false, fmt.Sprintf("could not keep node %d's log before replacing its container: %v: %s", n, logErr, strings.TrimSpace(string(out))), nil
+			}
+			replacedLogs.keep(c, keptLog{Step: i, Image: sr.nodeImage[n], Text: string(out)})
 			oldID := containerID(sr.ctx, c)
 			if err := sr.orch.RecreateServices(fmt.Sprintf("subject-%d", n)); err != nil {
 				_ = os.Remove(argsFile)
@@ -1445,15 +1562,35 @@ func (sr *scenarioRun) healthy(r healthRound) bool {
 	return checked > 0 && len(leaders) <= 1
 }
 
+// clusterIPHolders lists the cluster's members that hold ip now. A member that a
+// step took out of service holds nothing that a client can reach.
+func (sr *scenarioRun) clusterIPHolders(ip string) []int {
+	var holders []int
+	for n := range sr.active {
+		if !sr.down[n] && nodeHasClusterIP(sr.containers[n-1], ip) {
+			holders = append(holders, n)
+		}
+	}
+	sort.Ints(holders)
+	return holders
+}
+
 // waitRound waits for a round that satisfies ok, reading the prober's
-// newest round twice a second.
+// newest round twice a second. Only a round that began after the last
+// disruption counts.
 func (sr *scenarioRun) waitRound(within time.Duration, ok func(healthRound) bool) (healthRound, bool, error) {
+	return sr.waitRoundAfter(sr.lastDisruption, within, ok)
+}
+
+// waitRoundAfter waits for a round that began after since and satisfies ok,
+// reading the prober's newest round twice a second.
+func (sr *scenarioRun) waitRoundAfter(since time.Time, within time.Duration, ok func(healthRound) bool) (healthRound, bool, error) {
 	deadline := time.Now().Add(within)
 	var last healthRound
 	for {
 		if r, have := sr.probe.latest(); have {
 			last = r
-			if r.At.After(sr.lastDisruption) && ok(r) {
+			if r.At.After(since) && ok(r) {
 				return r, true, nil
 			}
 		}
@@ -1482,6 +1619,32 @@ func (sr *scenarioRun) startLoad() error {
 	}
 	sr.loadStarted = time.Now()
 	return nil
+}
+
+// pauseLoad freezes the load's containers (docker pause), or lets them go
+// on. A frozen client sends nothing, and the answer to a post it sent just
+// before the pause waits until it runs again. A case pauses the load so that
+// a node a step stops next holds no record it took in a moment before: a
+// stop then shows what the node keeps of its queues, not what it does with
+// the records of its last moment.
+func (sr *scenarioRun) pauseLoad(pause bool) (bool, string, error) {
+	if sr.loadStarted.IsZero() {
+		return false, "the load has not started", nil
+	}
+	verb := "unpause"
+	if pause {
+		verb = "pause"
+	}
+	for _, c := range sr.orch.GeneratorContainers() {
+		if err := dockerCmd(sr.ctx, 30*time.Second, verb, c); err != nil {
+			return false, fmt.Sprintf("docker %s %s: %v", verb, c, err), nil
+		}
+	}
+	sr.loadPaused = pause
+	if pause {
+		return true, "the load is paused", nil
+	}
+	return true, "the load goes on", nil
 }
 
 func (sr *scenarioRun) witnessAction(i int, st config.ScenarioStep) (bool, string, error) {
@@ -1523,10 +1686,7 @@ func (sr *scenarioRun) witnessAction(i int, st config.ScenarioStep) (bool, strin
 				return true, "the witness proxy accepts connections again", nil
 			}
 		}
-		container := "bench-azurite"
-		if sr.sc.Witness == "s3" {
-			container = "bench-minio"
-		}
+		container := sr.witnessContainer()
 		verb := "unpause"
 		if down {
 			verb = "pause"
@@ -1536,6 +1696,32 @@ func (sr *scenarioRun) witnessAction(i int, st config.ScenarioStep) (bool, strin
 		}
 		return true, fmt.Sprintf("%sd %s", verb, container), nil
 	}
+}
+
+// witnessContainer names the container of the store that holds the witness.
+func (sr *scenarioRun) witnessContainer() string {
+	switch sr.sc.Witness {
+	case "s3":
+		return "bench-minio"
+	case "redis":
+		return "bench-redis"
+	}
+	return "bench-azurite"
+}
+
+// witnessRestart kills the witness store with SIGKILL and starts it again, as
+// in a crash of the store. The store keeps only what it had written to its disk,
+// so a later step that needs the record shows whether the record survived.
+func (sr *scenarioRun) witnessRestart(i int, st config.ScenarioStep) (bool, string, error) {
+	sr.disrupt(i, st.Do, 0)
+	container := sr.witnessContainer()
+	if err := dockerCmd(sr.ctx, 30*time.Second, "kill", "-s", "KILL", container); err != nil {
+		return false, fmt.Sprintf("docker kill %s: %v", container, err), nil
+	}
+	if err := dockerCmd(sr.ctx, 60*time.Second, "start", container); err != nil {
+		return false, fmt.Sprintf("docker start %s: %v", container, err), nil
+	}
+	return true, fmt.Sprintf("killed %s with SIGKILL and started it again", container), nil
 }
 
 func (sr *scenarioRun) proxyAction(i int, st config.ScenarioStep) (bool, string, error) {
@@ -1579,7 +1765,7 @@ func (sr *scenarioRun) scaleTo(i int, st config.ScenarioStep) (bool, string, err
 			continue
 		}
 		path := orchestrator.ClusterNodeConfigPath(sr.tmpDir, n)
-		if err := orchestrator.RenderClusterNodeConfig(sr.configSrc, path, n, target); err != nil {
+		if err := orchestrator.RenderClusterNodeConfig(sr.configSrc, path, n, target, sr.stage); err != nil {
 			return false, fmt.Sprintf("rendering node %d's config for %d nodes: %v", n, target, err), nil
 		}
 	}
@@ -1611,8 +1797,58 @@ func (sr *scenarioRun) scaleTo(i int, st config.ScenarioStep) (bool, string, err
 	return true, fmt.Sprintf("cluster %d → %d nodes (started %v, stopped %v)", prev, target, started, stopped), nil
 }
 
+// waitVersion waits until every node reports st.Version on /health, as nodes
+// that update themselves do one at a time. It records when each node first did,
+// so that the report shows the order and the gaps.
+func (sr *scenarioRun) waitVersion(st config.ScenarioStep) (bool, string, error) {
+	within := st.DurationOr("within", 600*time.Second)
+	start := time.Now()
+	first := map[int]time.Duration{}
+	round, ok, err := sr.waitRound(within, func(r healthRound) bool {
+		for _, h := range r.Nodes {
+			if _, seen := first[h.Node]; !seen && h.Reachable && h.Version == st.Version {
+				first[h.Node] = r.At.Sub(start)
+			}
+		}
+		return len(first) == len(sr.containers)
+	})
+	if err != nil {
+		return false, "", err
+	}
+	parts := make([]string, 0, len(first))
+	for n := 1; n <= len(sr.containers); n++ {
+		if d, seen := first[n]; seen {
+			sr.record(fmt.Sprintf("%s_node%d", defaultStr(st.Record, "version"), n), float64(d.Milliseconds()))
+			parts = append(parts, fmt.Sprintf("node %d after %s", n, fmtMs(d.Milliseconds())))
+		}
+	}
+	if !ok {
+		return false, fmt.Sprintf("%d of %d nodes reported version %s within %s (%s): %s", len(first), len(sr.containers), st.Version, within, strings.Join(parts, ", "), describeRound(round)), nil
+	}
+	return true, fmt.Sprintf("every node reports version %s: %s", st.Version, strings.Join(parts, ", ")), nil
+}
+
+// setStage renders every member's config again at another stage
+// ({{@.Stage@}}): a change of the cluster's settings, such as the platform
+// sends every member at once. Each director reads its changed config by
+// itself, within a second or so.
+func (sr *scenarioRun) setStage(i int, st config.ScenarioStep) (bool, string, error) {
+	sr.disrupt(i, fmt.Sprintf("stage %d→%d", sr.stage, st.Stage), 0)
+	for n := 1; n <= sr.size; n++ {
+		path := orchestrator.ClusterNodeConfigPath(sr.tmpDir, n)
+		if err := orchestrator.RenderClusterNodeConfig(sr.configSrc, path, n, sr.size, st.Stage); err != nil {
+			return false, fmt.Sprintf("rendering node %d's config at stage %d: %v", n, st.Stage, err), nil
+		}
+	}
+	prev := sr.stage
+	sr.stage = st.Stage
+	return true, fmt.Sprintf("the configs of the %d members moved from stage %d to stage %d", sr.size, prev, st.Stage), nil
+}
+
 // rollingRestart restarts every active node in turn, followers first and
-// the leader last, and waits for a healthy cluster after each.
+// the leader last, and waits for a healthy cluster after each. With image,
+// it stops each node cleanly and starts it on that image instead: a rolling
+// upgrade.
 func (sr *scenarioRun) rollingRestart(i int, st config.ScenarioStep) (bool, string, error) {
 	within := st.DurationOr("within", 180*time.Second)
 	grace := st.DurationOr("grace", 30*time.Second)
@@ -1632,12 +1868,25 @@ func (sr *scenarioRun) rollingRestart(i int, st config.ScenarioStep) (bool, stri
 	var lines []string
 	for _, n := range order {
 		start := time.Now()
-		sr.disrupt(i, "rolling restart", n)
-		if err := dockerCmd(sr.ctx, grace+60*time.Second, "restart", "-t", strconv.Itoa(int(grace.Seconds())), sr.containers[n-1]); err != nil {
-			return false, fmt.Sprintf("restarting node %d: %v", n, err), nil
+		label := "rolling restart"
+		if st.Image != "" {
+			label = "rolling move to " + sr.imageRef(st.Image)
+		}
+		sr.disrupt(i, label, n)
+		failure, err := sr.rollingNode(i, n, st, grace)
+		if err != nil {
+			return false, "", err
+		}
+		if failure != "" {
+			return false, failure, nil
 		}
 		sr.relink(n)
-		round, ok, err := sr.waitRound(within, func(r healthRound) bool { return sr.healthy(r) })
+		// Only a round that began once the node was back counts. The
+		// disruption is noted before the node stops, and a round read while
+		// it was stopping could still show every node healthy, with every
+		// copy.
+		back := time.Now()
+		round, ok, err := sr.waitRoundAfter(back, within, func(r healthRound) bool { return sr.healthy(r) })
 		if err != nil {
 			return false, "", err
 		}
@@ -1646,9 +1895,78 @@ func (sr *scenarioRun) rollingRestart(i int, st config.ScenarioStep) (bool, stri
 		if !ok {
 			return false, fmt.Sprintf("the cluster was not healthy within %s after restarting node %d: %s", within, n, describeRound(round)), nil
 		}
-		lines = append(lines, fmt.Sprintf("node %d %s", n, fmtMs(ms)))
+		line := fmt.Sprintf("node %d %s", n, fmtMs(ms))
+		if st.WaitCopies {
+			// Every stream has all its copies back before the next node stops
+			waited := time.Now()
+			round, ok, err := sr.waitRoundAfter(back, within, func(r healthRound) bool { return sr.healthy(r) && copiesComplete(r) })
+			if err != nil {
+				return false, "", err
+			}
+			copiesMs := time.Since(waited).Milliseconds()
+			sr.record(fmt.Sprintf("%s_node%d_copies", defaultStr(st.Record, "rolling_restart"), n), float64(copiesMs))
+			if !ok {
+				return false, fmt.Sprintf("the streams did not have all their copies back within %s after node %d restarted: %s", within, n, describeCopies(round)), nil
+			}
+			line += fmt.Sprintf(" (copies back %s later)", fmtMs(copiesMs))
+		}
+		lines = append(lines, line)
+	}
+	if st.Image != "" {
+		return true, fmt.Sprintf("moved to %s and healthy again: %s", sr.imageRef(st.Image), strings.Join(lines, ", ")), nil
 	}
 	return true, "restarted and healthy again: " + strings.Join(lines, ", "), nil
+}
+
+// loadPauseLead is how long a rolling_restart step with pause_load_at_stop
+// pauses the load before it stops a node: long enough for the node to hand on
+// the records it took in last.
+const loadPauseLead = 3 * time.Second
+
+// rollingNode stops node n and starts it again, on st.Image when the step
+// names one. With pause_load_at_stop the load is paused from a few seconds
+// before the stop until the node has stopped. It returns why it failed, or an
+// error when the run must stop.
+func (sr *scenarioRun) rollingNode(i, n int, st config.ScenarioStep, grace time.Duration) (string, error) {
+	c := sr.containers[n-1]
+	graceSecs := strconv.Itoa(int(grace.Seconds()))
+	if st.Image == "" && !st.PauseLoadAtStop {
+		if err := dockerCmd(sr.ctx, grace+60*time.Second, "restart", "-t", graceSecs, c); err != nil {
+			return fmt.Sprintf("restarting node %d: %v", n, err), nil
+		}
+		return "", nil
+	}
+	if st.PauseLoadAtStop {
+		if ok, detail, _ := sr.pauseLoad(true); !ok {
+			return "pausing the load before node " + strconv.Itoa(n) + " stops: " + detail, nil
+		}
+		if err := sleepCtx(sr.ctx, loadPauseLead); err != nil {
+			return "", fmt.Errorf("interrupted: %w", err)
+		}
+	}
+	stopErr := dockerCmd(sr.ctx, grace+30*time.Second, "stop", "-t", graceSecs, c)
+	why := ""
+	if stopErr == nil {
+		why = ungracefulStop(n, c, grace)
+	}
+	if st.PauseLoadAtStop {
+		if ok, detail, _ := sr.pauseLoad(false); !ok {
+			return "resuming the load after node " + strconv.Itoa(n) + " stopped: " + detail, nil
+		}
+	}
+	switch {
+	case stopErr != nil:
+		return fmt.Sprintf("docker stop %s: %v", c, stopErr), nil
+	case why != "":
+		return why, nil
+	case st.Image != "":
+		_, failure := sr.moveNodeToImage(i, n, st.Image)
+		return failure, nil
+	}
+	if err := dockerCmd(sr.ctx, 60*time.Second, "start", c); err != nil {
+		return fmt.Sprintf("docker start %s: %v", c, err), nil
+	}
+	return "", nil
 }
 
 func defaultStr(v, def string) string {
@@ -1668,14 +1986,18 @@ type scenarioReport struct {
 	// the ID cannot, and a build usually labels the commit it came from.
 	ImageID     string            `json:"image_id,omitempty"`
 	ImageLabels map[string]string `json:"image_labels,omitempty"`
-	Nodes       int               `json:"nodes"`
-	NodeCPU     string            `json:"node_cpu_limit"`
-	NodeMem     string            `json:"node_mem_limit"`
-	Acked       int64             `json:"acked"`
+	// Images lists every image a node ran, and the step that moved it there,
+	// in a case whose nodes change image (start_image, image).
+	Images  []scenarioImage `json:"images,omitempty"`
+	Nodes   int             `json:"nodes"`
+	NodeCPU string          `json:"node_cpu_limit"`
+	NodeMem string          `json:"node_mem_limit"`
+	Acked   int64           `json:"acked"`
 	// Received, Unique, Missing, Duplicates and Extra are the receiver's
 	// counts. With several receivers they are the counts of the receiver
 	// that missed the most lines, and Receivers lists each one.
 	Received   int64                   `json:"received"`
+	CutLines   int64                   `json:"cut_lines"`
 	Unique     int64                   `json:"unique"`
 	Missing    int64                   `json:"missing"`
 	Duplicates int64                   `json:"duplicates"`
@@ -1684,8 +2006,12 @@ type scenarioReport struct {
 	Windows    map[string]latencyStats `json:"latency_windows,omitempty"`
 	// AckMaxWindows is the slowest acknowledgement the client waited for in
 	// each window between marks, in milliseconds.
-	AckMaxWindows map[string]int64   `json:"ack_latency_max_ms_windows,omitempty"`
-	Measures      map[string]float64 `json:"measures_ms"`
+	AckMaxWindows map[string]int64 `json:"ack_latency_max_ms_windows,omitempty"`
+	// WindowRates is how many lines reached the receiver in each window
+	// between marks, a second, from the receiver's arrival timeline. The last
+	// mark's window has no end, so it has no rate.
+	WindowRates map[string]float64 `json:"window_rates,omitempty"`
+	Measures    map[string]float64 `json:"measures_ms"`
 	// Counts holds the numbers of lines that steps counted beside their
 	// times, such as <record>_lines_acked. They are lines, not milliseconds.
 	Counts map[string]int64 `json:"counts,omitempty"`
@@ -1728,6 +2054,7 @@ func (rep scenarioReport) summary() map[string]any {
 		"acked":                    rep.Acked,
 		"missing":                  rep.Missing,
 		"duplicates":               rep.Duplicates,
+		"cut_lines":                rep.CutLines,
 		"latency_max_ms":           rep.Latency.MaxMs,
 		"split_brain_ms":           rep.Leadership.SplitBrainMs,
 		"max_self_claimed_leaders": rep.Leadership.MaxSelfClaimed,
@@ -1752,6 +2079,14 @@ func (rep scenarioReport) summary() map[string]any {
 	if rep.Rows != nil && rep.Rows.Error == "" {
 		out["rows_written"] = rep.Rows.Written
 		out["rows_missing"] = rep.Rows.Missing
+		out["rows_twice"] = rep.Rows.ArrivedTwice
+	}
+	if len(rep.Images) > 0 {
+		var moves []string
+		for _, im := range rep.Images {
+			moves = append(moves, fmt.Sprintf("node %d at step %d: %s (%s)", im.Node, im.Step, im.Image, im.ImageID))
+		}
+		out["node_images"] = moves
 	}
 	for _, p := range rep.Pending {
 		// A count that could not be finished is left out, not reported as 0.
@@ -1771,6 +2106,68 @@ func (rep scenarioReport) summary() map[string]any {
 	return out
 }
 
+// judgeStreamLeaderless returns why the longest stretch a stream had no
+// leader fails the case's limit, or "". A limit fails too when no clustered
+// node reported a stream: then nothing was measured.
+func judgeStreamLeaderless(l leadershipStats, limit *int64) string {
+	if limit == nil {
+		return ""
+	}
+	if l.StreamsReported == 0 {
+		return "no clustered node reported a stream, so it is not known how long a stream had no leader"
+	}
+	if l.StreamLeaderlessMs <= *limit {
+		return ""
+	}
+	iv := l.StreamLeaderless
+	if iv == nil {
+		// Validation refuses a negative limit, the only way to get here.
+		return fmt.Sprintf("max_stream_leaderless_ms must not be negative, got %d", *limit)
+	}
+	return fmt.Sprintf("stream %s had no leader for %s from %s (max_stream_leaderless_ms %d)%s",
+		iv.Stream, fmtMs(l.StreamLeaderlessMs), iv.From.UTC().Format("15:04:05.000"), *limit, describeCopiesReports(iv.Copies))
+}
+
+// judgeStreamSplit fails a run in which two nodes both named themselves the
+// leader of one stream for longer than the limit without a break. It judges the
+// longest stretch, never the sum of the stretches. A nil limit judges nothing.
+func judgeStreamSplit(l leadershipStats, limit *int64) string {
+	if limit == nil {
+		return ""
+	}
+	if l.StreamsReported == 0 {
+		return "no clustered node reported a stream, so it is not known whether a stream had two leaders"
+	}
+	var longest *splitInterval
+	for i := range l.StreamSplits {
+		if longest == nil || l.StreamSplits[i].LastsMs > longest.LastsMs {
+			longest = &l.StreamSplits[i]
+		}
+	}
+	if longest == nil || longest.LastsMs <= *limit {
+		return ""
+	}
+	return fmt.Sprintf("nodes %v both named themselves the leader of stream %s for %s from %s (max_stream_split_ms %d)",
+		longest.Nodes, longest.Stream, fmtMs(longest.LastsMs), longest.From.UTC().Format("15:04:05.000"), *limit)
+}
+
+// describeCopiesReports says, after a stream without a leader, which nodes reported
+// it and which copies they saw down, or that no node did.
+func describeCopiesReports(reports []copiesReport) string {
+	if len(reports) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(reports))
+	for _, c := range reports {
+		part := fmt.Sprintf("n%d: %d of %d copies", c.Node, c.Actual, c.Desired)
+		if len(c.OfflinePeers) > 0 {
+			part += ", down or behind " + strings.Join(c.OfflinePeers, " ")
+		}
+		parts = append(parts, part)
+	}
+	return "; " + strings.Join(parts, "; ")
+}
+
 type scenarioVerdict struct {
 	passed  bool
 	reasons []string
@@ -1783,6 +2180,7 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 		ImageID:     sr.imageID,
 		ImageLabels: sr.imageLabels,
 		Nodes:       sr.tc.Cluster.Nodes,
+		Images:      sr.nodeImagesForReport(),
 		NodeCPU:     sr.r.runCPULimit,
 		NodeMem:     sr.r.runMemLimit,
 		Measures:    sr.measures,
@@ -1792,6 +2190,16 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 
 	if !sr.tc.HasGenerator() {
 		return sr.finishWithoutLoad(rep)
+	}
+
+	// Validation keeps a case from ending with the load paused. Were that to
+	// change, the frozen client would never end, so let it go on.
+	if sr.loadPaused {
+		if ok, detail, _ := sr.pauseLoad(false); !ok {
+			sr.failures = append(sr.failures, "the load was still paused at the end, and could not be resumed: "+detail)
+		} else {
+			sr.notes = append(sr.notes, "the load was still paused at the end, and was resumed")
+		}
 	}
 
 	// The load ends after its duration plus the generator's drain timeout,
@@ -1840,8 +2248,17 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 	rep.Unique = worst.Unique
 	rep.Received = worst.Received
 	rep.DuplicateRanges = worst.DuplicateRanges
+	for _, res := range recvResults {
+		rep.CutLines += res.CutLines
+	}
 	if sr.tc.MultiReceiver() {
 		rep.Receivers = recvResults
+	}
+	// A case can collect database rows beside the load: compare them now
+	// that the load has ended. The rows check stops the row writer first.
+	if sr.sc.Rows != nil {
+		rows := sr.checkRows()
+		rep.Rows = &rows
 	}
 	// The count_pending steps: count again, now that every line that will
 	// arrive has arrived. The lines that arrived after the step were still
@@ -1955,6 +2372,14 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 	timeline, terr := sr.receiverTimeline()
 	if terr == nil {
 		rep.Timeline = &timeline
+		if len(sr.marks) > 0 {
+			rep.WindowRates = windowRates(sr.marks, timeline)
+			for _, m := range sr.marks {
+				if rate, ok := rep.WindowRates[m.Label]; ok {
+					fmt.Printf("    window %-16s %10.0f lines a second arrived\n", m.Label, rate)
+				}
+			}
+		}
 	}
 	for i := range sr.events {
 		ev := &sr.events[i]
@@ -1981,11 +2406,11 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 	rep.Steps = sr.steps
 
 	rounds := sr.probe.all()
-	rep.Leadership = analyzeLeadership(rounds)
+	rep.Leadership = analyzeLeadership(rounds, time.Now())
 	rep.HealthTrail = healthTrail(rounds)
-	fmt.Printf("  leadership: %d rounds read, %d leader changes, most self-named leaders at once %d, two-leader time %s, stream two-leader time %s\n",
+	fmt.Printf("  leadership: %d rounds read, %d leader changes, most self-named leaders at once %d, two-leader time %s, stream two-leader time %s, longest time a stream had no leader %s\n",
 		rep.Leadership.Rounds, rep.Leadership.LeaderChanges, rep.Leadership.MaxSelfClaimed,
-		fmtMs(rep.Leadership.SplitBrainMs), fmtMs(rep.Leadership.StreamSplitMs))
+		fmtMs(rep.Leadership.SplitBrainMs), fmtMs(rep.Leadership.StreamSplitMs), fmtMs(rep.Leadership.StreamLeaderlessMs))
 
 	// Verdict.
 	v := scenarioVerdict{reasons: append([]string(nil), sr.failures...)}
@@ -1995,6 +2420,7 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 	}
 	if len(rep.Receivers) > 0 {
 		v.reasons = append(v.reasons, receiverVerdict(rep.Receivers, ex)...)
+		v.reasons = append(v.reasons, sr.countedLossVerdict(rep.Receivers, ex)...)
 	} else {
 		if ex.MaxLoss != nil && rep.Missing > *ex.MaxLoss {
 			v.reasons = append(v.reasons, fmt.Sprintf("%d acknowledged lines never arrived (max_loss %d)", rep.Missing, *ex.MaxLoss))
@@ -2007,9 +2433,15 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 		v.reasons = append(v.reasons, fmt.Sprintf("two nodes named themselves the leader for %s (max_split_brain_ms %d)",
 			fmtMs(rep.Leadership.SplitBrainMs), *ex.MaxSplitBrainMs))
 	}
-	// Validation keeps rows to cases without a generator, so a run with load
-	// has none. Were that to change, a judged rows check that never ran fails
-	// here instead of passing unseen.
+	if reason := judgeStreamLeaderless(rep.Leadership, ex.MaxStreamLeaderlessMs); reason != "" {
+		v.reasons = append(v.reasons, reason)
+	}
+	if reason := judgeStreamSplit(rep.Leadership, ex.MaxStreamSplitMs); reason != "" {
+		v.reasons = append(v.reasons, reason)
+	}
+	v.reasons = append(v.reasons, judgeThroughput(rep.WindowRates, ex.Throughput)...)
+	// A judged rows check that never ran fails here instead of passing
+	// unseen.
 	if reason, _ := judgeRows(rep.Rows, ex.MaxMissingRows, ex.MaxRowsTwice); reason != "" {
 		v.reasons = append(v.reasons, reason)
 	}
@@ -2017,6 +2449,59 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 	rep.Notes = sr.notes
 	v.passed = len(v.reasons) == 0
 	return rep, v, nil
+}
+
+// windowRates counts the lines that first reached the receiver in each
+// window between marks, from the receiver's arrival timeline, and divides
+// them by the window's length in seconds. A window runs from its mark to the
+// next one, so the last mark has no rate. It counts the buckets that start
+// in the window, and a bucket after the last one the receiver has counts as
+// one in which nothing arrived. While a cluster is behind its load, which a
+// throughput case makes sure of, the rate is how many lines a second the
+// cluster delivers.
+func windowRates(marks []scenarioMark, tl receiverTimeline) map[string]float64 {
+	rates := map[string]float64{}
+	if tl.BucketMs <= 0 {
+		return rates
+	}
+	for i := 0; i+1 < len(marks); i++ {
+		from, to := bucketAtOrAfter(tl, marks[i].At), bucketAtOrAfter(tl, marks[i+1].At)
+		if to <= from || !marks[i+1].At.After(marks[i].At) {
+			continue
+		}
+		var lines int64
+		for b := from; b < to && b < len(tl.Unique); b++ {
+			lines += int64(tl.Unique[b])
+		}
+		seconds := marks[i+1].At.Sub(marks[i].At).Seconds()
+		rates[marks[i].Label] = float64(lines) / seconds
+	}
+	return rates
+}
+
+// judgeThroughput compares the windows' rates as expect.throughput asks, and
+// returns a reason for each comparison that falls short.
+func judgeThroughput(rates map[string]float64, expects []config.ScenarioThroughputExpect) []string {
+	var reasons []string
+	for _, e := range expects {
+		window, okWindow := rates[e.Window]
+		over, okOver := rates[e.Over]
+		switch {
+		case !okWindow || !okOver:
+			reasons = append(reasons, fmt.Sprintf("windows %q and %q could not be compared: the receiver gave no count for one of them", e.Window, e.Over))
+		case over <= 0:
+			reasons = append(reasons, fmt.Sprintf("no line sent in window %q arrived, so window %q has nothing to compare with", e.Over, e.Window))
+		default:
+			ratio := window / over
+			fmt.Printf("  throughput: window %q took %.0f lines a second, %.2f times the %.0f of window %q (min_ratio %.2f)\n",
+				e.Window, window, ratio, over, e.Over, e.MinRatio)
+			if ratio < e.MinRatio {
+				reasons = append(reasons, fmt.Sprintf("window %q took %.0f lines a second, %.2f times the %.0f of window %q, less than min_ratio %.2f",
+					e.Window, window, ratio, over, e.Over, e.MinRatio))
+			}
+		}
+	}
+	return reasons
 }
 
 // receiverResult is what one receiver got. In a case with several receivers
@@ -2028,6 +2513,7 @@ type receiverResult struct {
 	// so that its loss is unknown.
 	Checked    bool            `json:"checked"`
 	Received   int64           `json:"received"`
+	CutLines   int64           `json:"cut_lines"`
 	Unique     int64           `json:"unique"`
 	Missing    int64           `json:"missing"`
 	Duplicates int64           `json:"duplicates"`
@@ -2056,7 +2542,7 @@ func (sr *scenarioRun) checkReceiver(rc scenarioReceiver, acked map[string]int64
 		return receiverResult{}, fmt.Errorf("interrupted: %w", sr.ctx.Err())
 	}
 	res := receiverResult{ID: rc.ID, Checked: checked, SeqCheck: &check,
-		Unique: check.Unique, Missing: check.Missing, Duplicates: check.Duplicates, Extra: check.Extra}
+		Unique: check.Unique, Missing: check.Missing, Duplicates: check.Duplicates, Extra: check.Extra, CutLines: check.Cut}
 	if !checked {
 		sr.failures = append(sr.failures, fmt.Sprintf("%s never answered the sequence check, so loss is unknown: %v", rc.describe(), err))
 	}
@@ -2067,8 +2553,8 @@ func (sr *scenarioRun) checkReceiver(rc scenarioReceiver, acked map[string]int64
 	if rc.ID != "" {
 		at = " at receiver " + rc.ID
 	}
-	fmt.Printf("  delivery%s: %d acknowledged, %d of them arrived, %d missing, %d duplicates, %d extra\n",
-		at, check.Acked, check.ReceivedAcked, check.Missing, check.Duplicates, check.Extra)
+	fmt.Printf("  delivery%s: %d acknowledged, %d of them arrived, %d missing, %d duplicates, %d extra, %d cut lines\n",
+		at, check.Acked, check.ReceivedAcked, check.Missing, check.Duplicates, check.Extra, check.Cut)
 	for conn, cc := range check.Conns {
 		if cc.Missing > 0 {
 			fmt.Printf("    conn %s: missing %d, first ranges %v\n", conn, cc.Missing, cc.MissingRanges)
@@ -2126,6 +2612,99 @@ func receiverVerdict(rs []receiverResult, ex config.ScenarioExpect) []string {
 	return reasons
 }
 
+// nodeLogText returns a node container's whole log. A variable, so that tests can
+// stand in for docker.
+var nodeLogText = func(container string) (string, error) {
+	out, err := exec.Command("docker", "logs", container).CombinedOutput()
+	if err != nil && len(out) == 0 {
+		return "", err
+	}
+	return string(out), nil
+}
+
+// countedLossVerdict judges each receiver that expect.receivers gives a
+// counted_loss: the numbers that the nodes' logs report must add up to the lines
+// missing at the receiver, within max_gap_pct of them. A subject that loses
+// records on purpose must say how many, or its reader learns less than happened.
+func (sr *scenarioRun) countedLossVerdict(rs []receiverResult, ex config.ScenarioExpect) []string {
+	var reasons []string
+	for _, r := range rs {
+		own, ok := ex.Receivers[r.ID]
+		if !ok || own.CountedLoss == nil {
+			continue
+		}
+		if !r.Checked {
+			reasons = append(reasons, fmt.Sprintf("receiver %s never answered the sequence check, so its loss cannot be compared with what the nodes counted", r.ID))
+			continue
+		}
+		re := regexp.MustCompile(own.CountedLoss.Pattern)
+		var counted int64
+		for _, c := range sr.containers {
+			text, err := nodeLogText(c)
+			if err != nil {
+				reasons = append(reasons, fmt.Sprintf("the log of %s could not be read, so what it counted for receiver %s is not known: %v", c, r.ID, err))
+				continue
+			}
+			for _, m := range re.FindAllStringSubmatch(text, -1) {
+				if n, err := strconv.ParseInt(m[1], 10, 64); err == nil {
+					counted += n
+				}
+			}
+		}
+		reason := ""
+		if c := own.CountedLoss; c.OneSided() {
+			reason = judgeCountedLossSides(r.ID, counted, r.Missing, *c.MaxUnderPct, *c.MaxOver)
+		} else {
+			reason = judgeCountedLoss(r.ID, counted, r.Missing, c.MaxGapPct)
+		}
+		if reason != "" {
+			reasons = append(reasons, reason)
+		}
+	}
+	return reasons
+}
+
+// judgeCountedLossSides judges each side of a count apart. Below the missing
+// lines, it may be off by maxUnderPct of them at most, because a count that is
+// too low hides a loss. Above them, it may be off by maxOver lines at most, the
+// records that a subject can count as lost while it still delivers them.
+func judgeCountedLossSides(id string, counted, missing int64, maxUnderPct float64, maxOver int64) string {
+	if counted < missing {
+		pct := float64(missing-counted) * 100 / float64(missing)
+		if pct <= maxUnderPct {
+			return ""
+		}
+		return fmt.Sprintf("the nodes counted %d lost lines for receiver %s, and %d are missing there: %.1f%% too few (counted_loss.max_under_pct %v)",
+			counted, id, missing, pct, maxUnderPct)
+	}
+	if over := counted - missing; over > maxOver {
+		return fmt.Sprintf("the nodes counted %d lost lines for receiver %s, and %d are missing there: %d too many (counted_loss.max_over %d)",
+			counted, id, missing, over, maxOver)
+	}
+	return ""
+}
+
+// judgeCountedLoss compares what the nodes counted for a receiver with the lines
+// missing there.
+func judgeCountedLoss(id string, counted, missing int64, maxGapPct float64) string {
+	gap := counted - missing
+	if gap < 0 {
+		gap = -gap
+	}
+	if missing == 0 {
+		if counted == 0 {
+			return ""
+		}
+		return fmt.Sprintf("the nodes counted %d lost lines for receiver %s, and none is missing there", counted, id)
+	}
+	pct := float64(gap) * 100 / float64(missing)
+	if pct <= maxGapPct {
+		return ""
+	}
+	return fmt.Sprintf("the nodes counted %d lost lines for receiver %s, and %d are missing there: %.0f%% apart (counted_loss.max_gap_pct %v)",
+		counted, id, missing, pct, maxGapPct)
+}
+
 // judgeRows judges the rows check of a case whose data came from a database
 // (cluster.scenario.rows; config validation allows it only without a
 // generator). It returns a reason the run fails, or a note when the case does
@@ -2179,7 +2758,7 @@ func (sr *scenarioRun) finishWithoutLoad(rep scenarioReport) (scenarioReport, sc
 	rep.Events = sr.events
 	rep.Steps = sr.steps
 	rounds := sr.probe.all()
-	rep.Leadership = analyzeLeadership(rounds)
+	rep.Leadership = analyzeLeadership(rounds, time.Now())
 	rep.HealthTrail = healthTrail(rounds)
 	fmt.Printf("  leadership: %d rounds read, %d leader changes, most self-named leaders at once %d, two-leader time %s\n",
 		rep.Leadership.Rounds, rep.Leadership.LeaderChanges, rep.Leadership.MaxSelfClaimed, fmtMs(rep.Leadership.SplitBrainMs))
@@ -2202,6 +2781,16 @@ func (sr *scenarioRun) finishWithoutLoad(rep scenarioReport) (scenarioReport, sc
 // judged max_duplicates over a count that the receiver's sequence tracker had
 // replaced with zero, so rows that arrived twice went unseen.
 func withoutLoadVerdict(rep scenarioReport, ex config.ScenarioExpect, dedup bool, metricsErr error) (reasons, notes []string) {
+	if ex.MinReceived > 0 {
+		switch {
+		case !dedup:
+			reasons = append(reasons, "min_received needs correctness.validate_dedup: without it, the receiver counts no distinct lines")
+		case metricsErr != nil:
+			reasons = append(reasons, "the receiver's counts could not be read, so min_received was not checked: "+metricsErr.Error())
+		case rep.Unique < ex.MinReceived:
+			reasons = append(reasons, fmt.Sprintf("%d distinct lines arrived, fewer than min_received %d", rep.Unique, ex.MinReceived))
+		}
+	}
 	if ex.MaxDuplicates != nil {
 		switch {
 		case !dedup:
@@ -2217,6 +2806,12 @@ func withoutLoadVerdict(rep scenarioReport, ex config.ScenarioExpect, dedup bool
 	if ex.MaxSplitBrainMs != nil && rep.Leadership.SplitBrainMs > *ex.MaxSplitBrainMs {
 		reasons = append(reasons, fmt.Sprintf("two nodes named themselves the leader for %s (max_split_brain_ms %d)",
 			fmtMs(rep.Leadership.SplitBrainMs), *ex.MaxSplitBrainMs))
+	}
+	if reason := judgeStreamLeaderless(rep.Leadership, ex.MaxStreamLeaderlessMs); reason != "" {
+		reasons = append(reasons, reason)
+	}
+	if reason := judgeStreamSplit(rep.Leadership, ex.MaxStreamSplitMs); reason != "" {
+		reasons = append(reasons, reason)
 	}
 	// The rows are judged here, in the only verdict a case with rows reaches.
 	// A proof run found them reported and never judged: a row was missing, and
@@ -2459,6 +3054,14 @@ func (r *Runner) saveScenarioLogs(name string, containers []string) (string, err
 		return "", err
 	}
 	for _, c := range containers {
+		// The containers a step replaced with another image first, each in a
+		// file of its own named after the step that replaced it.
+		for _, kl := range replacedLogs.all(c) {
+			name := fmt.Sprintf("%s.before-step-%d.log", c, kl.Step)
+			if werr := os.WriteFile(filepath.Join(dir, name), []byte(kl.Text), 0o644); werr != nil {
+				return "", werr
+			}
+		}
 		out, err := exec.Command("docker", "logs", "-t", c).CombinedOutput()
 		if err != nil && len(out) == 0 {
 			continue
@@ -2579,7 +3182,8 @@ var readLogWindow = func(container string, since, until time.Time) (string, erro
 		}
 		return "", fmt.Errorf("docker logs %s: %w: %s", container, err, strings.TrimSpace(string(out)))
 	}
-	return string(out), nil
+	// What the containers a step replaced logged comes first: it is older.
+	return replacedLogs.window(container, since, until) + string(out), nil
 }
 
 // firstLogLineInWindow returns the docker timestamp of the first line from
@@ -2872,18 +3476,22 @@ func toxiproxySetLatency(port int, proxy string, latency, jitter time.Duration) 
 // imageIdentity returns the local image's short ID and its labels, so a
 // result always says which build it ran on.
 func imageIdentity(ref string) (string, map[string]string) {
-	out, err := exec.Command("docker", "image", "inspect", "-f", "{{.Id}}|{{json .Config.Labels}}", ref).Output()
+	// The whole config, not .Config.Labels: an image built without labels
+	// has no Labels key, and the template fails on a missing key.
+	out, err := exec.Command("docker", "image", "inspect", "-f", "{{.Id}}|{{json .Config}}", ref).Output()
 	if err != nil {
 		return "", nil
 	}
-	id, labelsJSON, _ := strings.Cut(strings.TrimSpace(string(out)), "|")
+	id, configJSON, _ := strings.Cut(strings.TrimSpace(string(out)), "|")
 	id = strings.TrimPrefix(id, "sha256:")
 	if len(id) > 12 {
 		id = id[:12]
 	}
-	var labels map[string]string
-	_ = json.Unmarshal([]byte(labelsJSON), &labels)
-	return id, labels
+	var cfg struct {
+		Labels map[string]string `json:"Labels"`
+	}
+	_ = json.Unmarshal([]byte(configJSON), &cfg)
+	return id, cfg.Labels
 }
 
 // settlingMarkers are director log lines that mean the cluster is still

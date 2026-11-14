@@ -172,6 +172,20 @@ type TestCase struct {
 	SubjectMemLimit string `yaml:"subject_mem_limit"`
 	SubjectVersion  string `yaml:"subject_version"`
 
+	// EmptyDiskOnRestart, in a persistence_restart_correctness case, removes the
+	// subject's container between the stop and the start, as a platform that
+	// replaces a container does. The container that comes back has none of the old
+	// one's disk, so the case shows what a clean stop hands on to something that
+	// outlives the container.
+	EmptyDiskOnRestart bool `yaml:"empty_disk_on_restart"`
+
+	// StopDelay, in a persistence_restart_correctness case, is how long the harness
+	// waits between the generator's exit and the stop. A sender's last lines can
+	// still be in the subject's socket when the sender exits, and a subject that
+	// stops at that moment never reads them. A case about what the subject does with
+	// the records it took in gives it time to read them.
+	StopDelay string `yaml:"stop_delay"`
+
 	// SubjectEntrypoint replaces the registry's entrypoint for this case, with
 	// the registry Command still appended as arguments. Same precedence and the
 	// same non-strict-decode tolerance as SubjectImage.
@@ -741,6 +755,10 @@ type Endpoint struct {
 	// otel-collector clickhouse exporter creates its schema on start, so the
 	// clickhouse endpoint declares a healthcheck and otel waits for it.
 	Healthcheck *EndpointHealthcheck `yaml:"healthcheck"`
+	// MountsSharedDir mounts the cluster scenario's shared directory
+	// (cluster.scenario.shared_dir) on the endpoint, at the same path as on the
+	// nodes, so that the endpoint can write a file that every node reads.
+	MountsSharedDir bool `yaml:"mounts_shared_dir"`
 }
 
 // EndpointHealthcheck is a compose healthcheck for an Endpoint. Only Test is
@@ -1066,6 +1084,65 @@ func (tc *TestCase) MidDeliveryTrigger() (string, time.Duration, bool, error) {
 	return tc.MidDelivery.TriggerLog, delay, true, nil
 }
 
+// StopDelayOrZero returns how long the harness waits between the generator's
+// exit and the stop. Validate has checked the value.
+func (tc *TestCase) StopDelayOrZero() time.Duration {
+	d, err := time.ParseDuration(strings.TrimSpace(tc.StopDelay))
+	if err != nil {
+		return 0
+	}
+	return d
+}
+
+// validateRestartOptions checks the settings that only the restart and crash
+// drivers read, so that a typo fails the case when it loads rather than leave a
+// run without the wait, the floor or the log check that it asked for.
+func (tc *TestCase) validateRestartOptions() error {
+	restart := tc.Type == "persistence_restart_correctness" || tc.Type == "persistence_crash_correctness"
+	onlyRestart := func(option string) error {
+		return fmt.Errorf("case %q: %s applies only to the persistence_restart_correctness and persistence_crash_correctness types", tc.Name, option)
+	}
+
+	if tc.EmptyDiskOnRestart && !restart {
+		return onlyRestart("empty_disk_on_restart")
+	}
+	if raw := strings.TrimSpace(tc.StopDelay); raw != "" {
+		if !restart {
+			return onlyRestart("stop_delay")
+		}
+		delay, err := time.ParseDuration(raw)
+		if err != nil {
+			return fmt.Errorf("case %q: stop_delay %q: %w", tc.Name, raw, err)
+		}
+		if delay < 0 {
+			return fmt.Errorf("case %q: stop_delay %q must not be negative", tc.Name, raw)
+		}
+	}
+
+	c := tc.Correctness
+	if c.MinLossPct != 0 {
+		if !restart {
+			return onlyRestart("correctness.min_loss_pct")
+		}
+		if c.MinLossPct < 0 || c.MinLossPct > 100 {
+			return fmt.Errorf("case %q: correctness.min_loss_pct %v must be between 0 and 100", tc.Name, c.MinLossPct)
+		}
+		if c.MinLossPct > c.ExpectedLossPct {
+			return fmt.Errorf("case %q: correctness.min_loss_pct %v is above expected_loss_pct %v, so no run could pass", tc.Name, c.MinLossPct, c.ExpectedLossPct)
+		}
+	}
+	for _, pattern := range c.RequireStopLog {
+		if !restart {
+			return onlyRestart("correctness.require_stop_log")
+		}
+		if _, err := regexp.Compile("(?m)" + pattern); err != nil {
+			return fmt.Errorf("case %q: correctness.require_stop_log %q: %w", tc.Name, pattern, err)
+		}
+	}
+
+	return nil
+}
+
 // IsMidDeliveryVerdictType reports whether the case runs through the shared
 // receiver-up mid-delivery driver (Runner.runMidDeliveryAction), which fires a
 // disruptive action partway through delivery and then judges loss.
@@ -1287,6 +1364,9 @@ func ParseByteSize(s string) (int64, error) {
 func (tc *TestCase) Validate() error {
 	if len(tc.Generators) > 0 && (tc.Generator.Mode != "" || tc.Generator.Target != "") {
 		return fmt.Errorf("case %q: both `generator:` and `generators:` are set — pick one", tc.Name)
+	}
+	if err := tc.validateRestartOptions(); err != nil {
+		return err
 	}
 	if tc.SubjectDisk != nil {
 		if tc.SubjectDisk.Path == "" || tc.SubjectDisk.Size == "" {
@@ -1563,7 +1643,8 @@ type ClusterConfig struct {
 	// SettleSeconds is how long to wait after a disruptive Action before asserting
 	// recovery (default 45 — must exceed the 15s heartbeat timeout + reassignment).
 	SettleSeconds int `yaml:"settle_seconds"`
-	// IP is the virtual/cluster IP the elected leader binds (cluster_ip_failover).
+	// IP is the virtual/cluster IP the elected leader binds (cluster_ip_failover,
+	// or a scenario case with an expect_cluster_ip step).
 	// Must lie in the harness-pinned bench subnet 172.30.0.0/16. The harness grants
 	// the node containers NET_ADMIN so the director can add it; the driver asserts
 	// the leader holds it and that it migrates to the new leader on failover.
@@ -1611,18 +1692,24 @@ func (tc *TestCase) validateCluster() error {
 		if tc.Cluster.IP == "" {
 			return fmt.Errorf("case %q: cluster.action cluster_ip_failover requires cluster.ip", tc.Name)
 		}
-		ip := net.ParseIP(tc.Cluster.IP)
-		if ip == nil || ip.To4() == nil {
-			return fmt.Errorf("case %q: cluster.ip %q must be an IPv4 address", tc.Name, tc.Cluster.IP)
-		}
-		// The harness pins the bench network to 172.30.0.0/16 (clusterBenchSubnet in
-		// internal/orchestrator/docker.go) so the VIP is in range; reject anything
-		// outside it up front rather than failing later when the director can't use it.
-		if _, benchNet, _ := net.ParseCIDR("172.30.0.0/16"); !benchNet.Contains(ip) {
-			return fmt.Errorf("case %q: cluster.ip %q must be within the pinned bench subnet 172.30.0.0/16", tc.Name, tc.Cluster.IP)
-		}
+		return tc.validateClusterIP()
 	} else if tc.Cluster.IP != "" {
 		return fmt.Errorf("case %q: cluster.ip is only valid with cluster.action cluster_ip_failover", tc.Name)
+	}
+	return nil
+}
+
+// validateClusterIP checks cluster.ip. The harness pins the bench network to
+// 172.30.0.0/16 (clusterBenchSubnet in internal/orchestrator/docker.go) so the
+// VIP is in range; reject anything outside it up front rather than failing later
+// when the director can't use it.
+func (tc *TestCase) validateClusterIP() error {
+	ip := net.ParseIP(tc.Cluster.IP)
+	if ip == nil || ip.To4() == nil {
+		return fmt.Errorf("case %q: cluster.ip %q must be an IPv4 address", tc.Name, tc.Cluster.IP)
+	}
+	if _, benchNet, _ := net.ParseCIDR("172.30.0.0/16"); !benchNet.Contains(ip) {
+		return fmt.Errorf("case %q: cluster.ip %q must be within the pinned bench subnet 172.30.0.0/16", tc.Name, tc.Cluster.IP)
 	}
 	return nil
 }
@@ -2939,6 +3026,16 @@ type CorrectnessConfig struct {
 	// for performance tests (O(1) per line, no heap growth).
 	ValidateContent bool    `yaml:"validate_content"`
 	ExpectedLossPct float64 `yaml:"expected_loss_pct"`
+	// MinLossPct, in a persistence_restart_correctness or
+	// persistence_crash_correctness case, is the least the run must lose. It is
+	// for a baseline: a run that loses nothing there built nothing to lose, so
+	// the case beside it passed without being tested.
+	MinLossPct float64 `yaml:"min_loss_pct"`
+	// RequireStopLog, in the same cases, lists regular expressions that must
+	// each match a line of the log of the subject that stopped. Matched in
+	// multi-line mode, so that $ ends a line. A case proves with it what the
+	// stop did, which the lines at the receiver cannot show.
+	RequireStopLog []string `yaml:"require_stop_log"`
 	// RequiredSubstring is a protocol-agnostic decode check: every emitted
 	// line must contain the configured substring. Used by tests where the
 	// generator and the on-the-wire output don't share a literal byte

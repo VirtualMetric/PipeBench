@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os/exec"
 	"path"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -208,6 +209,7 @@ func (sr *scenarioRun) relink(n int) {
 	if err := sr.links.resync(sr.ctx, sr.containers[n-1]); err != nil {
 		sr.failures = append(sr.failures, fmt.Sprintf("could not put node %d's link faults back after its start: %v", n, err))
 	}
+	sr.reslow(n)
 }
 
 // restoreAtEnd puts every link and every disk back as it was, once the steps
@@ -234,6 +236,7 @@ func (sr *scenarioRun) restoreAtEnd(ctx context.Context) {
 		}
 		sr.notes = append(sr.notes, fmt.Sprintf("the steps left node %d's disk full, which the harness freed before the drain", n))
 	}
+	sr.restoreDisks(ctx)
 }
 
 // fillerName is the file fill_disk writes on a node's disk.
@@ -435,7 +438,13 @@ func (sr *scenarioRun) checkRows() rowsCheck {
 }
 
 func (sr *scenarioRun) compareRowsOnce() rowsCheck {
-	rows, err := sr.queryRows(sr.sc.Rows.Query)
+	var rows []string
+	var err error
+	if sr.sc.Rows.File != "" {
+		rows, err = sr.fileRows(sr.sc.Rows.File, sr.sc.Rows.Key)
+	} else {
+		rows, err = sr.queryRows(sr.sc.Rows.Query)
+	}
 	if err != nil {
 		return rowsCheck{Error: err.Error()}
 	}
@@ -447,6 +456,45 @@ func (sr *scenarioRun) compareRowsOnce() rowsCheck {
 		return rowsCheck{Error: "reading the receiver's keys: " + err.Error()}
 	}
 	return compareRows(rows, keys.Keys, keys.LinesWithoutKey)
+}
+
+// fileRows reads a file of the shared directory from a node that runs, and
+// returns the key of each of its lines (cluster.scenario.rows.file). The row
+// writer has stopped by now, so the file does not change while it is read.
+func (sr *scenarioRun) fileRows(path, key string) ([]string, error) {
+	re, err := regexp.Compile(key)
+	if err != nil {
+		return nil, err
+	}
+	var lastErr error
+	for _, c := range sr.containers {
+		ctx, cancel := context.WithTimeout(sr.ctx, time.Minute)
+		out, err := exec.CommandContext(ctx, "docker", "exec", c, "cat", path).Output()
+		cancel()
+		if err != nil {
+			lastErr = fmt.Errorf("reading %s on %s: %w", path, c, err)
+			continue
+		}
+		return linesKeys(string(out), re), nil
+	}
+	return nil, lastErr
+}
+
+// linesKeys returns the key of each line of text: what re finds, or its first
+// group when it has one. A line without a key is left out.
+func linesKeys(text string, re *regexp.Regexp) []string {
+	var keys []string
+	for _, line := range strings.Split(text, "\n") {
+		m := re.FindStringSubmatch(line)
+		switch {
+		case m == nil:
+		case len(m) > 1:
+			keys = append(keys, m[1])
+		default:
+			keys = append(keys, m[0])
+		}
+	}
+	return keys
 }
 
 // queryRows runs query against the case's database and returns one value a

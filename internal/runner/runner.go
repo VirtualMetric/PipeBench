@@ -91,6 +91,7 @@ func (o *Options) applyDefaults() {
 // ReceiverMetrics is the JSON response from the receiver's /metrics endpoint.
 type ReceiverMetrics struct {
 	LinesReceived    int64    `json:"lines_received"`
+	CutLines         int64    `json:"cut_lines,omitempty"`
 	BytesReceived    int64    `json:"bytes_received"`
 	Done             bool     `json:"done"`
 	FirstReceivedNs  int64    `json:"first_received_ns"`
@@ -839,6 +840,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		LastReceivedNs:  recvMetrics.LastReceivedNs,
 		LinesIn:         genStats.LinesSent,
 		LinesOut:        recvMetrics.LinesReceived,
+		CutLines:        recvMetrics.CutLines,
 		BytesIn:         genStats.BytesSent,
 		BytesOut:        recvMetrics.BytesReceived,
 		LinesPerSec:     linesPerSec,
@@ -1394,6 +1396,7 @@ func (r *Runner) runPersistenceCorrectness(tc *config.TestCase, subject config.S
 		LastReceivedNs:  recvMetrics.LastReceivedNs,
 		LinesIn:         genStats.LinesSent,
 		LinesOut:        recvMetrics.LinesReceived,
+		CutLines:        recvMetrics.CutLines,
 		BytesIn:         genStats.BytesSent,
 		BytesOut:        recvMetrics.BytesReceived,
 		LinesPerSec:     receiveWindowRate(recvMetrics),
@@ -1582,6 +1585,13 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 	genStats := r.parseGeneratorStats(orch.GeneratorStdout())
 	fmt.Printf("  generator sent %s lines\n", formatCount(genStats.LinesSent))
 
+	if delay := tc.StopDelayOrZero(); delay > 0 {
+		fmt.Printf("  giving the subject %s to read what is in its socket…\n", delay)
+		if err := sleepCtx(r.ctx, delay); err != nil {
+			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+		}
+	}
+
 	// PHASE 3: stop subject. SIGTERM (restart variant) lets the subject flush
 	// state to disk gracefully; SIGKILL (crash variant) gives no chance for
 	// cleanup — only writes already persisted before the kill are recoverable.
@@ -1594,6 +1604,24 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 		fmt.Println("  phase 3: stopping subject immediately (SIGTERM)…")
 		if err := orch.StopServices(30*time.Second, "subject"); err != nil {
 			return results.RunResult{}, fmt.Errorf("stopping subject: %w", err)
+		}
+	}
+
+	// The log goes with the container that the next step removes
+	var stoppedLog string
+	if tc.EmptyDiskOnRestart || len(tc.Correctness.RequireStopLog) > 0 {
+		stoppedLog, err = r.keepStoppedSubjectLog(tc, orch.SubjectContainer())
+		if err != nil {
+			return results.RunResult{}, fmt.Errorf("keeping the stopped subject's log: %w", err)
+		}
+	}
+
+	// A platform that replaces a container gives the new one an empty disk, so
+	// only what the stop handed on comes back.
+	if tc.EmptyDiskOnRestart {
+		fmt.Println("  removing the subject and its disk (the container that comes back is a new one)…")
+		if err := orch.RemoveServices("subject"); err != nil {
+			return results.RunResult{}, fmt.Errorf("removing subject: %w", err)
 		}
 	}
 
@@ -1658,49 +1686,12 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 
 	elapsed := time.Since(startTime).Seconds()
 
-	lossPct := 0.0
-	if genStats.LinesSent > 0 {
-		lossPct = 100.0 * (1.0 - float64(recvMetrics.LinesReceived)/float64(genStats.LinesSent))
-		if lossPct < 0 {
-			lossPct = 0
-		}
-	}
-
-	passed := lossPct <= tc.Correctness.ExpectedLossPct
-	var errors []string
-	if !passed {
-		errors = append(errors, fmt.Sprintf("expected loss <= %.2f%%, got %.2f%% (%s of %s lines lost)",
-			tc.Correctness.ExpectedLossPct, lossPct,
-			formatCount(genStats.LinesSent-recvMetrics.LinesReceived), formatCount(genStats.LinesSent)))
-	}
-	if recvMetrics.LinesReceived > genStats.LinesSent {
-		extra := recvMetrics.LinesReceived - genStats.LinesSent
-		if tc.IsKafkaType() || tc.Correctness.AllowOverDelivery {
-			// At-least-once transports (Kafka, S3-via-SQS notifications, SQS,
-			// Kinesis): crash/restart recovery may re-deliver records already
-			// buffered. That is correct behavior — duplicates, never loss —
-			// so over-delivery is informational here, not a failure.
-			fmt.Printf("  note: over-delivery of %s lines (at-least-once duplicates from recovery — not a failure)\n", formatCount(extra))
-		} else {
-			passed = false
-			errors = append(errors, fmt.Sprintf("over-delivery: received %s lines but only %s were sent (%s extra/duplicate lines)",
-				formatCount(recvMetrics.LinesReceived), formatCount(genStats.LinesSent), formatCount(extra)))
-		}
-	}
-	if tc.Correctness.ValidateDedup && recvMetrics.Duplicates > 0 {
-		passed = false
-		errors = append(errors, fmt.Sprintf("expected 0 duplicates, got %s",
-			formatCount(recvMetrics.Duplicates)))
-	}
-	if tc.Correctness.ValidateContent && recvMetrics.MalformedLines > 0 {
-		passed = false
-		errors = append(errors, fmt.Sprintf("expected 0 malformed lines, got %s (memory corruption)",
-			formatCount(recvMetrics.MalformedLines)))
-	}
-	if tc.Correctness.ValidateJSON && recvMetrics.InvalidJSONLines > 0 {
-		passed = false
-		errors = append(errors, fmt.Sprintf("expected 0 invalid-JSON lines, got %s",
-			formatCount(recvMetrics.InvalidJSONLines)))
+	verdict := judgeRestart(tc, genStats.LinesSent, recvMetrics, stoppedLog)
+	lossPct := verdict.LossPct
+	passed := len(verdict.Errors) == 0
+	errors := verdict.Errors
+	for _, note := range verdict.Notes {
+		fmt.Printf("  note: %s\n", note)
 	}
 
 	result := results.RunResult{
@@ -1717,6 +1708,7 @@ func (r *Runner) runPersistenceShutdownCorrectness(tc *config.TestCase, subject 
 		LastReceivedNs:  recvMetrics.LastReceivedNs,
 		LinesIn:         genStats.LinesSent,
 		LinesOut:        recvMetrics.LinesReceived,
+		CutLines:        recvMetrics.CutLines,
 		BytesIn:         genStats.BytesSent,
 		BytesOut:        recvMetrics.BytesReceived,
 		LinesPerSec:     receiveWindowRate(recvMetrics),
@@ -2073,6 +2065,7 @@ func (r *Runner) runDiskPressureCorrectness(tc *config.TestCase, subject config.
 		LastReceivedNs:  recvMetrics.LastReceivedNs,
 		LinesIn:         genStats.LinesSent,
 		LinesOut:        recvMetrics.LinesReceived,
+		CutLines:        recvMetrics.CutLines,
 		BytesIn:         genStats.BytesSent,
 		BytesOut:        recvMetrics.BytesReceived,
 		LinesPerSec:     receiveWindowRate(recvMetrics),
@@ -2527,6 +2520,7 @@ func (r *Runner) runMidDeliveryAction(tc *config.TestCase, subject config.Subjec
 		LastReceivedNs:  recvMetrics.LastReceivedNs,
 		LinesIn:         expectedSent,
 		LinesOut:        recvMetrics.LinesReceived,
+		CutLines:        recvMetrics.CutLines,
 		UniqueOut:       recvMetrics.UniqueLines,
 		BytesIn:         genStats.BytesSent,
 		BytesOut:        recvMetrics.BytesReceived,
@@ -3209,6 +3203,7 @@ func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject confi
 		FirstReceivedNs: recvMetrics.FirstReceivedNs,
 		LastReceivedNs:  recvMetrics.LastReceivedNs,
 		LinesOut:        recvMetrics.LinesReceived,
+		CutLines:        recvMetrics.CutLines,
 		BytesOut:        recvMetrics.BytesReceived,
 		Passed:          &passed,
 	}
@@ -3730,12 +3725,43 @@ func agentlessDeviceOwner(containers []string) string {
 	return owner
 }
 
+// agentlessDeliveryWait is how long the agentless failover waits for the
+// receiver to get a new line, while the old owner is still down.
+const agentlessDeliveryWait = 180 * time.Second
+
+// waitCountGrows polls count until it returns more than before, or until the
+// deadline. It returns the last count it read, and whether it grew. A count
+// that cannot be read does not grow.
+func waitCountGrows(ctx context.Context, count func() (int64, error), before int64, deadline time.Time, poll time.Duration) (int64, bool) {
+	last := before
+	for {
+		if n, err := count(); err == nil {
+			last = n
+			if n > before {
+				return n, true
+			}
+		}
+		if !time.Now().Before(deadline) || sleepCtx(ctx, poll) != nil {
+			return last, false
+		}
+	}
+}
+
+const (
+	// agentlessStopQuiet is how long the lines that a stopped owner had handed on take
+	// to arrive.
+	agentlessStopQuiet = 5 * time.Second
+	// agentlessResumeLines is how many new lines show that delivery resumed. One could be
+	// the last of what the old owner handed on.
+	agentlessResumeLines = 3
+)
+
 // agentlessCollectingNow reports whether a node is ACTIVELY collecting from an
 // agentless device right now: its recent logs show the collector forwarding
 // records to the router ("Forwarded N log entries from device ... to router").
 // This is the director-level proof that a deployed agent is delivering data to
 // its owning node — independent of the downstream receiver (cluster E2E delivery
-// has a separate gap; see runDirectorClusterCorrectness agentless_failover).
+// is judged apart; see runDirectorClusterCorrectness agentless_failover).
 func agentlessCollectingNow(container string) bool {
 	return strings.Contains(dockerLogsSince(container, "30s"), "entries from device")
 }
@@ -4337,10 +4363,19 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 				// strength afterwards (matching "the node that starts the agentless
 				// machine gets restarted").
 				fmt.Printf("  agentless device owner = node %s (%s); stopping it to force a failover…\n", owner, ownerContainer)
-				preFailover := finalCount
 				if serr := exec.Command("docker", "stop", "-t", "10", ownerContainer).Run(); serr != nil {
 					actionOK = false
 					errs = append(errs, fmt.Sprintf("docker stop %s failed: %v (disruption did not happen)", ownerContainer, serr))
+				}
+				// Lines the owner had handed on still arrive for a moment after it stops,
+				// and they would pass for a new owner's lines. So the count that delivery
+				// must grow past is read once they have arrived.
+				if err := sleepCtx(r.ctx, agentlessStopQuiet); err != nil {
+					return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
+				}
+				preFailover := finalCount
+				if rm, qerr := r.queryReceiverMetrics(metricsPort, 10*time.Second); qerr == nil {
+					preFailover = rm.LinesReceived
 				}
 				fmt.Printf("  waiting %s for the leader to detect the down node and reassign the device…\n", settle)
 				if err := sleepCtx(r.ctx, settle); err != nil {
@@ -4361,17 +4396,6 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 					actionOK = false
 					errs = append(errs, "no leader after the owning node went down")
 				}
-				// Bring the owner back so the cluster returns to full strength.
-				fmt.Printf("  starting node %s again to restore the cluster…\n", ownerContainer)
-				if serr := exec.Command("docker", "start", ownerContainer).Run(); serr != nil {
-					actionOK = false
-					errs = append(errs, fmt.Sprintf("docker start %s failed: %v", ownerContainer, serr))
-				}
-				// SOFT: a survivor resuming collection, and end-to-end receiver delivery, are
-				//   logged but NOT asserted. Cluster agentless data-plane recovery after a node
-				//   loss is a known gap: the degraded 2/3 window can stall the new owner's ingest,
-				//   and cross-node payload object-store reads can return NotFound → "payload
-				//   evicted". The hard verdict is the automatic ownership failover above.
 				collectDeadline := time.Now().Add(settle + 90*time.Second)
 				if collectDeadline.After(runDeadline) {
 					collectDeadline = runDeadline
@@ -4379,9 +4403,36 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 				if newOwner, _, ok := waitAgentlessCollectingExcluding(r.ctx, nodes, owner, collectDeadline); ok {
 					fmt.Printf("  (soft) a surviving node (%s) is collecting the device after failover ✓\n", newOwner)
 				} else {
-					fmt.Println("  (soft) no survivor observed collecting within the window — known cluster data-plane gap")
+					fmt.Println("  (soft) no survivor observed collecting within the window")
 				}
-				r.sampleDelivery(metricsPort, preFailover)
+				// HARD 3: delivery resumes, while the old owner is still down. The
+				//   endpoint goes on adding lines to the file that the agent reads, so
+				//   the receiver must get more lines than it had when the owner stopped.
+				//   A device that moved but delivers nothing is a failed failover, and
+				//   the old owner's return must not be what brings the lines.
+				deliveryDeadline := time.Now().Add(agentlessDeliveryWait)
+				if deliveryDeadline.After(runDeadline) {
+					deliveryDeadline = runDeadline
+				}
+				count := func() (int64, error) {
+					rm, err := r.queryReceiverMetrics(metricsPort, 10*time.Second)
+					if err != nil {
+						return 0, err
+					}
+					return rm.LinesReceived, nil
+				}
+				if got, ok := waitCountGrows(r.ctx, count, preFailover+agentlessResumeLines-1, deliveryDeadline, 5*time.Second); ok {
+					fmt.Printf("  delivery resumed after the failover: %s lines, %s when the owner stopped ✓\n", formatCount(got), formatCount(preFailover))
+				} else {
+					actionOK = false
+					errs = append(errs, fmt.Sprintf("delivery did not resume after the failover: the receiver has %s lines, and it had %s when the owner stopped", formatCount(got), formatCount(preFailover)))
+				}
+				// Bring the owner back so the cluster returns to full strength.
+				fmt.Printf("  starting node %s again to restore the cluster…\n", ownerContainer)
+				if serr := exec.Command("docker", "start", ownerContainer).Run(); serr != nil {
+					actionOK = false
+					errs = append(errs, fmt.Sprintf("docker start %s failed: %v", ownerContainer, serr))
+				}
 			}
 		case "device_failover":
 			// Generalized placement-device failover (DB / file). The baseline branch
@@ -8142,6 +8193,7 @@ func (r *Runner) runKafkaOffsetCommitRestart(tc *config.TestCase, subject config
 		LastReceivedNs:  recvMetrics.LastReceivedNs,
 		LinesIn:         sent,
 		LinesOut:        recvMetrics.LinesReceived,
+		CutLines:        recvMetrics.CutLines,
 		BytesIn:         genStats.BytesSent,
 		BytesOut:        recvMetrics.BytesReceived,
 		LossPercent:     lossPct,
@@ -8385,6 +8437,7 @@ func (r *Runner) runPersistenceFileRestartCorrectness(tc *config.TestCase, subje
 		LastReceivedNs:  recvMetrics.LastReceivedNs,
 		LinesIn:         genStats.LinesSent,
 		LinesOut:        recvMetrics.LinesReceived,
+		CutLines:        recvMetrics.CutLines,
 		BytesIn:         genStats.BytesSent,
 		BytesOut:        recvMetrics.BytesReceived,
 		LinesPerSec:     receiveWindowRate(recvMetrics),

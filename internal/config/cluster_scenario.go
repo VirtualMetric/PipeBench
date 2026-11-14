@@ -3,7 +3,9 @@ package config
 import (
 	"fmt"
 	"math"
+	"path"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -44,10 +46,16 @@ type ScenarioConfig struct {
 	// Witness wires a witness store into every node. "dir" mounts a shared
 	// volume at WitnessDir (default /witness), writable by the director.
 	// "azure" and "s3" only add the start-up order: the case declares the
-	// `azure:` or `minio:` block and names the store in its config. Empty
-	// means no witness.
+	// `azure:` or `minio:` block and names the store in its config. "redis"
+	// does the same for an endpoint named redis, which needs a healthcheck.
+	// Empty means no witness.
 	Witness    string `yaml:"witness"`
 	WitnessDir string `yaml:"witness_dir"`
+
+	// SharedDir mounts one volume at this path on every node, and on each
+	// endpoint that sets mounts_shared_dir: a directory that they all see, as
+	// they see a network share. Empty means none.
+	SharedDir string `yaml:"shared_dir"`
 
 	// Proxies put Toxiproxy between the nodes and a service, so a step can
 	// slow the connection down or cut it (the witness store, for example).
@@ -80,14 +88,63 @@ type ScenarioConfig struct {
 	// acknowledged line to arrive (default 180).
 	DrainSeconds int `yaml:"drain_seconds"`
 
+	// Throughput marks a case that measures how many lines a second the
+	// cluster delivers, under a load it cannot keep up with. Such a case may
+	// send more than MaxScenarioRate, which keeps the other cases at a load a
+	// shared machine can carry, so run it on a machine that does nothing
+	// else. Its expect.throughput compares the windows between its marks.
+	Throughput bool `yaml:"throughput"`
+
 	// NodeDisk gives chosen nodes a small disk of their own at a path: a
 	// size-limited tmpfs, which a fill_disk step can fill.
 	NodeDisk *ScenarioNodeDisk `yaml:"node_disk"`
 
-	// Rows compares the rows a database holds with the rows that reached the
-	// receiver, for a case whose data comes from a database device. A row
-	// that never arrives counts as missing.
+	// Rows compares the rows a database holds, or the lines of a file, with
+	// the rows that reached the receiver, for a case whose data comes from a
+	// database or a file device. A row that never arrives counts as missing. A case with the http_ack load can
+	// have it too: the receiver then counts the load's lines and the rows
+	// apart, and the first receiver is the one whose rows are compared.
 	Rows *ScenarioRows `yaml:"rows"`
+
+	// StartImage is the image every node starts on, with its tag, such as an
+	// earlier release (vmetric/director:2.6.0). Empty means the image under
+	// test. A start or rolling_restart step with `image` moves nodes to
+	// another image later in the run.
+	StartImage string `yaml:"start_image"`
+
+	// NodeVolume keeps one directory of every node, such as the director's
+	// storage directory, on a Docker volume of the node's own. The volume
+	// outlives the node's container. A step that moves a node to another
+	// image gives it a new container, and the new container finds the node's
+	// data in the volume, as a director that an upgrade replaced on its
+	// machine finds its data on the machine's disk.
+	NodeVolume string `yaml:"node_volume"`
+}
+
+// SubjectImageKeyword is the value of a step's image that names the image
+// under test (the --image and --version of the run).
+const SubjectImageKeyword = "subject"
+
+// imageRefPattern is the form of an image reference a case may name: an
+// optional registry host, a repository, and a tag or a digest. The reference
+// goes into the compose file, so it allows no spaces, quotes or $.
+var imageRefPattern = regexp.MustCompile(`^(?:[a-z0-9][a-z0-9.-]*(?::[0-9]+)?/)?[a-z0-9]+(?:[._-]+[a-z0-9]+)*(?:/[a-z0-9]+(?:[._-]+[a-z0-9]+)*)*(?::[A-Za-z0-9_][A-Za-z0-9._-]{0,127})?(?:@sha256:[a-f0-9]{64})?$`)
+
+// checkImageRef says what is wrong with an image reference, or returns nil.
+// A reference must carry a tag or a digest: an image without one is
+// "latest", which moves, so the case would not say which build it ran.
+func checkImageRef(ref string) error {
+	if !imageRefPattern.MatchString(ref) {
+		return fmt.Errorf("is not an image reference such as vmetric/director:2.6.0")
+	}
+	name := ref
+	if i := strings.LastIndex(ref, "/"); i >= 0 {
+		name = ref[i+1:]
+	}
+	if !strings.Contains(name, ":") && !strings.Contains(ref, "@sha256:") {
+		return fmt.Errorf("names no tag; name the image with its tag, such as vmetric/director:2.6.0")
+	}
+	return nil
 }
 
 // ScenarioNodeDisk is the cluster.scenario.node_disk block.
@@ -123,6 +180,11 @@ type ScenarioRows struct {
 	// Query returns the key of every row the device should deliver, one per
 	// row, such as SELECT message FROM events.
 	Query string `yaml:"query"`
+	// File names a file under cluster.scenario.shared_dir that the device
+	// reads, in place of Query. The harness reads it from a node that runs, and
+	// finds a row's key in each of its lines with Key. A line without a key is
+	// no row.
+	File string `yaml:"file"`
 	// Key is a regular expression that finds a row's key in a line the
 	// receiver gets. With a group, the first group is the key.
 	Key string `yaml:"key"`
@@ -162,9 +224,23 @@ type ScenarioExpect struct {
 	// MaxSplitBrainMs is how long two nodes may both name themselves the
 	// cluster's leader in the same round of /health reads.
 	MaxSplitBrainMs *int64 `yaml:"max_split_brain_ms"`
+	// MaxStreamLeaderlessMs is how long one stream of the cluster may go
+	// without a leader: every reachable node that reports it names none.
+	MaxStreamLeaderlessMs *int64 `yaml:"max_stream_leaderless_ms"`
+	// MaxStreamSplitMs is the longest that two nodes may both name themselves
+	// the leader of one stream, without a break. It judges each stretch of
+	// each stream on its own, never their sum. With a witness, a leader that a
+	// takeover replaced still names itself the leader until its next check of
+	// the witness, while it commits nothing, so a stretch up to that check is
+	// expected.
+	MaxStreamSplitMs *int64 `yaml:"max_stream_split_ms"`
 	// MinAcked is the fewest lines the generator must have had
 	// acknowledged, so a run that sent nothing cannot pass.
 	MinAcked int64 `yaml:"min_acked"`
+	// MinReceived is the fewest distinct lines that must reach the receiver in
+	// a run without a generator, whose lines nobody acknowledges: those of an
+	// agent, for one. It needs correctness.validate_dedup, which counts them.
+	MinReceived int64 `yaml:"min_received"`
 	// MaxMissingRows is how many database rows (cluster.scenario.rows) may
 	// never arrive.
 	MaxMissingRows *int64 `yaml:"max_missing_rows"`
@@ -174,6 +250,13 @@ type ScenarioExpect struct {
 	// the receiver's hash-based duplicate count does not see.
 	MaxRowsTwice *int64 `yaml:"max_rows_twice"`
 
+	// Throughput compares the rates of two windows between marks. A window's
+	// rate is the number of lines that first reached the receiver in it,
+	// divided by its length in seconds. A case that measures how the
+	// cluster's throughput grows with its size names the window at the larger
+	// size, the window to compare it with, and the least ratio between them.
+	Throughput []ScenarioThroughputExpect `yaml:"throughput"`
+
 	// Receivers judges chosen receivers of a case with several on their own,
 	// keyed by the receiver's id. A limit set for a receiver here replaces
 	// the case's own for that receiver, and the other receivers keep the
@@ -181,6 +264,16 @@ type ScenarioExpect struct {
 	// (at a size limit, for one) names that target's receiver here, while
 	// every other receiver must still get every line.
 	Receivers map[string]ScenarioReceiverExpect `yaml:"receivers"`
+}
+
+// ScenarioThroughputExpect is one entry of cluster.scenario.expect.throughput.
+type ScenarioThroughputExpect struct {
+	// Window and Over name marks. A mark's window runs from the mark to the
+	// next mark, so neither may name the last mark.
+	Window string `yaml:"window"`
+	Over   string `yaml:"over"`
+	// MinRatio is the least that Window's rate divided by Over's rate may be.
+	MinRatio float64 `yaml:"min_ratio"`
 }
 
 // ScenarioReceiverExpect is how one receiver is judged
@@ -193,6 +286,34 @@ type ScenarioReceiverExpect struct {
 	// receiver. A case that tests a loss the subject makes on purpose fails
 	// when nothing was lost, because it then tested nothing.
 	MinLoss *int64 `yaml:"min_loss"`
+	// CountedLoss checks that the subject counted the loss at this receiver:
+	// the numbers its nodes logged must add up to the lines missing here.
+	CountedLoss *CountedLoss `yaml:"counted_loss"`
+}
+
+// CountedLoss is what the subject says it lost for a receiver, read from its
+// nodes' logs after the run.
+type CountedLoss struct {
+	// Pattern is a regular expression with one group, which captures a number.
+	// The numbers of every matching line of every node's log add up to what
+	// the subject counted.
+	Pattern string `yaml:"pattern"`
+	// MaxGapPct is how far that sum may be from the lines missing at the
+	// receiver, in percent of the missing lines.
+	MaxGapPct float64 `yaml:"max_gap_pct"`
+	// MaxUnderPct and MaxOver judge the two sides apart, in place of
+	// MaxGapPct. A sum below the missing lines hides a loss, so MaxUnderPct is
+	// how far below them it may be, in percent of them. A sum above them says
+	// that more was lost than was, as when a subject counts records that it was
+	// still delivering. MaxOver is how many lines above them it may be.
+	MaxUnderPct *float64 `yaml:"max_under_pct"`
+	MaxOver     *int64   `yaml:"max_over"`
+}
+
+// OneSided reports whether the count is judged on each side apart
+// (max_under_pct and max_over) rather than by max_gap_pct.
+func (c CountedLoss) OneSided() bool {
+	return c.MaxUnderPct != nil || c.MaxOver != nil
 }
 
 // ReceiverLimits returns the limits receiver id is judged by: the case's
@@ -268,6 +389,16 @@ type ScenarioStep struct {
 
 	// Nodes is the cluster size a scale_to step moves to.
 	Nodes int `yaml:"nodes"`
+	// Version is what every node must report on /health for a wait_version
+	// step to end. A node that updates itself reports it once the new binary
+	// runs.
+	Version string `yaml:"version"`
+
+	// Stage is the stage a set_stage step renders every member's config at:
+	// the config template reads it as {{@.Stage@}}, which is 1 at the start.
+	// A case changes a cluster setting at a stage, as the platform changes a
+	// setting on every member at once.
+	Stage int `yaml:"stage"`
 
 	// Log is the text wait_log waits for, or that expect_no_log must not see.
 	Log string `yaml:"log"`
@@ -328,10 +459,43 @@ type ScenarioStep struct {
 
 	// EmptyDisk makes a start step replace the node's container with a new
 	// one, which starts on an empty disk, as a node whose disk was replaced.
+	// With image, on a start or a rolling_restart step, the new container comes
+	// from that image: a container platform moves a replica to a new image that
+	// way, and the replica's old disk is gone. A case without
+	// cluster.scenario.node_volume says so with this.
 	EmptyDisk bool `yaml:"empty_disk"`
+	// Image makes a start step start the node on another image, and a
+	// rolling_restart step move every node to it in turn: "subject" for the
+	// image under test, or an image reference with its tag. The node gets a
+	// new container from that image, on the data its volume keeps
+	// (cluster.scenario.node_volume). A start step with image starts a node
+	// that an earlier step stopped or killed, so the case says how the old
+	// version stopped.
+	Image string `yaml:"image"`
+	// PauseLoadAtStop makes a rolling_restart step pause the load from a few
+	// seconds before it stops each node until the node has stopped, as a
+	// pause_load step does. The node then holds no record it took in a
+	// moment before its stop: the case tests what the restart keeps, not
+	// what a version does with the records of its last moment.
+	PauseLoadAtStop bool `yaml:"pause_load_at_stop"`
+	// WaitCopies makes a rolling_restart step wait, after each node is
+	// healthy again, until every stream has all its copies back, as the
+	// stream's leader reports them: as many copies as the cluster has
+	// members (five at most), and no copy offline or behind. Only then does
+	// it stop the next node. A node that starts
+	// can make streams lose copies for a moment, and stopping the next node
+	// before they are back can leave a stream without a leader. A step that
+	// does wait_copies waits the same way once, for up to within (default
+	// 120s), and fails when the copies are not all there by then.
+	WaitCopies bool `yaml:"wait_copies"`
 	// Leave is how much free space a fill_disk step leaves on the node's disk
 	// (default 1m).
 	Leave string `yaml:"leave"`
+	// DiskBPS and DiskIOPS are how fast a slow_disk step lets the node read
+	// and write the disk that holds its volume: bytes a second, such as 1m,
+	// and operations a second. A step sets one of them or both.
+	DiskBPS  string `yaml:"disk_bps"`
+	DiskIOPS int    `yaml:"disk_iops"`
 }
 
 // PeerList returns the peers a link step names: its peers, or its one peer.
@@ -366,6 +530,8 @@ func LossPercent(s string) (float64, error) {
 var scenarioActions = map[string]bool{
 	"wait_ready":                false,
 	"start_load":                false,
+	"pause_load":                false,
+	"resume_load":               false,
 	"sleep":                     false,
 	"mark":                      false,
 	"kill":                      true,
@@ -386,16 +552,21 @@ var scenarioActions = map[string]bool{
 	"wait_healthy":              false,
 	"witness_down":              false,
 	"witness_up":                false,
+	"witness_restart":           false,
 	"proxy_latency":             false,
 	"proxy_down":                false,
 	"proxy_up":                  false,
 	"receiver_pause":            false,
 	"receiver_unpause":          false,
 	"scale_to":                  false,
+	"set_stage":                 false,
 	"rolling_restart":           false,
 	"wait_log":                  false,
+	"wait_version":              false,
 	"expect_no_log":             true,
 	"wait_stable":               false,
+	"wait_copies":               false,
+	"expect_cluster_ip":         false,
 	"count_pending":             false,
 	"expect_arrived":            false,
 	// The link steps check their node themselves: it may be "all".
@@ -405,6 +576,68 @@ var scenarioActions = map[string]bool{
 	"split":        false,
 	"fill_disk":    true,
 	"free_disk":    true,
+	"slow_disk":    true,
+	"restore_disk": true,
+}
+
+// loadCountingSteps are the steps that count the load's lines or wait for
+// them. None may run while the load is paused, because no line is sent then.
+var loadCountingSteps = map[string]bool{
+	"expect_writes_continue": true, "expect_delivery_continues": true, "wait_delivery": true,
+	"expect_writes_stop": true,
+}
+
+// checkLoadPause follows the pause_load and resume_load steps in order: the
+// load must run to be paused, and be paused to be resumed.
+func checkLoadPause(do string, paused *bool) error {
+	switch do {
+	case "pause_load":
+		if *paused {
+			return fmt.Errorf("the load is paused already")
+		}
+		*paused = true
+	case "resume_load":
+		if !*paused {
+			return fmt.Errorf("no earlier pause_load step paused the load")
+		}
+		*paused = false
+	}
+	return nil
+}
+
+// pausedAtEnd reports whether the steps leave the load paused.
+func pausedAtEnd(steps []ScenarioStep) bool {
+	paused := false
+	for _, st := range steps {
+		switch st.Do {
+		case "pause_load":
+			paused = true
+		case "resume_load":
+			paused = false
+		}
+	}
+	return paused
+}
+
+// checkDiskLimit checks the limit of a slow_disk step: disk_bps, disk_iops,
+// or both, each above 0.
+func checkDiskLimit(st ScenarioStep) error {
+	if st.DiskBPS == "" && st.DiskIOPS == 0 {
+		return fmt.Errorf("needs disk_bps, disk_iops or both: how fast the node may use its disk")
+	}
+	if st.DiskBPS != "" {
+		bps, err := ParseByteSize(st.DiskBPS)
+		if err != nil {
+			return fmt.Errorf("disk_bps %q: %w", st.DiskBPS, err)
+		}
+		if bps <= 0 {
+			return fmt.Errorf("disk_bps must be above 0, got %q", st.DiskBPS)
+		}
+	}
+	if st.DiskIOPS < 0 {
+		return fmt.Errorf("disk_iops must be above 0, got %d", st.DiskIOPS)
+	}
+	return nil
 }
 
 // linkSteps are the actions that change the links between containers.
@@ -415,7 +648,7 @@ var linkSteps = map[string]bool{"cut_link": true, "shape_link": true, "restore_l
 var nodeActionSteps = map[string]bool{
 	"kill": true, "stop": true, "start": true, "restart": true,
 	"pause": true, "unpause": true, "disconnect": true, "connect": true,
-	"fill_disk": true, "free_disk": true,
+	"fill_disk": true, "free_disk": true, "slow_disk": true, "restore_disk": true,
 }
 
 // containerPeerPattern is the form of a link step's peer that names another
@@ -550,8 +783,13 @@ func (tc *TestCase) validateClusterScenario() error {
 	if tc.Cluster.Nodes < 1 {
 		return fmt.Errorf("case %q: cluster.nodes must be >= 1, got %d", tc.Name, tc.Cluster.Nodes)
 	}
-	if tc.Cluster.Action != "" || tc.Cluster.IP != "" {
-		return fmt.Errorf("case %q: cluster.action and cluster.ip belong to director_cluster_correctness; a scenario case uses cluster.scenario.steps", tc.Name)
+	if tc.Cluster.Action != "" {
+		return fmt.Errorf("case %q: cluster.action belongs to director_cluster_correctness; a scenario case uses cluster.scenario.steps", tc.Name)
+	}
+	if tc.Cluster.IP != "" {
+		if err := tc.validateClusterIP(); err != nil {
+			return err
+		}
 	}
 	sc := tc.Cluster.Scenario
 	if sc == nil || len(sc.Steps) == 0 {
@@ -565,6 +803,14 @@ func (tc *TestCase) validateClusterScenario() error {
 		if sc.Expect.MaxLoss != nil || sc.Expect.MinAcked > 0 {
 			return fmt.Errorf("case %q: expect.max_loss and expect.min_acked need the http_ack generator", tc.Name)
 		}
+		if sc.Expect.MinReceived < 0 {
+			return fmt.Errorf("case %q: expect.min_received cannot be negative", tc.Name)
+		}
+		if sc.Expect.MinReceived > 0 && !tc.Correctness.ValidateDedup {
+			return fmt.Errorf("case %q: expect.min_received needs correctness.validate_dedup, which counts the distinct lines", tc.Name)
+		}
+	case sc.Expect.MinReceived != 0:
+		return fmt.Errorf("case %q: expect.min_received is for a case without a generator", tc.Name)
 	case tc.Generator.Mode != "http_ack":
 		return fmt.Errorf("case %q: a scenario case counts acknowledged lines, so its generator must use mode http_ack (got %q)", tc.Name, tc.Generator.Mode)
 	// The rate is per worker, and an unset worker count means three per CPU
@@ -573,7 +819,7 @@ func (tc *TestCase) validateClusterScenario() error {
 	case tc.Generator.Connections < 1 || tc.Generator.Rate < 1:
 		return fmt.Errorf("case %q: a scenario case sets generator.connections and generator.rate explicitly", tc.Name)
 	}
-	if total := tc.Generator.Connections * tc.Generator.Rate; tc.HasGenerator() && total > MaxScenarioRate {
+	if total := tc.Generator.Connections * tc.Generator.Rate; tc.HasGenerator() && total > MaxScenarioRate && !sc.Throughput {
 		return fmt.Errorf("case %q: generator.connections × generator.rate is %d lines a second, more than the %d a scenario case may send", tc.Name, total, MaxScenarioRate)
 	}
 	// With several receivers, the driver checks the load's acknowledged lines
@@ -582,9 +828,9 @@ func (tc *TestCase) validateClusterScenario() error {
 		return fmt.Errorf("case %q: a scenario case with several receivers checks the load's lines at each of them, so it needs the http_ack generator", tc.Name)
 	}
 	switch sc.Witness {
-	case "", "dir", "azure", "s3":
+	case "", "dir", "azure", "s3", "redis":
 	default:
-		return fmt.Errorf("case %q: cluster.scenario.witness must be dir, azure or s3, got %q", tc.Name, sc.Witness)
+		return fmt.Errorf("case %q: cluster.scenario.witness must be dir, azure, s3 or redis, got %q", tc.Name, sc.Witness)
 	}
 	if sc.WitnessDir != "" {
 		if err := checkWitnessDir(sc.WitnessDir); err != nil {
@@ -597,8 +843,16 @@ func (tc *TestCase) validateClusterScenario() error {
 	if sc.Witness == "s3" && !tc.UsesMinio() {
 		return fmt.Errorf("case %q: cluster.scenario.witness s3 needs the case's `minio:` block", tc.Name)
 	}
+	if sc.Witness == "redis" && !slices.ContainsFunc(tc.Endpoints, func(e Endpoint) bool {
+		return e.Name == "redis" && e.Healthcheck != nil && e.Healthcheck.Test != ""
+	}) {
+		return fmt.Errorf("case %q: cluster.scenario.witness redis needs an endpoint named redis, with a healthcheck", tc.Name)
+	}
 	if sc.SpareNodes < 0 {
 		return fmt.Errorf("case %q: cluster.scenario.spare_nodes must be >= 0", tc.Name)
+	}
+	if err := tc.validateScenarioImages(); err != nil {
+		return err
 	}
 	proxies := map[string]bool{}
 	for _, p := range sc.Proxies {
@@ -622,6 +876,9 @@ func (tc *TestCase) validateClusterScenario() error {
 		}
 	}
 
+	if pausedAtEnd(sc.Steps) {
+		return fmt.Errorf("case %q: a pause_load step pauses the load and no later resume_load step resumes it, so the run would wait for a load that never ends", tc.Name)
+	}
 	maxNodes := tc.Cluster.Nodes + sc.SpareNodes
 	if err := tc.validateScenarioDiskAndRows(maxNodes); err != nil {
 		return err
@@ -629,15 +886,33 @@ func (tc *TestCase) validateClusterScenario() error {
 	if err := tc.validateReceiverExpect(sc.Expect); err != nil {
 		return fmt.Errorf("case %q: %w", tc.Name, err)
 	}
+	if sc.Expect.MaxStreamLeaderlessMs != nil && *sc.Expect.MaxStreamLeaderlessMs < 0 {
+		return fmt.Errorf("case %q: expect.max_stream_leaderless_ms must not be negative, got %d", tc.Name, *sc.Expect.MaxStreamLeaderlessMs)
+	}
+	if sc.Expect.MaxStreamSplitMs != nil && *sc.Expect.MaxStreamSplitMs < 0 {
+		return fmt.Errorf("case %q: expect.max_stream_split_ms must not be negative, got %d", tc.Name, *sc.Expect.MaxStreamSplitMs)
+	}
+	if sc.Expect.MaxStreamLeaderlessMs != nil && tc.Cluster.Nodes+sc.SpareNodes < 2 {
+		return fmt.Errorf("case %q: expect.max_stream_leaderless_ms measures the leaders of a cluster's streams, and one director leads its streams itself", tc.Name)
+	}
+	if err := validateThroughputExpect(sc); err != nil {
+		return fmt.Errorf("case %q: %w", tc.Name, err)
+	}
 	names := map[string]bool{}
 	// marks holds the labels of the marks set so far: since and sent_before
 	// may only name a mark an earlier step sets.
 	marks := map[string]bool{}
+	// paused says whether a pause_load step has paused the load at this
+	// point of the steps.
+	paused := false
 	for i, st := range sc.Steps {
 		where := fmt.Sprintf("case %q: cluster.scenario.steps[%d] (%s)", tc.Name, i, st.Do)
 		needsNode, known := scenarioActions[st.Do]
 		if !known {
 			return fmt.Errorf("case %q: cluster.scenario.steps[%d]: unknown action %q", tc.Name, i, st.Do)
+		}
+		if st.Do == "expect_cluster_ip" && tc.Cluster.IP == "" {
+			return fmt.Errorf("%s: needs cluster.ip", where)
 		}
 		// A step that acts on a node must name it. A wait that may name one
 		// (wait_leader, wait_log) must name it the same way when it does. A
@@ -665,6 +940,21 @@ func (tc *TestCase) validateClusterScenario() error {
 			if _, err := time.ParseDuration(v); err != nil {
 				return fmt.Errorf("%s: %s: %w", where, field, err)
 			}
+		}
+		if (st.Do == "pause_load" || st.Do == "resume_load") && !tc.HasGenerator() {
+			return fmt.Errorf("%s: pauses and resumes the load, and the case has no generator", where)
+		}
+		if st.PauseLoadAtStop && !tc.HasGenerator() {
+			return fmt.Errorf("%s: pause_load_at_stop pauses the load, and the case has no generator", where)
+		}
+		if st.PauseLoadAtStop && paused {
+			return fmt.Errorf("%s: pause_load_at_stop pauses the load, which a pause_load step has paused already", where)
+		}
+		if paused && loadCountingSteps[st.Do] {
+			return fmt.Errorf("%s: counts the load's lines while a pause_load step has paused the load; resume it first", where)
+		}
+		if err := checkLoadPause(st.Do, &paused); err != nil {
+			return fmt.Errorf("%s: %w", where, err)
 		}
 		if st.Do == "expect_delivery_continues" && !tc.HasGenerator() {
 			return fmt.Errorf("%s: counts the load's lines, and the case has no generator", where)
@@ -760,13 +1050,33 @@ func (tc *TestCase) validateClusterScenario() error {
 					return fmt.Errorf("%s: leave %q: %w", where, st.Leave, err)
 				}
 			}
-		case "witness_down", "witness_up":
+		case "slow_disk", "restore_disk":
+			if sc.NodeVolume == "" {
+				return fmt.Errorf("%s: limits the disk that holds the node's volume, so it needs cluster.scenario.node_volume", where)
+			}
+			if st.Do == "slow_disk" {
+				if err := checkDiskLimit(st); err != nil {
+					return fmt.Errorf("%s: %w", where, err)
+				}
+			}
+		case "witness_down", "witness_up", "witness_restart":
 			if sc.Witness == "" {
 				return fmt.Errorf("%s: the case has no witness", where)
+			}
+			if st.Do == "witness_restart" && sc.Witness == "dir" {
+				return fmt.Errorf("%s: a witness on a directory has no store to restart", where)
 			}
 		case "proxy_latency", "proxy_down", "proxy_up":
 			if !proxies[st.Proxy] {
 				return fmt.Errorf("%s: proxy %q is not declared in cluster.scenario.proxies", where, st.Proxy)
+			}
+		case "set_stage":
+			if st.Stage < 1 {
+				return fmt.Errorf("%s: needs stage, 1 or more: the stage every member's config is rendered at", where)
+			}
+		case "wait_version":
+			if st.Version == "" {
+				return fmt.Errorf("%s: needs version, the version every node must report", where)
 			}
 		case "scale_to":
 			if st.Nodes < 1 || st.Nodes > maxNodes {
@@ -800,6 +1110,104 @@ func (tc *TestCase) validateClusterScenario() error {
 	return nil
 }
 
+// validateScenarioImages checks start_image, node_volume and the image of
+// every step that moves nodes to another image.
+func (tc *TestCase) validateScenarioImages() error {
+	sc := tc.Cluster.Scenario
+	if sc.StartImage != "" {
+		if err := checkImageRef(sc.StartImage); err != nil {
+			return fmt.Errorf("case %q: cluster.scenario.start_image %q %v", tc.Name, sc.StartImage, err)
+		}
+	}
+	if sc.NodeVolume != "" {
+		if err := checkWitnessDir(sc.NodeVolume); err != nil {
+			return fmt.Errorf("case %q: cluster.scenario.node_volume %q %v", tc.Name, sc.NodeVolume, err)
+		}
+		if sc.NodeDisk != nil && path.Clean(sc.NodeDisk.Path) == path.Clean(sc.NodeVolume) {
+			return fmt.Errorf("case %q: cluster.scenario.node_volume and node_disk.path are both %q; a directory is on a volume or on a small disk, not both", tc.Name, sc.NodeVolume)
+		}
+	}
+	testsSubject := false
+	for i, st := range sc.Steps {
+		where := fmt.Sprintf("case %q: cluster.scenario.steps[%d] (%s)", tc.Name, i, st.Do)
+		if st.Do == "rolling_restart" && st.EmptyDisk && st.Image == "" {
+			return fmt.Errorf("%s: empty_disk needs image: a restart without one keeps the node's container and its disk", where)
+		}
+		if st.EmptyDisk && sc.NodeVolume != "" {
+			return fmt.Errorf("%s: empty_disk starts the node on an empty disk, but cluster.scenario.node_volume keeps the node's data in a volume; a case uses one of them", where)
+		}
+		// Nodes that update themselves move to the build under test without a
+		// step that gives them an image: wait_version waits for that.
+		if st.Do == "wait_version" {
+			testsSubject = true
+		}
+		if st.Image == "" {
+			continue
+		}
+		if st.Image == SubjectImageKeyword {
+			testsSubject = true
+		} else if err := checkImageRef(st.Image); err != nil {
+			return fmt.Errorf("%s: image %q %v, or subject for the image under test", where, st.Image, err)
+		}
+		if sc.NodeVolume == "" && !st.EmptyDisk {
+			return fmt.Errorf("%s: image gives the node a new container, which would start on an empty disk; say empty_disk: true when the case means that, or set cluster.scenario.node_volume to keep the node's data", where)
+		}
+	}
+	// A case whose nodes start on another image must move them to the build
+	// under test at some step. Otherwise it would pass or fail whatever the
+	// build under test does.
+	if sc.StartImage != "" && !testsSubject {
+		return fmt.Errorf("case %q: cluster.scenario.start_image starts the nodes on %s, and no step moves a node to the image under test (image: subject), so the case would not test it", tc.Name, sc.StartImage)
+	}
+	return nil
+}
+
+// validateThroughputExpect checks cluster.scenario.expect.throughput: each
+// entry compares two windows that the steps' marks open and close, by a ratio
+// above zero. Only a case that sets throughput loads the cluster beyond what
+// it keeps up with, and only that load says how much it can take.
+func validateThroughputExpect(sc *ScenarioConfig) error {
+	if len(sc.Expect.Throughput) == 0 {
+		return nil
+	}
+	if !sc.Throughput {
+		return fmt.Errorf("expect.throughput compares how much the cluster takes under a load it cannot keep up with, so it needs cluster.scenario.throughput: true")
+	}
+	// closed holds the marks whose window a later mark closes
+	closed := map[string]bool{}
+	last := ""
+	for _, st := range sc.Steps {
+		if st.Do != "mark" {
+			continue
+		}
+		if last != "" {
+			closed[last] = true
+		}
+		last = st.Label
+	}
+	for i, e := range sc.Expect.Throughput {
+		where := fmt.Sprintf("expect.throughput[%d]", i)
+		if e.Window == "" || e.Over == "" {
+			return fmt.Errorf("%s needs window and over, the marks of the two windows it compares", where)
+		}
+		if e.Window == e.Over {
+			return fmt.Errorf("%s compares window %q with itself", where, e.Window)
+		}
+		for _, m := range []string{e.Window, e.Over} {
+			if !closed[m] {
+				if m == last {
+					return fmt.Errorf("%s names mark %q, the last mark, whose window no later mark closes", where, m)
+				}
+				return fmt.Errorf("%s names mark %q, which no step sets", where, m)
+			}
+		}
+		if math.IsNaN(e.MinRatio) || e.MinRatio <= 0 {
+			return fmt.Errorf("%s: min_ratio must be more than 0, got %v", where, e.MinRatio)
+		}
+	}
+	return nil
+}
+
 // validateReceiverExpect checks cluster.scenario.expect.receivers: each
 // entry names one of the case's several receivers, and its limits make sense.
 func (tc *TestCase) validateReceiverExpect(ex ScenarioExpect) error {
@@ -828,8 +1236,28 @@ func (tc *TestCase) validateReceiverExpect(ex ScenarioExpect) error {
 		if minLoss != nil && maxLoss != nil && *minLoss > *maxLoss {
 			return fmt.Errorf("expect.receivers.%s: min_loss %d is more than max_loss %d", id, *minLoss, *maxLoss)
 		}
-		if own.MaxLoss == nil && own.MaxDuplicates == nil && own.MinLoss == nil {
+		if own.MaxLoss == nil && own.MaxDuplicates == nil && own.MinLoss == nil && own.CountedLoss == nil {
 			return fmt.Errorf("expect.receivers.%s sets no limit", id)
+		}
+		if c := own.CountedLoss; c != nil {
+			re, err := regexp.Compile(c.Pattern)
+			switch {
+			case err != nil:
+				return fmt.Errorf("expect.receivers.%s.counted_loss.pattern: %w", id, err)
+			case re.NumSubexp() != 1:
+				return fmt.Errorf("expect.receivers.%s.counted_loss.pattern must have one group, which captures a number; it has %d", id, re.NumSubexp())
+			case c.MaxGapPct < 0 || c.MaxGapPct > 100:
+				return fmt.Errorf("expect.receivers.%s.counted_loss.max_gap_pct must be between 0 and 100, got %v", id, c.MaxGapPct)
+			case !c.OneSided():
+			case c.MaxUnderPct == nil || c.MaxOver == nil:
+				return fmt.Errorf("expect.receivers.%s.counted_loss: max_under_pct and max_over go together", id)
+			case c.MaxGapPct != 0:
+				return fmt.Errorf("expect.receivers.%s.counted_loss: set max_gap_pct, or max_under_pct and max_over, not both", id)
+			case *c.MaxUnderPct < 0 || *c.MaxUnderPct > 100:
+				return fmt.Errorf("expect.receivers.%s.counted_loss.max_under_pct must be between 0 and 100, got %v", id, *c.MaxUnderPct)
+			case *c.MaxOver < 0:
+				return fmt.Errorf("expect.receivers.%s.counted_loss.max_over must be 0 or more, got %d", id, *c.MaxOver)
+			}
 		}
 	}
 	return nil
@@ -941,8 +1369,15 @@ var stepFieldOwners = []struct {
 	{"one_way", func(s ScenarioStep) bool { return s.OneWay }, map[string]bool{"cut_link": true, "shape_link": true, "restore_link": true}},
 	{"loss", func(s ScenarioStep) bool { return s.Loss != "" }, map[string]bool{"shape_link": true}},
 	{"groups", func(s ScenarioStep) bool { return s.Groups != nil }, map[string]bool{"split": true, "wait_leader": true}},
-	{"empty_disk", func(s ScenarioStep) bool { return s.EmptyDisk }, map[string]bool{"start": true}},
+	{"empty_disk", func(s ScenarioStep) bool { return s.EmptyDisk }, map[string]bool{"start": true, "rolling_restart": true}},
+	{"image", func(s ScenarioStep) bool { return s.Image != "" }, map[string]bool{"start": true, "rolling_restart": true}},
+	{"stage", func(s ScenarioStep) bool { return s.Stage != 0 }, map[string]bool{"set_stage": true}},
+	{"version", func(s ScenarioStep) bool { return s.Version != "" }, map[string]bool{"wait_version": true}},
+	{"pause_load_at_stop", func(s ScenarioStep) bool { return s.PauseLoadAtStop }, map[string]bool{"rolling_restart": true}},
+	{"wait_copies", func(s ScenarioStep) bool { return s.WaitCopies }, map[string]bool{"rolling_restart": true}},
 	{"leave", func(s ScenarioStep) bool { return s.Leave != "" }, map[string]bool{"fill_disk": true}},
+	{"disk_bps", func(s ScenarioStep) bool { return s.DiskBPS != "" }, map[string]bool{"slow_disk": true}},
+	{"disk_iops", func(s ScenarioStep) bool { return s.DiskIOPS != 0 }, map[string]bool{"slow_disk": true}},
 	{"gap", func(s ScenarioStep) bool { return s.Gap != "" }, map[string]bool{"expect_delivery_continues": true, "expect_writes_continue": true}},
 	{"receiver", func(s ScenarioStep) bool { return s.Receiver != "" }, map[string]bool{"receiver_pause": true, "receiver_unpause": true, "expect_arrived": true}},
 	{"sent_after", func(s ScenarioStep) bool { return s.SentAfter != "" }, map[string]bool{"expect_arrived": true}},
@@ -1084,9 +1519,22 @@ func (tc *TestCase) validateScenarioDiskAndRows(maxNodes int) error {
 			}
 		}
 	}
+	if sc.SharedDir != "" {
+		if err := checkWitnessDir(sc.SharedDir); err != nil {
+			return fmt.Errorf("case %q: cluster.scenario.shared_dir %q %v", tc.Name, sc.SharedDir, err)
+		}
+	}
+	for _, ep := range tc.Endpoints {
+		if ep.MountsSharedDir && sc.SharedDir == "" {
+			return fmt.Errorf("case %q: endpoint %q sets mounts_shared_dir, but the case has no cluster.scenario.shared_dir", tc.Name, ep.Name)
+		}
+	}
 	if r := sc.Rows; r != nil {
-		if strings.TrimSpace(r.Query) == "" {
-			return fmt.Errorf("case %q: cluster.scenario.rows needs query, which returns the key of every row", tc.Name)
+		if (strings.TrimSpace(r.Query) == "") == (r.File == "") {
+			return fmt.Errorf("case %q: cluster.scenario.rows needs either query, which returns the key of every row, or file", tc.Name)
+		}
+		if r.File != "" && (sc.SharedDir == "" || !strings.HasPrefix(r.File, strings.TrimRight(sc.SharedDir, "/")+"/")) {
+			return fmt.Errorf("case %q: cluster.scenario.rows.file %q must be under cluster.scenario.shared_dir", tc.Name, r.File)
 		}
 		if r.Key == "" {
 			return fmt.Errorf("case %q: cluster.scenario.rows needs key, the expression that finds a row's key in a received line", tc.Name)
@@ -1099,10 +1547,7 @@ func (tc *TestCase) validateScenarioDiskAndRows(maxNodes int) error {
 		if strings.ContainsAny(r.Key, "\"\\$") {
 			return fmt.Errorf("case %q: cluster.scenario.rows.key must not contain a backslash, a double quote or $; write [0-9] for \\d", tc.Name)
 		}
-		if tc.HasGenerator() {
-			return fmt.Errorf("case %q: cluster.scenario.rows is for a case whose data comes from a database device; this case has a generator", tc.Name)
-		}
-		if tc.Database == nil || tc.Database.Engine != "postgres" {
+		if r.File == "" && (tc.Database == nil || tc.Database.Engine != "postgres") {
 			return fmt.Errorf("case %q: cluster.scenario.rows reads the case's database, which must use engine postgres", tc.Name)
 		}
 		if r.Writer != "" && !tc.hasEndpoint(r.Writer) {
