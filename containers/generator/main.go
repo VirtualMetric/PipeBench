@@ -132,6 +132,15 @@ func (sc *sendClock) Bounds() (first, last int64) {
 }
 
 func main() {
+	// The disk baseline of a latency case measures the disk, and sends nothing
+	if getEnv("GENERATOR_MODE", "") == "disk_baseline" {
+		if err := runDiskBaseline(); err != nil {
+			fmt.Fprintf(os.Stderr, "generator error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	cfg := loadConfig()
 
 	// Sample-file replay: load and parse the file once here so the parallel

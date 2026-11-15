@@ -276,6 +276,47 @@ The limits are recorded in `summary.json` (`subject_cpu_limit`, `subject_mem_lim
 
 ---
 
+## Latency cases
+
+A case with a `latency:` block measures how long records take, at several loads, instead of how many get through. It needs one `http_ack` generator and one receiver, in a `performance` case or a `director_cluster_scenario_correctness` case.
+
+```yaml
+latency:
+  steps: ["capacity:60s", "1000:120s", "10000:120s", "50%:120s", "80%:120s"]
+  step_warmup: 20s # each step leaves out its first 20 seconds (the default)
+  disk_baseline: true # measure the disk under --subject-data first
+  stages: true # read a vmetric director's stage times while the load runs
+  stage_interval: 5s # how often (the default)
+  capacity_from: receiver # what a percent step takes a share of (the default)
+  step_drain: 60s # how long a step waits at most for the receiver to catch up (the default)
+```
+
+Each step is a load and a duration:
+
+- `capacity` sends as fast as the subject takes records, and measures that rate.
+- A number, such as `1000`, sends that many lines a second.
+- A percent, such as `50%`, sends that share of the capacity the last capacity step measured.
+
+A subject can confirm records faster than it delivers them, and keep the rest in a queue. So by default the capacity is the rate at which the lines arrived at the receiver in the capacity step, and a percent of it is a load the subject can deliver. With `capacity_from: acknowledgements`, it is the rate the lines were confirmed at instead. Each percent step records the capacity it used (`capacity_per_sec`) and where it came from (`capacity_from`).
+
+Each step but the last also waits, up to `step_drain`, until the receiver has every confirmed line, so that the next step starts with an empty queue. Each step records that wait (`drain_ms`) and the rate its lines arrived at the receiver (`delivered_per_sec`).
+
+Under a number or a percent, the load is open: each post has a fixed time on a timeline, and its latency counts from that time. A subject that stalls therefore shows the stall as latency, and does not slow the load down.
+
+For each step, the result's `latency` block holds:
+
+- the acknowledgement latency the generator measured;
+- the end-to-end latency of the lines sent in the step, from the receiver;
+- with `stages`, how long each stage of the director took in the step.
+
+Every time is in microseconds, with p50, p90, p99, p99.9 and the maximum.
+
+`--subject-data <folder>` puts the subject's data folder on the disk under that folder. Each run gets a folder of its own there, and the harness removes it after the run. With `disk_baseline`, the harness first measures how long that disk takes to sync a 4 KB write, and to sync a new 4 KB file. In a director cluster, each node gets a folder of its own there, named after its hostname.
+
+Every result row also has a `hardware_info` block: the cloud's name for the machine, the CPU, the memory, and the disk under the subject's data.
+
+---
+
 ## Understanding the results
 
 Each test run produces a `summary.json` with all metrics:

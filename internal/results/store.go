@@ -116,6 +116,15 @@ type RunResult struct {
 	// per second, and where its evidence lies. Omitted for other cases.
 	SharedState map[string]any `json:"shared_state,omitempty"`
 
+	// Latency holds what a case's latency block measured: each step's acknowledgement, end-to-end
+	// and stage latency in microseconds, and the disk baseline. Omitted for other cases.
+	Latency map[string]any `json:"latency,omitempty"`
+
+	// HardwareInfo says what machine and disk the row ran on, as the harness found them: the
+	// cloud's size for the machine, the CPU, the memory and the disk under the subject's data.
+	// --hardware is only the label of the results folder.
+	HardwareInfo map[string]any `json:"hardware_info,omitempty"`
+
 	// MetricsFile used to point at a copy of metrics.csv; with the
 	// subject-file layout we don't archive the raw CSV per run any more.
 	// Kept on the struct so old code paths compile; always empty now.
@@ -195,6 +204,9 @@ type ResultEntry struct {
 	LoadBalance map[string]any   `json:"load_balance,omitempty"`
 	Scenario    map[string]any   `json:"scenario,omitempty"`
 	SharedState map[string]any   `json:"shared_state,omitempty"`
+	// Latency and HardwareInfo are RunResult's.
+	Latency      map[string]any `json:"latency,omitempty"`
+	HardwareInfo map[string]any `json:"hardware_info,omitempty"`
 }
 
 // Store manages writing the subject-file layout.
@@ -345,6 +357,8 @@ func (s *Store) Save(r RunResult, _unusedMetricsCSVSrc string) (string, error) {
 		LoadBalance:     r.LoadBalance,
 		Scenario:        r.Scenario,
 		SharedState:     r.SharedState,
+		Latency:         r.Latency,
+		HardwareInfo:    r.HardwareInfo,
 	}
 
 	// Replace matching (test, config) or append.
