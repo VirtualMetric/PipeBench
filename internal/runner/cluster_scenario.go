@@ -411,6 +411,24 @@ func (r *Runner) runClusterScenario(tc *config.TestCase, subject config.Subject)
 		maps.Copy(extraEnv, cfg.Env)
 	}
 
+	// With --subject-data, each node keeps its data in a folder of its own in the run's folder, on
+	// the disk being measured, and a latency case measures that disk first
+	subjectDataHost, subjectDataDst, err := prepareSubjectData(r.opts.SubjectData, tc.Name, subject.Name, time.Now())
+	if err != nil {
+		return results.RunResult{}, err
+	}
+	r.subjectDataHost = subjectDataHost
+	if subjectDataHost != "" && !r.opts.NoCleanup {
+		defer removeSubjectData(r.opts.GeneratorImage, subjectDataHost)
+	}
+	var diskBaseline map[string]any
+	if tc.Latency != nil && tc.Latency.DiskBaseline && subjectDataHost != "" {
+		fmt.Printf("  measuring the disk under %s…\n", subjectDataHost)
+		if diskBaseline, err = runDiskBaseline(r.ctx, r.opts.GeneratorImage, subjectDataHost); err != nil {
+			fmt.Fprintf(os.Stderr, "  warning: disk baseline: %v\n", err)
+		}
+	}
+
 	orch, err := orchestrator.NewComposeRunner(r.ctx, orchestrator.RunConfig{
 		TestCase:         tc,
 		Subject:          subject,
@@ -425,6 +443,8 @@ func (r *Runner) runClusterScenario(tc *config.TestCase, subject config.Subject)
 		ExtraSubjectEnv:  extraEnv,
 		CPULimit:         r.runCPULimit,
 		MemLimit:         r.runMemLimit,
+		SubjectDataHost:  subjectDataHost,
+		SubjectDataDst:   subjectDataDst,
 	})
 	if err != nil {
 		return results.RunResult{}, fmt.Errorf("compose setup: %w", err)
@@ -489,6 +509,13 @@ func (r *Runner) runClusterScenario(tc *config.TestCase, subject config.Subject)
 	sr.probe.start(r.ctx)
 	defer sr.probe.stop()
 
+	// A latency case reads the stage times of node 1, which takes the load
+	var sampler *stageSampler
+	if tc.Latency != nil && tc.Latency.Stages && subject.Name == "vmetric" {
+		sampler = startStageSampler(r.ctx, containers[0], tc.Latency.StageIntervalOrDefault())
+		defer sampler.finish(r.ctx)
+	}
+
 	for i, st := range sc.Steps {
 		if err := r.ctx.Err(); err != nil {
 			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
@@ -510,6 +537,17 @@ func (r *Runner) runClusterScenario(tc *config.TestCase, subject config.Subject)
 		return results.RunResult{}, err
 	}
 	sr.probe.stop()
+
+	// Each latency step's end-to-end latency and node 1's stage times, while the receiver still
+	// runs
+	var latencyResult map[string]any
+	if tc.Latency != nil {
+		var readings []stageReading
+		if sampler != nil {
+			readings = sampler.finish(r.ctx)
+		}
+		latencyResult = collectLatency(orch.GeneratorStdout(), sr.recvPort, readings, diskBaseline, sampler)
+	}
 
 	// Keep every container's log next to the report: the evidence for a
 	// failure is in the nodes' logs, and teardown removes the containers.
@@ -571,6 +609,7 @@ func (r *Runner) runClusterScenario(tc *config.TestCase, subject config.Subject)
 		SystemMemMB:     sysMemMB,
 		Passed:          &passed,
 		Scenario:        report.summary(),
+		Latency:         latencyResult,
 	}
 	if report.Acked > 0 {
 		result.LossPercent = 100 * float64(report.Missing) / float64(report.Acked)
