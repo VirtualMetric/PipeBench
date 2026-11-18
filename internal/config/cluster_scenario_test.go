@@ -219,7 +219,7 @@ func TestValidateClusterScenarioReceiverSteps(t *testing.T) {
 		}, "the case has one receiver"},
 		"a receiver on another action": {twoReceiverScenarioCase, func(tc *TestCase) {
 			tc.Cluster.Scenario.Steps[6].Receiver = "a"
-		}, "receiver only applies to expect_arrived, receiver_pause, receiver_unpause"},
+		}, "receiver only applies to expect_arrived, receiver_pause, receiver_refuse, receiver_unpause"},
 		"several receivers without the load": {twoReceiverScenarioCase, func(tc *TestCase) { tc.Generator = GeneratorConfig{} }, "needs the http_ack generator"},
 	}
 	for name, c := range cases {
@@ -427,5 +427,36 @@ expect:
 	b := sc.Expect.Receivers["b"]
 	if b.MaxLoss == nil || *b.MaxLoss != 200000 || b.MinLoss == nil || *b.MinLoss != 1 || b.MaxDuplicates != nil {
 		t.Fatalf("expect.receivers.b = %+v", b)
+	}
+}
+
+// A receiver_refuse step needs an http receiver and a time to refuse for, and takes a min of 1 or
+// more. A sleep's up_to must be longer than its for, and only a sleep takes one.
+func TestValidateClusterScenarioRefuseAndRandomSleep(t *testing.T) {
+	withSteps := func(mode string, steps ...ScenarioStep) *TestCase {
+		tc := validScenarioCase()
+		tc.Receiver.Mode = mode
+		tc.Cluster.Scenario.Steps = append(tc.Cluster.Scenario.Steps, steps...)
+		return tc
+	}
+	if err := withSteps("http", ScenarioStep{Do: "receiver_refuse", For: "40s", Min: int64p(3)}, ScenarioStep{Do: "sleep", For: "5s", UpTo: "30s"}).Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	cases := map[string]struct {
+		tc   *TestCase
+		want string
+	}{
+		"a refusal of a tcp receiver": {withSteps("tcp", ScenarioStep{Do: "receiver_refuse", For: "40s"}), "needs an http receiver"},
+		"a refusal without a time":    {withSteps("http", ScenarioStep{Do: "receiver_refuse"}), "needs for"},
+		"a refusal with a min of 0":   {withSteps("http", ScenarioStep{Do: "receiver_refuse", For: "40s", Min: int64p(0)}), "min must be 1 or more"},
+		"an up_to shorter than for":   {withSteps("http", ScenarioStep{Do: "sleep", For: "30s", UpTo: "5s"}), "up_to must be a duration longer than for"},
+		"an up_to on a kill":          {withSteps("http", ScenarioStep{Do: "kill", Node: "1", UpTo: "5s"}), "up_to only applies to sleep"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := c.tc.Validate(); err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("Validate() = %v, want an error containing %q", err, c.want)
+			}
+		})
 	}
 }

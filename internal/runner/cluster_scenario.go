@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"os"
@@ -302,6 +303,7 @@ type scenarioRun struct {
 	marks    []scenarioMark
 	pending  []pendingCount
 	arrived  []arrivedCheck
+	refused  []scenarioRefusal
 	measures map[string]float64
 	counts   map[string]int64
 	failures []string
@@ -698,10 +700,37 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		return true, "load started", nil
 
 	case "sleep":
-		if err := sleepCtx(sr.ctx, st.DurationOr("for", 0)); err != nil {
+		d, said := sleepLength(st)
+		if err := sleepCtx(sr.ctx, d); err != nil {
 			return false, "", fmt.Errorf("interrupted: %w", err)
 		}
-		return true, "", nil
+		return true, said, nil
+
+	case "receiver_refuse":
+		// The receiver answers 503 for the step's for, as a destination that
+		// is down for a moment does. It drops nothing that it took. The run
+		// fails if the receiver refused fewer requests than the step's min
+		// meanwhile, since the case then tested less than it says
+		// (checkRefusals).
+		rc, ok := sr.receiverByID(st.Receiver)
+		if !ok {
+			return false, fmt.Sprintf("receiver %q is not one of the case's receivers", st.Receiver), nil
+		}
+		before, err := refusedSoFar(rc)
+		if err != nil {
+			return false, fmt.Sprintf("could not read how many requests %s refused before: %v", rc.describe(), err), nil
+		}
+		d := st.DurationOr("for", 0)
+		if err := receiverPost(rc.Port, "/refuse?for="+d.String()); err != nil {
+			return false, fmt.Sprintf("the receiver did not start refusing: %v", err), nil
+		}
+		sr.disrupt(i, st.Do, 0)
+		least := int64(1)
+		if st.Min != nil {
+			least = *st.Min
+		}
+		sr.refused = append(sr.refused, scenarioRefusal{step: i, receiver: rc, before: before, least: least})
+		return true, fmt.Sprintf("%s refuses for %s", rc.describe(), d), nil
 
 	case "mark":
 		sr.marks = append(sr.marks, scenarioMark{Label: st.Label, At: time.Now()})
@@ -1843,6 +1872,7 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 	if sr.tc.MultiReceiver() {
 		rep.Receivers = recvResults
 	}
+	sr.checkRefusals()
 	// The count_pending steps: count again, now that every line that will
 	// arrive has arrived. The lines that arrived after the step were still
 	// on their way when it ran.
@@ -2165,6 +2195,7 @@ func judgeRows(rows *rowsCheck, maxMissing, maxTwice *int64) (reason, note strin
 // own counts (and its hash-based duplicate check, when the case turns it on)
 // are reported as they are.
 func (sr *scenarioRun) finishWithoutLoad(rep scenarioReport) (scenarioReport, scenarioVerdict, error) {
+	sr.checkRefusals()
 	if sr.sc.Rows != nil {
 		rows := sr.checkRows()
 		rep.Rows = &rows
@@ -2747,6 +2778,92 @@ var receiverClient = &http.Client{Timeout: 10 * time.Second}
 // timelines and the latencies read.
 func (sr *scenarioRun) receiverGet(path string, out any) error {
 	return receiverGetAt(sr.recvPort, path, out)
+}
+
+// scenarioRefusal is a receiver_refuse step: the receiver it asked to refuse,
+// how many requests that receiver had refused before, and the fewest it must
+// refuse during the step's refusal.
+type scenarioRefusal struct {
+	step     int
+	receiver scenarioReceiver
+	before   int64
+	least    int64
+}
+
+// refusedSoFar reads how many requests the receiver has refused so far.
+func refusedSoFar(rc scenarioReceiver) (int64, error) {
+	var m struct {
+		Refused *int64 `json:"refused_requests"`
+	}
+	if err := receiverGetAt(rc.Port, "/metrics", &m); err != nil {
+		return 0, err
+	}
+	if m.Refused == nil {
+		return 0, fmt.Errorf("its /metrics has no refused_requests, so its image cannot refuse")
+	}
+	return *m.Refused, nil
+}
+
+// checkRefusals counts the requests that each receiver_refuse step's receiver
+// refused during that step's refusal: from the step to the receiver's next
+// refusal, or to the end of the run. A step whose receiver refused fewer than
+// the step's least fails the run: too little reached the receiver while it
+// refused, so the case tested less than it says, and its verdict says nothing
+// about the rest.
+func (sr *scenarioRun) checkRefusals() {
+	for k, r := range sr.refused {
+		after := int64(-1)
+		for _, next := range sr.refused[k+1:] {
+			if next.receiver.ID == r.receiver.ID {
+				after = next.before
+				break
+			}
+		}
+		if after < 0 {
+			now, err := refusedSoFar(r.receiver)
+			if err != nil {
+				sr.failures = append(sr.failures, fmt.Sprintf("step %d (receiver_refuse): could not read how many requests %s refused, so the refusal is not known to have happened: %v", r.step, r.receiver.describe(), err))
+				continue
+			}
+			after = now
+		}
+		refused := after - r.before
+		sr.counts[fmt.Sprintf("refused_requests_step_%d", r.step)] = refused
+		fmt.Printf("  step %d: %s refused %d requests\n", r.step, r.receiver.describe(), refused)
+		if refused < r.least {
+			sr.failures = append(sr.failures, fmt.Sprintf("step %d (receiver_refuse): %s refused %d requests, fewer than the %d the step needs, so the case tested less than it says: too little was sent to it while it refused", r.step, r.receiver.describe(), refused, r.least))
+		}
+	}
+}
+
+// sleepLength returns how long a sleep step sleeps: its for, or a random time between its for and
+// its up_to, and the text that says which.
+func sleepLength(st config.ScenarioStep) (time.Duration, string) {
+	lo := st.DurationOr("for", 0)
+	if st.UpTo == "" {
+		return lo, ""
+	}
+	hi, err := time.ParseDuration(st.UpTo)
+	if err != nil || hi <= lo {
+		return lo, ""
+	}
+	d := lo + time.Duration(rand.Int64N(int64(hi-lo)))
+	d = d.Round(100 * time.Millisecond)
+	return d, fmt.Sprintf("slept %s (between %s and %s)", d, lo, hi)
+}
+
+// receiverPost asks the receiver whose endpoints are on port to do path.
+func receiverPost(port int, path string) error {
+	resp, err := receiverClient.Post(fmt.Sprintf("http://localhost:%d%s", port, path), "text/plain", nil) //nolint:noctx // short local call
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	msg, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(msg)))
+	}
+	return nil
 }
 
 // receiverGetAt queries the receiver whose endpoints are on port.
