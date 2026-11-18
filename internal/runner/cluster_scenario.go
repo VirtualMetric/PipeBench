@@ -838,7 +838,9 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		return true, fmt.Sprintf("no leader after %s, and none for %s", fmtMs(lostMs), hold), nil
 
 	case "wait_delivery":
-		// Delivery is back once lines sent after the disruption arrive. Only
+		// Delivery is back once lines sent after the disruption arrive, at
+		// every receiver of the case: each one takes the records of a target
+		// of its own, and one target can be back while another is not. Only
 		// lines sent at least deliveryMargin after it count, so that lines
 		// already on their way, and a small difference between this host's
 		// clock and the containers' clock, cannot satisfy the wait.
@@ -846,14 +848,14 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 		since := sr.lastDisruption
 		deadline := time.Now().Add(within)
 		for {
-			ls, err := sr.receiverLatency(since.Add(deliveryMargin), time.Time{})
-			if err == nil && ls.Count >= deliveryLines {
+			waiting := sr.receiversWithoutDelivery(since.Add(deliveryMargin))
+			if len(waiting) == 0 {
 				ms := time.Since(since).Milliseconds()
 				sr.record(st.Record, float64(ms))
 				return true, fmt.Sprintf("lines sent after the disruption arrive (seen %s after it)", fmtMs(ms)), nil
 			}
 			if time.Now().After(deadline) {
-				return false, fmt.Sprintf("no line sent after the disruption arrived within %s", within), nil
+				return false, fmt.Sprintf("no line sent after the disruption arrived at %s within %s", strings.Join(waiting, ", "), within), nil
 			}
 			if err := sleepCtx(sr.ctx, 250*time.Millisecond); err != nil {
 				return false, "", fmt.Errorf("interrupted: %w", err)
@@ -2904,6 +2906,25 @@ func (sr *scenarioRun) receiverLatency(from, to time.Time) (latencyStats, error)
 	var out latencyStats
 	err := sr.receiverGet(latencyPath(from, to), &out)
 	return out, err
+}
+
+// receiversWithoutDelivery names the receivers that have not yet got
+// deliveryLines lines sent from from on: "the receiver" in a case with one, and
+// "receiver <id>" for each one of several. A receiver that does not answer is
+// named too.
+func (sr *scenarioRun) receiversWithoutDelivery(from time.Time) []string {
+	recvs := sr.receivers
+	if len(recvs) == 0 {
+		recvs = []scenarioReceiver{{Port: sr.recvPort}}
+	}
+	var waiting []string
+	for _, rc := range recvs {
+		var ls latencyStats
+		if err := receiverGetAt(rc.Port, latencyPath(from, time.Time{}), &ls); err != nil || ls.Count < deliveryLines {
+			waiting = append(waiting, rc.describe())
+		}
+	}
+	return waiting
 }
 
 // latencyPath is the receiver query for the lines sent from from up to to. A
