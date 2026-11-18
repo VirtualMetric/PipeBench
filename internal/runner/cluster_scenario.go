@@ -709,18 +709,27 @@ func (sr *scenarioRun) doStep(i int, st config.ScenarioStep, rep *scenarioStepRe
 	case "receiver_refuse":
 		// The receiver answers 503 for the step's for, as a destination that
 		// is down for a moment does. It drops nothing that it took. The run
-		// fails if the receiver refused no request, since the case then
-		// tested no refusal (checkRefusals).
+		// fails if the receiver refused fewer requests than the step's min
+		// meanwhile, since the case then tested less than it says
+		// (checkRefusals).
 		rc, ok := sr.receiverByID(st.Receiver)
 		if !ok {
 			return false, fmt.Sprintf("receiver %q is not one of the case's receivers", st.Receiver), nil
+		}
+		before, err := refusedSoFar(rc)
+		if err != nil {
+			return false, fmt.Sprintf("could not read how many requests %s refused before: %v", rc.describe(), err), nil
 		}
 		d := st.DurationOr("for", 0)
 		if err := receiverPost(rc.Port, "/refuse?for="+d.String()); err != nil {
 			return false, fmt.Sprintf("the receiver did not start refusing: %v", err), nil
 		}
 		sr.disrupt(i, st.Do, 0)
-		sr.refused = append(sr.refused, scenarioRefusal{step: i, receiver: rc})
+		least := int64(1)
+		if st.Min != nil {
+			least = *st.Min
+		}
+		sr.refused = append(sr.refused, scenarioRefusal{step: i, receiver: rc, before: before, least: least})
 		return true, fmt.Sprintf("%s refuses for %s", rc.describe(), d), nil
 
 	case "mark":
@@ -2771,39 +2780,58 @@ func (sr *scenarioRun) receiverGet(path string, out any) error {
 	return receiverGetAt(sr.recvPort, path, out)
 }
 
-// scenarioRefusal is a receiver_refuse step and the receiver it asked to
-// refuse.
+// scenarioRefusal is a receiver_refuse step: the receiver it asked to refuse,
+// how many requests that receiver had refused before, and the fewest it must
+// refuse during the step's refusal.
 type scenarioRefusal struct {
 	step     int
 	receiver scenarioReceiver
+	before   int64
+	least    int64
 }
 
-// checkRefusals reads how many requests each receiver that a receiver_refuse
-// step asked to refuse did refuse, and counts them. A receiver that refused
-// none fails the run: nothing reached it while it refused, so the case tested
-// no refusal and its verdict says nothing about one.
+// refusedSoFar reads how many requests the receiver has refused so far.
+func refusedSoFar(rc scenarioReceiver) (int64, error) {
+	var m struct {
+		Refused *int64 `json:"refused_requests"`
+	}
+	if err := receiverGetAt(rc.Port, "/metrics", &m); err != nil {
+		return 0, err
+	}
+	if m.Refused == nil {
+		return 0, fmt.Errorf("its /metrics has no refused_requests, so its image cannot refuse")
+	}
+	return *m.Refused, nil
+}
+
+// checkRefusals counts the requests that each receiver_refuse step's receiver
+// refused during that step's refusal: from the step to the receiver's next
+// refusal, or to the end of the run. A step whose receiver refused fewer than
+// the step's least fails the run: too little reached the receiver while it
+// refused, so the case tested less than it says, and its verdict says nothing
+// about the rest.
 func (sr *scenarioRun) checkRefusals() {
-	seen := map[string]bool{}
-	for _, r := range sr.refused {
-		if seen[r.receiver.ID] {
-			continue
+	for k, r := range sr.refused {
+		after := int64(-1)
+		for _, next := range sr.refused[k+1:] {
+			if next.receiver.ID == r.receiver.ID {
+				after = next.before
+				break
+			}
 		}
-		seen[r.receiver.ID] = true
-		var m struct {
-			Refused int64 `json:"refused_requests"`
+		if after < 0 {
+			now, err := refusedSoFar(r.receiver)
+			if err != nil {
+				sr.failures = append(sr.failures, fmt.Sprintf("step %d (receiver_refuse): could not read how many requests %s refused, so the refusal is not known to have happened: %v", r.step, r.receiver.describe(), err))
+				continue
+			}
+			after = now
 		}
-		if err := receiverGetAt(r.receiver.Port, "/metrics", &m); err != nil {
-			sr.failures = append(sr.failures, fmt.Sprintf("step %d (receiver_refuse): could not read how many requests %s refused, so the refusal is not known to have happened: %v", r.step, r.receiver.describe(), err))
-			continue
-		}
-		key := "refused_requests"
-		if r.receiver.ID != "" {
-			key += "_" + r.receiver.ID
-		}
-		sr.counts[key] = m.Refused
-		fmt.Printf("  %s refused %d requests\n", r.receiver.describe(), m.Refused)
-		if m.Refused == 0 {
-			sr.failures = append(sr.failures, fmt.Sprintf("step %d (receiver_refuse): %s refused no request, so the case tested no refusal: nothing was sent to it while it refused", r.step, r.receiver.describe()))
+		refused := after - r.before
+		sr.counts[fmt.Sprintf("refused_requests_step_%d", r.step)] = refused
+		fmt.Printf("  step %d: %s refused %d requests\n", r.step, r.receiver.describe(), refused)
+		if refused < r.least {
+			sr.failures = append(sr.failures, fmt.Sprintf("step %d (receiver_refuse): %s refused %d requests, fewer than the %d the step needs, so the case tested less than it says: too little was sent to it while it refused", r.step, r.receiver.describe(), refused, r.least))
 		}
 	}
 }

@@ -826,11 +826,11 @@ func newHTTPReceiveHandler(cfg config, cnt *counters, val *validator) http.Handl
 
 	// Generic POST handler — counts every line in the body
 	genericHandler := func(w http.ResponseWriter, r *http.Request) {
-		if refuseIfAsked(w) {
-			return
-		}
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if refuseIfAsked(w) {
 			return
 		}
 		defer r.Body.Close()
@@ -861,11 +861,11 @@ func newHTTPReceiveHandler(cfg config, cnt *counters, val *validator) http.Handl
 	// action metadata and odd lines (1,3,5,…) are the actual documents.
 	// We only count the document lines.
 	bulkHandler := func(w http.ResponseWriter, r *http.Request) {
-		if refuseIfAsked(w) {
-			return
-		}
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if refuseIfAsked(w) {
 			return
 		}
 		defer r.Body.Close()

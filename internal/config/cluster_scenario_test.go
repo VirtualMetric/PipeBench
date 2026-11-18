@@ -430,8 +430,8 @@ expect:
 	}
 }
 
-// A receiver_refuse step needs an http receiver and a time to refuse for. A sleep's up_to must be
-// longer than its for, and only a sleep takes one.
+// A receiver_refuse step needs an http receiver and a time to refuse for, and takes a min of 1 or
+// more. A sleep's up_to must be longer than its for, and only a sleep takes one.
 func TestValidateClusterScenarioRefuseAndRandomSleep(t *testing.T) {
 	withSteps := func(mode string, steps ...ScenarioStep) *TestCase {
 		tc := validScenarioCase()
@@ -439,7 +439,7 @@ func TestValidateClusterScenarioRefuseAndRandomSleep(t *testing.T) {
 		tc.Cluster.Scenario.Steps = append(tc.Cluster.Scenario.Steps, steps...)
 		return tc
 	}
-	if err := withSteps("http", ScenarioStep{Do: "receiver_refuse", For: "40s"}, ScenarioStep{Do: "sleep", For: "5s", UpTo: "30s"}).Validate(); err != nil {
+	if err := withSteps("http", ScenarioStep{Do: "receiver_refuse", For: "40s", Min: int64p(3)}, ScenarioStep{Do: "sleep", For: "5s", UpTo: "30s"}).Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
 	cases := map[string]struct {
@@ -448,6 +448,7 @@ func TestValidateClusterScenarioRefuseAndRandomSleep(t *testing.T) {
 	}{
 		"a refusal of a tcp receiver": {withSteps("tcp", ScenarioStep{Do: "receiver_refuse", For: "40s"}), "needs an http receiver"},
 		"a refusal without a time":    {withSteps("http", ScenarioStep{Do: "receiver_refuse"}), "needs for"},
+		"a refusal with a min of 0":   {withSteps("http", ScenarioStep{Do: "receiver_refuse", For: "40s", Min: int64p(0)}), "min must be 1 or more"},
 		"an up_to shorter than for":   {withSteps("http", ScenarioStep{Do: "sleep", For: "30s", UpTo: "5s"}), "up_to must be a duration longer than for"},
 		"an up_to on a kill":          {withSteps("http", ScenarioStep{Do: "kill", Node: "1", UpTo: "5s"}), "up_to only applies to sleep"},
 	}
