@@ -227,10 +227,14 @@ type ScenarioStep struct {
 	// As remembers the node this step acted on, for a later "@name".
 	As string `yaml:"as"`
 
-	// Within bounds a wait; For is how long an expectation must hold, or a
-	// sleep's length.
+	// Within bounds a wait; For is how long an expectation must hold, a
+	// sleep's length, or how long a receiver_refuse step refuses.
 	Within string `yaml:"within"`
 	For    string `yaml:"for"`
+	// UpTo makes a sleep last a random time between For and UpTo, so that a
+	// disruption after it lands at a moment the case does not choose. The run
+	// logs the time it chose.
+	UpTo string `yaml:"up_to"`
 
 	// Record names the measurement a wait stores: the time from the last
 	// disruption to the moment the wait was satisfied. expect_writes_stop,
@@ -261,8 +265,8 @@ type ScenarioStep struct {
 	Latency string `yaml:"latency"`
 	Jitter  string `yaml:"jitter"`
 
-	// Receiver names, by its id, the receiver a receiver_pause or
-	// receiver_unpause step acts on. A case with several receivers
+	// Receiver names, by its id, the receiver a receiver_pause,
+	// receiver_unpause or receiver_refuse step acts on. A case with several receivers
 	// (`receivers:`) names one; a case with one receiver names none.
 	Receiver string `yaml:"receiver"`
 
@@ -390,6 +394,7 @@ var scenarioActions = map[string]bool{
 	"proxy_down":                false,
 	"proxy_up":                  false,
 	"receiver_pause":            false,
+	"receiver_refuse":           false,
 	"receiver_unpause":          false,
 	"scale_to":                  false,
 	"rolling_restart":           false,
@@ -712,6 +717,23 @@ func (tc *TestCase) validateClusterScenario() error {
 			if st.For == "" {
 				return fmt.Errorf("%s: needs for", where)
 			}
+			if st.UpTo != "" {
+				lo, err1 := time.ParseDuration(st.For)
+				hi, err2 := time.ParseDuration(st.UpTo)
+				if err1 != nil || err2 != nil || hi <= lo {
+					return fmt.Errorf("%s: up_to must be a duration longer than for", where)
+				}
+			}
+		case "receiver_refuse":
+			if d, err := time.ParseDuration(st.For); st.For == "" || err != nil || d <= 0 {
+				return fmt.Errorf("%s: needs for, a duration above 0", where)
+			}
+			if err := tc.validateScenarioReceiver(st.Receiver); err != nil {
+				return fmt.Errorf("%s: %w", where, err)
+			}
+			if mode := tc.scenarioReceiverMode(st.Receiver); mode != "http" {
+				return fmt.Errorf("%s: receiver_refuse needs an http receiver, and this one is %q", where, mode)
+			}
 		case "mark":
 			if st.Label == "" {
 				return fmt.Errorf("%s: needs label", where)
@@ -889,9 +911,22 @@ func (tc *TestCase) validateExpectArrived(st ScenarioStep, marks map[string]bool
 	return tc.validateScenarioReceiver(st.Receiver)
 }
 
-// validateScenarioReceiver checks the receiver a receiver_pause or
-// receiver_unpause step names: one of the case's receivers when it has
-// several, and none when it has one.
+// scenarioReceiverMode returns the mode of the receiver id, or of the case's one receiver.
+func (tc *TestCase) scenarioReceiverMode(id string) string {
+	if !tc.MultiReceiver() {
+		return tc.Receiver.Mode
+	}
+	for _, r := range tc.Receivers {
+		if r.ID == id {
+			return r.Mode
+		}
+	}
+	return ""
+}
+
+// validateScenarioReceiver checks the receiver a receiver_pause,
+// receiver_unpause or receiver_refuse step names: one of the case's receivers
+// when it has several, and none when it has one.
 func (tc *TestCase) validateScenarioReceiver(id string) error {
 	if !tc.MultiReceiver() {
 		if id != "" {
@@ -944,7 +979,8 @@ var stepFieldOwners = []struct {
 	{"empty_disk", func(s ScenarioStep) bool { return s.EmptyDisk }, map[string]bool{"start": true}},
 	{"leave", func(s ScenarioStep) bool { return s.Leave != "" }, map[string]bool{"fill_disk": true}},
 	{"gap", func(s ScenarioStep) bool { return s.Gap != "" }, map[string]bool{"expect_delivery_continues": true, "expect_writes_continue": true}},
-	{"receiver", func(s ScenarioStep) bool { return s.Receiver != "" }, map[string]bool{"receiver_pause": true, "receiver_unpause": true, "expect_arrived": true}},
+	{"receiver", func(s ScenarioStep) bool { return s.Receiver != "" }, map[string]bool{"receiver_pause": true, "receiver_unpause": true, "receiver_refuse": true, "expect_arrived": true}},
+	{"up_to", func(s ScenarioStep) bool { return s.UpTo != "" }, map[string]bool{"sleep": true}},
 	{"sent_after", func(s ScenarioStep) bool { return s.SentAfter != "" }, map[string]bool{"expect_arrived": true}},
 	{"min", func(s ScenarioStep) bool { return s.Min != nil }, map[string]bool{"expect_arrived": true}},
 	{"max", func(s ScenarioStep) bool { return s.Max != nil }, map[string]bool{"expect_arrived": true}},

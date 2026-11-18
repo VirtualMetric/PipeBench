@@ -826,6 +826,9 @@ func newHTTPReceiveHandler(cfg config, cnt *counters, val *validator) http.Handl
 
 	// Generic POST handler — counts every line in the body
 	genericHandler := func(w http.ResponseWriter, r *http.Request) {
+		if refuseIfAsked(w) {
+			return
+		}
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
@@ -858,6 +861,9 @@ func newHTTPReceiveHandler(cfg config, cnt *counters, val *validator) http.Handl
 	// action metadata and odd lines (1,3,5,…) are the actual documents.
 	// We only count the document lines.
 	bulkHandler := func(w http.ResponseWriter, r *http.Request) {
+		if refuseIfAsked(w) {
+			return
+		}
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
@@ -932,6 +938,9 @@ func newHTTPDataHandler(cfg config, cnt *counters, val *validator) http.Handler 
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("X-Elastic-Product", "Elasticsearch")
 			fmt.Fprintf(w, `{"name":"bench-receiver","cluster_name":"bench","version":{"number":"8.13.0","build_type":"docker"},"tagline":"You Know, for Search"}`)
+			return
+		}
+		if refuseIfAsked(w) {
 			return
 		}
 		defer r.Body.Close()
@@ -1010,6 +1019,7 @@ func newHTTPDataHandler(cfg config, cnt *counters, val *validator) http.Handler 
 func serveMetrics(port string, cnt *counters, val *validator, cfg config) {
 	mux := http.NewServeMux()
 
+	mux.HandleFunc("/refuse", handleRefuse)
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		// Aggregate across all per-connection shards. firstNs is the earliest
@@ -1018,6 +1028,7 @@ func serveMetrics(port string, cnt *counters, val *validator, cfg config) {
 		resp := map[string]any{
 			"lines_received":    totalLines,
 			"bytes_received":    totalBytes,
+			"refused_requests":  refusedRequests.Load(),
 			"done":              cnt.Done.Load(),
 			"first_received_ns": firstNs,
 			"last_received_ns":  lastNs,
