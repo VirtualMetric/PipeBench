@@ -841,9 +841,9 @@ func (run *ssRun) checkHealthAll(label string) {
 		if !run.running[rep.N] {
 			continue
 		}
-		want := run.ss.ExpectHealthOrDefault()
+		want := run.ss.ExpectedHealth()
 		if rep.N == run.bad {
-			want = run.ss.BadHealthOrDefault()
+			want = []string{run.ss.BadHealthOrDefault()}
 		}
 		status, message, overall, ok := run.healthOf(rep.N, label)
 		if !ok {
@@ -851,8 +851,8 @@ func (run *ssRun) checkHealthAll(label string) {
 			continue
 		}
 		got[rep.Service] = status
-		if status != want {
-			run.fail("%s: /health of %s reports shared_state %q (%s), want %q", label, rep.Service, status, message, want)
+		if !slices.Contains(want, status) {
+			run.fail("%s: /health of %s reports shared_state %q (%s), want %q", label, rep.Service, status, message, strings.Join(want, `" or "`))
 			continue
 		}
 		fmt.Printf("    /health %s: shared_state %s (overall %s)\n", rep.Service, status, overall)
