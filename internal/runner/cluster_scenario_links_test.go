@@ -106,6 +106,38 @@ func TestWithoutLoadVerdict(t *testing.T) {
 	}
 }
 
+// min_received counts distinct lines, in a run whose lines nobody acknowledged. A
+// count that was never taken is not enough lines.
+func TestWithoutLoadVerdictMinReceived(t *testing.T) {
+	ex := config.ScenarioExpect{MinReceived: 12}
+	cases := []struct {
+		name       string
+		rep        scenarioReport
+		dedup      bool
+		metricsErr error
+		reasonPart string
+	}{
+		{"all arrived", scenarioReport{Received: 12, Unique: 12}, true, nil, ""},
+		{"all arrived, some twice", scenarioReport{Received: 14, Unique: 12, Duplicates: 2}, true, nil, ""},
+		{"one missing, and another twice", scenarioReport{Received: 12, Unique: 11, Duplicates: 1}, true, nil, "11 distinct lines"},
+		{"no hashing", scenarioReport{Received: 12, Unique: 12}, false, nil, "validate_dedup"},
+		{"counts not read", scenarioReport{}, true, errors.New("connection refused"), "could not be read"},
+	}
+	for _, c := range cases {
+		reasons, _ := withoutLoadVerdict(c.rep, ex, c.dedup, c.metricsErr)
+		got := strings.Join(reasons, "; ")
+		if c.reasonPart == "" {
+			if got != "" {
+				t.Errorf("%s: failed with %q, want a pass", c.name, got)
+			}
+			continue
+		}
+		if !strings.Contains(got, c.reasonPart) {
+			t.Errorf("%s: reasons %q, want one that mentions %q", c.name, got, c.reasonPart)
+		}
+	}
+}
+
 // max_rows_twice alone makes the rows comparison one the run depends on.
 func TestJudgeRowsTwiceOnly(t *testing.T) {
 	zero := int64(0)

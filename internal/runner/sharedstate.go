@@ -138,6 +138,7 @@ func (r *Runner) runDirectorSharedStateCorrectness(tc *config.TestCase, subject 
 		DurationSec:     time.Since(run.started).Seconds(),
 		LinesIn:         run.linesIn,
 		LinesOut:        run.linesOut,
+		CutLines:        run.cutLines,
 		UniqueOut:       run.uniqueOut,
 		PerReceiver:     run.perReceiver,
 		AvgCPUPercent:   metrics.CPUAvg,
@@ -214,6 +215,7 @@ type ssRun struct {
 	measures map[string]any
 
 	linesIn, linesOut, uniqueOut int64
+	cutLines                     int64
 	perReceiver                  map[string]int64
 
 	// confirmedBefore is how many records each stream's sender had got
@@ -225,6 +227,11 @@ type ssRun struct {
 	// stream name and then replica. Only streams that set min_after_rejoin
 	// are counted.
 	confirmedAtRejoin map[string]map[int]int64
+	// confirmedAtResume is how many records each stream's sender had got
+	// confirmed through each replica it posts to when the store came back
+	// after a pause_store outage, by stream name and then replica. Only
+	// streams that set min_each_after_outage are counted.
+	confirmedAtResume map[string]map[int]int64
 }
 
 func newSSRun(r *Runner, tc *config.TestCase, subject config.Subject, orch *orchestrator.ComposeRunner) *ssRun {
@@ -240,6 +247,7 @@ func newSSRun(r *Runner, tc *config.TestCase, subject config.Subject, orch *orch
 
 		confirmedBefore:   map[string]int64{},
 		confirmedAtRejoin: map[string]map[int]int64{},
+		confirmedAtResume: map[string]map[int]int64{},
 	}
 	run.measures["evidence"] = run.evidence
 	if tc.SharedState.Action == config.SharedStateActionWrongCredentials {
@@ -387,22 +395,36 @@ func (run *ssRun) drive() bool {
 
 // startInfrastructure starts what the replicas need before they start:
 // Azurite and its init, the store when it is another (MinIO and its init, an
-// endpoint such as Redis, or the share's init), the receivers and the
-// collector. It waits for every init to finish and for every endpoint with a
-// healthcheck to be healthy.
+// endpoint such as Redis, or the share's init), the broker of their pipeline
+// bus when the case has one, the receivers and the collector. It waits for
+// every init to finish and for every endpoint with a healthcheck to be healthy.
 func (run *ssRun) startInfrastructure() bool {
 	services, inits, names := []string{"azurite", "azure-init"}, []string{"azure-init"}, []string{"Azurite"}
 	if run.tc.UsesMinio() {
 		services, inits, names = append(services, "minio", "minio-init"), append(inits, "minio-init"), append(names, "MinIO")
 	}
-	if run.ss.StoreOrDefault() == config.SharedStateStoreShare {
-		services, inits = append(services, "witness-init"), append(inits, "witness-init")
-	}
 	var healthy []string
+	switch {
+	case run.ss.ShareInVolume():
+		services, inits = append(services, "witness-init"), append(inits, "witness-init")
+	case run.ss.StoreOrDefault() == config.SharedStateStoreShare:
+		// The share's server: the replicas can mount the share once it is
+		// healthy
+		services, names = append(services, config.ShareServerService), append(names, "the server of "+run.ss.StoreName())
+		healthy = append(healthy, config.ShareServerService)
+	}
 	for _, e := range run.tc.Endpoints {
 		services, names = append(services, e.Name), append(names, e.Name)
 		if e.Healthcheck != nil {
 			healthy = append(healthy, e.Name)
+		}
+	}
+	// The replicas start with --no-deps, so nothing else starts their broker
+	if broker := run.tc.PipelineBroker; broker != nil {
+		services, names = append(services, "pipeline-broker"), append(names, "the pipeline broker")
+		healthy = append(healthy, "pipeline-broker")
+		if len(broker.Topics) > 0 {
+			services, inits = append(services, "pipeline-broker-init"), append(inits, "pipeline-broker-init")
 		}
 	}
 	services = append(services, "receiver", "collector")
@@ -638,7 +660,7 @@ func (run *ssRun) readyAt(container string, since time.Time) (time.Time, bool) {
 			return time.Time{}, false
 		}
 		return later(busReady, manager), true
-	case config.SharedStateModeEmbedded:
+	case config.SharedStateModeEmbedded, config.SharedStateModeStoreCluster:
 		return manager, !manager.IsZero()
 	default:
 		var last time.Time
@@ -858,6 +880,70 @@ func (run *ssRun) checkHealthAll(label string) {
 		fmt.Printf("    /health %s: shared_state %s (overall %s)\n", rep.Service, status, overall)
 	}
 	run.measures[label+"_health"] = got
+	if run.ss.ModeOrDefault() == config.SharedStateModeStoreCluster {
+		run.checkStoreClusterAll(label)
+	}
+}
+
+// checkStoreClusterAll waits up to a minute for the store_cluster component
+// of every running replica's /health to report ok: the replica is a member
+// of its cluster's generation and reaches a quorum of it. A replica that
+// just joined reports starting while it catches up, so the driver asks
+// again until the minute is over.
+func (run *ssRun) checkStoreClusterAll(label string) {
+	deadline := earliest(time.Now().Add(time.Minute), run.deadline)
+	got := map[string]string{}
+	for _, rep := range run.replicas {
+		if !run.running[rep.N] {
+			continue
+		}
+		var status, message string
+		for {
+			status, message = run.componentOf(rep.N, label, "store_cluster")
+			if status == "ok" || time.Now().After(deadline) || sleepCtx(run.r.ctx, 3*time.Second) != nil {
+				break
+			}
+		}
+		got[rep.Service] = status
+		if status != "ok" {
+			run.fail("%s: /health of %s reports store_cluster %q (%s), want \"ok\"", label, rep.Service, status, message)
+			continue
+		}
+		fmt.Printf("    /health %s: store_cluster ok (%s)\n", rep.Service, message)
+	}
+	run.measures[label+"_store_cluster"] = got
+}
+
+// componentOf returns the status and the message of one component of the
+// /health of replica n, or no status and the reason when /health did not
+// answer.
+func (run *ssRun) componentOf(n int, label, name string) (status, message string) {
+	rep := run.replica(n)
+	out, err := exec.Command("docker", "exec", rep.Container, "wget", "-qO-", "-T", "5", "http://127.0.0.1:15551/health").CombinedOutput()
+	run.health[fmt.Sprintf("%s-%s-%s", label, name, rep.Service)] = string(out)
+	if err != nil {
+		return "", strings.TrimSpace(string(out))
+	}
+	return healthComponent(out, name)
+}
+
+// healthComponent returns the status and the message of the component name
+// of a /health answer.
+func healthComponent(answer []byte, name string) (status, message string) {
+	var h struct {
+		Components map[string]struct {
+			Status  string `json:"status"`
+			Message string `json:"message"`
+		} `json:"components"`
+	}
+	if json.Unmarshal(answer, &h) != nil {
+		return "", "unreadable /health answer"
+	}
+	c, ok := h.Components[name]
+	if !ok {
+		return "", "/health has no " + name + " component"
+	}
+	return c.Status, c.Message
 }
 
 // waitBaseline waits until every stream's receiver holds its baseline.
@@ -940,6 +1026,16 @@ func (run *ssRun) act() {
 		run.rollingReplace("kill")
 	case config.SharedStateActionMoveAcrossCutLink:
 		run.moveAcrossCutLink()
+	case config.SharedStateActionKillAll:
+		run.killAll()
+	case config.SharedStateActionRevisionUpdate:
+		run.revisionUpdate()
+	case config.SharedStateActionPauseReceivers:
+		run.pauseReceivers()
+	case config.SharedStateActionSlowStore:
+		run.slowStore()
+	case config.SharedStateActionSplitLeader:
+		run.splitLeader()
 	}
 }
 
@@ -1380,20 +1476,21 @@ func (run *ssRun) checkStreams() {
 			run.fail("stream %s: the receiver did not count the records' sequence numbers (%v); these cases need the receiver of PipeBench v0.4.7 or later", st.StreamName(), err)
 			continue
 		}
-		got := ssStreamCounts{Received: m.LinesReceived, Unique: seq.Unique, Duplicates: seq.Duplicates, Unparsed: seq.Unparsed}
+		got := ssStreamCounts{Received: m.LinesReceived, Unique: seq.Unique, Duplicates: seq.Duplicates, Unparsed: seq.Unparsed, Cut: seq.Cut}
 		loss := max(sent-got.Unique, 0)
 		dupPct := got.duplicatePct()
 		streams[st.StreamName()] = map[string]any{
 			"sent": sent, "received": got.Received, "unique": got.Unique,
 			"duplicates": got.Duplicates, "duplicate_pct": dupPct, "lost": loss,
-			"unnumbered": got.Unparsed,
+			"unnumbered": got.Unparsed, "cut_lines": got.Cut,
 		}
 		run.linesIn += sent
 		run.linesOut += got.Received
+		run.cutLines += got.Cut
 		run.uniqueOut += got.Unique
 		run.perReceiver[st.Receiver] = got.Received
-		fmt.Printf("  stream %s: sent %d, received %d (%d distinct, %d repeated, %.2f%%, %d without a number), lost %d\n",
-			st.StreamName(), sent, got.Received, got.Unique, got.Duplicates, dupPct, got.Unparsed, loss)
+		fmt.Printf("  stream %s: sent %d, received %d (%d distinct, %d repeated, %.2f%%, %d without a number, %d cut), lost %d\n",
+			st.StreamName(), sent, got.Received, got.Unique, got.Duplicates, dupPct, got.Unparsed, got.Cut, loss)
 		for _, why := range judgeStream(st, sent, got) {
 			run.fail("%s", why)
 		}
@@ -1405,7 +1502,7 @@ func (run *ssRun) checkStreams() {
 // arrived, the distinct records among them by their sequence numbers, the
 // copies of records that arrived before, and the lines that carry no number.
 type ssStreamCounts struct {
-	Received, Unique, Duplicates, Unparsed int64
+	Received, Unique, Duplicates, Unparsed, Cut int64
 }
 
 func (c ssStreamCounts) duplicatePct() float64 {
@@ -1463,6 +1560,9 @@ func numberingProblems(st config.SharedStateStream, sent int64, got ssStreamCoun
 	if got.Unparsed > 0 {
 		out = append(out, fmt.Sprintf("stream %s: %d lines arrived without a record's sequence number, so they arrived cut or garbled", st.StreamName(), got.Unparsed))
 	}
+	if got.Cut > st.MaxCutLines {
+		out = append(out, fmt.Sprintf("stream %s: %d pieces of a line arrived, from connections that ended inside a line, above max_cut_lines %d", st.StreamName(), got.Cut, st.MaxCutLines))
+	}
 	if got.Unique > sent {
 		out = append(out, fmt.Sprintf("stream %s: %d distinct records arrived, %d more than the generator sent", st.StreamName(), got.Unique, got.Unique-sent))
 	}
@@ -1512,11 +1612,11 @@ func (run *ssRun) checkAckedStream(st config.SharedStateStream, genOut string, p
 		run.fail("stream %s: the receiver did not answer the sequence check, so the loss is unknown: %v", st.StreamName(), err)
 		return nil
 	}
-	got := ssStreamCounts{Received: received, Unique: check.Unique, Duplicates: check.Duplicates, Unparsed: check.Unparsed}
+	got := ssStreamCounts{Received: received, Unique: check.Unique, Duplicates: check.Duplicates, Unparsed: check.Unparsed, Cut: check.Cut}
 	counts := map[string]any{
 		"sent": sent, "confirmed": gen.Ack.LinesAcked, "unconfirmed": gen.Ack.LinesUnacked,
 		"received": got.Received, "unique": got.Unique, "duplicates": got.Duplicates, "duplicate_pct": got.duplicatePct(),
-		"lost": check.Missing, "unnumbered": got.Unparsed,
+		"lost": check.Missing, "unnumbered": got.Unparsed, "cut_lines": got.Cut,
 		"requests": gen.Ack.Requests, "failed_requests": gen.Ack.Failures, "status_counts": gen.Ack.StatusCounts,
 	}
 	if lat := gen.Ack.AckLatency; lat != nil {
@@ -1524,10 +1624,11 @@ func (run *ssRun) checkAckedStream(st config.SharedStateStream, genOut string, p
 	}
 	run.linesIn += gen.Ack.LinesAcked
 	run.linesOut += got.Received
+	run.cutLines += got.Cut
 	run.uniqueOut += check.ReceivedAcked
 	run.perReceiver[st.Receiver] = got.Received
-	fmt.Printf("  stream %s: sent %d, %d confirmed and %d not, received %d (%d distinct, %d repeated, %.2f%%, %d without a number), %d confirmed records lost\n",
-		st.StreamName(), sent, gen.Ack.LinesAcked, gen.Ack.LinesUnacked, got.Received, got.Unique, got.Duplicates, got.duplicatePct(), got.Unparsed, check.Missing)
+	fmt.Printf("  stream %s: sent %d, %d confirmed and %d not, received %d (%d distinct, %d repeated, %.2f%%, %d without a number, %d cut), %d confirmed records lost\n",
+		st.StreamName(), sent, gen.Ack.LinesAcked, gen.Ack.LinesUnacked, got.Received, got.Unique, got.Duplicates, got.duplicatePct(), got.Unparsed, got.Cut, check.Missing)
 	if lat := gen.Ack.AckLatency; lat != nil {
 		fmt.Printf("    a confirmation took %d ms at the median, %d ms at p95, %d ms at p99 and %d ms at most\n", lat.P50, lat.P95, lat.P99, lat.Max)
 	}
@@ -1561,6 +1662,22 @@ func (run *ssRun) checkAckedStream(st config.SharedStateStream, genOut string, p
 		counts["confirmed_after_rejoin"] = byReplica
 		for _, why := range judgeAfterRejoin(st, after) {
 			run.fail("%s", why)
+		}
+	}
+	if st.MinEachAfterOutage > 0 {
+		// A sender whose counts at the store's return are missing already
+		// failed the run in countConfirmedAtResume
+		if atResume, ok := run.confirmedAtResume[st.StreamName()]; ok {
+			after := confirmedAfterRejoin(gen.Ack.AckedPerTarget, atResume)
+			byReplica := map[string]int64{}
+			for _, n := range slices.Sorted(maps.Keys(after)) {
+				byReplica[run.replica(n).Service] = after[n]
+				fmt.Printf("    %d records were confirmed through %s after the store came back\n", after[n], run.replica(n).Service)
+			}
+			counts["confirmed_after_outage"] = byReplica
+			for _, why := range judgeEachAfterOutage(st, after) {
+				run.fail("%s", why)
+			}
 		}
 	}
 	return counts

@@ -285,6 +285,109 @@ func TestSharedStateComposeRendersOtherStores(t *testing.T) {
 	})
 }
 
+// TestSharedStateComposeRendersAShareOnAServer checks a share on an SMB or an
+// NFS server: the server at its fixed address on a fixed subnet, privileged
+// and capped, the replicas waiting until it is healthy, the share volume
+// mounted over the network, and no witness-init, which a mount with the
+// director's user and modes does not need.
+func TestSharedStateComposeRendersAShareOnAServer(t *testing.T) {
+	for _, c := range []struct {
+		server, image, mountType, device, option string
+	}{
+		{config.SharedStateShareServerSMB, "vmetric/bench-share-smb:latest", "cifs", "//172.30.250.250/share", "vers=3.1.1"},
+		{config.SharedStateShareServerNFS, "vmetric/bench-share-nfs:latest", "nfs", ":/", "nfsvers=4.2"},
+	} {
+		t.Run(c.server, func(t *testing.T) {
+			srcCfg := filepath.Join(t.TempDir(), "vmetric.yml")
+			if err := os.WriteFile(srcCfg, []byte("director:\n  id: 7001\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			tc := &config.TestCase{
+				Name:       "director_shared_state_share_server_render",
+				Type:       "director_shared_state_correctness",
+				Azure:      &config.AzureConfig{Containers: []string{"bench-in"}},
+				Generators: []config.GeneratorConfig{{ID: "blob", Mode: "azure_blob", Target: "http://azurite:10000", Rate: 10, Format: "raw"}},
+				Receivers:  []config.ReceiverConfig{{ID: "blob", Mode: "tcp", Listen: ":9001"}},
+				SharedState: &config.SharedStateConfig{
+					Replicas:    2,
+					Store:       config.SharedStateStoreShare,
+					SharePath:   "/mnt/vm-state",
+					ShareServer: c.server,
+					Streams:     []config.SharedStateStream{{Generator: "blob", Receiver: "blob"}},
+				},
+			}
+			if err := tc.Validate(); err != nil {
+				t.Fatalf("validate: %v", err)
+			}
+			cr, err := NewComposeRunner(context.Background(), RunConfig{
+				TestCase: tc, Subject: config.Subject{Name: "vmetric", Image: "vmetric/director-enterprise", Version: "dev", ConfigPath: "/config.yml"},
+				ConfigName: "default", ConfigSrcPath: srcCfg, TmpDir: t.TempDir(),
+				GeneratorImage: "img-gen", ReceiverImage: "img-recv", CollectorImage: "img-coll", ReceiverHostPort: 19001,
+				CPULimit: "1.0", MemLimit: "1g", HelperCPULimit: "1", HelperMemLimit: "1g",
+			})
+			if err != nil {
+				t.Fatalf("NewComposeRunner: %v", err)
+			}
+			data, err := os.ReadFile(cr.composeFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var parsed struct {
+				Networks map[string]map[string]any `yaml:"networks"`
+				Volumes  map[string]map[string]any `yaml:"volumes"`
+				Services map[string]map[string]any `yaml:"services"`
+			}
+			if err := yaml.Unmarshal(data, &parsed); err != nil {
+				t.Fatalf("rendered compose is not valid YAML: %v\n%s", err, data)
+			}
+
+			server := parsed.Services["share-server"]
+			if server == nil {
+				t.Fatalf("no share-server service:\n%s", data)
+			}
+			deploy, _ := server["deploy"].(map[string]any)
+			resources, _ := deploy["resources"].(map[string]any)
+			limits, _ := resources["limits"].(map[string]any)
+			if server["image"] != c.image || server["privileged"] != true || limits["cpus"] == nil || limits["memory"] == nil {
+				t.Errorf("share-server = %v, want image %s, privileged and capped", server, c.image)
+			}
+			networks, _ := server["networks"].(map[string]any)
+			bench, _ := networks["bench"].(map[string]any)
+			if bench["ipv4_address"] != "172.30.250.250" {
+				t.Errorf("share-server networks = %v, want the fixed address", networks)
+			}
+			if !strings.Contains(string(data), `subnet: "172.30.0.0/16"`) {
+				t.Error("the bench network has no fixed subnet for the server's address")
+			}
+			if parsed.Services["witness-init"] != nil {
+				t.Error("witness-init is rendered for a share on a server")
+			}
+			for _, name := range []string{"subject-1", "subject-2"} {
+				deps, _ := parsed.Services[name]["depends_on"].(map[string]any)
+				dep, _ := deps["share-server"].(map[string]any)
+				if dep["condition"] != "service_healthy" {
+					t.Errorf("%s depends_on = %v, want the share's server healthy", name, deps)
+				}
+				if deps["witness-init"] != nil {
+					t.Errorf("%s waits for witness-init", name)
+				}
+			}
+
+			volume := parsed.Volumes["witness-dir"]
+			opts, _ := volume["driver_opts"].(map[string]any)
+			if volume["driver"] != "local" || opts["type"] != c.mountType || opts["device"] != c.device {
+				t.Errorf("witness-dir = %v, want a %s mount of %s", volume, c.mountType, c.device)
+			}
+			if o, _ := opts["o"].(string); !strings.Contains(o, "addr=172.30.250.250") || !strings.Contains(o, c.option) {
+				t.Errorf("witness-dir options = %q", o)
+			}
+			if _, ok := parsed.Volumes["share-export"]; ok != (c.server == config.SharedStateShareServerNFS) {
+				t.Errorf("volumes = %v: only the NFS server has an export volume", parsed.Volumes)
+			}
+		})
+	}
+}
+
 // TestSharedStateHelperLimitsApplyEachLimitAlone checks that a helper limit
 // applies without the other: the containers the template caps (Azurite) and
 // the ones capped after rendering (MinIO) both take the one limit that is
