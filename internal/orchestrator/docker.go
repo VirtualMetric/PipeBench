@@ -190,6 +190,11 @@ services:
     cap_add:
       - NET_ADMIN
 {{- end }}
+{{- if $.NodesPrivileged }}
+    # The node's image mounts a FUSE file system, such as LazyFS, under the
+    # director's storage (cluster.scenario.node_privileged).
+    privileged: true
+{{- end }}
 {{- if or $.VerifierLocalDir $.AzureEnabled $.NodeDependsOn }}
     depends_on:
 {{- if $.VerifierLocalDir }}
@@ -2003,6 +2008,9 @@ type composeVars struct {
 	// NodesNeedNetAdmin grants the cluster node containers NET_ADMIN so the elected
 	// director leader can add the virtual IP to its interface (cluster_ip_failover).
 	NodesNeedNetAdmin bool
+	// NodesPrivileged runs the cluster node containers privileged, so that
+	// their image can mount a FUSE file system (cluster.scenario.node_privileged).
+	NodesPrivileged bool
 
 	// Cluster scenario topology (cluster_scenario_compose.go). NodeDependsOn
 	// orders every node after the services it needs at start (the witness
@@ -2384,6 +2392,12 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 		// user, else the bind fails with EPERM.
 		subjectUser = "0:0"
 	}
+	// Only root can mount a FUSE file system, so a privileged node starts as
+	// root. Its image's entrypoint drops root before it starts the director.
+	nodesPrivileged := tc.Cluster != nil && tc.Cluster.Scenario != nil && tc.Cluster.Scenario.NodePrivileged
+	if nodesPrivileged {
+		subjectUser = "0:0"
+	}
 
 	// Cloud emulator env. Injected into the subject whenever the case
 	// declares an emulator (subject configs interpolate these), and into
@@ -2559,6 +2573,7 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 		Subjects:          clusterNodes,
 		BenchSubnet:       benchSubnet,
 		NodesNeedNetAdmin: nodesNeedNetAdmin,
+		NodesPrivileged:   nodesPrivileged,
 		SubjectEnv:        env,
 		// Emit only the limits the caller actually set: back-filling the
 		// unset one (the old defaultStr(.., "1"/"1g") behavior) silently

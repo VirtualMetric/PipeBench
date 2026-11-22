@@ -88,6 +88,14 @@ type ScenarioConfig struct {
 	// that does nothing else.
 	Throughput bool `yaml:"throughput"`
 
+	// NodePrivileged runs every node's container privileged, and as root, so
+	// that its image can mount a FUSE file system under the director's
+	// storage. A power-loss case uses it: the image puts the storage on
+	// LazyFS, which keeps every write that was not synced in its own memory,
+	// so a kill step loses those writes as a power loss would. The image's
+	// entrypoint drops root before it starts the director.
+	NodePrivileged bool `yaml:"node_privileged"`
+
 	// NodeDisk gives chosen nodes a small disk of their own at a path: a
 	// size-limited tmpfs, which a fill_disk step can fill.
 	NodeDisk *ScenarioNodeDisk `yaml:"node_disk"`

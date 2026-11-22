@@ -232,6 +232,36 @@ func TestClusterComposeKeepsOtherCasesUnchanged(t *testing.T) {
 	}
 }
 
+// TestClusterScenarioComposeRunsPrivilegedNodes checks node_privileged: every
+// node, the spare too, runs privileged and as root, so its image can mount
+// LazyFS under the director's storage. The helpers stay unprivileged, and a
+// case without the field gets neither.
+func TestClusterScenarioComposeRunsPrivilegedNodes(t *testing.T) {
+	src := "director:\n  id: {{@.NodeID@}}\n"
+	sc := &config.ScenarioConfig{Steps: []config.ScenarioStep{{Do: "wait_ready"}}, SpareNodes: 1, NodePrivileged: true}
+	doc, _, _ := renderScenario(t, scenarioCase(sc), src)
+	for _, name := range []string{"subject-1", "subject-2", "subject-3", "subject-4"} {
+		svc := service(t, doc, name)
+		if svc["privileged"] != true {
+			t.Fatalf("%s must run privileged: %v", name, svc["privileged"])
+		}
+		if svc["user"] != "0:0" {
+			t.Fatalf("%s must start as root to mount a FUSE file system: %v", name, svc["user"])
+		}
+	}
+	for _, name := range []string{"generator", "receiver"} {
+		if service(t, doc, name)["privileged"] != nil {
+			t.Fatalf("%s must not run privileged", name)
+		}
+	}
+
+	plain := &config.ScenarioConfig{Steps: []config.ScenarioStep{{Do: "wait_ready"}}}
+	doc, _, _ = renderScenario(t, scenarioCase(plain), src)
+	if svc := service(t, doc, "subject-1"); svc["privileged"] != nil || svc["user"] != nil {
+		t.Fatalf("a case without node_privileged rendered privileged %v, user %v", svc["privileged"], svc["user"])
+	}
+}
+
 // TestClusterScenarioComposeTracksSequences checks that every receiver of a
 // scenario case tracks sequences, even when the case does not ask for it:
 // the driver's loss check reads /seqcheck.
