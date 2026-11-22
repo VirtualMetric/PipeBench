@@ -50,10 +50,23 @@ func TestSharedStateValidates(t *testing.T) {
 	if got := tc.SharedState.ExpectHealthOrDefault(); got != "ok" {
 		t.Errorf("a state bus expects shared_state ok, got %q", got)
 	}
+	if got := tc.SharedState.ExpectedHealth(); !reflect.DeepEqual(got, []string{"ok"}) {
+		t.Errorf("a state bus accepts shared_state ok only, got %q", got)
+	}
 	tc.SharedState.Mode = SharedStateModeEmbedded
 	if got := tc.SharedState.ExpectHealthOrDefault(); got != "not_configured" {
 		t.Errorf("an embedded queue runs no state bus, so /health says not_configured; got %q", got)
 	}
+	// From VM-10711 on, a director with an embedded queue reports ok and names
+	// the store. One from before reports not_configured.
+	if got := tc.SharedState.ExpectedHealth(); !reflect.DeepEqual(got, []string{"ok", "not_configured"}) {
+		t.Errorf("an embedded queue accepts ok and not_configured, got %q", got)
+	}
+	tc.SharedState.ExpectHealth = "error"
+	if got := tc.SharedState.ExpectedHealth(); !reflect.DeepEqual(got, []string{"error"}) {
+		t.Errorf("a case's expect_health is the only status it accepts, got %q", got)
+	}
+	tc.SharedState.ExpectHealth = ""
 	if !tc.SharedState.SharesBus() {
 		t.Error("an embedded queue shares a bus")
 	}
