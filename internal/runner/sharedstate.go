@@ -605,6 +605,8 @@ func (run *ssRun) readiness(n int, since time.Time) string {
 			seen = append(seen, "manager on the shared bus")
 		case ssHeldBack:
 			seen = append(seen, fmt.Sprintf("device %d held back", e.Device))
+		case ssAtRisk:
+			seen = append(seen, fmt.Sprintf("device %d at risk", e.Device))
 		}
 	}
 	if len(seen) == 0 {
@@ -631,7 +633,8 @@ func (run *ssRun) waitReady(n int, since, deadline time.Time) (time.Time, bool) 
 // readyAt returns when the container became ready after since. A state bus
 // replica is ready once its state bus connected and the director manager
 // runs on it; an embedded queue's once the manager runs on the shared bus;
-// a memory replica's once it held back every placed device.
+// a memory replica's once it said of every placed device that it runs it at
+// risk (VM-8626), or, before VM-8626, that it holds it back.
 func (run *ssRun) readyAt(container string, since time.Time) (time.Time, bool) {
 	var busReady, manager time.Time
 	held := map[int64]time.Time{}
@@ -648,7 +651,7 @@ func (run *ssRun) readyAt(container string, since time.Time) (time.Time, bool) {
 			if manager.IsZero() {
 				manager = e.At
 			}
-		case ssHeldBack:
+		case ssHeldBack, ssAtRisk:
 			if _, ok := held[e.Device]; !ok {
 				held[e.Device] = e.At
 			}
@@ -751,8 +754,10 @@ func (run *ssRun) waitOneLeader(deadline time.Time) (int, bool) {
 
 // checkSettled waits until the replica set is in the state the mode expects,
 // and fails the case when it does not get there by the deadline: one leader
-// and each placed device on exactly one replica for a shared bus, every
-// placed device held back on every replica for memory.
+// and each placed device on exactly one replica for a shared bus. For memory,
+// every replica has said of every placed device that it runs it at risk
+// (VM-8626), or that it holds it back, and a device every replica holds back
+// runs nowhere.
 func (run *ssRun) checkSettled(phase string, deadline time.Time) bool {
 	var why string
 	for {
@@ -774,19 +779,31 @@ func (run *ssRun) checkSettled(phase string, deadline time.Time) bool {
 func (run *ssRun) unsettled() string {
 	now := current()
 	if !run.ss.SharesBus() {
+		// A director keeps no shared state outside memory, so each replica
+		// decides for itself. Since VM-8626 it runs such a device at risk and
+		// says so. Before, it held the device back, and the device must then
+		// run nowhere.
+		atRisk := map[int64]bool{}
 		for _, rep := range run.replicas {
 			if !run.running[rep.N] {
 				continue
 			}
 			for _, d := range run.ss.PlacedDevices {
-				if !slices.ContainsFunc(run.events(rep.Container), func(e ssEvent) bool { return e.Kind == ssHeldBack && e.Device == d }) {
-					return fmt.Sprintf("%s has not held device %d back", rep.Service, d)
+				said := func(k ssKind) bool {
+					return slices.ContainsFunc(run.events(rep.Container), func(e ssEvent) bool { return e.Kind == k && e.Device == d })
+				}
+				switch {
+				case said(ssAtRisk):
+					atRisk[d] = true
+				case said(ssHeldBack):
+				default:
+					return fmt.Sprintf("%s has not said that it runs device %d at risk, or that it holds it back", rep.Service, d)
 				}
 			}
 		}
 		for _, d := range run.ss.PlacedDevices {
-			if o := run.owners(d, now); len(o) > 0 {
-				return fmt.Sprintf("device %d runs on %s although the shared state is in memory", d, run.names(o))
+			if o := run.owners(d, now); len(o) > 0 && !atRisk[d] {
+				return fmt.Sprintf("device %d runs on %s although every replica held it back", d, run.names(o))
 			}
 		}
 		return ""
@@ -818,7 +835,7 @@ func (run *ssRun) reportPlacement(phase string) {
 	if run.ss.SharesBus() {
 		fmt.Printf("  %s: leader %s; %s\n", phase, leader, strings.Join(parts, ", "))
 	} else {
-		fmt.Printf("  %s: no leader (memory); every placed device held back on every replica\n", phase)
+		fmt.Printf("  %s: no leader (memory); %s\n", phase, strings.Join(parts, ", "))
 	}
 }
 
