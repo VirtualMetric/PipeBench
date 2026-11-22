@@ -729,6 +729,7 @@ func loadCatalog(casesDir string) []results.CatalogEntry {
 			Name:        tc.Name,
 			Type:        tc.Type,
 			Description: tc.Description,
+			Hidden:      tc.Hidden,
 		})
 	}
 	return out

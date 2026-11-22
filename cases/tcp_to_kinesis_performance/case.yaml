@@ -1,5 +1,6 @@
 name: tcp_to_kinesis_performance
 type: performance
+hidden: true
 description: "Measures throughput of a TCP-in to Kinesis-out pipeline (LocalStack emulator, 4 shards). The receiver reads every shard from TRIM_HORIZON. Fixed generator rate — LocalStack's Kinesis is the known ceiling, not the subject."
 
 duration: 60s

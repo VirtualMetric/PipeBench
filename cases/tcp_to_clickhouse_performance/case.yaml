@@ -1,5 +1,6 @@
 name: tcp_to_clickhouse_performance
 type: performance
+hidden: true
 description: "Measures throughput of a TCP-in to ClickHouse-out pipeline against a real clickhouse-server (24.8). Unlimited generator rate — pushes peak. Each subject ingests into ClickHouse over its native integration: vmetric and the OpenTelemetry Collector batch-INSERT over the native TCP protocol (:9000, the lowest-overhead wire path); Vector, Fluent Bit, and Cribl Stream POST JSONEachRow over the HTTP interface (:8123). This isolates how efficiently each tool batches and pipelines log ingest into ClickHouse — not the TCP receiver, which is out of the data path here. The receiver polls ClickHouse for the committed row count every 500ms (summing active MergeTree parts across the whole database, so it counts whatever table a subject created) and the harness derives EPS from the row-count timeline."
 
 duration: 60s

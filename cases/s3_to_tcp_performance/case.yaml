@@ -1,5 +1,6 @@
 name: s3_to_tcp_performance
 type: performance
+hidden: true
 description: "Measures throughput ingesting from S3 (LocalStack emulator) to a TCP sink. The generator uploads objects continuously; SQS-notification-driven subjects (vmetric, vector, filebeat) consume via the bench-events queue, bucket-polling subjects (logstash) list the bucket. Numbers are comparable across subjects, not against non-emulator cases — LocalStack itself caps throughput."
 
 duration: 60s

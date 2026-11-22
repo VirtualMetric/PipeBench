@@ -1,5 +1,6 @@
 name: kafka_crash_correctness
 type: kafka_crash_correctness
+hidden: true
 description: "Hard-crash (SIGKILL) durability: subject consumes from Kafka while the receiver is down, is killed with no graceful shutdown, restarted, and must deliver every record"
 
 duration: 30s

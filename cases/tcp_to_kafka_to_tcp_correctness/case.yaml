@@ -1,5 +1,6 @@
 name: tcp_to_kafka_to_tcp_correctness
 type: correctness
+hidden: true
 description: "Round-trips records through Kafka inside one vmetric instance with TWO routes: TCP device -> Kafka target (write), then Kafka device -> TCP target (read). Exercises the Kafka target AND device plus multi-route in a single director."
 
 duration: 30s

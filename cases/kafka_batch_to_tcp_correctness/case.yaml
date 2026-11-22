@@ -1,5 +1,6 @@
 name: kafka_batch_to_tcp_correctness
 type: kafka_correctness
+hidden: true
 description: "Generator packs 10 JSON objects per Kafka message as a JSON array; vmetric's Kafka device must split each array back into individual events (split_mode: json_array) and forward every record to TCP. Tests the device's batch/array parsing — received records == sent records only if the split works."
 
 duration: 120s

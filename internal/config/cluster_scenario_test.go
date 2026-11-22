@@ -49,6 +49,35 @@ func TestValidateClusterScenarioAcceptsARedisWitness(t *testing.T) {
 	}
 }
 
+// A throughput case may send more than MaxScenarioRate. Any other case may not.
+func TestValidateClusterScenarioThroughputLiftsTheRateLimit(t *testing.T) {
+	tc := validScenarioCase()
+	tc.Generator.Connections, tc.Generator.Rate = 32, 2000
+	err := tc.Validate()
+	if err == nil || !strings.Contains(err.Error(), "cluster.scenario.throughput") {
+		t.Fatalf("64,000 lines a second without throughput: got %v, want an error that names cluster.scenario.throughput", err)
+	}
+	tc.Cluster.Scenario.Throughput = true
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("64,000 lines a second with throughput: %v", err)
+	}
+	// It lifts only the limit: the rate must still be stated.
+	tc.Generator.Rate = 0
+	if err := tc.Validate(); err == nil || !strings.Contains(err.Error(), "explicitly") {
+		t.Fatalf("an unstated rate with throughput: got %v, want the explicit-rate error", err)
+	}
+}
+
+func TestValidateClusterScenarioThroughputFromYAML(t *testing.T) {
+	var sc ScenarioConfig
+	if err := yaml.Unmarshal([]byte("throughput: true\nsteps: [{do: start_load}]\n"), &sc); err != nil {
+		t.Fatal(err)
+	}
+	if !sc.Throughput {
+		t.Fatal("throughput: true did not set Throughput")
+	}
+}
+
 func TestValidateClusterScenarioRejects(t *testing.T) {
 	cases := map[string]struct {
 		edit func(tc *TestCase)
@@ -241,7 +270,7 @@ func TestValidateClusterScenarioReceiverSteps(t *testing.T) {
 		}, "the case has one receiver"},
 		"a receiver on another action": {twoReceiverScenarioCase, func(tc *TestCase) {
 			tc.Cluster.Scenario.Steps[6].Receiver = "a"
-		}, "receiver only applies to expect_arrived, receiver_pause, receiver_unpause"},
+		}, "receiver only applies to expect_arrived, receiver_pause, receiver_refuse, receiver_unpause"},
 		"several receivers without the load": {twoReceiverScenarioCase, func(tc *TestCase) { tc.Generator = GeneratorConfig{} }, "needs the http_ack generator"},
 	}
 	for name, c := range cases {
@@ -574,5 +603,36 @@ func TestValidateSetStage(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s: Validate = %v, want an error with %q", name, err, c.want)
 		}
+	}
+}
+
+// A receiver_refuse step needs an http receiver and a time to refuse for, and takes a min of 1 or
+// more. A sleep's up_to must be longer than its for, and only a sleep takes one.
+func TestValidateClusterScenarioRefuseAndRandomSleep(t *testing.T) {
+	withSteps := func(mode string, steps ...ScenarioStep) *TestCase {
+		tc := validScenarioCase()
+		tc.Receiver.Mode = mode
+		tc.Cluster.Scenario.Steps = append(tc.Cluster.Scenario.Steps, steps...)
+		return tc
+	}
+	if err := withSteps("http", ScenarioStep{Do: "receiver_refuse", For: "40s", Min: int64p(3)}, ScenarioStep{Do: "sleep", For: "5s", UpTo: "30s"}).Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	cases := map[string]struct {
+		tc   *TestCase
+		want string
+	}{
+		"a refusal of a tcp receiver": {withSteps("tcp", ScenarioStep{Do: "receiver_refuse", For: "40s"}), "needs an http receiver"},
+		"a refusal without a time":    {withSteps("http", ScenarioStep{Do: "receiver_refuse"}), "needs for"},
+		"a refusal with a min of 0":   {withSteps("http", ScenarioStep{Do: "receiver_refuse", For: "40s", Min: int64p(0)}), "min must be 1 or more"},
+		"an up_to shorter than for":   {withSteps("http", ScenarioStep{Do: "sleep", For: "30s", UpTo: "5s"}), "up_to must be a duration longer than for"},
+		"an up_to on a kill":          {withSteps("http", ScenarioStep{Do: "kill", Node: "1", UpTo: "5s"}), "up_to only applies to sleep"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := c.tc.Validate(); err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("Validate() = %v, want an error containing %q", err, c.want)
+			}
+		})
 	}
 }

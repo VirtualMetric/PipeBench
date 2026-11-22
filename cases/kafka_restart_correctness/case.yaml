@@ -1,5 +1,6 @@
 name: kafka_restart_correctness
 type: kafka_restart_correctness
+hidden: true
 description: "Graceful-restart (SIGTERM) durability: subject consumes from Kafka while the receiver is down, is stopped, restarted, and must deliver every record"
 
 duration: 30s

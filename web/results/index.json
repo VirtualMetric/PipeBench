@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-06-01T23:03:42.1511699Z",
+  "generated_at": "2026-11-12T16:08:12.1243806Z",
   "hardwares": [
     "c7i.large",
     "c7i.xlarge",
@@ -82,6 +82,16 @@
       "description": "End-to-end OTLP/gRPC throughput head-to-head: each subject receives OTLP/gRPC on 4317 and forwards as OTLP/gRPC. Isolates per-protocol overhead vs. the HTTP+protobuf generic case. vector is excluded — its OTLP sink is HTTP-only as of 2026."
     },
     {
+      "test": "otlp_metrics_to_otlp_correctness",
+      "type": "correctness",
+      "description": "End-to-end OTLP/Metrics correctness head-to-head: each subject receives OTLP/HTTP+protobuf metrics and forwards via OTLP/HTTP+protobuf. Verifies the full receive→forward path and zero-loss for the metrics signal across vmetric and otel-collector."
+    },
+    {
+      "test": "otlp_metrics_to_otlp_performance",
+      "type": "performance",
+      "description": "End-to-end OTLP/Metrics throughput head-to-head: rate at which each subject can receive OTLP/HTTP+protobuf metrics and forward them as OTLP/HTTP+protobuf. vmetric vs. otel-collector."
+    },
+    {
       "test": "otlp_pipeline_to_otlp_correctness",
       "type": "correctness",
       "description": "OTLP/HTTP receive→forward with one pipeline-stage transform per record (add a static attribute). Validates the per-record decode → mutate → re-encode round-trip preserves the LogRecord body bytes. rotel is excluded — its built-in transform layer doesn't expose a portable add-attribute primitive."
@@ -100,6 +110,16 @@
       "test": "otlp_to_otlp_generic_performance",
       "type": "performance",
       "description": "End-to-end OTLP/Logs throughput head-to-head: rate at which each subject can receive OTLP/HTTP+protobuf and forward it as OTLP/HTTP+protobuf. vmetric vs. rotel vs. otel-collector vs. vector vs. fluent-bit vs. grafana-alloy vs. bindplane-agent vs. cribl-stream."
+    },
+    {
+      "test": "otlp_traces_to_otlp_correctness",
+      "type": "correctness",
+      "description": "End-to-end OTLP/Traces correctness head-to-head: each subject receives OTLP/HTTP+protobuf spans and forwards via OTLP/HTTP+protobuf. Verifies the full receive→forward path and zero-loss for the traces signal across vmetric and otel-collector."
+    },
+    {
+      "test": "otlp_traces_to_otlp_performance",
+      "type": "performance",
+      "description": "End-to-end OTLP/Traces throughput head-to-head: rate at which each subject can receive OTLP/HTTP+protobuf spans and forward them as OTLP/HTTP+protobuf. vmetric vs. otel-collector."
     },
     {
       "test": "real_world_1_performance",

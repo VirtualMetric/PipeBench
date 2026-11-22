@@ -19,8 +19,9 @@ import (
 // at the end that no acknowledged record was lost.
 const ClusterScenarioType = "director_cluster_scenario_correctness"
 
-// MaxScenarioRate caps a scenario case's load, in lines a second. The cases
-// test failover, not throughput, and run on shared machines.
+// MaxScenarioRate caps a scenario case's load, in lines a second. Most cases
+// test failover, not throughput, and run on shared machines. A case that sets
+// cluster.scenario.throughput may send more.
 const MaxScenarioRate = 2000
 
 // IsClusterScenarioType reports whether the case is a cluster scenario case.
@@ -88,12 +89,20 @@ type ScenarioConfig struct {
 	// acknowledged line to arrive (default 180).
 	DrainSeconds int `yaml:"drain_seconds"`
 
-	// Throughput marks a case that measures how many lines a second the
-	// cluster delivers, under a load it cannot keep up with. Such a case may
-	// send more than MaxScenarioRate, which keeps the other cases at a load a
-	// shared machine can carry, so run it on a machine that does nothing
-	// else. Its expect.throughput compares the windows between its marks.
+	// Throughput marks a case that loads the cluster at a realistic rate, or
+	// beyond what it can keep up with to measure its capacity. Such a case may
+	// send more than MaxScenarioRate. That limit keeps the other cases at a
+	// load a shared machine can carry, so run a throughput case on a machine
+	// that does nothing else.
 	Throughput bool `yaml:"throughput"`
+
+	// NodePrivileged runs every node's container privileged, and as root, so
+	// that its image can mount a FUSE file system under the director's
+	// storage. A power-loss case uses it: the image puts the storage on
+	// LazyFS, which keeps every write that was not synced in its own memory,
+	// so a kill step loses those writes as a power loss would. The image's
+	// entrypoint drops root before it starts the director.
+	NodePrivileged bool `yaml:"node_privileged"`
 
 	// NodeDisk gives chosen nodes a small disk of their own at a path: a
 	// size-limited tmpfs, which a fill_disk step can fill.
@@ -348,10 +357,14 @@ type ScenarioStep struct {
 	// As remembers the node this step acted on, for a later "@name".
 	As string `yaml:"as"`
 
-	// Within bounds a wait; For is how long an expectation must hold, or a
-	// sleep's length.
+	// Within bounds a wait; For is how long an expectation must hold, a
+	// sleep's length, or how long a receiver_refuse step refuses.
 	Within string `yaml:"within"`
 	For    string `yaml:"for"`
+	// UpTo makes a sleep last a random time between For and UpTo, so that a
+	// disruption after it lands at a moment the case does not choose. The run
+	// logs the time it chose.
+	UpTo string `yaml:"up_to"`
 
 	// Record names the measurement a wait stores: the time from the last
 	// disruption to the moment the wait was satisfied. expect_writes_stop,
@@ -382,8 +395,8 @@ type ScenarioStep struct {
 	Latency string `yaml:"latency"`
 	Jitter  string `yaml:"jitter"`
 
-	// Receiver names, by its id, the receiver a receiver_pause or
-	// receiver_unpause step acts on. A case with several receivers
+	// Receiver names, by its id, the receiver a receiver_pause,
+	// receiver_unpause or receiver_refuse step acts on. A case with several receivers
 	// (`receivers:`) names one; a case with one receiver names none.
 	Receiver string `yaml:"receiver"`
 
@@ -427,7 +440,9 @@ type ScenarioStep struct {
 	// receiver. It counts after the drain, so a line still on its way at the
 	// step counts too.
 	SentAfter string `yaml:"sent_after"`
-	// Min and Max bound an expect_arrived step's count.
+	// Min and Max bound an expect_arrived step's count. Min is also the
+	// fewest requests a receiver_refuse step's receiver must refuse while the
+	// refusal lasts, 1 when it is not set.
 	Min *int64 `yaml:"min"`
 	Max *int64 `yaml:"max"`
 	// CompareTo names another receiver for an expect_arrived step, and
@@ -557,6 +572,7 @@ var scenarioActions = map[string]bool{
 	"proxy_down":                false,
 	"proxy_up":                  false,
 	"receiver_pause":            false,
+	"receiver_refuse":           false,
 	"receiver_unpause":          false,
 	"scale_to":                  false,
 	"set_stage":                 false,
@@ -820,7 +836,7 @@ func (tc *TestCase) validateClusterScenario() error {
 		return fmt.Errorf("case %q: a scenario case sets generator.connections and generator.rate explicitly", tc.Name)
 	}
 	if total := tc.Generator.Connections * tc.Generator.Rate; tc.HasGenerator() && total > MaxScenarioRate && !sc.Throughput {
-		return fmt.Errorf("case %q: generator.connections × generator.rate is %d lines a second, more than the %d a scenario case may send", tc.Name, total, MaxScenarioRate)
+		return fmt.Errorf("case %q: generator.connections × generator.rate is %d lines a second, more than the %d a scenario case may send without cluster.scenario.throughput: true", tc.Name, total, MaxScenarioRate)
 	}
 	// With several receivers, the driver checks the load's acknowledged lines
 	// at each of them. Without the load there is nothing to check them by.
@@ -1001,6 +1017,26 @@ func (tc *TestCase) validateClusterScenario() error {
 		case "sleep":
 			if st.For == "" {
 				return fmt.Errorf("%s: needs for", where)
+			}
+			if st.UpTo != "" {
+				lo, err1 := time.ParseDuration(st.For)
+				hi, err2 := time.ParseDuration(st.UpTo)
+				if err1 != nil || err2 != nil || hi <= lo {
+					return fmt.Errorf("%s: up_to must be a duration longer than for", where)
+				}
+			}
+		case "receiver_refuse":
+			if d, err := time.ParseDuration(st.For); st.For == "" || err != nil || d <= 0 {
+				return fmt.Errorf("%s: needs for, a duration above 0", where)
+			}
+			if st.Min != nil && *st.Min < 1 {
+				return fmt.Errorf("%s: min must be 1 or more", where)
+			}
+			if err := tc.validateScenarioReceiver(st.Receiver); err != nil {
+				return fmt.Errorf("%s: %w", where, err)
+			}
+			if mode := tc.scenarioReceiverMode(st.Receiver); mode != "http" {
+				return fmt.Errorf("%s: receiver_refuse needs an http receiver, and this one is %q", where, mode)
 			}
 		case "mark":
 			if st.Label == "" {
@@ -1317,9 +1353,22 @@ func (tc *TestCase) validateExpectArrived(st ScenarioStep, marks map[string]bool
 	return tc.validateScenarioReceiver(st.Receiver)
 }
 
-// validateScenarioReceiver checks the receiver a receiver_pause or
-// receiver_unpause step names: one of the case's receivers when it has
-// several, and none when it has one.
+// scenarioReceiverMode returns the mode of the receiver id, or of the case's one receiver.
+func (tc *TestCase) scenarioReceiverMode(id string) string {
+	if !tc.MultiReceiver() {
+		return tc.Receiver.Mode
+	}
+	for _, r := range tc.Receivers {
+		if r.ID == id {
+			return r.Mode
+		}
+	}
+	return ""
+}
+
+// validateScenarioReceiver checks the receiver a receiver_pause,
+// receiver_unpause or receiver_refuse step names: one of the case's receivers
+// when it has several, and none when it has one.
 func (tc *TestCase) validateScenarioReceiver(id string) error {
 	if !tc.MultiReceiver() {
 		if id != "" {
@@ -1379,9 +1428,10 @@ var stepFieldOwners = []struct {
 	{"disk_bps", func(s ScenarioStep) bool { return s.DiskBPS != "" }, map[string]bool{"slow_disk": true}},
 	{"disk_iops", func(s ScenarioStep) bool { return s.DiskIOPS != 0 }, map[string]bool{"slow_disk": true}},
 	{"gap", func(s ScenarioStep) bool { return s.Gap != "" }, map[string]bool{"expect_delivery_continues": true, "expect_writes_continue": true}},
-	{"receiver", func(s ScenarioStep) bool { return s.Receiver != "" }, map[string]bool{"receiver_pause": true, "receiver_unpause": true, "expect_arrived": true}},
+	{"receiver", func(s ScenarioStep) bool { return s.Receiver != "" }, map[string]bool{"receiver_pause": true, "receiver_unpause": true, "receiver_refuse": true, "expect_arrived": true}},
+	{"up_to", func(s ScenarioStep) bool { return s.UpTo != "" }, map[string]bool{"sleep": true}},
 	{"sent_after", func(s ScenarioStep) bool { return s.SentAfter != "" }, map[string]bool{"expect_arrived": true}},
-	{"min", func(s ScenarioStep) bool { return s.Min != nil }, map[string]bool{"expect_arrived": true}},
+	{"min", func(s ScenarioStep) bool { return s.Min != nil }, map[string]bool{"expect_arrived": true, "receiver_refuse": true}},
 	{"max", func(s ScenarioStep) bool { return s.Max != nil }, map[string]bool{"expect_arrived": true}},
 	{"compare_to", func(s ScenarioStep) bool { return s.CompareTo != "" }, map[string]bool{"expect_arrived": true}},
 	{"min_share", func(s ScenarioStep) bool { return s.MinShare != nil }, map[string]bool{"expect_arrived": true}},

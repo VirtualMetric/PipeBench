@@ -1,5 +1,6 @@
 name: s3_to_tcp_correctness
 type: correctness
+hidden: true
 description: "Validates that every record uploaded to S3 (LocalStack emulator) is emitted over TCP. S3-via-SQS notification consumption is at-least-once, so duplicates are allowed (allow_overdelivery) — loss is not."
 
 duration: 60s

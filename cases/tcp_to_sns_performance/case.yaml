@@ -1,5 +1,6 @@
 name: tcp_to_sns_performance
 type: performance
+hidden: true
 description: "Measures throughput of a TCP-in to SNS-out pipeline (LocalStack emulator). SNS is not directly observable, so init subscribes an SQS queue to the topic with RawMessageDelivery and the receiver drains that queue. Fixed generator rate — LocalStack is the known ceiling."
 
 duration: 60s

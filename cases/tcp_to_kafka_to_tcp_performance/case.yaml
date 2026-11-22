@@ -1,5 +1,6 @@
 name: tcp_to_kafka_to_tcp_performance
 type: performance
+hidden: true
 description: "Throughput of the Kafka round-trip inside one vmetric instance with TWO routes: TCP device -> Kafka target (write) and Kafka device -> TCP target (read). Measures end-to-end EPS through TCP -> Kafka -> TCP."
 
 duration: 60s

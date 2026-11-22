@@ -22,9 +22,13 @@ type TestCase struct {
 	Name        string `yaml:"name"`
 	Type        string `yaml:"type"` // "performance" | "correctness"
 	Description string `yaml:"description"`
-	Duration    string `yaml:"duration"`
-	Warmup      string `yaml:"warmup"`
-	DrainGrace  string `yaml:"drain_grace"`
+	// Hidden leaves the case off the results page: `harness report` and
+	// `harness serve` don't list it in index.json. The harness still runs
+	// it, and its results stay in the subject files.
+	Hidden     bool   `yaml:"hidden"`
+	Duration   string `yaml:"duration"`
+	Warmup     string `yaml:"warmup"`
+	DrainGrace string `yaml:"drain_grace"`
 
 	// Singular generator/receiver: the original, single-source/single-sink
 	// schema. These remain the canonical form for the case files in this

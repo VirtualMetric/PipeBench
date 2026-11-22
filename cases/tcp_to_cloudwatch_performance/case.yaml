@@ -1,5 +1,6 @@
 name: tcp_to_cloudwatch_performance
 type: performance
+hidden: true
 description: "Measures throughput of a TCP-in to CloudWatch-Logs-out pipeline (LocalStack emulator). The receiver polls every stream of the log group with forward tokens. Fixed generator rate — LocalStack's CloudWatch is the known ceiling, not the subject."
 
 duration: 60s
