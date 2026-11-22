@@ -17,8 +17,9 @@ import (
 // at the end that no acknowledged record was lost.
 const ClusterScenarioType = "director_cluster_scenario_correctness"
 
-// MaxScenarioRate caps a scenario case's load, in lines a second. The cases
-// test failover, not throughput, and run on shared machines.
+// MaxScenarioRate caps a scenario case's load, in lines a second. Most cases
+// test failover, not throughput, and run on shared machines. A case that sets
+// cluster.scenario.throughput may send more.
 const MaxScenarioRate = 2000
 
 // IsClusterScenarioType reports whether the case is a cluster scenario case.
@@ -79,6 +80,21 @@ type ScenarioConfig struct {
 	// DrainSeconds bounds the wait, after the load stops, for every
 	// acknowledged line to arrive (default 180).
 	DrainSeconds int `yaml:"drain_seconds"`
+
+	// Throughput marks a case that loads the cluster at a realistic rate, or
+	// beyond what it can keep up with to measure its capacity. Such a case may
+	// send more than MaxScenarioRate. That limit keeps the other cases at a
+	// load a shared machine can carry, so run a throughput case on a machine
+	// that does nothing else.
+	Throughput bool `yaml:"throughput"`
+
+	// NodePrivileged runs every node's container privileged, and as root, so
+	// that its image can mount a FUSE file system under the director's
+	// storage. A power-loss case uses it: the image puts the storage on
+	// LazyFS, which keeps every write that was not synced in its own memory,
+	// so a kill step loses those writes as a power loss would. The image's
+	// entrypoint drops root before it starts the director.
+	NodePrivileged bool `yaml:"node_privileged"`
 
 	// NodeDisk gives chosen nodes a small disk of their own at a path: a
 	// size-limited tmpfs, which a fill_disk step can fill.
@@ -580,8 +596,8 @@ func (tc *TestCase) validateClusterScenario() error {
 	case tc.Generator.Connections < 1 || tc.Generator.Rate < 1:
 		return fmt.Errorf("case %q: a scenario case sets generator.connections and generator.rate explicitly", tc.Name)
 	}
-	if total := tc.Generator.Connections * tc.Generator.Rate; tc.HasGenerator() && total > MaxScenarioRate {
-		return fmt.Errorf("case %q: generator.connections × generator.rate is %d lines a second, more than the %d a scenario case may send", tc.Name, total, MaxScenarioRate)
+	if total := tc.Generator.Connections * tc.Generator.Rate; tc.HasGenerator() && total > MaxScenarioRate && !sc.Throughput {
+		return fmt.Errorf("case %q: generator.connections × generator.rate is %d lines a second, more than the %d a scenario case may send without cluster.scenario.throughput: true", tc.Name, total, MaxScenarioRate)
 	}
 	// With several receivers, the driver checks the load's acknowledged lines
 	// at each of them. Without the load there is nothing to check them by.
