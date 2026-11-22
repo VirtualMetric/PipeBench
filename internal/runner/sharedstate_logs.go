@@ -151,7 +151,7 @@ const (
 	// ssPlaced: the leader placed a device on a member.
 	ssPlaced
 	// ssHeldBack: the replica does not start a device because the director
-	// keeps its shared state in memory. Director 2.7.0 and older did this.
+	// keeps its shared state in memory. Directors before 2.7.0 did this.
 	ssHeldBack
 	// ssAtRisk: the replica runs a device at risk because the director keeps
 	// its shared state in memory, and says so once for the device. Directors
