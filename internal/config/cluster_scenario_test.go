@@ -39,6 +39,35 @@ func TestValidateClusterScenarioAcceptsAValidCase(t *testing.T) {
 	}
 }
 
+// A throughput case may send more than MaxScenarioRate. Any other case may not.
+func TestValidateClusterScenarioThroughputLiftsTheRateLimit(t *testing.T) {
+	tc := validScenarioCase()
+	tc.Generator.Connections, tc.Generator.Rate = 32, 2000
+	err := tc.Validate()
+	if err == nil || !strings.Contains(err.Error(), "cluster.scenario.throughput") {
+		t.Fatalf("64,000 lines a second without throughput: got %v, want an error that names cluster.scenario.throughput", err)
+	}
+	tc.Cluster.Scenario.Throughput = true
+	if err := tc.Validate(); err != nil {
+		t.Fatalf("64,000 lines a second with throughput: %v", err)
+	}
+	// It lifts only the limit: the rate must still be stated.
+	tc.Generator.Rate = 0
+	if err := tc.Validate(); err == nil || !strings.Contains(err.Error(), "explicitly") {
+		t.Fatalf("an unstated rate with throughput: got %v, want the explicit-rate error", err)
+	}
+}
+
+func TestValidateClusterScenarioThroughputFromYAML(t *testing.T) {
+	var sc ScenarioConfig
+	if err := yaml.Unmarshal([]byte("throughput: true\nsteps: [{do: start_load}]\n"), &sc); err != nil {
+		t.Fatal(err)
+	}
+	if !sc.Throughput {
+		t.Fatal("throughput: true did not set Throughput")
+	}
+}
+
 func TestValidateClusterScenarioRejects(t *testing.T) {
 	cases := map[string]struct {
 		edit func(tc *TestCase)
