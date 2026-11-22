@@ -506,7 +506,7 @@ type SharedStateStream struct {
 	// count as cut_lines, so a jump is visible.
 	MaxCutLines int64 `yaml:"max_cut_lines"`
 	// ExpectNothing says that no record of the stream may arrive: its devices
-	// must not run at all, as on a director 2.7.0 or older that keeps its
+	// must not run at all, as on a director before 2.7.0 that keeps its
 	// shared state in memory. A newer one runs them at risk (VM-8626). Loss is
 	// not judged then.
 	ExpectNothing bool `yaml:"expect_nothing"`
