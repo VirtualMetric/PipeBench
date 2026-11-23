@@ -23,6 +23,7 @@ VERIFIER_IMAGE  := vmetric/bench-verifier:latest
 NETTOOL_IMAGE   := vmetric/bench-nettool:latest
 SHARE_SMB_IMAGE := vmetric/bench-share-smb:latest
 SHARE_NFS_IMAGE := vmetric/bench-share-nfs:latest
+SSH_HOST_IMAGE  := vmetric/bench-sshhost:latest
 
 # Set ATTEST=1 to emit SBOM + max-mode provenance (used when publishing to Docker Hub).
 # Requires the docker-container buildx driver; the default docker driver on GitHub
@@ -142,7 +143,18 @@ build-share-nfs:
 		--load \
 		.
 
-build-containers: build-generator build-receiver build-collector build-kdc build-verifier build-nettool build-share-smb build-share-nfs
+# The SSH server of the cases that deploy an agent over SSH: OpenSSH on
+# Alpine, installed when the image is built, so a run downloads nothing.
+build-ssh-host:
+	$(DOCKER_BUILD) \
+		-f containers/sshhost/Dockerfile \
+		-t $(SSH_HOST_IMAGE) \
+		--platform linux/amd64 \
+		--build-arg BUILDKIT_INLINE_CACHE=1 \
+		--load \
+		.
+
+build-containers: build-generator build-receiver build-collector build-kdc build-verifier build-nettool build-share-smb build-share-nfs build-ssh-host
 
 # ── Publish to Docker Hub ─────────────────────────────────────────────────────
 #
@@ -238,7 +250,18 @@ push-share-nfs:
 		--push \
 		.
 
-push-containers: push-generator push-receiver push-collector push-kdc push-verifier push-nettool push-share-smb push-share-nfs
+push-ssh-host:
+	$(DOCKER_BUILD) \
+		-f containers/sshhost/Dockerfile \
+		-t $(SSH_HOST_IMAGE) \
+		-t vmetric/bench-sshhost:sha-$(COMMIT) \
+		--platform linux/amd64 \
+		$(ATTEST_FLAGS) \
+		--build-arg BUILDKIT_INLINE_CACHE=1 \
+		--push \
+		.
+
+push-containers: push-generator push-receiver push-collector push-kdc push-verifier push-nettool push-share-smb push-share-nfs push-ssh-host
 
 # ── End-to-end test ───────────────────────────────────────────────────────────
 
