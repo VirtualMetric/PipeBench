@@ -2084,14 +2084,14 @@ func (run *ssRun) moveAcrossCutLink() {
 		return
 	}
 	leader := leaders[0]
-	d, from, problem := pickMoveDevice(run.ss.MoveCandidates(), leader, func(device int64) []int { return run.owners(device, now) }, func(n int) string { return run.replica(n).Service })
+	d, from, skipped, problem := pickMoveDevice(run.ss.MoveCandidates(), leader, func(device int64) []int { return run.owners(device, now) }, func(n int) string { return run.replica(n).Service })
 	if problem != "" {
 		run.fail("%s", problem)
 		return
 	}
-	if d != run.ss.MoveCandidates()[0] {
-		fmt.Printf("  device %d runs on the leader %s, so the move takes device %d, which runs on %s\n",
-			run.ss.MoveCandidates()[0], run.replica(leader).Service, d, run.replica(from).Service)
+	if len(skipped) > 0 {
+		fmt.Printf("  the move takes device %d, which runs on %s; it skipped: %s\n",
+			d, run.replica(from).Service, strings.Join(skipped, "; "))
 	}
 	to := 0
 	for _, rep := range run.replicas {
@@ -2187,30 +2187,41 @@ func (run *ssRun) moveAcrossCutLink() {
 
 // pickMoveDevice chooses the device move_across_cut_link moves: the first of
 // candidates that runs on exactly one replica, and not on the leader. It
-// returns the device and the replica that runs it, or a problem that fails the
-// run. A candidate that runs on no replica, or on more than one, fails the run
-// at once, because the placement is wrong, not only unlucky. ownersOf returns
-// the replicas that run a device, and service names a replica.
-func pickMoveDevice(candidates []int64, leader int, ownersOf func(int64) []int, service func(int) string) (int64, int, string) {
-	var onLeader []string
+// returns the device, the replica that runs it, and why it skipped each
+// candidate before it. A candidate can be skipped because it runs on the
+// leader, on no replica, or on more than one. When no candidate can move, it
+// returns a problem that fails the run and names every candidate and why. With
+// one candidate, the problem is worded as it was before a case could name
+// several. ownersOf returns the replicas that run a device, and service names
+// a replica.
+func pickMoveDevice(candidates []int64, leader int, ownersOf func(int64) []int, service func(int) string) (int64, int, []string, string) {
+	var skipped []string
+	onLeader := false
 	for _, d := range candidates {
 		owners := ownersOf(d)
-		if len(owners) != 1 {
+		switch {
+		case len(owners) != 1:
 			names := make([]string, len(owners))
 			for i, n := range owners {
 				names[i] = service(n)
 			}
-			return 0, 0, fmt.Sprintf("device %d runs on %d replicas (%s); the move needs one owner", d, len(owners), strings.Join(names, ", "))
+			skipped = append(skipped, fmt.Sprintf("device %d runs on %d replicas (%s)", d, len(owners), strings.Join(names, ", ")))
+		case owners[0] == leader:
+			skipped = append(skipped, fmt.Sprintf("device %d runs on the leader %s", d, service(leader)))
+			onLeader = true
+		default:
+			return d, owners[0], skipped, ""
 		}
-		if owners[0] != leader {
-			return d, owners[0], ""
-		}
-		onLeader = append(onLeader, strconv.FormatInt(d, 10))
 	}
-	if len(onLeader) == 1 {
-		return 0, 0, fmt.Sprintf("device %s runs on the leader %s; the move needs an owner that does not lead", onLeader[0], service(leader))
+	switch {
+	case len(candidates) == 0:
+		return 0, 0, nil, "the move names no device"
+	case len(candidates) == 1 && onLeader:
+		return 0, 0, nil, skipped[0] + "; the move needs an owner that does not lead"
+	case len(candidates) == 1:
+		return 0, 0, nil, skipped[0] + "; the move needs one owner"
 	}
-	return 0, 0, fmt.Sprintf("devices %s all run on the leader %s; the move needs an owner that does not lead", strings.Join(onLeader, ", "), service(leader))
+	return 0, 0, nil, "no device can move: " + strings.Join(skipped, "; ") + ". The move needs a device that runs on one replica, which does not lead"
 }
 
 // memberOf returns the member name replica n's director last logged: the

@@ -12,10 +12,16 @@
 # that disappears from a registry cannot break the cases that use it. The base
 # is pinned by digest, and the packages come from that Alpine release.
 FROM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+# sed exits 0 when it matches nothing, so the build checks each setting after
+# the edits. A newer base whose sshd_config words a setting otherwise fails
+# here, not in the cases that sign in.
 RUN apk add --no-cache openssh openssh-server openssh-sftp-server && \
     sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config && \
     sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
-    (grep -q '^Subsystem sftp' /etc/ssh/sshd_config || echo 'Subsystem sftp /usr/lib/ssh/sftp-server' >> /etc/ssh/sshd_config)
+    (grep -q '^Subsystem sftp' /etc/ssh/sshd_config || echo 'Subsystem sftp /usr/lib/ssh/sftp-server' >> /etc/ssh/sshd_config) && \
+    grep -q '^PermitRootLogin yes$' /etc/ssh/sshd_config && \
+    grep -q '^PasswordAuthentication yes$' /etc/ssh/sshd_config && \
+    grep -q '^Subsystem[[:space:]]\+sftp' /etc/ssh/sshd_config
 COPY containers/sshhost/start.sh /start.sh
 EXPOSE 22
 ENTRYPOINT ["/bin/sh", "/start.sh"]
