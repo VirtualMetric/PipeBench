@@ -477,7 +477,9 @@ func TestKillAllAndRevisionUpdateValidation(t *testing.T) {
 }
 
 // The store_cluster mode is valid, and expects what the embedded mode
-// expects of the shared_state component: no state bus (VM-8792).
+// expects of the shared_state component. A store cluster runs no state bus. A
+// director released after 2.7.0 reports ok and names the store, and an older
+// one reports not_configured, so the driver accepts both.
 func TestStoreClusterMode(t *testing.T) {
 	tc := sharedStateCase()
 	tc.SharedState.Mode = SharedStateModeStoreCluster
@@ -487,6 +489,14 @@ func TestStoreClusterMode(t *testing.T) {
 	if got := tc.SharedState.ExpectHealthOrDefault(); got != "not_configured" {
 		t.Errorf("ExpectHealthOrDefault = %q, want not_configured", got)
 	}
+	if got := tc.SharedState.ExpectedHealth(); !reflect.DeepEqual(got, []string{"ok", "not_configured"}) {
+		t.Errorf("a store cluster accepts ok and not_configured, got %q", got)
+	}
+	tc.SharedState.ExpectHealth = "ok"
+	if got := tc.SharedState.ExpectedHealth(); !reflect.DeepEqual(got, []string{"ok"}) {
+		t.Errorf("a store cluster case that sets expect_health accepts only that, got %q", got)
+	}
+	tc.SharedState.ExpectHealth = ""
 	if !tc.SharedState.SharesBus() {
 		t.Error("a store cluster shares a bus")
 	}

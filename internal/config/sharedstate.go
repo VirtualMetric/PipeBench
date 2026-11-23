@@ -575,17 +575,19 @@ func (s *SharedStateConfig) ExpectHealthOrDefault() string {
 // ExpectedHealth returns the statuses the director's /health may report for
 // its shared_state component on every running replica: ExpectHealth when the
 // case sets it, or else what the mode implies. A state bus is "ok", and a
-// memory queue, which keeps no shared state, is "not_configured". An embedded
-// queue keeps its shared state in its own bus, on the store: a director from
-// VM-10711 on (after 2.7.0) reports "ok" and names the store, and an older one
-// reports "not_configured". Both are right for their release, so both pass.
+// memory queue, which keeps no shared state, is "not_configured".
+//
+// An embedded queue and a store cluster keep their shared state in their own
+// bus, on the store. A director released after 2.7.0 reports "ok" for them and
+// names the store. An older one reports "not_configured". Both are right for
+// their release, so both pass.
 func (s *SharedStateConfig) ExpectedHealth() []string {
 	switch {
 	case s != nil && s.ExpectHealth != "":
 		return []string{s.ExpectHealth}
 	case s.ModeOrDefault() == SharedStateModeStateBus:
 		return []string{"ok"}
-	case s.ModeOrDefault() == SharedStateModeEmbedded:
+	case s.ModeOrDefault() == SharedStateModeEmbedded, s.ModeOrDefault() == SharedStateModeStoreCluster:
 		return []string{"ok", "not_configured"}
 	default:
 		return []string{"not_configured"}
