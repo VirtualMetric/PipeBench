@@ -195,8 +195,10 @@ func storeOutageArgs(ss *config.SharedStateConfig, away bool, via, image string)
 		if away {
 			mode = "000"
 		}
-		return []string{"run", "--rm", "--volumes-from", via, "--user", "0:0", "--network", "none",
-			"--cpus", "0.5", "--memory", "64m", "--entrypoint", "chmod", image, mode, ss.SharePath}
+		return []string{
+			"run", "--rm", "--volumes-from", via, "--user", "0:0", "--network", "none",
+			"--cpus", "0.5", "--memory", "64m", "--entrypoint", "chmod", image, mode, ss.SharePath,
+		}
 	}
 	if away {
 		return []string{"pause", "bench-" + ss.StoreService()}
@@ -2074,7 +2076,6 @@ func logOnceProblems(lines []ssLine, want string) []string {
 // if the device ever runs on both. The link stays cut for hold_seconds after
 // the move, and is then restored.
 func (run *ssRun) moveAcrossCutLink() {
-	d := run.ss.MoveDevice
 	run.refreshAll()
 	now := current()
 	leaders := run.leaders(now)
@@ -2083,15 +2084,14 @@ func (run *ssRun) moveAcrossCutLink() {
 		return
 	}
 	leader := leaders[0]
-	owners := run.owners(d, now)
-	if len(owners) != 1 {
-		run.fail("device %d runs on %d replicas (%s); the move needs one owner", d, len(owners), run.names(owners))
+	d, from, skipped, problem := pickMoveDevice(run.ss.MoveCandidates(), leader, func(device int64) []int { return run.owners(device, now) }, func(n int) string { return run.replica(n).Service })
+	if problem != "" {
+		run.fail("%s", problem)
 		return
 	}
-	from := owners[0]
-	if from == leader {
-		run.fail("device %d runs on the leader %s; the move needs an owner that does not lead", d, run.replica(from).Service)
-		return
+	if len(skipped) > 0 {
+		fmt.Printf("  the move takes device %d, which runs on %s; it skipped: %s\n",
+			d, run.replica(from).Service, strings.Join(skipped, "; "))
 	}
 	to := 0
 	for _, rep := range run.replicas {
@@ -2143,7 +2143,7 @@ func (run *ssRun) moveAcrossCutLink() {
 
 	skew := run.daemonSkew()
 	issued := time.Now()
-	if err := run.orch.RenderReplicaConfigsMoving(3, member); err != nil {
+	if err := run.orch.RenderReplicaConfigsMoving(3, member, d); err != nil {
 		run.fail("rendering the config's third stage: %v", err)
 		return
 	}
@@ -2183,6 +2183,45 @@ func (run *ssRun) moveAcrossCutLink() {
 	restore()
 	run.checkSettled("after the move", earliest(time.Now().Add(time.Duration(run.ss.SettleOrDefault())*time.Second), run.deadline))
 	run.checkHealthAll("after")
+}
+
+// pickMoveDevice chooses the device move_across_cut_link moves: the first of
+// candidates that runs on exactly one replica, and not on the leader. It
+// returns the device, the replica that runs it, and why it skipped each
+// candidate before it. A candidate can be skipped because it runs on the
+// leader, on no replica, or on more than one. When no candidate can move, it
+// returns a problem that fails the run and names every candidate and why. With
+// one candidate, the problem is worded as it was before a case could name
+// several. ownersOf returns the replicas that run a device, and service names
+// a replica.
+func pickMoveDevice(candidates []int64, leader int, ownersOf func(int64) []int, service func(int) string) (int64, int, []string, string) {
+	var skipped []string
+	onLeader := false
+	for _, d := range candidates {
+		owners := ownersOf(d)
+		switch {
+		case len(owners) != 1:
+			names := make([]string, len(owners))
+			for i, n := range owners {
+				names[i] = service(n)
+			}
+			skipped = append(skipped, fmt.Sprintf("device %d runs on %d replicas (%s)", d, len(owners), strings.Join(names, ", ")))
+		case owners[0] == leader:
+			skipped = append(skipped, fmt.Sprintf("device %d runs on the leader %s", d, service(leader)))
+			onLeader = true
+		default:
+			return d, owners[0], skipped, ""
+		}
+	}
+	switch {
+	case len(candidates) == 0:
+		return 0, 0, nil, "the move names no device"
+	case len(candidates) == 1 && onLeader:
+		return 0, 0, nil, skipped[0] + "; the move needs an owner that does not lead"
+	case len(candidates) == 1:
+		return 0, 0, nil, skipped[0] + "; the move needs one owner"
+	}
+	return 0, 0, nil, "no device can move: " + strings.Join(skipped, "; ") + ". The move needs a device that runs on one replica, which does not lead"
 }
 
 // memberOf returns the member name replica n's director last logged: the

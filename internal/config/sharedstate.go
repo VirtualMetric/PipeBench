@@ -93,7 +93,10 @@ const (
 	// config's third stage, in which {{@.MoveTarget@}} is the second replica's
 	// member name: the case allows the device only there, so the leader moves
 	// it across the cut link at once. The device must start on the second
-	// replica and must never run on both.
+	// replica and must never run on both. A case that names move_devices
+	// instead lets the action move the first of them that runs on a replica
+	// that does not lead, and the third stage reads which one from
+	// {{@.MoveDevice@}}.
 	SharedStateActionMoveAcrossCutLink = "move_across_cut_link"
 	// SharedStateActionKillAll kills every replica at once with SIGKILL, as
 	// the loss of the host or the zone that runs them does, and then starts
@@ -313,6 +316,13 @@ type SharedStateConfig struct {
 	ActionDelaySeconds int `yaml:"action_delay_seconds"`
 	// MoveDevice is the placed device move_across_cut_link moves.
 	MoveDevice int64 `yaml:"move_device"`
+	// MoveDevices are the placed devices move_across_cut_link may move, in
+	// place of move_device. The action moves the first of them, in this order,
+	// that runs on a replica that does not lead. The leader may place a new
+	// device on itself, so a case that names one device cannot be sure that
+	// the device runs where the move needs it. The config's third stage reads
+	// the device that moves from {{@.MoveDevice@}}.
+	MoveDevices []int64 `yaml:"move_devices"`
 	// CutHoldSeconds is how long move_across_cut_link keeps the link cut
 	// before it moves the device, so both replicas notice the cut first
 	// (default 10).
@@ -549,6 +559,21 @@ const (
 	// store_cluster ok on every replica once the replicas settle.
 	SharedStateModeStoreCluster = "store_cluster"
 )
+
+// MoveCandidates returns the devices move_across_cut_link may move, in order:
+// move_devices, or else move_device alone.
+func (s *SharedStateConfig) MoveCandidates() []int64 {
+	if s == nil {
+		return nil
+	}
+	if len(s.MoveDevices) > 0 {
+		return s.MoveDevices
+	}
+	if s.MoveDevice != 0 {
+		return []int64{s.MoveDevice}
+	}
+	return nil
+}
 
 // ModeOrDefault returns Mode, or "state_bus".
 func (s *SharedStateConfig) ModeOrDefault() string {
@@ -1000,15 +1025,27 @@ func (tc *TestCase) validateSharedState() error {
 		if s.Replicas < 3 {
 			return fmt.Errorf("case %q: shared_state.action move_across_cut_link needs three replicas: the leader, the device's owner and the replica the device moves to", tc.Name)
 		}
-		if s.MoveDevice == 0 || !slices.Contains(s.PlacedDevices, s.MoveDevice) {
+		if s.MoveDevice != 0 && len(s.MoveDevices) > 0 {
+			return fmt.Errorf("case %q: shared_state.move_device and move_devices name the device to move twice; set one of them", tc.Name)
+		}
+		candidates := s.MoveCandidates()
+		if len(candidates) == 0 {
 			return fmt.Errorf("case %q: shared_state.action move_across_cut_link needs shared_state.move_device, one of placed_devices", tc.Name)
+		}
+		for i, d := range candidates {
+			if d == 0 || !slices.Contains(s.PlacedDevices, d) {
+				return fmt.Errorf("case %q: shared_state.action move_across_cut_link moves device %d, which is not one of placed_devices", tc.Name, d)
+			}
+			if slices.Contains(candidates[:i], d) {
+				return fmt.Errorf("case %q: shared_state.move_devices names device %d twice", tc.Name, d)
+			}
 		}
 		if !s.SharesBus() {
 			return fmt.Errorf("case %q: shared_state.action move_across_cut_link moves a placed device, and with the shared state in memory no device is placed", tc.Name)
 		}
 	}
-	if s.MoveDevice != 0 && s.Action != SharedStateActionMoveAcrossCutLink {
-		return fmt.Errorf("case %q: shared_state.move_device is only used by the move_across_cut_link action", tc.Name)
+	if (s.MoveDevice != 0 || len(s.MoveDevices) > 0) && s.Action != SharedStateActionMoveAcrossCutLink {
+		return fmt.Errorf("case %q: shared_state.move_device and move_devices are only used by the move_across_cut_link action", tc.Name)
 	}
 	if s.MinCopies < 0 || s.ScaledOutCopies < 0 {
 		return fmt.Errorf("case %q: shared_state.min_copies and scaled_out_copies must not be negative", tc.Name)

@@ -301,15 +301,43 @@ func TestMoveAcrossCutLinkValidation(t *testing.T) {
 	if err := valid().Validate(); err != nil {
 		t.Fatalf("a valid case was refused: %v", err)
 	}
+	if got := valid().SharedState.MoveCandidates(); !reflect.DeepEqual(got, []int64{12}) {
+		t.Errorf("MoveCandidates of move_device 12 = %v, want [12]", got)
+	}
+	// A case may name several devices, and the action moves the first that
+	// runs on a replica that does not lead.
+	several := valid()
+	several.SharedState.MoveDevice = 0
+	several.SharedState.MoveDevices = []int64{11, 12, 13}
+	if err := several.Validate(); err != nil {
+		t.Fatalf("a case with move_devices was refused: %v", err)
+	}
+	if got := several.SharedState.MoveCandidates(); !reflect.DeepEqual(got, []int64{11, 12, 13}) {
+		t.Errorf("MoveCandidates of move_devices = %v, want [11 12 13]", got)
+	}
 	cases := map[string]struct {
 		edit func(tc *TestCase)
 		want string
 	}{
-		"two replicas":      {func(tc *TestCase) { tc.SharedState.Replicas = 2 }, "needs three replicas"},
-		"no device":         {func(tc *TestCase) { tc.SharedState.MoveDevice = 0 }, "needs shared_state.move_device"},
-		"device not placed": {func(tc *TestCase) { tc.SharedState.MoveDevice = 99 }, "one of placed_devices"},
-		"device, no move":   {func(tc *TestCase) { tc.SharedState.Action = SharedStateActionKillLeader }, "only used by the move_across_cut_link"},
-		"negative cut hold": {func(tc *TestCase) { tc.SharedState.CutHoldSeconds = -1 }, "cut_hold_seconds"},
+		"two replicas":       {func(tc *TestCase) { tc.SharedState.Replicas = 2 }, "needs three replicas"},
+		"no device":          {func(tc *TestCase) { tc.SharedState.MoveDevice = 0 }, "needs shared_state.move_device"},
+		"device not placed":  {func(tc *TestCase) { tc.SharedState.MoveDevice = 99 }, "one of placed_devices"},
+		"device, no move":    {func(tc *TestCase) { tc.SharedState.Action = SharedStateActionKillLeader }, "only used by the move_across_cut_link"},
+		"negative cut hold":  {func(tc *TestCase) { tc.SharedState.CutHoldSeconds = -1 }, "cut_hold_seconds"},
+		"device and devices": {func(tc *TestCase) { tc.SharedState.MoveDevices = []int64{11, 12} }, "set one of them"},
+		"devices not placed": {func(tc *TestCase) {
+			tc.SharedState.MoveDevice = 0
+			tc.SharedState.MoveDevices = []int64{11, 99}
+		}, "device 99, which is not one of placed_devices"},
+		"a device twice": {func(tc *TestCase) {
+			tc.SharedState.MoveDevice = 0
+			tc.SharedState.MoveDevices = []int64{11, 11}
+		}, "names device 11 twice"},
+		"devices, no move": {func(tc *TestCase) {
+			tc.SharedState.MoveDevice = 0
+			tc.SharedState.MoveDevices = []int64{11, 12}
+			tc.SharedState.Action = SharedStateActionKillLeader
+		}, "only used by the move_across_cut_link"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {

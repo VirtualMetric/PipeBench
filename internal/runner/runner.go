@@ -3766,13 +3766,22 @@ func agentlessCollectingNow(container string) bool {
 	return strings.Contains(dockerLogsSince(container, "30s"), "entries from device")
 }
 
+// ownerContainerOf returns the container of the subject's node owner, or "" when
+// no owner is known.
+func ownerContainerOf(subjectName, owner string) string {
+	if owner == "" {
+		return ""
+	}
+	return fmt.Sprintf("bench-subject-%s-%s", subjectName, owner)
+}
+
 // waitAgentlessCollecting waits until the agentless device is assigned to a node
 // AND that owner is actively collecting (forwarding to the router). Returns the
 // owner node name ("1".."N"), its container, and whether it became ready.
 func waitAgentlessCollecting(ctx context.Context, subjectName string, containers []string, deadline time.Time) (string, string, bool) {
 	for time.Now().Before(deadline) {
 		if owner := agentlessDeviceOwner(containers); owner != "" {
-			ownerContainer := fmt.Sprintf("bench-subject-%s-%s", subjectName, owner)
+			ownerContainer := ownerContainerOf(subjectName, owner)
 			if agentlessCollectingNow(ownerContainer) {
 				return owner, ownerContainer, true
 			}
@@ -3781,7 +3790,11 @@ func waitAgentlessCollecting(ctx context.Context, subjectName string, containers
 			break
 		}
 	}
-	return agentlessDeviceOwner(containers), "", false
+	// The owner did not collect in time. Name its container all the same, so
+	// that the action can still stop it: an empty name made the stop fail, and
+	// the case then reported that no failover happened, though none was tried.
+	owner := agentlessDeviceOwner(containers)
+	return owner, ownerContainerOf(subjectName, owner), false
 }
 
 // waitAgentlessCollectingExcluding waits until SOME node other than `exclude`
@@ -3822,7 +3835,7 @@ func waitAgentlessCollectingExcluding(ctx context.Context, containers []string, 
 func waitDeviceCollecting(ctx context.Context, subjectName string, containers []string, marker string, deadline time.Time) (string, string, bool) {
 	for time.Now().Before(deadline) {
 		if owner := agentlessDeviceOwner(containers); owner != "" {
-			ownerContainer := fmt.Sprintf("bench-subject-%s-%s", subjectName, owner)
+			ownerContainer := ownerContainerOf(subjectName, owner)
 			if strings.Contains(dockerLogsSince(ownerContainer, "30s"), marker) {
 				return owner, ownerContainer, true
 			}
@@ -3831,7 +3844,11 @@ func waitDeviceCollecting(ctx context.Context, subjectName string, containers []
 			break
 		}
 	}
-	return agentlessDeviceOwner(containers), "", false
+	// The owner did not collect in time. Name its container all the same, so
+	// that the action can still stop it: an empty name made the stop fail, and
+	// the case then reported that no failover happened, though none was tried.
+	owner := agentlessDeviceOwner(containers)
+	return owner, ownerContainerOf(subjectName, owner), false
 }
 
 func waitDeviceCollectingExcluding(ctx context.Context, containers []string, exclude, marker string, deadline time.Time) (string, bool) {
@@ -4447,7 +4464,7 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 				actionOK = false
 				errs = append(errs, "could not determine the placement device owner (no 'Assigned/Reassigned device' log) — failover untestable")
 			} else {
-				ownerContainer = fmt.Sprintf("bench-subject-%s-%s", subject.Name, owner)
+				ownerContainer = ownerContainerOf(subject.Name, owner)
 				preFailover := finalCount
 				fmt.Printf("  placement device owner = node %s (%s); stopping it to force a failover…\n", owner, ownerContainer)
 
@@ -4516,7 +4533,7 @@ func (r *Runner) runDirectorClusterCorrectness(tc *config.TestCase, subject conf
 				actionOK = false
 				errs = append(errs, "could not determine the placement device owner (no 'Assigned/Reassigned device' log) — fence untestable")
 			} else {
-				ownerContainer = fmt.Sprintf("bench-subject-%s-%s", subject.Name, owner)
+				ownerContainer = ownerContainerOf(subject.Name, owner)
 				preFailover := finalCount
 				fmt.Printf("  placement device owner = node %s (%s); pausing it to freeze heartbeats and lease renewals…\n", owner, ownerContainer)
 				pausedAt := time.Now().UTC()
