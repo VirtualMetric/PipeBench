@@ -21,7 +21,7 @@ import (
 func TestSharedStateComposeRendersReplicas(t *testing.T) {
 	srcDir := t.TempDir()
 	srcCfg := filepath.Join(srcDir, "vmetric.yml")
-	src := "director:\n  id: 7001\nstage: {{@.Stage@}}\nbad: {{@ if eq .NodeID 3 @}}yes{{@ else @}}no{{@ end @}}\nmove: [{{@.MoveTarget@}}]\n"
+	src := "director:\n  id: 7001\nstage: {{@.Stage@}}\nbad: {{@ if eq .NodeID 3 @}}yes{{@ else @}}no{{@ end @}}\nmove: [{{@.MoveTarget@}}]\nonly12: {{@ if and (ge .Stage 3) (eq .MoveDevice 12) @}}yes{{@ else @}}no{{@ end @}}\n"
 	if err := os.WriteFile(srcCfg, []byte(src), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -133,16 +133,17 @@ func TestSharedStateComposeRendersReplicas(t *testing.T) {
 		t.Fatalf("RenderReplicaConfigs: %v", err)
 	}
 	for n := 1; n <= 4; n++ {
-		if !strings.Contains(read(n), "stage: 2") || !strings.Contains(read(n), "move: []") {
+		if !strings.Contains(read(n), "stage: 2") || !strings.Contains(read(n), "move: []") || !strings.Contains(read(n), "only12: no") {
 			t.Errorf("replica %d after the second stage: %q", n, read(n))
 		}
 	}
-	// A move_across_cut_link action names the replica a device moves to.
-	if err := cr.RenderReplicaConfigsMoving(3, "subject-3-abc"); err != nil {
+	// A move_across_cut_link action names the replica a device moves to, and
+	// the device that moves.
+	if err := cr.RenderReplicaConfigsMoving(3, "subject-3-abc", 12); err != nil {
 		t.Fatalf("RenderReplicaConfigsMoving: %v", err)
 	}
 	for n := 1; n <= 4; n++ {
-		if !strings.Contains(read(n), "stage: 3") || !strings.Contains(read(n), "move: [subject-3-abc]") {
+		if !strings.Contains(read(n), "stage: 3") || !strings.Contains(read(n), "move: [subject-3-abc]") || !strings.Contains(read(n), "only12: yes") {
 			t.Errorf("replica %d after the third stage: %q", n, read(n))
 		}
 	}

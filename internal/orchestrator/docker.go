@@ -70,6 +70,11 @@ type configTemplateContext struct {
 	// (RenderReplicaConfigsMoving), so the config can allow the device only
 	// there through its placement_nodes. Empty in every other render.
 	MoveTarget string
+	// MoveDevice is the id of the device that the same action moves, in the
+	// stage it renders, so a case that lets the action choose among several
+	// devices (move_devices) can allow only that one on MoveTarget. 0 in every
+	// other render.
+	MoveDevice int64
 }
 
 // T0Plus returns T0 + sec seconds as RFC3339 UTC, for absolute device
@@ -1484,12 +1489,12 @@ type ComposeRunner struct {
 // a changed config on its own, so this changes a running replica set without
 // restarting it.
 func (r *ComposeRunner) RenderReplicaConfigs(stage int) error {
-	return r.RenderReplicaConfigsMoving(stage, "")
+	return r.RenderReplicaConfigsMoving(stage, "", 0)
 }
 
 // RenderReplicaConfigsMoving is RenderReplicaConfigs with {{@.MoveTarget@}}
-// set to moveTarget.
-func (r *ComposeRunner) RenderReplicaConfigsMoving(stage int, moveTarget string) error {
+// set to moveTarget and {{@.MoveDevice@}} set to moveDevice.
+func (r *ComposeRunner) RenderReplicaConfigsMoving(stage int, moveTarget string, moveDevice int64) error {
 	raw, err := os.ReadFile(r.cfg.ConfigSrcPath)
 	if err != nil {
 		return err
@@ -1502,7 +1507,7 @@ func (r *ComposeRunner) RenderReplicaConfigsMoving(stage int, moveTarget string)
 		// Render in memory and write the file in one call: a director that
 		// reads its config while it is written must not find it empty.
 		var buf bytes.Buffer
-		ctx := configTemplateContext{CPUs: runtime.NumCPU(), NodeID: i, T0: r.renderedAt, Stage: stage, MoveTarget: moveTarget}
+		ctx := configTemplateContext{CPUs: runtime.NumCPU(), NodeID: i, T0: r.renderedAt, Stage: stage, MoveTarget: moveTarget, MoveDevice: moveDevice}
 		if err := tmpl.Execute(&buf, ctx); err != nil {
 			return fmt.Errorf("rendering replica config %d: %w", i, err)
 		}
