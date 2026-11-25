@@ -81,6 +81,24 @@ Examples:
 
 Avoid subject-specific shortcuts that change the work. For example, a config should not drop fields, batch away records, disable required parsing, or bypass the receiver just to improve throughput.
 
+### Files Beyond The Config
+
+When a subject needs more than its config file (a plugin folder, a license, a binary it serves), the case mounts it with a `mounts:` block. Each key names a container the case runs: `subject` (every node, when the case runs a cluster), `agent`, or an endpoint's name. Each entry maps a path in that container to a host path:
+
+```yaml
+mounts:
+  subject:
+    /opt/product/plugins: ../../shared/plugins   # relative to the case's folder
+    /etc/product/license.lic: ${LICENSE}         # from --mount LICENSE=<host path>
+  agent:
+    /var/lib/agent/cache: cache:rw               # writable
+```
+
+- A host path is relative to the case's folder, or absolute. A folder outside the case, such as one several cases share, is reached with `..`.
+- `${NAME}` is filled from `harness test --mount NAME=<host path>`, for files a case cannot keep in its folder: a license, or a binary the run downloads. A relative `--mount` path is relative to the directory the harness runs in.
+- A mount is read-only unless its host path ends in `:rw`. A program that writes next to a mounted file needs `:rw`, or a command that copies the file somewhere writable first.
+- A missing `${NAME}`, or a host path that does not exist, fails the case before any container starts, so a case never runs without the files it was written for.
+
 ## Generating Results For A PR
 
 If you only want review of the subject integration, a local smoke result is enough. If you want the official published comparison to include the subject, run the same hardware tiers used by the project.
