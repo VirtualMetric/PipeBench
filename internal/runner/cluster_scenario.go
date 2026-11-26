@@ -567,7 +567,7 @@ func (r *Runner) runClusterScenario(tc *config.TestCase, subject config.Subject)
 		if sampler != nil {
 			readings = sampler.finish(r.ctx)
 		}
-		latencyResult = collectLatency(orch.GeneratorStdout(), sr.recvPort, readings, diskBaseline, sampler)
+		latencyResult = collectLatency(r.ctx, orch.GeneratorStdout(), sr.recvPort, readings, diskBaseline, sampler)
 	}
 
 	// Keep every container's log next to the report: the evidence for a

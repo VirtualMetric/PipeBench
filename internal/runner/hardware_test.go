@@ -7,6 +7,7 @@ const testMountinfo = `22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
 30 22 259:0 / /mnt/nvme rw,relatime shared:20 - xfs /dev/nvme0n1 rw,attr2
 31 22 259:5 / /mnt/nvme-other rw,relatime shared:21 - ext4 /dev/nvme1n1 rw
 32 22 8:17 / /var/lib/docker rw,relatime shared:22 - ext4 /dev/sdb1 rw
+33 22 259:7 / /mnt/fast\040disk rw,relatime shared:23 - ext4 /dev/mapper/fast\040x rw
 `
 
 func TestMountOfFindsTheMountThatHoldsAPath(t *testing.T) {
@@ -17,6 +18,8 @@ func TestMountOfFindsTheMountThatHoldsAPath(t *testing.T) {
 		{"/mnt/nvme-other/x", "/mnt/nvme-other", "ext4", "/dev/nvme1n1", "259:5"},
 		{"/var/lib/docker/volumes/", "/var/lib/docker", "ext4", "/dev/sdb1", "8:17"},
 		{"/home/farm", "/", "ext4", "/dev/sda1", "8:1"},
+		// the kernel writes a space in a path as \040
+		{"/mnt/fast disk/run", "/mnt/fast disk", "ext4", "/dev/mapper/fast x", "259:7"},
 	} {
 		m, ok := mountOf(testMountinfo, c.path)
 		if !ok || m.point != c.point || m.fsType != c.fs || m.source != c.source || m.majorMinor != c.dev {

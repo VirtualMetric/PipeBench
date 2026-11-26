@@ -296,8 +296,9 @@ func bucketQuantileUs(buckets [][2]uint64, total uint64, q float64) float64 {
 
 // collectLatency builds the latency result of a run: each step of the generator, with its
 // end-to-end latency from the receiver on metricsPort and, with readings, the subject's stage
-// times. baseline is the disk baseline, or nil.
-func collectLatency(genStdout string, metricsPort int, readings []stageReading, baseline map[string]any, sampler *stageSampler) map[string]any {
+// times. baseline is the disk baseline, or nil. A step whose end-to-end latency could not be read
+// says why in end_to_end_error; once ctx is cancelled, no step asks the receiver.
+func collectLatency(ctx context.Context, genStdout string, metricsPort int, readings []stageReading, baseline map[string]any, sampler *stageSampler) map[string]any {
 	res := map[string]any{}
 	if baseline != nil {
 		res["disk_baseline"] = baseline
@@ -326,13 +327,12 @@ func collectLatency(genStdout string, metricsPort int, readings []stageReading, 
 		if from <= 0 || to <= from {
 			continue
 		}
-		var e2e map[string]any
 		url := fmt.Sprintf("http://localhost:%d/latency?from_ns=%d&to_ns=%d", metricsPort, from, to)
-		if resp, err := client.Get(url); err == nil {
-			_ = json.NewDecoder(resp.Body).Decode(&e2e)
-			resp.Body.Close()
-		}
-		if e2e != nil {
+		if ctx.Err() != nil {
+			step["end_to_end_error"] = "the run was stopped before the receiver was asked"
+		} else if e2e, err := receiverLatency(ctx, client, url); err != nil {
+			step["end_to_end_error"] = err.Error()
+		} else {
 			step["end_to_end_us"] = map[string]any{
 				"count": e2e["count"], "p50_us": e2e["p50_us"], "p90_us": e2e["p90_us"],
 				"p99_us": e2e["p99_us"], "p999_us": e2e["p999_us"], "max_us": e2e["max_us"],
@@ -345,6 +345,27 @@ func collectLatency(genStdout string, metricsPort int, readings []stageReading, 
 	}
 	res["steps"] = ack.Steps
 	return res
+}
+
+// receiverLatency asks the receiver for the first-arrival latency of the lines sent in one step.
+func receiverLatency(ctx context.Context, client *http.Client, url string) (map[string]any, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("asking the receiver for the step's latency: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("the receiver's /latency answered %s", resp.Status)
+	}
+	var e2e map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&e2e); err != nil {
+		return nil, fmt.Errorf("reading the receiver's /latency: %w", err)
+	}
+	return e2e, nil
 }
 
 // generatorAckSteps is the part of the generator's final answer that a latency case reads.

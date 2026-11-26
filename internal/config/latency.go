@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -92,6 +93,16 @@ func (l *LatencyConfig) StepsDuration() time.Duration {
 	return total
 }
 
+// MinDuration returns how long the generator may need for the steps: the steps, and the longest
+// wait for the receiver after each step but the last. It is 0 while a step does not parse.
+func (l *LatencyConfig) MinDuration() time.Duration {
+	d := l.StepsDuration()
+	if d == 0 {
+		return 0
+	}
+	return d + time.Duration(len(l.Steps)-1)*l.StepDrainOrDefault()
+}
+
 // parseLatencyStep reads one step: capacity, a rate or a percent, a colon, and a duration. It
 // returns the load part and the duration.
 func parseLatencyStep(s string) (string, time.Duration, error) {
@@ -107,8 +118,9 @@ func parseLatencyStep(s string) (string, time.Duration, error) {
 	if load == "capacity" {
 		return load, d, nil
 	}
+	// ParseFloat takes NaN and Inf, which no rate or percent is
 	v, err := strconv.ParseFloat(strings.TrimSuffix(load, "%"), 64)
-	if err != nil || v <= 0 {
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v <= 0 {
 		return "", 0, fmt.Errorf("step %q is neither capacity, a rate nor a percent", s)
 	}
 	return load, d, nil
@@ -172,8 +184,9 @@ func (tc *TestCase) validateLatency() error {
 	default:
 		return fmt.Errorf("case %q: latency.capacity_from is %q, and can be receiver or acknowledgements", tc.Name, l.CapacityFrom)
 	}
-	if d := tc.DurationOrDefault(0); d > 0 && d < l.StepsDuration() {
-		return fmt.Errorf("case %q: duration %s is shorter than the latency steps, %s", tc.Name, d, l.StepsDuration())
+	if d := tc.DurationOrDefault(0); d > 0 && d < l.MinDuration() {
+		return fmt.Errorf("case %q: duration %s is shorter than the latency steps and the longest waits between them (step_drain), %s",
+			tc.Name, d, l.MinDuration())
 	}
 	return nil
 }
@@ -203,8 +216,8 @@ func (tc *TestCase) applyLatency() {
 	}
 	tc.Receiver.Env["RECEIVER_TRACK_SEQ"] = "true"
 	if tc.Duration == "" {
-		if d := l.StepsDuration(); d > 0 {
-			tc.Duration = (d + time.Duration(len(l.Steps)-1)*l.StepDrainOrDefault()).String()
+		if d := l.MinDuration(); d > 0 {
+			tc.Duration = d.String()
 		}
 	}
 }

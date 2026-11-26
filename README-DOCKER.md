@@ -297,7 +297,7 @@ Each step is a load and a duration:
 - A number, such as `1000`, sends that many lines a second.
 - A percent, such as `50%`, sends that share of the capacity the last capacity step measured.
 
-A subject can confirm records faster than it delivers them, and keep the rest in a queue. So by default the capacity is the rate at which the lines arrived at the receiver in the capacity step, and a percent of it is a load the subject can deliver. With `capacity_from: acknowledgements`, it is the rate the lines were confirmed at instead. Each percent step records the capacity it used (`capacity_per_sec`) and where it came from (`capacity_from`).
+A subject can confirm records faster than it delivers them, and keep the rest in a queue. So by default the capacity is the rate at which the lines arrived at the receiver in the capacity step, and a percent of it is a load the subject can deliver. With `capacity_from: acknowledgements`, it is the rate the lines were confirmed at instead. A capacity step whose lines did not reach the receiver, or whose arrivals could not be read, gives no capacity, and the percent steps after it fail rather than run at a load the subject did not deliver. Each percent step records the capacity it used (`capacity_per_sec`) and where it came from (`capacity_from`).
 
 Each step but the last also waits, up to `step_drain`, until the receiver has every confirmed line, so that the next step starts with an empty queue. Each step records that wait (`drain_ms`) and the rate its lines arrived at the receiver (`delivered_per_sec`).
 
@@ -306,7 +306,7 @@ Under a number or a percent, the load is open: each post has a fixed time on a t
 For each step, the result's `latency` block holds:
 
 - the acknowledgement latency the generator measured;
-- the end-to-end latency of the lines sent in the step, from the receiver;
+- the end-to-end latency of the lines sent in the step, from the receiver, or why the receiver could not give it (`end_to_end_error`);
 - with `stages`, how long each stage of the director took in the step.
 
 Every time is in microseconds, with p50, p90, p99, p99.9 and the maximum.

@@ -2773,6 +2773,12 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 		subjectDiskPath = tc.SubjectDisk.Path
 		subjectDiskSizeBytes = size
 	}
+	// A size-limited disk at the subject's data folder keeps it, as a cluster node's does: two
+	// mounts at one path would fail the compose file
+	subjectDataHost := filepath.ToSlash(cfg.SubjectDataHost)
+	if subjectDiskPath != "" && subjectDiskPath == cfg.SubjectDataDst {
+		subjectDataHost = ""
+	}
 
 	vars := composeVars{
 		SubjectImage:      s.ImageRef(),
@@ -2804,7 +2810,7 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 		HelperMemLimit:       cfg.HelperMemLimit,
 		UseSharedData:        useSharedData,
 		SubjectDiskPath:      subjectDiskPath,
-		SubjectDataHost:      filepath.ToSlash(cfg.SubjectDataHost),
+		SubjectDataHost:      subjectDataHost,
 		SubjectDataDst:       cfg.SubjectDataDst,
 		SubjectDiskSizeBytes: subjectDiskSizeBytes,
 		// DeferReceiver drops the `generator.depends_on: receiver` link

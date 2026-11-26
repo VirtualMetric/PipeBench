@@ -83,6 +83,18 @@ func TestALatencyBlockThatCannotRunIsRefused(t *testing.T) {
 		"a step that is no load": {
 			`["capacity:60s", "1000:120s", "50%:120s"]`, `["fast:60s"]`, "neither capacity, a rate nor a percent",
 		},
+		"a rate that is no number": {
+			`["capacity:60s", "1000:120s", "50%:120s"]`, `["NaN:60s"]`, "neither capacity, a rate nor a percent",
+		},
+		"an infinite rate": {
+			`["capacity:60s", "1000:120s", "50%:120s"]`, `["+Inf:60s"]`, "neither capacity, a rate nor a percent",
+		},
+		"a percent that is no number": {
+			`["capacity:60s", "1000:120s", "50%:120s"]`, `["capacity:60s", "NaN%:120s"]`, "neither capacity, a rate nor a percent",
+		},
+		"a duration that leaves the steps no time to drain": {
+			"type: performance", "type: performance\nduration: 300s", "the longest waits between them",
+		},
 		"another generator mode": {
 			"mode: http_ack", "mode: tcp", "http_ack",
 		},

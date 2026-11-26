@@ -91,17 +91,25 @@ func TestPickReadingsTakesTheReadingsAroundTheWindow(t *testing.T) {
 
 func TestTheSamplerKeepsEveryReadingAndCountsFailures(t *testing.T) {
 	var n atomic.Int64
+	failed := make(chan struct{})
+	var once sync.Once
 	read := func(_ context.Context, container string) (stageReading, error) {
 		if container != "bench-subject-vmetric" {
 			return stageReading{}, fmt.Errorf("read %q", container)
 		}
 		if n.Add(1)%3 == 0 {
+			once.Do(func() { close(failed) })
 			return stageReading{}, errors.New("no answer")
 		}
 		return reading(time.Now()), nil
 	}
 	s := runStageSampler(context.Background(), "bench-subject-vmetric", 10*time.Millisecond, read)
-	time.Sleep(100 * time.Millisecond)
+	// Wait for the first failed read, however slowly the sampler starts
+	select {
+	case <-failed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the sampler did not read three times within 10s")
+	}
 	first := s.finish(context.Background())
 	second := s.finish(context.Background())
 	if len(first) == 0 || len(first) != len(second) {
@@ -154,7 +162,7 @@ func TestCollectLatencyGivesEachStepItsEndToEndAndStageTimes(t *testing.T) {
 		reading(at(to1+time.Second.Nanoseconds()), stageCounts{Stage: "buffer.sync", Count: 11, Buckets: [][2]uint64{{1_000_000, 11}}}),
 	}
 	baseline := map[string]any{"write_4k_fdatasync_us": map[string]any{"p99_us": 900}}
-	res := collectLatency(gen, port, readings, baseline, nil)
+	res := collectLatency(context.Background(), gen, port, readings, baseline, nil)
 
 	if res["error"] != nil {
 		t.Fatalf("error: %v", res["error"])
@@ -192,8 +200,38 @@ func TestCollectLatencyGivesEachStepItsEndToEndAndStageTimes(t *testing.T) {
 	}
 }
 
+// A step whose end-to-end latency could not be read says why, and has no numbers. Once the run is
+// stopped, no step asks the receiver.
+func TestCollectLatencySaysWhyAStepHasNoEndToEndLatency(t *testing.T) {
+	var asked atomic.Int64
+	port := receiverOn(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": "no tracker"})
+	}))
+	gen := `{"ack":{"steps":[{"name":"1000","measure_from_ns":10,"end_ns":20}]}}`
+
+	res := collectLatency(context.Background(), gen, port, nil, nil, nil)
+	step := res["steps"].([]map[string]any)[0]
+	if step["end_to_end_us"] != nil {
+		t.Errorf("a 500 gave end-to-end numbers: %v", step["end_to_end_us"])
+	}
+	if msg, _ := step["end_to_end_error"].(string); !strings.Contains(msg, "500") {
+		t.Errorf("end_to_end_error = %v, want the receiver's status", step["end_to_end_error"])
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	before := asked.Load()
+	res = collectLatency(ctx, gen, port, nil, nil, nil)
+	step = res["steps"].([]map[string]any)[0]
+	if asked.Load() != before || step["end_to_end_error"] == nil {
+		t.Errorf("a stopped run asked the receiver %d times, error %v", asked.Load()-before, step["end_to_end_error"])
+	}
+}
+
 func TestCollectLatencySaysWhenTheGeneratorGaveNoSummary(t *testing.T) {
-	res := collectLatency(`{"progress":{"lines":10}}`, 1, nil, nil, nil)
+	res := collectLatency(context.Background(), `{"progress":{"lines":10}}`, 1, nil, nil, nil)
 	if msg, _ := res["error"].(string); !strings.Contains(msg, "no acknowledgement summary") {
 		t.Fatalf("error = %v", res["error"])
 	}

@@ -803,7 +803,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 			}
 			// Each latency step's end-to-end latency, while the receiver still runs
 			if tc.Latency != nil {
-				latencyResult = collectLatency(orch.GeneratorStdout(), metricsPort, stageReadings, diskBaseline, sampler)
+				latencyResult = collectLatency(r.ctx, orch.GeneratorStdout(), metricsPort, stageReadings, diskBaseline, sampler)
 			}
 		}
 	}

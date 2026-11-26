@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -175,9 +176,10 @@ type mount struct {
 	majorMinor, point, fsType, source string
 }
 
-// mountOf returns the mount that holds path: the one whose mount point is the longest prefix of it.
-func mountOf(mountinfo, path string) (mount, bool) {
-	path = filepath.Clean(path)
+// mountOf returns the mount that holds target: the one whose mount point is the longest prefix of
+// it. mountinfo's paths are Linux paths, so target is cleaned as one, on any host.
+func mountOf(mountinfo, target string) (mount, bool) {
+	p := path.Clean(filepath.ToSlash(target))
 	var best mount
 	found := false
 	sc := bufio.NewScanner(strings.NewReader(mountinfo))
@@ -190,15 +192,34 @@ func mountOf(mountinfo, path string) (mount, bool) {
 		if len(lf) < 5 || len(rf) < 2 {
 			continue
 		}
-		point := lf[4]
-		if point != "/" && path != point && !strings.HasPrefix(path, point+"/") {
+		point := unescapeMountinfo(lf[4])
+		if point != "/" && p != point && !strings.HasPrefix(p, point+"/") {
 			continue
 		}
 		if !found || len(point) > len(best.point) {
-			best, found = mount{majorMinor: lf[2], point: point, fsType: rf[0], source: rf[1]}, true
+			best, found = mount{majorMinor: lf[2], point: point, fsType: rf[0], source: unescapeMountinfo(rf[1])}, true
 		}
 	}
 	return best, found
+}
+
+// unescapeMountinfo decodes the octal escapes the kernel writes in /proc/self/mountinfo for a space,
+// a tab, a newline or a backslash in a path: /mnt/fast disk is /mnt/fast\040disk there.
+func unescapeMountinfo(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	octal := func(c byte) bool { return c >= '0' && c <= '7' }
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+3 < len(s) && octal(s[i+1]) && octal(s[i+2]) && octal(s[i+3]) {
+			b.WriteByte(byte(int(s[i+1]-'0')<<6 | int(s[i+2]-'0')<<3 | int(s[i+3]-'0')))
+			i += 3
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }
 
 // blockDevice reads the model and whether the disk spins, for the block device at sysPath

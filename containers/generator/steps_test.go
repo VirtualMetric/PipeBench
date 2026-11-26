@@ -33,7 +33,7 @@ func TestParseStepsReadsEachKindOfStep(t *testing.T) {
 	if got := stepsDuration(steps); got != 4*time.Minute+30*time.Second {
 		t.Fatalf("the steps last %s, want 4m30s", got)
 	}
-	for _, bad := range []string{"1000", "fast:10s", "0:10s", "-5%:10s", "100:0s", "100:soon"} {
+	for _, bad := range []string{"1000", "fast:10s", "0:10s", "-5%:10s", "100:0s", "100:soon", "NaN:10s", "+Inf:10s", "NaN%:10s", "Inf%:10s"} {
 		if _, err := parseSteps(bad); err == nil {
 			t.Errorf("the step %q was taken", bad)
 		}

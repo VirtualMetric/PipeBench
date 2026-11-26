@@ -30,6 +30,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -84,13 +85,13 @@ func parseSteps(s string) ([]stepSpec, error) {
 			st.Kind = stepCapacity
 		case strings.HasSuffix(load, "%"):
 			v, err := strconv.ParseFloat(strings.TrimSuffix(load, "%"), 64)
-			if err != nil || v <= 0 {
+			if err != nil || !finitePositive(v) {
 				return nil, fmt.Errorf("step %q has no valid percent", part)
 			}
 			st.Kind, st.Value = stepPercent, v
 		default:
 			v, err := strconv.ParseFloat(load, 64)
-			if err != nil || v <= 0 {
+			if err != nil || !finitePositive(v) {
 				return nil, fmt.Errorf("step %q is neither capacity, a rate nor a percent", part)
 			}
 			st.Kind, st.Value = stepRate, v
@@ -98,6 +99,11 @@ func parseSteps(s string) ([]stepSpec, error) {
 		steps = append(steps, st)
 	}
 	return steps, nil
+}
+
+// finitePositive is whether v is a rate or a percent: ParseFloat takes NaN and Inf too.
+func finitePositive(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0) && v > 0
 }
 
 // stepsDuration is how long the steps last together.
@@ -193,8 +199,10 @@ func runAckSteps(cfg config, ac ackConfig, steps []stepSpec, slots []*ackSlot, s
 			}
 		}
 		if st.Kind == stepCapacity && res.Error == "" {
+			// A receiver that got nothing, or whose timeline could not be read, gives no
+			// capacity: the acknowledged rate is a load the subject may not deliver.
 			capacity, from = res.AckedPerSec, capacityFromAcks
-			if ac.capacityFrom == capacityFromReceiver && res.DeliveredPerSec > 0 {
+			if ac.capacityFrom == capacityFromReceiver {
 				capacity, from = res.DeliveredPerSec, capacityFromReceiver
 			}
 		}
@@ -303,6 +311,9 @@ func runAckStep(cfg config, ac ackConfig, st stepSpec, capacity float64, from st
 	case stepPercent:
 		if capacity <= 0 {
 			res.Error = "no capacity step before it measured a rate"
+			if from != "" {
+				res.Error += " (capacity_from: " + from + ")"
+			}
 			res.EndNs = start.UnixNano()
 			return res
 		}
@@ -360,6 +371,13 @@ func runAckStep(cfg config, ac ackConfig, st stepSpec, capacity float64, from st
 		}
 	}
 	wg.Wait()
+	// An open step's workers stop once the next post's time is at or after end, which is
+	// up to one interval before it. The step still lasts until end, so that its rate is over
+	// the time it was asked to run and the next step starts on time. Posts that overran end
+	// keep the later stop.
+	if d := time.Until(end); d > 0 && st.Kind != stepCapacity {
+		time.Sleep(d)
+	}
 
 	stop := time.Now()
 	res.EndNs = stop.UnixNano()
