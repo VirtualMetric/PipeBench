@@ -28,6 +28,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"sort"
 	"strconv"
@@ -289,6 +290,12 @@ type latencyStats struct {
 	P99Ms     float64 `json:"p99_ms"`
 	MaxMs     float64 `json:"max_ms"`
 	MaxSentNs int64   `json:"max_sent_ns,omitempty"`
+	// The same in microseconds, with p90 and p99.9
+	P50Us  float64 `json:"p50_us"`
+	P90Us  float64 `json:"p90_us"`
+	P99Us  float64 `json:"p99_us"`
+	P999Us float64 `json:"p999_us"`
+	MaxUs  float64 `json:"max_us"`
 	// SampleEvery is set when the receiver keeps the latency of one line in
 	// SampleEvery only. Count is then the number of samples.
 	SampleEvery int64 `json:"sample_every,omitempty"`
@@ -318,16 +325,20 @@ func summarizeLatency(vals []latSample) latencyStats {
 		return out
 	}
 	sort.Slice(vals, func(i, j int) bool { return vals[i].lat < vals[j].lat })
-	at := func(p int) float64 {
-		idx := len(vals) * p / 100
+	// nth returns the latency below which per of every thousand values fall, in nanoseconds
+	nth := func(per int) int64 {
+		idx := len(vals) * per / 1000
 		if idx >= len(vals) {
 			idx = len(vals) - 1
 		}
-		return float64(vals[idx].lat) / 1e6
+		return vals[idx].lat
 	}
-	out.P50Ms, out.P95Ms, out.P99Ms = at(50), at(95), at(99)
+	ms := func(ns int64) float64 { return float64(ns) / 1e6 }
+	us := func(ns int64) float64 { return math.Round(float64(ns)/100) / 10 }
+	out.P50Ms, out.P95Ms, out.P99Ms = ms(nth(500)), ms(nth(950)), ms(nth(990))
+	out.P50Us, out.P90Us, out.P99Us, out.P999Us = us(nth(500)), us(nth(900)), us(nth(990)), us(nth(999))
 	last := vals[len(vals)-1]
-	out.MaxMs = float64(last.lat) / 1e6
+	out.MaxMs, out.MaxUs = ms(last.lat), us(last.lat)
 	out.MaxSentNs = last.sent
 	return out
 }

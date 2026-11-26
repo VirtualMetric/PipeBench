@@ -159,6 +159,10 @@ type TestCase struct {
 	// it alongside cluster:, where the mount would silently not render.
 	SubjectDisk *SubjectDiskConfig `yaml:"subject_disk"`
 
+	// Latency runs the http_ack generator through steps of load and records the latency of
+	// each step (latency.go).
+	Latency *LatencyConfig `yaml:"latency"`
+
 	// Requires lists subject capabilities every subject in this case must
 	// declare (Subject.Capabilities); the runner fails fast on subjects
 	// lacking one instead of starting a run that silently produces zero
@@ -1609,6 +1613,9 @@ func (tc *TestCase) Validate() error {
 		return err
 	}
 	if err := tc.validateEndpointSource(); err != nil {
+		return err
+	}
+	if err := tc.validateLatency(); err != nil {
 		return err
 	}
 	return nil
@@ -3192,6 +3199,7 @@ func LoadCase(casesDir, name string) (*TestCase, error) {
 	if tc.Name == "" {
 		tc.Name = name
 	}
+	tc.applyLatency()
 	if err := tc.Validate(); err != nil {
 		return nil, err
 	}

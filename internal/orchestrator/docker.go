@@ -261,6 +261,9 @@ services:
 {{- if $.SharedDirMount }}
       - "shared-dir:{{ $.SharedDirMount }}"
 {{- end }}
+{{- if .DataHost }}
+      - "{{ .DataHost }}:{{ $.SubjectDataDst }}"
+{{- end }}
 {{- if .DiskPath }}
       - type: tmpfs
         target: "{{ .DiskPath }}"
@@ -363,6 +366,9 @@ services:
     volumes:
       - "{{ .ConfigSrc }}:{{ .ConfigDst }}{{ .ConfigMountOpts }}"
       - "{{ .TmpDir }}:/results"
+{{- if .SubjectDataHost }}
+      - "{{ .SubjectDataHost }}:{{ .SubjectDataDst }}"
+{{- end }}
 {{- if .UseSharedData }}
       - "shared-data:/data"
 {{- end }}
@@ -1452,6 +1458,12 @@ type RunConfig struct {
 	// path is bind-mounted into the subject and every TLS-using generator
 	// at /certs:ro.
 	TLSCertsHost string
+	// SubjectDataHost, when set, is a host folder that the singular subject service mounts at
+	// SubjectDataDst, its data folder (--subject-data); each node of a cluster mounts a folder of
+	// its own in it, named after its hostname. A latency case puts the subject's
+	// data on a chosen disk this way, and measures that disk before the run.
+	SubjectDataHost string
+	SubjectDataDst  string
 	// VaultTLSHost / VaultSecretsHost / VaultSeeds are the host paths and
 	// seed list provisioned by PrepareVault for a `vault:`-enabled case.
 	// NewComposeRunner populates them when empty; tests may set them
@@ -2059,6 +2071,9 @@ type clusterNode struct {
 	// size-limited tmpfs at DiskPath (cluster.scenario.node_disk).
 	DiskPath      string
 	DiskSizeBytes int64
+	// DataHost is the node's own folder under the run's subject data folder (--subject-data),
+	// which it mounts as its data folder, or empty.
+	DataHost string
 	// Image is the image the node starts on when it is not the image under
 	// test (cluster.scenario.start_image). Empty means the image under test.
 	Image string
@@ -2132,6 +2147,11 @@ type composeVars struct {
 	// unambiguous integer. Empty path emits nothing.
 	SubjectDiskPath      string
 	SubjectDiskSizeBytes int64
+
+	// SubjectDataHost / SubjectDataDst bind-mount a host folder as the singular subject's data
+	// folder (RunConfig.SubjectDataHost). Empty host emits nothing.
+	SubjectDataHost string
+	SubjectDataDst  string
 
 	// BenchSubnet, when set, pins the bench bridge network's IPAM subnet (instead
 	// of letting Docker auto-assign one) so a cluster_ip_failover case can bind a
@@ -2543,6 +2563,19 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 				node.Volume, node.VolumePath = NodeVolumeName(i), sc.NodeVolume
 			}
 		}
+		// A node with a size-limited disk or a volume of its own at its data
+		// folder keeps it: two mounts at one path would fail the compose file
+		if cfg.SubjectDataHost != "" && node.DiskPath != cfg.SubjectDataDst && node.VolumePath != cfg.SubjectDataDst {
+			dir := filepath.Join(cfg.SubjectDataHost, node.Hostname)
+			// The node runs as a user of its own, and must write there
+			if err := os.MkdirAll(dir, 0o777); err != nil {
+				return fmt.Errorf("--subject-data: %w", err)
+			}
+			if err := os.Chmod(dir, 0o777); err != nil {
+				return fmt.Errorf("--subject-data: %w", err)
+			}
+			node.DataHost = filepath.ToSlash(dir)
+		}
 		clusterNodes = append(clusterNodes, node)
 	}
 
@@ -2740,6 +2773,12 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 		subjectDiskPath = tc.SubjectDisk.Path
 		subjectDiskSizeBytes = size
 	}
+	// A size-limited disk at the subject's data folder keeps it, as a cluster node's does: two
+	// mounts at one path would fail the compose file
+	subjectDataHost := filepath.ToSlash(cfg.SubjectDataHost)
+	if subjectDiskPath != "" && subjectDiskPath == cfg.SubjectDataDst {
+		subjectDataHost = ""
+	}
 
 	vars := composeVars{
 		SubjectImage:      s.ImageRef(),
@@ -2771,6 +2810,8 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 		HelperMemLimit:       cfg.HelperMemLimit,
 		UseSharedData:        useSharedData,
 		SubjectDiskPath:      subjectDiskPath,
+		SubjectDataHost:      subjectDataHost,
+		SubjectDataDst:       cfg.SubjectDataDst,
 		SubjectDiskSizeBytes: subjectDiskSizeBytes,
 		// DeferReceiver drops the `generator.depends_on: receiver` link
 		// so `UpServices("generator")` doesn't transitively start the

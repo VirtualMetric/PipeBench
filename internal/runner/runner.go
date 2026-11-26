@@ -59,6 +59,10 @@ type Options struct {
 	// the result. Used to tell apart real data loss from "the test ended
 	// before the subject finished forwarding its queue."
 	Drain time.Duration
+	// SubjectData, when set, is a host folder under which each run gets a folder of its own, which
+	// the subject mounts as its data folder: a latency case puts the subject's data on a chosen
+	// disk this way, and measures that disk first (latency.go).
+	SubjectData string
 
 	// Mounts fills the ${NAME}s in a case's mounts: block, from
 	// `--mount NAME=<host path>`. The paths are absolute.
@@ -143,6 +147,9 @@ type Runner struct {
 	// cmd/harness calls it sequentially.
 	runCPULimit string
 	runMemLimit string
+	// subjectDataHost is the current run's folder under --subject-data, or empty; the hardware
+	// block of the saved row describes the disk under it. Run clears it on entry.
+	subjectDataHost string
 }
 
 // hardwareID returns the BENCH_HARDWARE env var or "custom" when unset.
@@ -275,6 +282,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	// Runner is reused across cases and a stale pin must not survive.
 	r.runCPULimit = subjectCPULimit(tc, r.opts.CPULimit)
 	r.runMemLimit = subjectMemLimit(tc, r.opts.MemLimit)
+	r.subjectDataHost = ""
 
 	// Mounts first: a resolve step starts a container, and a case whose
 	// mounts cannot be resolved must fail before any container starts. Mount
@@ -492,6 +500,28 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		return results.RunResult{}, fmt.Errorf("resolving case directory: %w", err)
 	}
 
+	// A latency case's subject keeps its data in a folder of the run under --subject-data, on the
+	// disk being measured, and the harness measures that disk first
+	subjectDataHost, subjectDataDst, err := prepareSubjectData(r.opts.SubjectData, tc.Name, subject.Name, time.Now())
+	if err != nil {
+		return results.RunResult{}, err
+	}
+	r.subjectDataHost = subjectDataHost
+	if subjectDataHost != "" && !r.opts.NoCleanup {
+		defer removeSubjectData(r.opts.GeneratorImage, subjectDataHost)
+	}
+	var diskBaseline map[string]any
+	if tc.Latency != nil && tc.Latency.DiskBaseline {
+		if subjectDataHost == "" {
+			fmt.Println("  latency: no --subject-data, so the run measures no disk baseline")
+		} else {
+			fmt.Printf("  measuring the disk under %s…\n", subjectDataHost)
+			if diskBaseline, err = runDiskBaseline(r.ctx, r.opts.GeneratorImage, subjectDataHost); err != nil {
+				fmt.Fprintf(os.Stderr, "  warning: disk baseline: %v\n", err)
+			}
+		}
+	}
+
 	runCfg := orchestrator.RunConfig{
 		TestCase:         tc,
 		Subject:          subject,
@@ -499,6 +529,8 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		ConfigSrcPath:    configSrc,
 		CaseDir:          caseDir,
 		TmpDir:           tmpDir,
+		SubjectDataHost:  subjectDataHost,
+		SubjectDataDst:   subjectDataDst,
 		GeneratorImage:   r.opts.GeneratorImage,
 		ReceiverImage:    r.opts.ReceiverImage,
 		CollectorImage:   r.opts.CollectorImage,
@@ -570,6 +602,18 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	}
 	defer cleanup()
 
+	// A latency case with stages reads the director's stage times while the load runs
+	var sampler *stageSampler
+	var stageReadings []stageReading
+	if tc.Latency != nil && tc.Latency.Stages {
+		if subject.Name == "vmetric" {
+			sampler = startStageSampler(r.ctx, orch.SubjectContainer(), tc.Latency.StageIntervalOrDefault())
+			defer sampler.finish(r.ctx)
+		} else {
+			fmt.Printf("  latency: %s has no stage times to read\n", subject.Name)
+		}
+	}
+
 	// Wait for the generator to finish (duration + warmup + buffer)
 	duration := tc.DurationOrDefault(2 * time.Minute)
 	warmup := tc.WarmupOrDefault(10 * time.Second)
@@ -609,6 +653,10 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 			return results.RunResult{}, fmt.Errorf("interrupted: %w", err)
 		}
 	}
+	if sampler != nil {
+		stageReadings = sampler.finish(r.ctx)
+	}
+	var latencyResult map[string]any
 
 	// The verifier path replaces the receiver entirely: the subject's sink is
 	// S3, nothing listens on TCP, and the s3 receiver's destructive drain would
@@ -753,6 +801,10 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 			if err != nil {
 				return results.RunResult{}, fmt.Errorf("querying receiver metrics: %w", err)
 			}
+			// Each latency step's end-to-end latency, while the receiver still runs
+			if tc.Latency != nil {
+				latencyResult = collectLatency(r.ctx, orch.GeneratorStdout(), metricsPort, stageReadings, diskBaseline, sampler)
+			}
 		}
 	}
 
@@ -892,6 +944,7 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 		LatencyP95Ms:    recvMetrics.LatencyP95Ms,
 		LatencyP99Ms:    recvMetrics.LatencyP99Ms,
 		Passed:          recvMetrics.Passed,
+		Latency:         latencyResult,
 	}
 	if recvMetrics.Passed != nil && !*recvMetrics.Passed {
 		result.FailReason = strings.Join(recvMetrics.Errors, "; ")
@@ -8576,6 +8629,9 @@ func (r *Runner) saveResult(result results.RunResult, metricsCSVSrc string) (str
 
 	result.SubjectCPULimit = r.runCPULimit
 	result.SubjectMemLimit = r.runMemLimit
+	if result.HardwareInfo == nil {
+		result.HardwareInfo = readHardware(r.subjectDataHost)
+	}
 
 	return r.store.Save(result, metricsCSVSrc)
 }

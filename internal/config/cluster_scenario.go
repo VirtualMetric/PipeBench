@@ -831,8 +831,9 @@ func (tc *TestCase) validateClusterScenario() error {
 		return fmt.Errorf("case %q: a scenario case counts acknowledged lines, so its generator must use mode http_ack (got %q)", tc.Name, tc.Generator.Mode)
 	// The rate is per worker, and an unset worker count means three per CPU
 	// (ResolveGeneratorConnections), so a scenario case states both and stays
-	// at a load a shared machine can carry.
-	case tc.Generator.Connections < 1 || tc.Generator.Rate < 1:
+	// at a load a shared machine can carry. A latency block sets the load in its steps instead of
+	// the rate, and runs on a bench machine of its own.
+	case tc.Generator.Connections < 1 || (tc.Generator.Rate < 1 && tc.Latency == nil):
 		return fmt.Errorf("case %q: a scenario case sets generator.connections and generator.rate explicitly", tc.Name)
 	}
 	if total := tc.Generator.Connections * tc.Generator.Rate; tc.HasGenerator() && total > MaxScenarioRate && !sc.Throughput {

@@ -283,6 +283,24 @@ func TestSeqCountsKeepTheHashCountsForLinesWithoutASequence(t *testing.T) {
 	}
 }
 
+// The latency summary gives the quantiles in microseconds too, with p90 and p99.9.
+func TestSeqTrackerLatencyInMicroseconds(t *testing.T) {
+	tr := newSeqTracker(1)
+	base := time.Now().UnixNano()
+	for i := range 1000 {
+		sent := base + int64(i)*int64(time.Millisecond)
+		line := []byte(fmt.Sprintf("CONN=0 SEQ=%d TS=%d x", i, sent))
+		tr.record(line, sent+int64(i+1)*int64(time.Microsecond))
+	}
+	got := tr.latency(0, 0)
+	if got.Count != 1000 || got.P50Us != 501 || got.P90Us != 901 || got.P99Us != 991 || got.P999Us != 1000 || got.MaxUs != 1000 {
+		t.Fatalf("the summary is %+v, want p50 501, p90 901, p99 991, p99.9 1000 and max 1000 µs", got)
+	}
+	if got.P99Ms != 0.991 {
+		t.Fatalf("p99 is %v ms, want 0.991", got.P99Ms)
+	}
+}
+
 // A tracker that samples keeps the latency of one line in N, the lines whose
 // SEQ is a multiple of N, and still counts every line as arrived, so that the
 // loss check stays exact (RECEIVER_LATENCY_SAMPLE_EVERY).

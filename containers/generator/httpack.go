@@ -53,8 +53,12 @@ type ackResult struct {
 	// is the slowest acknowledged post in each second of the run.
 	AckLatency          *ackLatency `json:"ack_latency_ms,omitempty"`
 	AckLatencyMaxPerSec []int64     `json:"ack_latency_max_ms_per_second,omitempty"`
-	FirstAckNs          int64       `json:"first_ack_ns,omitempty"`
-	LastAckNs           int64       `json:"last_ack_ns,omitempty"`
+	// AckLatencyUs is AckLatency in microseconds, with p90, p99.9 and the mean.
+	AckLatencyUs *latencyUs `json:"ack_latency_us,omitempty"`
+	// Steps are the results of GENERATOR_STEPS, one after the other (steps.go).
+	Steps      []ackStepResult `json:"steps,omitempty"`
+	FirstAckNs int64           `json:"first_ack_ns,omitempty"`
+	LastAckNs  int64           `json:"last_ack_ns,omitempty"`
 }
 
 // lastAckResult carries the http_ack summary from runHTTPAck to main, which
@@ -72,6 +76,19 @@ type ackConfig struct {
 	drain       time.Duration
 	contentType string
 	progress    time.Duration
+	// steps are GENERATOR_STEPS, and stepWarmup the part of each step that its numbers leave out
+	// (steps.go). stepsErr says why GENERATOR_STEPS could not be read.
+	steps      []stepSpec
+	stepWarmup time.Duration
+	stepsErr   error
+	// receiver is the receiver's metrics address (GENERATOR_RECEIVER_METRICS), which the steps
+	// read their delivered rate from. stepDrain bounds the wait after each step for the receiver
+	// to have every acknowledged line (GENERATOR_STEP_DRAIN, default 60s). capacityFrom says what
+	// the percent steps take a share of: "receiver", the default with a receiver, or
+	// "acknowledgements" (GENERATOR_STEP_CAPACITY). See steps.go.
+	receiver     string
+	stepDrain    time.Duration
+	capacityFrom string
 }
 
 func loadAckConfig(cfg config) ackConfig {
@@ -85,7 +102,15 @@ func loadAckConfig(cfg config) ackConfig {
 		drain:       envDuration("GENERATOR_DRAIN_TIMEOUT", 60*time.Second),
 		contentType: getEnv("GENERATOR_HTTP_CONTENT_TYPE", "text/plain"),
 		progress:    envDuration("GENERATOR_PROGRESS_INTERVAL", time.Second),
+		stepWarmup:  envDuration("GENERATOR_STEP_WARMUP", 20*time.Second),
+		receiver:    strings.TrimRight(os.Getenv("GENERATOR_RECEIVER_METRICS"), "/"),
+		stepDrain:   envDuration("GENERATOR_STEP_DRAIN", 60*time.Second),
 	}
+	ac.capacityFrom = capacityFromAcks
+	if ac.receiver != "" && strings.ToLower(getEnv("GENERATOR_STEP_CAPACITY", capacityFromReceiver)) != capacityFromAcks {
+		ac.capacityFrom = capacityFromReceiver
+	}
+	ac.steps, ac.stepsErr = parseSteps(os.Getenv("GENERATOR_STEPS"))
 	ac.targets = splitTargets(cfg.Target)
 	if ac.batch < 1 {
 		ac.batch = 1
@@ -224,6 +249,7 @@ type ackStats struct {
 	lastErr   string
 	postLat   []int64 // ms, acknowledged posts
 	perSecMax []int64 // ms, slowest acknowledged post per second since start
+	postHist  durHist // the same posts, to the nanosecond
 }
 
 func (s *ackStats) noteStatus(key string) {
@@ -286,6 +312,13 @@ func runHTTPAck(cfg config, clock *sendClock) (int64, int64, error) {
 	if len(ac.targets) == 0 {
 		return 0, 0, errors.New("http_ack: GENERATOR_TARGET names no target")
 	}
+	if ac.stepsErr != nil {
+		return 0, 0, fmt.Errorf("http_ack: GENERATOR_STEPS: %w", ac.stepsErr)
+	}
+	// With steps, they set how long the run lasts
+	if len(ac.steps) > 0 {
+		cfg.Duration = stepsDuration(ac.steps)
+	}
 	workers := cfg.Connections
 	if workers < 1 {
 		workers = 1
@@ -324,15 +357,30 @@ func runHTTPAck(cfg config, clock *sendClock) (int64, int64, error) {
 		pads[i] = randString(cfg.LineSize)
 	}
 
-	var wg sync.WaitGroup
-	for w := range workers {
-		wg.Add(1)
-		go func(conn int) {
-			defer wg.Done()
-			runAckWorker(cfg, ac, conn, stats, picker, clock, pads, deadline, hardStop)
-		}(cfg.ConnOffset + w)
+	slots := make([]*ackSlot, workers)
+	for w := range slots {
+		slots[w] = newAckSlot(cfg.ConnOffset+w, ac)
 	}
-	wg.Wait()
+	defer func() {
+		for _, slot := range slots {
+			slot.client.CloseIdleConnections()
+		}
+	}()
+
+	var steps []ackStepResult
+	if len(ac.steps) > 0 {
+		steps = runAckSteps(cfg, ac, ac.steps, slots, stats, picker, clock, pads, ac.drain)
+	} else {
+		var wg sync.WaitGroup
+		for _, slot := range slots {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				runAckWorker(cfg, ac, slot, stats, picker, clock, pads, deadline, hardStop)
+			}()
+		}
+		wg.Wait()
+	}
 	close(done)
 	printer.Wait()
 
@@ -352,6 +400,8 @@ func runHTTPAck(cfg config, clock *sendClock) (int64, int64, error) {
 		MaxAckStallMs:       stats.maxStall.Load(),
 		AckLatency:          summarizeAckLatency(stats.postLat),
 		AckLatencyMaxPerSec: stats.perSecMax,
+		AckLatencyUs:        stats.postHist.summary(),
+		Steps:               steps,
 		FirstAckNs:          stats.firstAck.Load(),
 		LastAckNs:           stats.lastAck.Load(),
 	}
@@ -379,22 +429,103 @@ func ackProgressLine(s *ackStats, now time.Time) string {
 		s.failovers.Load(), s.pending.Load(), s.lastAck.Load(), perTarget, lastErr)
 }
 
-// runAckWorker sends one CONN id's lines until the deadline, a batch at a
-// time, and retries a batch until it is acknowledged or hardStop passes.
-func runAckWorker(cfg config, ac ackConfig, conn int, stats *ackStats, picker *targetPicker,
-	clock *sendClock, pads []string, deadline, hardStop time.Time,
-) {
-	client := &http.Client{
-		Timeout: ac.timeout,
-		Transport: &http.Transport{
-			DialContext:         (&net.Dialer{Timeout: ac.timeout}).DialContext,
-			MaxIdleConnsPerHost: 2,
-			IdleConnTimeout:     30 * time.Second,
-			DisableCompression:  true,
+// ackSlot is one CONN id of the generator, with its own sequence and HTTP client. It sends one
+// batch at a time, so the lines it counts as acknowledged are SEQ 0 to acked-1 of its CONN id.
+type ackSlot struct {
+	conn   int
+	seq    int64
+	last   int
+	client *http.Client
+	buf    bytes.Buffer
+}
+
+func newAckSlot(conn int, ac ackConfig) *ackSlot {
+	return &ackSlot{
+		conn: conn,
+		last: -1,
+		client: &http.Client{
+			Timeout: ac.timeout,
+			Transport: &http.Transport{
+				DialContext:         (&net.Dialer{Timeout: ac.timeout}).DialContext,
+				MaxIdleConnsPerHost: 2,
+				IdleConnTimeout:     30 * time.Second,
+				DisableCompression:  true,
+			},
 		},
 	}
-	defer client.CloseIdleConnections()
+}
 
+// send posts the slot's next batch, whose lines carry TS=ts, and tries it again, to the next
+// target, until a target acknowledges it or hardStop passes. It returns when the batch was
+// acknowledged, and false when it never was: its lines may still arrive, but they are not owed.
+func (sl *ackSlot) send(cfg config, ac ackConfig, stats *ackStats, picker *targetPicker,
+	clock *sendClock, pads []string, ts int64, hardStop time.Time,
+) (time.Time, bool) {
+	sl.buf.Reset()
+	for i := range ac.batch {
+		if i > 0 {
+			sl.buf.WriteByte('\n')
+		}
+		seq := sl.seq + int64(i)
+		buildAckLine(&sl.buf, sl.conn, seq, ts, cfg.LineSize, pads[seq%int64(len(pads))])
+	}
+	body := append([]byte(nil), sl.buf.Bytes()...)
+	stats.pending.Add(int64(ac.batch))
+	defer stats.pending.Add(-int64(ac.batch))
+
+	fresh := true
+	for {
+		now := time.Now()
+		if now.After(hardStop) {
+			stats.unacked.Add(int64(ac.batch))
+			return time.Time{}, false
+		}
+		idx := picker.pick(now, fresh)
+		if !fresh && sl.last >= 0 && idx != sl.last {
+			stats.failovers.Add(1)
+		}
+		fresh = false
+		sl.last = idx
+		target := ac.targets[idx]
+
+		stats.requests.Add(1)
+		postStart := time.Now()
+		code, err := postBatch(sl.client, target, ac.contentType, body)
+		switch {
+		case err == nil && code >= 200 && code < 300:
+			ackedAt := time.Now()
+			stats.noteStatus(strconv.Itoa(code))
+			stats.noteAck(sl.conn, target, ac.batch, len(body), ackedAt.UnixNano())
+			stats.notePostLatency(postStart, ackedAt.Sub(postStart))
+			clock.RecordSend()
+			picker.succeeded(idx)
+			sl.seq += int64(ac.batch)
+			return ackedAt, true
+		case err != nil:
+			stats.failures.Add(1)
+			key := "error"
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				key = "timeout"
+			}
+			stats.noteStatus(key)
+			stats.noteError(err.Error())
+			picker.failed(idx, time.Now())
+		default:
+			stats.failures.Add(1)
+			stats.noteStatus(strconv.Itoa(code))
+			stats.noteError(fmt.Sprintf("%s answered %d", target, code))
+			picker.failed(idx, time.Now())
+		}
+		time.Sleep(ac.backoff)
+	}
+}
+
+// runAckWorker sends one slot's lines until the deadline, a batch at a time, paced to
+// GENERATOR_RATE: the closed load of a run without steps.
+func runAckWorker(cfg config, ac ackConfig, slot *ackSlot, stats *ackStats, picker *targetPicker,
+	clock *sendClock, pads []string, deadline, hardStop time.Time,
+) {
 	interval := time.Second
 	if cfg.Rate > 0 {
 		interval = time.Duration(float64(ac.batch) / float64(cfg.Rate) * float64(time.Second))
@@ -403,11 +534,7 @@ func runAckWorker(cfg config, ac ackConfig, conn int, stats *ackStats, picker *t
 		interval = time.Millisecond
 	}
 
-	var seq int64
-	var buf bytes.Buffer
 	next := time.Now()
-	last := -1
-
 	for time.Now().Before(deadline) {
 		// Pace: one batch per interval. After a long retry the schedule
 		// restarts from now, so the client never bursts to catch up.
@@ -418,72 +545,9 @@ func runAckWorker(cfg config, ac ackConfig, conn int, stats *ackStats, picker *t
 		}
 		next = next.Add(interval)
 
-		ts := time.Now().UnixNano()
-		buf.Reset()
-		for i := range ac.batch {
-			if i > 0 {
-				buf.WriteByte('\n')
-			}
-			buildAckLine(&buf, conn, seq+int64(i), ts, cfg.LineSize, pads[(seq+int64(i))%int64(len(pads))])
-		}
-		body := append([]byte(nil), buf.Bytes()...)
-		stats.pending.Add(int64(ac.batch))
-
-		acked := false
-		fresh := true
-		for {
-			now := time.Now()
-			if now.After(hardStop) {
-				break
-			}
-			idx := picker.pick(now, fresh)
-			if !fresh && last >= 0 && idx != last {
-				stats.failovers.Add(1)
-			}
-			fresh = false
-			last = idx
-			target := ac.targets[idx]
-
-			stats.requests.Add(1)
-			postStart := time.Now()
-			code, err := postBatch(client, target, ac.contentType, body)
-			switch {
-			case err == nil && code >= 200 && code < 300:
-				stats.noteStatus(strconv.Itoa(code))
-				stats.noteAck(conn, target, ac.batch, len(body), time.Now().UnixNano())
-				stats.notePostLatency(postStart, time.Since(postStart))
-				clock.RecordSend()
-				picker.succeeded(idx)
-				acked = true
-			case err != nil:
-				stats.failures.Add(1)
-				key := "error"
-				var ne net.Error
-				if errors.As(err, &ne) && ne.Timeout() {
-					key = "timeout"
-				}
-				stats.noteStatus(key)
-				stats.noteError(err.Error())
-				picker.failed(idx, time.Now())
-			default:
-				stats.failures.Add(1)
-				stats.noteStatus(strconv.Itoa(code))
-				stats.noteError(fmt.Sprintf("%s answered %d", target, code))
-				picker.failed(idx, time.Now())
-			}
-			if acked {
-				break
-			}
-			time.Sleep(ac.backoff)
-		}
-		stats.pending.Add(-int64(ac.batch))
-		if !acked {
-			// The run is over and this batch was never acknowledged. Its lines
-			// may still arrive, but they are not owed.
-			stats.unacked.Add(int64(ac.batch))
+		if _, ok := slot.send(cfg, ac, stats, picker, clock, pads, time.Now().UnixNano(), hardStop); !ok {
 			return
 		}
-		seq += int64(ac.batch)
 	}
 }
 
@@ -518,6 +582,7 @@ func (s *ackStats) notePostLatency(at time.Time, d time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.postLat = append(s.postLat, ms)
+	s.postHist.record(d)
 	if sec < 0 {
 		return
 	}

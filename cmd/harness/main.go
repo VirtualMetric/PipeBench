@@ -54,6 +54,7 @@ var (
 	memLimit         string
 	hardware         string
 	drain            time.Duration
+	subjectData      string
 	failOnVerdict    bool
 	mountFlags       []string
 )
@@ -274,6 +275,7 @@ func testCmd() *cobra.Command {
 				CPULimit:         cpuLimit,
 				MemLimit:         memLimit,
 				Drain:            drain,
+				SubjectData:      subjectData,
 				Mounts:           mounts,
 			}
 
@@ -400,6 +402,7 @@ func testCmd() *cobra.Command {
 	cmd.Flags().StringVar(&subjectVersion, "version", "", "subject image version tag (overrides registry default)")
 	cmd.Flags().StringVar(&subjectImage, "image", "", "subject image repository, e.g. \"myco/director\" (overrides registry default; combine with --version to pin the tag)")
 	cmd.Flags().BoolVar(&noCleanup, "no-cleanup", false, "leave containers running after test (for debugging)")
+	cmd.Flags().StringVar(&subjectData, "subject-data", "", "host folder for the subject's data: each run gets a folder of its own there, which the subject mounts as its data folder, so a latency case measures that disk")
 	cmd.Flags().DurationVar(&drain, "drain", 0, "performance: wait up to this long for receiver to go idle (instead of fixed 5s grace), recompute EPS over the receiver window, and skip persisting the result — diagnostic only")
 	cmd.Flags().IntVar(&receiverHostPort, "receiver-port", 19001, "host port for receiver metrics endpoint")
 	cmd.Flags().DurationVar(&timeout, "timeout", 10*time.Minute, "maximum time to wait for test completion")
