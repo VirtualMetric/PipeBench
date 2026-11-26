@@ -276,10 +276,14 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	r.runCPULimit = subjectCPULimit(tc, r.opts.CPULimit)
 	r.runMemLimit = subjectMemLimit(tc, r.opts.MemLimit)
 
-	if err := r.resolveValues(tc, subject); err != nil {
+	// Mounts first: a resolve step starts a container, and a case whose
+	// mounts cannot be resolved must fail before any container starts. Mount
+	// names come from --mount only, never from a resolve step, so nothing
+	// here depends on resolveValues.
+	if err := r.resolveMounts(tc); err != nil {
 		return results.RunResult{}, err
 	}
-	if err := r.resolveMounts(tc); err != nil {
+	if err := r.resolveValues(tc, subject); err != nil {
 		return results.RunResult{}, err
 	}
 	if tc.Type == "persistence_correctness" {
