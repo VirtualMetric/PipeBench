@@ -75,6 +75,30 @@ type TestCase struct {
 	// WebSocket + HTTP endpoints are bound when the agent dials in.
 	Agent *AgentConfig `yaml:"agent"`
 
+	// Mounts puts host files and folders into the containers the case runs.
+	// Each key names a container: "subject" (every node, when the case runs a
+	// cluster or replicas), "agent", or an endpoint's name. Each value maps a
+	// path in that container to a host path:
+	//
+	//	mounts:
+	//	  subject:
+	//	    /opt/product/plugins: ../../shared/plugins
+	//	    /etc/product/license.lic: ${LICENSE}
+	//	  agent:
+	//	    /var/lib/agent/cache: cache:rw
+	//
+	// A host path is relative to the case's folder, or absolute. ${NAME} is
+	// filled from `harness test --mount NAME=<host path>`, for files a case
+	// can't keep in its folder, such as a license or a binary the run
+	// downloads. A mount is read-only unless its host path ends in ":rw".
+	// See mounts.go.
+	Mounts map[string]map[string]string `yaml:"mounts"`
+
+	// RunMounts holds Mounts resolved for one run: every ${NAME} filled, every
+	// host path absolute and checked to exist. The runner sets it before it
+	// starts any container, and the compose file is written from it.
+	RunMounts map[string][]ResolvedMount `yaml:"-"`
+
 	// Kafka, when set, adds a Redpanda (Kafka-compatible) broker to the test
 	// topology: the harness renders a `redpanda` service plus a one-shot
 	// `redpanda-init` that creates the topic, and the generator (mode: kafka)
@@ -688,9 +712,9 @@ func (d *DatabaseConfig) DatabaseOrDefault() string {
 // the subject (depends_on: subject service_started) so the director's
 // WebSocket + HTTP endpoints are ready when the agent first dials in.
 type AgentConfig struct {
-	// Image is the container image to run. For vmetric agent-mode tests this
-	// is typically vmetric/director-enterprise (which bakes vmetric-agent at
-	// /package/agent/linux/amd64), avoiding a separate published image.
+	// Image is the container image to run. An untagged image gets the run's
+	// --version, as the subject does. The agent binary can come from the image
+	// or from the case's mounts: block (mounts.agent).
 	Image string `yaml:"image"`
 	// Env is the agent's environment — e.g. VMETRIC_CONFIG_HASH for the
 	// vmetric-agent registration URL + device token + device ID.
@@ -1450,6 +1474,9 @@ func (tc *TestCase) Validate() error {
 			return fmt.Errorf("case %q: duplicate endpoint name %q", tc.Name, e.Name)
 		}
 		epNames[e.Name] = struct{}{}
+	}
+	if err := tc.validateMounts(); err != nil {
+		return err
 	}
 	// Resolved values must be well formed and actually referenced. An unused or
 	// misspelled entry is the failure mode worth catching here: the ${NAME} it

@@ -55,6 +55,7 @@ var (
 	hardware         string
 	drain            time.Duration
 	failOnVerdict    bool
+	mountFlags       []string
 )
 
 func main() {
@@ -120,6 +121,10 @@ func testCmd() *cobra.Command {
 			}
 			if allTests && testName != "" {
 				return fmt.Errorf("--all-tests and --test are mutually exclusive")
+			}
+			mounts, err := parseMountFlags(mountFlags)
+			if err != nil {
+				return err
 			}
 
 			// Thread the --hardware flag through to the runner via BENCH_HARDWARE
@@ -269,6 +274,7 @@ func testCmd() *cobra.Command {
 				CPULimit:         cpuLimit,
 				MemLimit:         memLimit,
 				Drain:            drain,
+				Mounts:           mounts,
 			}
 
 			r := runner.New(cmd.Context(), opts)
@@ -407,8 +413,38 @@ func testCmd() *cobra.Command {
 	cmd.Flags().StringVar(&hardware, "hardware", "", "hardware tier label — groups results under results/<hardware>/ (e.g. \"c7i.4xlarge\"); defaults to $BENCH_HARDWARE or \"custom\"")
 	cmd.Flags().StringVar(&typeFilter, "type", "", "with --all-tests, run only cases whose type matches (e.g. \"correctness\" also matches \"persistence_correctness\"); \"performance\" matches only the plain performance type")
 	cmd.Flags().BoolVar(&failOnVerdict, "fail-on-verdict", false, "exit with code 1 when a run's checks fail, as well as when a run cannot finish (by default a failed check only shows as FAIL in the summary and in the results)")
+	cmd.Flags().StringArrayVar(&mountFlags, "mount", nil, "NAME=<host path> fills ${NAME} in a case's mounts: block; repeat for more names (a relative path is relative to the current directory)")
 
 	return cmd
+}
+
+// parseMountFlags turns the --mount values into the ${NAME} values a case's
+// mounts: block uses. Each path is made absolute here, against the directory
+// the harness runs in, because a case resolves its own relative paths against
+// its own folder.
+func parseMountFlags(values []string) (map[string]string, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	mounts := make(map[string]string, len(values))
+	for _, v := range values {
+		name, hostPath, ok := strings.Cut(v, "=")
+		if !ok || hostPath == "" {
+			return nil, fmt.Errorf("--mount %q: want NAME=<host path>", v)
+		}
+		if !config.ValidMountVarName(name) {
+			return nil, fmt.Errorf("--mount %q: %q is not a valid name (letters, digits and _, not starting with a digit)", v, name)
+		}
+		if _, dup := mounts[name]; dup {
+			return nil, fmt.Errorf("--mount: %s is given twice", name)
+		}
+		abs, err := filepath.Abs(hostPath)
+		if err != nil {
+			return nil, fmt.Errorf("--mount %q: %w", v, err)
+		}
+		mounts[name] = abs
+	}
+	return mounts, nil
 }
 
 // failedVerdicts names the runs that finished but did not pass their checks.

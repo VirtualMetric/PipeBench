@@ -271,6 +271,7 @@ services:
 {{- if .Volume }}
       - "{{ .Volume }}:{{ .VolumePath }}"
 {{- end }}
+{{- template "bindMounts" $.SubjectMounts }}
 {{- if $.SubjectUser }}
     user: "{{ $.SubjectUser }}"
 {{- end }}
@@ -394,6 +395,7 @@ services:
           size: {{ .SubjectDiskSizeBytes }}
           mode: 01777
 {{- end }}
+{{- template "bindMounts" .SubjectMounts }}
 {{- if .SubjectUser }}
     user: "{{ .SubjectUser }}"
 {{- end }}
@@ -907,9 +909,12 @@ services:
     container_name: "bench-{{ .Name }}"
     hostname: "{{ .Name }}"
     networks: [bench]
-{{- if .MountsSharedDir }}
+{{- if or .MountsSharedDir .Mounts }}
     volumes:
+{{- if .MountsSharedDir }}
       - "shared-dir:{{ $.SharedDirMount }}"
+{{- end }}
+{{- template "bindMounts" .Mounts }}
 {{- end }}
 {{- if .Command }}
     command: {{ .Command }}
@@ -943,9 +948,14 @@ services:
     depends_on:
       {{ if .Subjects }}{{ (index .Subjects 0).Hostname }}{{ else }}subject{{ end }}:
         condition: service_started
-{{- if .AgentMountsSharedData }}
+{{- if or .AgentMountsSharedData .AgentMounts }}
     volumes:
+{{- if .AgentMountsSharedData }}
       - "shared-data:/data"
+{{- end }}
+{{- template "bindMounts" .AgentMounts }}
+{{- end }}
+{{- if .AgentMountsSharedData }}
     user: "0:0"
 {{- end }}
 {{- if .AgentCommand }}
@@ -1406,6 +1416,12 @@ services:
 {{- if .HelperMemLimit }}
           memory: "{{ .HelperMemLimit }}"
 {{- end }}{{ end }}{{ end }}
+{{- define "bindMounts" }}{{ range . }}
+      - type: bind
+        source: {{ .Source }}
+        target: {{ .Target }}
+        read_only: {{ .ReadOnly }}
+{{- end }}{{ end }}
 `
 
 // RunConfig holds parameters for a single test run.
@@ -2012,6 +2028,8 @@ type endpointTpl struct {
 	Command string // pre-formatted YAML list, empty = use the image's default
 	// MountsSharedDir mounts the shared directory of a cluster scenario.
 	MountsSharedDir bool
+	// Mounts are the endpoint's entries in the case's mounts: block.
+	Mounts []bindMount
 	// Healthcheck (optional): when HasHealthcheck is set, the endpoint gets a
 	// compose healthcheck and the subject gates on it (service_healthy).
 	HasHealthcheck bool
@@ -2376,12 +2394,43 @@ type composeVars struct {
 	AgentCommand          string
 	AgentEnv              map[string]string
 	AgentMountsSharedData bool
+	AgentMounts           []bindMount
+
+	// SubjectMounts are the subject's entries in the case's mounts: block,
+	// rendered on the singular subject and on every cluster node or replica.
+	SubjectMounts []bindMount
 
 	// TLSCertsHost is the host directory holding the auto-generated cert
 	// material for TLS-enabled runs. Empty when no generator opts into
 	// TLS; non-empty triggers the /certs bind mount on subject and
 	// generators.
 	TLSCertsHost string
+}
+
+// bindMount is one entry of a case's mounts: block, ready for the compose
+// template. Source and Target are already quoted YAML strings, so that a path
+// with a space, a colon (a Windows drive) or a quote stays one value, and a
+// "$" in Source is doubled so compose doesn't read it as a variable.
+type bindMount struct {
+	Source   string
+	Target   string
+	ReadOnly bool
+}
+
+// bindMounts turns one container's resolved mounts into template data.
+func bindMounts(mounts []config.ResolvedMount) []bindMount {
+	if len(mounts) == 0 {
+		return nil
+	}
+	out := make([]bindMount, len(mounts))
+	for i, m := range mounts {
+		out[i] = bindMount{
+			Source:   fmt.Sprintf("%q", strings.ReplaceAll(filepath.ToSlash(m.Source), "$", "$$")),
+			Target:   fmt.Sprintf("%q", strings.ReplaceAll(m.Target, "$", "$$")),
+			ReadOnly: !m.Writable,
+		}
+	}
+	return out
 }
 
 // resolveSampleHost resolves a generator's case-relative sample_file to the
@@ -2421,6 +2470,11 @@ func replicaConfigPath(tmpDir string, n int) string {
 func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 	tc := cfg.TestCase
 	s := cfg.Subject
+	// The runner resolves a case's mounts before it starts any container. A
+	// path that skipped it would start the containers without them.
+	if len(tc.Mounts) > 0 && tc.RunMounts == nil {
+		return fmt.Errorf("case %q: its mounts were not resolved for this run", tc.Name)
+	}
 	// One render instant shared by the subject config (T0Plus) and the
 	// LocalStack init script ($TODAY) so both anchor to the same clock.
 
@@ -3105,6 +3159,7 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 			Env:             env,
 			Command:         formatYAMLList(cmd),
 			MountsSharedDir: ep.MountsSharedDir,
+			Mounts:          bindMounts(tc.RunMounts[ep.Name]),
 		}
 		if hc := ep.Healthcheck; hc != nil && hc.Test != "" {
 			et.HasHealthcheck = true
@@ -3150,7 +3205,9 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 		vars.AgentCommand = formatYAMLList(agentCmd)
 		vars.AgentEnv = agentEnv
 		vars.AgentMountsSharedData = a.MountsSharedData
+		vars.AgentMounts = bindMounts(tc.RunMounts[config.MountAgent])
 	}
+	vars.SubjectMounts = bindMounts(tc.RunMounts[config.MountSubject])
 
 	// Cluster scenario topology: witness store, Toxiproxy, one-start node
 	// arguments, deferred load (cluster_scenario_compose.go).

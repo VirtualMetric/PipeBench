@@ -59,6 +59,10 @@ type Options struct {
 	// the result. Used to tell apart real data loss from "the test ended
 	// before the subject finished forwarding its queue."
 	Drain time.Duration
+
+	// Mounts fills the ${NAME}s in a case's mounts: block, from
+	// `--mount NAME=<host path>`. The paths are absolute.
+	Mounts map[string]string
 }
 
 func (o *Options) applyDefaults() {
@@ -247,6 +251,24 @@ func (r *Runner) resolveValues(tc *config.TestCase, subject config.Subject) erro
 	return nil
 }
 
+// resolveMounts fills tc.RunMounts from the case's mounts: block and the run's
+// --mount values, before any container starts. Every run path writes its
+// compose file from tc.RunMounts, so resolving here covers all of them. It
+// assigns a new map rather than changing one in place, so a case shared by
+// several runs never sees another run's paths.
+func (r *Runner) resolveMounts(tc *config.TestCase) error {
+	caseDir, err := filepath.Abs(filepath.Join(r.opts.CasesDir, tc.Name))
+	if err != nil {
+		return fmt.Errorf("resolving case directory: %w", err)
+	}
+	mounts, err := tc.ResolveMounts(caseDir, r.opts.Mounts)
+	if err != nil {
+		return err
+	}
+	tc.RunMounts = mounts
+	return nil
+}
+
 // Run executes the test and returns the persisted result.
 func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunResult, error) {
 	// Resolve the subject's ceilings once for this run. Unconditional: a
@@ -254,6 +276,13 @@ func (r *Runner) Run(tc *config.TestCase, subject config.Subject) (results.RunRe
 	r.runCPULimit = subjectCPULimit(tc, r.opts.CPULimit)
 	r.runMemLimit = subjectMemLimit(tc, r.opts.MemLimit)
 
+	// Mounts first: a resolve step starts a container, and a case whose
+	// mounts cannot be resolved must fail before any container starts. Mount
+	// names come from --mount only, never from a resolve step, so nothing
+	// here depends on resolveValues.
+	if err := r.resolveMounts(tc); err != nil {
+		return results.RunResult{}, err
+	}
 	if err := r.resolveValues(tc, subject); err != nil {
 		return results.RunResult{}, err
 	}
@@ -2733,10 +2762,10 @@ func (r *Runner) runKafkaCertRotation(tc *config.TestCase, subject config.Subjec
 }
 
 // subjectHasAgentPackage reports whether the subject (director) container ships
-// the baked vmetric-agent that the push-deploy pushes to endpoints. The
-// agent-capable image (vmetric/director-enterprise) ships
-// /opt/vmetric/package/agent; the default vmetric/director image has no package
-// dir at all, so a director↔agent case run on it can never deploy an agent.
+// the vmetric-agent that the push-deploy pushes to endpoints, at
+// /opt/vmetric/package/agent. Director releases carry none, so a case mounts
+// one there (mounts: in case.yaml); without it a director↔agent case can never
+// deploy an agent.
 //
 // conclusive is false when the probe could not run (empty container, exec not
 // ready, neither marker printed) so callers do NOT fast-fail on noise — they
@@ -2959,8 +2988,8 @@ func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject confi
 	if present, conclusive := subjectHasAgentPackage(orch.SubjectContainer()); conclusive && !present {
 		return results.RunResult{}, fmt.Errorf(
 			"subject image %s:%s has no baked vmetric-agent (/opt/vmetric/package/agent missing): "+
-				"director↔agent cert-rotation cases require the agent-capable image — "+
-				"re-run with VMETRIC_IMAGE=vmetric/director-enterprise",
+				"director↔agent cert-rotation cases need an agent there — "+
+				"mount one with the case's mounts: block",
 			subject.Image, subject.Version,
 		)
 	}
@@ -2994,8 +3023,8 @@ func (r *Runner) runDirectorAgentCertRotation(tc *config.TestCase, subject confi
 	if !established {
 		return results.RunResult{}, fmt.Errorf(
 			"agent never delivered the initial %s records within %s (subject image %s:%s) — "+
-				"deploy/enroll/connect failed; if this is not the agent-capable image, "+
-				"re-run with VMETRIC_IMAGE=vmetric/director-enterprise",
+				"deploy/enroll/connect failed; check that the case mounts an agent "+
+				"at /opt/vmetric/package/agent",
 			formatCount(minRecv), initialBudget, subject.Image, subject.Version,
 		)
 	}
@@ -3363,8 +3392,8 @@ func (r *Runner) runDirectorAgentACLRotation(tc *config.TestCase, subject config
 	if present, conclusive := subjectHasAgentPackage(orch.SubjectContainer()); conclusive && !present {
 		return results.RunResult{}, fmt.Errorf(
 			"subject image %s:%s has no baked vmetric-agent (/opt/vmetric/package/agent missing): "+
-				"director↔agent ACL-rotation cases require the agent-capable image — "+
-				"re-run with VMETRIC_IMAGE=vmetric/director-enterprise",
+				"director↔agent ACL-rotation cases need an agent there — "+
+				"mount one with the case's mounts: block",
 			subject.Image, subject.Version,
 		)
 	}
@@ -3496,7 +3525,7 @@ func (r *Runner) runDirectorAgentACLRotation(tc *config.TestCase, subject config
 		if !established {
 			return results.RunResult{}, fmt.Errorf(
 				"agent never delivered the initial %s records — cannot test revocation (subject image %s:%s); "+
-					"if this is not the agent-capable image, re-run with VMETRIC_IMAGE=vmetric/director-enterprise",
+					"check that the case mounts an agent at /opt/vmetric/package/agent",
 				formatCount(minRecv), subject.Image, subject.Version,
 			)
 		}
