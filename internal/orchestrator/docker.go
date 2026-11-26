@@ -70,6 +70,11 @@ type configTemplateContext struct {
 	// (RenderReplicaConfigsMoving), so the config can allow the device only
 	// there through its placement_nodes. Empty in every other render.
 	MoveTarget string
+	// MoveDevice is the id of the device that the same action moves, in the
+	// stage it renders, so a case that lets the action choose among several
+	// devices (move_devices) can allow only that one on MoveTarget. 0 in every
+	// other render.
+	MoveDevice int64
 }
 
 // T0Plus returns T0 + sec seconds as RFC3339 UTC, for absolute device
@@ -168,8 +173,39 @@ networks:
 
 volumes:
   shared-data:
+{{- if .SharedDirMount }}
+  shared-dir:
+{{- end }}
 {{- if .WitnessDirMount }}
   witness-dir:
+{{- if eq .ShareServer "smb" }}
+    # The share on the Samba server, mounted by Docker in the host's kernel
+    # over SMB 3.1.1, for the director's user (uid 100, gid 101). The server
+    # has a fixed address, because the host's kernel cannot resolve a
+    # service's name. The password is the harness's constant, not a secret.
+    driver: local
+    driver_opts:
+      type: cifs
+      device: "//{{ .ShareServerIP }}/share"
+      o: "addr={{ .ShareServerIP }},username=bench,password=bench,vers=3.1.1,uid=100,gid=101,file_mode=0660,dir_mode=0770,nobrl"
+{{- else if eq .ShareServer "nfs" }}
+    # The share on the NFS server, mounted by Docker in the host's kernel over
+    # NFS 4.2, at the server's fixed address
+    driver: local
+    driver_opts:
+      type: nfs
+      device: ":/"
+      o: "addr={{ .ShareServerIP }},nfsvers=4.2,rw,hard"
+{{- end }}
+{{- end }}
+{{- if eq .ShareServer "nfs" }}
+  # The NFS server's export: the kernel exports no overlay file system
+  share-export:
+{{- end }}
+{{- range .Subjects }}
+{{- if .Volume }}
+  {{ .Volume }}:
+{{- end }}
 {{- end }}
 
 services:
@@ -177,7 +213,7 @@ services:
 {{- if .Subjects }}
 {{- range .Subjects }}
   {{ .Hostname }}:
-    image: "{{ $.SubjectImage }}"
+    image: "{{ if .Image }}{{ .Image }}{{ else }}{{ $.SubjectImage }}{{ end }}"
     container_name: "{{ .Container }}"
     hostname: "{{ .Hostname }}"
     networks: [bench]
@@ -189,6 +225,11 @@ services:
 {{- if $.NodesNeedNetAdmin }}
     cap_add:
       - NET_ADMIN
+{{- end }}
+{{- if $.NodesPrivileged }}
+    # The node's image mounts a FUSE file system, such as LazyFS, under the
+    # director's storage (cluster.scenario.node_privileged).
+    privileged: true
 {{- end }}
 {{- if or $.VerifierLocalDir $.AzureEnabled $.NodeDependsOn }}
     depends_on:
@@ -217,6 +258,9 @@ services:
 {{- if $.WitnessDirMount }}
       - "witness-dir:{{ $.WitnessDirMount }}"
 {{- end }}
+{{- if $.SharedDirMount }}
+      - "shared-dir:{{ $.SharedDirMount }}"
+{{- end }}
 {{- if .DataHost }}
       - "{{ .DataHost }}:{{ $.SubjectDataDst }}"
 {{- end }}
@@ -227,6 +271,10 @@ services:
           size: {{ .DiskSizeBytes }}
           mode: 01777
 {{- end }}
+{{- if .Volume }}
+      - "{{ .Volume }}:{{ .VolumePath }}"
+{{- end }}
+{{- template "bindMounts" $.SubjectMounts }}
 {{- if $.SubjectUser }}
     user: "{{ $.SubjectUser }}"
 {{- end }}
@@ -353,6 +401,7 @@ services:
           size: {{ .SubjectDiskSizeBytes }}
           mode: 01777
 {{- end }}
+{{- template "bindMounts" .SubjectMounts }}
 {{- if .SubjectUser }}
     user: "{{ .SubjectUser }}"
 {{- end }}
@@ -726,7 +775,7 @@ services:
       COLLECTOR_OUTPUT: "/results/metrics.csv"
 {{- template "helperLimits" $ }}
     restart: "no"
-{{- if .WitnessDirMount }}
+{{- if and .WitnessDirMount (not .ShareServer) }}
 
   # One-shot: make the shared witness directory writable for the director,
   # which runs as a non-root user, before any node starts. Reuses the subject
@@ -746,6 +795,35 @@ services:
       WITNESS_DIR: "{{ .WitnessDirMount }}"
     volumes:
       - "witness-dir:{{ .WitnessDirMount }}"
+    restart: "no"
+{{- end }}
+{{- if .ShareServer }}
+
+  # The server of the replicas' share: Samba, or the kernel's NFS server. It
+  # has a fixed address, because Docker mounts the share in the host's kernel,
+  # which cannot resolve a service's name. It is privileged to load the
+  # kernel's cifs, nfs and nfsd modules from the host's /lib/modules, and the
+  # NFS server also runs in the host's kernel. The share mounts with the
+  # director's user and modes, so it needs no witness-init.
+  share-server:
+    image: "{{ .ShareServerImage }}"
+    container_name: "bench-share-server"
+    hostname: "share-server"
+    privileged: true
+    networks:
+      bench:
+        ipv4_address: "{{ .ShareServerIP }}"
+    volumes:
+      - "/lib/modules:/lib/modules:ro"
+{{- if eq .ShareServer "nfs" }}
+      - "share-export:/export"
+{{- end }}
+    healthcheck:
+      test: ["CMD", "test", "-f", "/run/share-ready"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+{{- template "helperLimits" $ }}
     restart: "no"
 {{- end }}
 {{- if .ToxiproxyEnabled }}
@@ -837,6 +915,13 @@ services:
     container_name: "bench-{{ .Name }}"
     hostname: "{{ .Name }}"
     networks: [bench]
+{{- if or .MountsSharedDir .Mounts }}
+    volumes:
+{{- if .MountsSharedDir }}
+      - "shared-dir:{{ $.SharedDirMount }}"
+{{- end }}
+{{- template "bindMounts" .Mounts }}
+{{- end }}
 {{- if .Command }}
     command: {{ .Command }}
 {{- end }}
@@ -869,9 +954,14 @@ services:
     depends_on:
       {{ if .Subjects }}{{ (index .Subjects 0).Hostname }}{{ else }}subject{{ end }}:
         condition: service_started
-{{- if .AgentMountsSharedData }}
+{{- if or .AgentMountsSharedData .AgentMounts }}
     volumes:
+{{- if .AgentMountsSharedData }}
       - "shared-data:/data"
+{{- end }}
+{{- template "bindMounts" .AgentMounts }}
+{{- end }}
+{{- if .AgentMountsSharedData }}
     user: "0:0"
 {{- end }}
 {{- if .AgentCommand }}
@@ -1332,6 +1422,12 @@ services:
 {{- if .HelperMemLimit }}
           memory: "{{ .HelperMemLimit }}"
 {{- end }}{{ end }}{{ end }}
+{{- define "bindMounts" }}{{ range . }}
+      - type: bind
+        source: {{ .Source }}
+        target: {{ .Target }}
+        read_only: {{ .ReadOnly }}
+{{- end }}{{ end }}
 `
 
 // RunConfig holds parameters for a single test run.
@@ -1421,12 +1517,12 @@ type ComposeRunner struct {
 // a changed config on its own, so this changes a running replica set without
 // restarting it.
 func (r *ComposeRunner) RenderReplicaConfigs(stage int) error {
-	return r.RenderReplicaConfigsMoving(stage, "")
+	return r.RenderReplicaConfigsMoving(stage, "", 0)
 }
 
 // RenderReplicaConfigsMoving is RenderReplicaConfigs with {{@.MoveTarget@}}
-// set to moveTarget.
-func (r *ComposeRunner) RenderReplicaConfigsMoving(stage int, moveTarget string) error {
+// set to moveTarget and {{@.MoveDevice@}} set to moveDevice.
+func (r *ComposeRunner) RenderReplicaConfigsMoving(stage int, moveTarget string, moveDevice int64) error {
 	raw, err := os.ReadFile(r.cfg.ConfigSrcPath)
 	if err != nil {
 		return err
@@ -1439,7 +1535,7 @@ func (r *ComposeRunner) RenderReplicaConfigsMoving(stage int, moveTarget string)
 		// Render in memory and write the file in one call: a director that
 		// reads its config while it is written must not find it empty.
 		var buf bytes.Buffer
-		ctx := configTemplateContext{CPUs: runtime.NumCPU(), NodeID: i, T0: r.renderedAt, Stage: stage, MoveTarget: moveTarget}
+		ctx := configTemplateContext{CPUs: runtime.NumCPU(), NodeID: i, T0: r.renderedAt, Stage: stage, MoveTarget: moveTarget, MoveDevice: moveDevice}
 		if err := tmpl.Execute(&buf, ctx); err != nil {
 			return fmt.Errorf("rendering replica config %d: %w", i, err)
 		}
@@ -1613,11 +1709,24 @@ func (r *ComposeRunner) RestartServices(services ...string) error {
 // RecreateServices replaces the named services with new containers, without
 // touching their dependencies. A container platform that replaces a replica
 // starts it on an empty disk, which `docker start` of the old container would
-// not do: whatever the replica keeps must come back from elsewhere.
+// not do: whatever the replica keeps must come back from elsewhere. Compose
+// hands a recreated container its old anonymous volumes unless it is told not to,
+// so --renew-anon-volumes is what makes that disk empty.
 func (r *ComposeRunner) RecreateServices(services ...string) error {
 	resolved := r.resolveServiceAliases(services)
-	args := append([]string{"up", "-d", "--quiet-pull", "--no-deps", "--force-recreate"}, resolved...)
+	args := append([]string{"up", "-d", "--quiet-pull", "--no-deps", "--force-recreate", "--renew-anon-volumes"}, resolved...)
 	return r.compose(args...)
+}
+
+// RecreateServiceWithImage sets the service's image in the compose file, in
+// place, and replaces the service's container with one from that image. The
+// compose file then names the image the service runs now, so any later `up`
+// of the service keeps it.
+func (r *ComposeRunner) RecreateServiceWithImage(service, image string) error {
+	if err := setComposeServiceImage(r.composeFile, service, image); err != nil {
+		return err
+	}
+	return r.RecreateServices(service)
 }
 
 // resolveServiceAliases expands the logical names "generator" and "receiver"
@@ -1667,6 +1776,17 @@ func (r *ComposeRunner) KillServices(services ...string) error {
 	defer cancel()
 	resolved := r.resolveServiceAliases(services)
 	args := append([]string{"kill", "-s", "SIGKILL"}, resolved...)
+	return r.composeCtx(ctx, args...)
+}
+
+// RemoveServices removes the containers of the services, with their anonymous
+// volumes and whatever they wrote to their own filesystem. The next UpServices
+// creates new ones, on an empty disk.
+func (r *ComposeRunner) RemoveServices(services ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	resolved := r.resolveServiceAliases(services)
+	args := append([]string{"rm", "--force", "--stop", "--volumes"}, resolved...)
 	return r.composeCtx(ctx, args...)
 }
 
@@ -1918,6 +2038,10 @@ type endpointTpl struct {
 	Image   string
 	Env     map[string]string
 	Command string // pre-formatted YAML list, empty = use the image's default
+	// MountsSharedDir mounts the shared directory of a cluster scenario.
+	MountsSharedDir bool
+	// Mounts are the endpoint's entries in the case's mounts: block.
+	Mounts []bindMount
 	// Healthcheck (optional): when HasHealthcheck is set, the endpoint gets a
 	// compose healthcheck and the subject gates on it (service_healthy).
 	HasHealthcheck bool
@@ -1950,6 +2074,19 @@ type clusterNode struct {
 	// DataHost is the node's own folder under the run's subject data folder (--subject-data),
 	// which it mounts as its data folder, or empty.
 	DataHost string
+	// Image is the image the node starts on when it is not the image under
+	// test (cluster.scenario.start_image). Empty means the image under test.
+	Image string
+	// Volume names a Docker volume of the node's own, mounted at VolumePath
+	// (cluster.scenario.node_volume). It outlives the node's container.
+	Volume     string
+	VolumePath string
+}
+
+// NodeVolumeName is the compose name of node n's volume
+// (cluster.scenario.node_volume).
+func NodeVolumeName(n int) string {
+	return fmt.Sprintf("node-%d-data", n)
 }
 
 // nodeDependency is one depends_on entry of every cluster node service.
@@ -2023,6 +2160,9 @@ type composeVars struct {
 	// NodesNeedNetAdmin grants the cluster node containers NET_ADMIN so the elected
 	// director leader can add the virtual IP to its interface (cluster_ip_failover).
 	NodesNeedNetAdmin bool
+	// NodesPrivileged runs the cluster node containers privileged, so that
+	// their image can mount a FUSE file system (cluster.scenario.node_privileged).
+	NodesPrivileged bool
 
 	// Cluster scenario topology (cluster_scenario_compose.go). NodeDependsOn
 	// orders every node after the services it needs at start (the witness
@@ -2030,8 +2170,18 @@ type composeVars struct {
 	// and adds witness-init. NodeArgsEntrypoint replaces each node's
 	// entrypoint with the one-start-arguments wrapper. GenDeferred keeps the
 	// generator out of the initial `up` (profile "load").
-	NodeDependsOn       []nodeDependency
-	WitnessDirMount     string
+	NodeDependsOn   []nodeDependency
+	WitnessDirMount string
+	// SharedDirMount mounts one volume at this path on every node and on each
+	// endpoint that asks for it (cluster.scenario.shared_dir).
+	SharedDirMount string
+	// ShareServer, when set, serves the witness-dir volume from a Samba
+	// ("smb") or an NFS ("nfs") server, the share-server service at
+	// ShareServerIP, instead of keeping it on the host's disk
+	// (sharedstate_compose.go). The volume then needs no witness-init.
+	ShareServer         string
+	ShareServerImage    string
+	ShareServerIP       string
 	NodeArgsEntrypoint  string
 	GenDeferred         bool
 	ToxiproxyEnabled    bool
@@ -2264,12 +2414,43 @@ type composeVars struct {
 	AgentCommand          string
 	AgentEnv              map[string]string
 	AgentMountsSharedData bool
+	AgentMounts           []bindMount
+
+	// SubjectMounts are the subject's entries in the case's mounts: block,
+	// rendered on the singular subject and on every cluster node or replica.
+	SubjectMounts []bindMount
 
 	// TLSCertsHost is the host directory holding the auto-generated cert
 	// material for TLS-enabled runs. Empty when no generator opts into
 	// TLS; non-empty triggers the /certs bind mount on subject and
 	// generators.
 	TLSCertsHost string
+}
+
+// bindMount is one entry of a case's mounts: block, ready for the compose
+// template. Source and Target are already quoted YAML strings, so that a path
+// with a space, a colon (a Windows drive) or a quote stays one value, and a
+// "$" in Source is doubled so compose doesn't read it as a variable.
+type bindMount struct {
+	Source   string
+	Target   string
+	ReadOnly bool
+}
+
+// bindMounts turns one container's resolved mounts into template data.
+func bindMounts(mounts []config.ResolvedMount) []bindMount {
+	if len(mounts) == 0 {
+		return nil
+	}
+	out := make([]bindMount, len(mounts))
+	for i, m := range mounts {
+		out[i] = bindMount{
+			Source:   fmt.Sprintf("%q", strings.ReplaceAll(filepath.ToSlash(m.Source), "$", "$$")),
+			Target:   fmt.Sprintf("%q", strings.ReplaceAll(m.Target, "$", "$$")),
+			ReadOnly: !m.Writable,
+		}
+	}
+	return out
 }
 
 // resolveSampleHost resolves a generator's case-relative sample_file to the
@@ -2309,6 +2490,11 @@ func replicaConfigPath(tmpDir string, n int) string {
 func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 	tc := cfg.TestCase
 	s := cfg.Subject
+	// The runner resolves a case's mounts before it starts any container. A
+	// path that skipped it would start the containers without them.
+	if len(tc.Mounts) > 0 && tc.RunMounts == nil {
+		return fmt.Errorf("case %q: its mounts were not resolved for this run", tc.Name)
+	}
 	// One render instant shared by the subject config (T0Plus) and the
 	// LocalStack init script ($TODAY) so both anchor to the same clock.
 
@@ -2370,8 +2556,16 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 			}
 			node.DiskPath, node.DiskSizeBytes = disk.Path, size
 		}
-		// A node with a size-limited disk at its data folder keeps that disk
-		if cfg.SubjectDataHost != "" && node.DiskPath != cfg.SubjectDataDst {
+		if tc.Cluster != nil && tc.Cluster.Scenario != nil {
+			sc := tc.Cluster.Scenario
+			node.Image = sc.StartImage
+			if sc.NodeVolume != "" {
+				node.Volume, node.VolumePath = NodeVolumeName(i), sc.NodeVolume
+			}
+		}
+		// A node with a size-limited disk or a volume of its own at its data
+		// folder keeps it: two mounts at one path would fail the compose file
+		if cfg.SubjectDataHost != "" && node.DiskPath != cfg.SubjectDataDst && node.VolumePath != cfg.SubjectDataDst {
 			dir := filepath.Join(cfg.SubjectDataHost, node.Hostname)
 			// The node runs as a user of its own, and must write there
 			if err := os.MkdirAll(dir, 0o777); err != nil {
@@ -2414,6 +2608,12 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 		// VIP bind (`ip addr add`) needs an effective NET_ADMIN, which only root
 		// has — force root for the cluster-IP path regardless of any subject-defined
 		// user, else the bind fails with EPERM.
+		subjectUser = "0:0"
+	}
+	// Only root can mount a FUSE file system, so a privileged node starts as
+	// root. Its image's entrypoint drops root before it starts the director.
+	nodesPrivileged := tc.Cluster != nil && tc.Cluster.Scenario != nil && tc.Cluster.Scenario.NodePrivileged
+	if nodesPrivileged {
 		subjectUser = "0:0"
 	}
 
@@ -2591,6 +2791,7 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 		Subjects:          clusterNodes,
 		BenchSubnet:       benchSubnet,
 		NodesNeedNetAdmin: nodesNeedNetAdmin,
+		NodesPrivileged:   nodesPrivileged,
 		SubjectEnv:        env,
 		// Emit only the limits the caller actually set: back-filling the
 		// unset one (the old defaultStr(.., "1"/"1g") behavior) silently
@@ -2988,10 +3189,12 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 			env[k] = strings.ReplaceAll(v, "$", "$$")
 		}
 		et := endpointTpl{
-			Name:    ep.Name,
-			Image:   ep.Image,
-			Env:     env,
-			Command: formatYAMLList(cmd),
+			Name:            ep.Name,
+			Image:           ep.Image,
+			Env:             env,
+			Command:         formatYAMLList(cmd),
+			MountsSharedDir: ep.MountsSharedDir,
+			Mounts:          bindMounts(tc.RunMounts[ep.Name]),
 		}
 		if hc := ep.Healthcheck; hc != nil && hc.Test != "" {
 			et.HasHealthcheck = true
@@ -3037,7 +3240,9 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 		vars.AgentCommand = formatYAMLList(agentCmd)
 		vars.AgentEnv = agentEnv
 		vars.AgentMountsSharedData = a.MountsSharedData
+		vars.AgentMounts = bindMounts(tc.RunMounts[config.MountAgent])
 	}
+	vars.SubjectMounts = bindMounts(tc.RunMounts[config.MountSubject])
 
 	// Cluster scenario topology: witness store, Toxiproxy, one-start node
 	// arguments, deferred load (cluster_scenario_compose.go).

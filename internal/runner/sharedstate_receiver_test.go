@@ -90,6 +90,31 @@ func TestJudgeAckedStream(t *testing.T) {
 		t.Errorf("a line without a number: %v, want that failure", got)
 	}
 
+	// A case that pauses its receivers may allow pieces of lines, and no more than it says.
+	if got := judgeAckedStream(st, 1000, 1000, whole, ssStreamCounts{Received: 1001, Unique: 1000, Cut: 1}); len(got) != 1 || !strings.Contains(got[0], "above max_cut_lines 0") {
+		t.Errorf("a piece of a line where none is allowed: %v, want that failure", got)
+	}
+	cut := st
+	cut.MaxCutLines = 2
+	if got := judgeAckedStream(cut, 1000, 1000, whole, ssStreamCounts{Received: 1002, Unique: 1000, Cut: 2}); len(got) != 0 {
+		t.Errorf("two pieces where two are allowed: %v, want no failure", got)
+	}
+	if got := judgeAckedStream(cut, 1000, 1000, whole, ssStreamCounts{Received: 1003, Unique: 1000, Cut: 3}); len(got) != 1 || !strings.Contains(got[0], "above max_cut_lines 2") {
+		t.Errorf("three pieces where two are allowed: %v, want that failure", got)
+	}
+	// It forgives a piece and nothing else: a garbled line still fails.
+	if got := judgeAckedStream(cut, 1000, 1000, whole, ssStreamCounts{Received: 1001, Unique: 1000, Unparsed: 1}); len(got) != 1 || !strings.Contains(got[0], "without a record's sequence number") {
+		t.Errorf("a garbled line where pieces are allowed: %v, want that failure", got)
+	}
+	// And a record whose only trace is a piece is lost, whatever the case allows.
+	onlyAPiece := seqCheckResult{Acked: 1000, ReceivedAcked: 999, Missing: 1, Unique: 999, Cut: 1}
+	if got := judgeAckedStream(cut, 1000, 1000, onlyAPiece, ssStreamCounts{Received: 1000, Unique: 999, Cut: 1}); len(got) != 1 || !strings.Contains(got[0], "1 of the 1000 records the sender got a 2xx for never arrived, above max_loss 0") {
+		t.Errorf("a confirmed record whose only trace is a piece: %v, want it lost", got)
+	}
+	if got := judgeStream(cut, 1000, ssStreamCounts{Received: 1000, Unique: 999, Cut: 1}); len(got) != 1 || !strings.Contains(got[0], "1 records were lost, above max_loss 0") {
+		t.Errorf("a sent record whose only trace is a piece: %v, want it lost", got)
+	}
+
 	st.MaxDuplicatePct = 5
 	if got := judgeAckedStream(st, 1000, 1000, whole, ssStreamCounts{Received: 1100, Unique: 1000, Duplicates: 100}); len(got) != 1 || !strings.Contains(got[0], "above max_duplicate_pct 5.00") {
 		t.Errorf("10%% repeated with a 5%% bound: %v, want that failure", got)

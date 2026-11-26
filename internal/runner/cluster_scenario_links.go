@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os/exec"
 	"path"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -208,6 +209,7 @@ func (sr *scenarioRun) relink(n int) {
 	if err := sr.links.resync(sr.ctx, sr.containers[n-1]); err != nil {
 		sr.failures = append(sr.failures, fmt.Sprintf("could not put node %d's link faults back after its start: %v", n, err))
 	}
+	sr.reslow(n)
 }
 
 // restoreAtEnd puts every link and every disk back as it was, once the steps
@@ -234,9 +236,10 @@ func (sr *scenarioRun) restoreAtEnd(ctx context.Context) {
 		}
 		sr.notes = append(sr.notes, fmt.Sprintf("the steps left node %d's disk full, which the harness freed before the drain", n))
 	}
+	sr.restoreDisks(ctx)
 }
 
-// fillerName is the file fill_disk writes on a node's disk.
+// fillerName starts the names of the files fill_disk writes on a node's disk: .pipebench-fill.0, .1 and on.
 const fillerName = ".pipebench-fill"
 
 // diskAction runs fill_disk and free_disk.
@@ -277,28 +280,41 @@ func (sr *scenarioRun) diskAction(i int, st config.ScenarioStep, rep *scenarioSt
 		return false, fmt.Sprintf("node %d's disk has only %s free, no more than leave %s", n, fmtBytes(free), fmtBytes(leave)), nil
 	}
 	sr.disrupt(i, "fill_disk", n)
-	filler := path.Join(disk.Path, fillerName)
-	// fallocate takes the space at once; dd is for a file system without it.
-	script := fmt.Sprintf("fallocate -l %d %s 2>/dev/null || dd if=/dev/zero of=%s bs=1048576 count=%d 2>/dev/null; true",
-		size, filler, filler, size>>20)
-	if err := dockerCmd(sr.ctx, 3*time.Minute, "exec", c, "sh", "-c", script); err != nil {
-		return false, fmt.Sprintf("filling node %d's disk: %v", n, err), nil
-	}
-	sr.filled[n] = true
-	after, err := diskFree(c, disk.Path)
-	if err != nil {
-		return false, err.Error(), nil
-	}
-	if after > leave+(1<<20) {
-		return false, fmt.Sprintf("filled node %d's disk, but %s is still free (wanted %s)", n, fmtBytes(after), fmtBytes(leave)), nil
+	// The director goes on writing to the disk, and removes its own files as
+	// its records are delivered, so space can come back while the disk is
+	// filled. Each round fills what is free now, in a file of its own, until
+	// no more than leave is free.
+	var after int64
+	for round := 0; ; round++ {
+		filler := path.Join(disk.Path, fmt.Sprintf("%s.%d", fillerName, round))
+		// fallocate takes the space at once; dd is for a file system without it.
+		script := fmt.Sprintf("fallocate -l %d %s 2>/dev/null || dd if=/dev/zero of=%s bs=1048576 count=%d 2>/dev/null; true",
+			size, filler, filler, size>>20)
+		if err := dockerCmd(sr.ctx, 3*time.Minute, "exec", c, "sh", "-c", script); err != nil {
+			return false, fmt.Sprintf("filling node %d's disk: %v", n, err), nil
+		}
+		sr.filled[n] = true
+		if after, err = diskFree(c, disk.Path); err != nil {
+			return false, err.Error(), nil
+		}
+		if after <= leave+(1<<20) {
+			break
+		}
+		if round == fillRounds-1 {
+			return false, fmt.Sprintf("filled node %d's disk %d times, but %s is still free (wanted %s)", n, fillRounds, fmtBytes(after), fmtBytes(leave)), nil
+		}
+		size = after - leave
 	}
 	return true, fmt.Sprintf("filled node %d's disk: %s of %s free", n, fmtBytes(after), fmtBytes(free)), nil
 }
 
-// freeDisk removes the file fill_disk wrote on node n's disk.
+// fillRounds is how many times fill_disk fills what is free before it gives up.
+const fillRounds = 5
+
+// freeDisk removes the files fill_disk wrote on node n's disk.
 func (sr *scenarioRun) freeDisk(ctx context.Context, n int) error {
-	filler := path.Join(sr.sc.NodeDisk.Path, fillerName)
-	if err := dockerCmd(ctx, time.Minute, "exec", sr.containers[n-1], "rm", "-f", filler); err != nil {
+	fillers := path.Join(sr.sc.NodeDisk.Path, fillerName) + "*"
+	if err := dockerCmd(ctx, time.Minute, "exec", sr.containers[n-1], "sh", "-c", "rm -f "+fillers); err != nil {
 		return fmt.Errorf("freeing node %d's disk: %w", n, err)
 	}
 	delete(sr.filled, n)
@@ -435,7 +451,13 @@ func (sr *scenarioRun) checkRows() rowsCheck {
 }
 
 func (sr *scenarioRun) compareRowsOnce() rowsCheck {
-	rows, err := sr.queryRows(sr.sc.Rows.Query)
+	var rows []string
+	var err error
+	if sr.sc.Rows.File != "" {
+		rows, err = sr.fileRows(sr.sc.Rows.File, sr.sc.Rows.Key)
+	} else {
+		rows, err = sr.queryRows(sr.sc.Rows.Query)
+	}
 	if err != nil {
 		return rowsCheck{Error: err.Error()}
 	}
@@ -447,6 +469,45 @@ func (sr *scenarioRun) compareRowsOnce() rowsCheck {
 		return rowsCheck{Error: "reading the receiver's keys: " + err.Error()}
 	}
 	return compareRows(rows, keys.Keys, keys.LinesWithoutKey)
+}
+
+// fileRows reads a file of the shared directory from a node that runs, and
+// returns the key of each of its lines (cluster.scenario.rows.file). The row
+// writer has stopped by now, so the file does not change while it is read.
+func (sr *scenarioRun) fileRows(path, key string) ([]string, error) {
+	re, err := regexp.Compile(key)
+	if err != nil {
+		return nil, err
+	}
+	var lastErr error
+	for _, c := range sr.containers {
+		ctx, cancel := context.WithTimeout(sr.ctx, time.Minute)
+		out, err := exec.CommandContext(ctx, "docker", "exec", c, "cat", path).Output()
+		cancel()
+		if err != nil {
+			lastErr = fmt.Errorf("reading %s on %s: %w", path, c, err)
+			continue
+		}
+		return linesKeys(string(out), re), nil
+	}
+	return nil, lastErr
+}
+
+// linesKeys returns the key of each line of text: what re finds, or its first
+// group when it has one. A line without a key is left out.
+func linesKeys(text string, re *regexp.Regexp) []string {
+	var keys []string
+	for _, line := range strings.Split(text, "\n") {
+		m := re.FindStringSubmatch(line)
+		switch {
+		case m == nil:
+		case len(m) > 1:
+			keys = append(keys, m[1])
+		default:
+			keys = append(keys, m[0])
+		}
+	}
+	return keys
 }
 
 // queryRows runs query against the case's database and returns one value a

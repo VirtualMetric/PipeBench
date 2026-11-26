@@ -93,6 +93,10 @@ jobs:
         if: github.event_name == 'pull_request'
         run: make build-nettool
 
+      - name: Build SSH host image
+        if: github.event_name == 'pull_request'
+        run: make build-ssh-host
+
       # Main branch: build + tag with both :latest and :sha-<commit>, then push.
       - name: Build & push generator image
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -117,6 +121,10 @@ jobs:
       - name: Build & push nettool image
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: make push-nettool ATTEST=1
+
+      - name: Build & push SSH host image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: make push-ssh-host ATTEST=1
 
   emulator-smoke:
     name: Emulator Smoke (LocalStack + Azurite)

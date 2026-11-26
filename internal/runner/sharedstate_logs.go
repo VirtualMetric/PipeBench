@@ -151,8 +151,12 @@ const (
 	// ssPlaced: the leader placed a device on a member.
 	ssPlaced
 	// ssHeldBack: the replica does not start a device because the director
-	// keeps its shared state in memory.
+	// keeps its shared state in memory. Directors before 2.7.0 did this.
 	ssHeldBack
+	// ssAtRisk: the replica runs a device at risk because the director keeps
+	// its shared state in memory, and says so once for the device. Directors
+	// do this since VM-8626, in place of holding the device back.
+	ssAtRisk
 	// ssFenced: the replica's bus stopped writing its streams, because another
 	// replica took them over or a write failed for good.
 	ssFenced
@@ -168,6 +172,7 @@ var (
 	rePlacedNew     = regexp.MustCompile(`Assigned new device (\d+) \(.*\) to node (\S+)`)
 	rePlacedMove    = regexp.MustCompile(`Reassigned device (\d+) \(.*\) from \S* ?to (\S+)`)
 	reHeldBack      = regexp.MustCompile(`Device (\d+) \(.*\) does not start on this director, because the director keeps its shared state in memory`)
+	reAtRisk        = regexp.MustCompile(`Device (\d+) \(.*\) runs on this director at risk, because the director keeps its shared state in memory`)
 )
 
 // ssEvent is one thing a replica's log says happened, or one thing the
@@ -229,6 +234,9 @@ func parseSSLine(text string) (kind ssKind, device int64, member string, ok bool
 	}
 	if m := reHeldBack.FindStringSubmatch(text); m != nil {
 		return ssHeldBack, deviceOf(m), "", true
+	}
+	if m := reAtRisk.FindStringSubmatch(text); m != nil {
+		return ssAtRisk, deviceOf(m), "", true
 	}
 	return ssNone, 0, "", false
 }

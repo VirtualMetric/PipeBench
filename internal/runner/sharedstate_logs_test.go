@@ -67,6 +67,7 @@ func TestParseSSLine(t *testing.T) {
 		{"[Information] [director] Reassigned device 11 (blob-0) from subject-3-f4d7 to subject-2-47d4", ssPlaced, 11, "subject-2-47d4"},
 		{"[Information] [director] Reassigned device 11 (blob-0) from  to subject-2-47d4", ssPlaced, 11, "subject-2-47d4"},
 		{"[Warning] [director] Device 11 (blob-0) does not start on this director, because the director keeps its shared state in memory. Devices of type azblob keep their progress", ssHeldBack, 11, ""},
+		{"[Warning] [director] Device 12 (blob-1) runs on this director at risk, because the director keeps its shared state in memory. Devices of type azblob keep their progress between restarts", ssAtRisk, 12, ""},
 		{"[Warning] [director] State bus: JetStream segment store: this node can no longer write its streams; disabling JetStream", ssFenced, 0, ""},
 	}
 	for _, c := range cases {

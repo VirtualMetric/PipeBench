@@ -21,6 +21,9 @@ COLLECTOR_IMAGE := vmetric/bench-collector:latest
 KDC_IMAGE       := vmetric/bench-kdc:latest
 VERIFIER_IMAGE  := vmetric/bench-verifier:latest
 NETTOOL_IMAGE   := vmetric/bench-nettool:latest
+SHARE_SMB_IMAGE := vmetric/bench-share-smb:latest
+SHARE_NFS_IMAGE := vmetric/bench-share-nfs:latest
+SSH_HOST_IMAGE  := vmetric/bench-sshhost:latest
 
 # Set ATTEST=1 to emit SBOM + max-mode provenance (used when publishing to Docker Hub).
 # Requires the docker-container buildx driver; the default docker driver on GitHub
@@ -118,7 +121,40 @@ build-nettool:
 		--load \
 		.
 
-build-containers: build-generator build-receiver build-collector build-kdc build-verifier build-nettool
+# The SMB server of the shared-state cases that keep their share on SMB: Samba
+# on Alpine, which also loads the host kernel's cifs module.
+build-share-smb:
+	$(DOCKER_BUILD) \
+		-f containers/sharesmb/Dockerfile \
+		-t $(SHARE_SMB_IMAGE) \
+		--platform linux/amd64 \
+		--build-arg BUILDKIT_INLINE_CACHE=1 \
+		--load \
+		.
+
+# The NFS server of the shared-state cases that keep their share on NFS: the
+# kernel's NFS server, started from Alpine in a privileged container.
+build-share-nfs:
+	$(DOCKER_BUILD) \
+		-f containers/sharenfs/Dockerfile \
+		-t $(SHARE_NFS_IMAGE) \
+		--platform linux/amd64 \
+		--build-arg BUILDKIT_INLINE_CACHE=1 \
+		--load \
+		.
+
+# The SSH server of the cases that deploy an agent over SSH: OpenSSH on
+# Alpine, installed when the image is built, so a run downloads nothing.
+build-ssh-host:
+	$(DOCKER_BUILD) \
+		-f containers/sshhost/Dockerfile \
+		-t $(SSH_HOST_IMAGE) \
+		--platform linux/amd64 \
+		--build-arg BUILDKIT_INLINE_CACHE=1 \
+		--load \
+		.
+
+build-containers: build-generator build-receiver build-collector build-kdc build-verifier build-nettool build-share-smb build-share-nfs build-ssh-host
 
 # ── Publish to Docker Hub ─────────────────────────────────────────────────────
 #
@@ -192,7 +228,40 @@ push-nettool:
 		--push \
 		.
 
-push-containers: push-generator push-receiver push-collector push-kdc push-verifier push-nettool
+push-share-smb:
+	$(DOCKER_BUILD) \
+		-f containers/sharesmb/Dockerfile \
+		-t $(SHARE_SMB_IMAGE) \
+		-t vmetric/bench-share-smb:sha-$(COMMIT) \
+		--platform linux/amd64 \
+		$(ATTEST_FLAGS) \
+		--build-arg BUILDKIT_INLINE_CACHE=1 \
+		--push \
+		.
+
+push-share-nfs:
+	$(DOCKER_BUILD) \
+		-f containers/sharenfs/Dockerfile \
+		-t $(SHARE_NFS_IMAGE) \
+		-t vmetric/bench-share-nfs:sha-$(COMMIT) \
+		--platform linux/amd64 \
+		$(ATTEST_FLAGS) \
+		--build-arg BUILDKIT_INLINE_CACHE=1 \
+		--push \
+		.
+
+push-ssh-host:
+	$(DOCKER_BUILD) \
+		-f containers/sshhost/Dockerfile \
+		-t $(SSH_HOST_IMAGE) \
+		-t vmetric/bench-sshhost:sha-$(COMMIT) \
+		--platform linux/amd64 \
+		$(ATTEST_FLAGS) \
+		--build-arg BUILDKIT_INLINE_CACHE=1 \
+		--push \
+		.
+
+push-containers: push-generator push-receiver push-collector push-kdc push-verifier push-nettool push-share-smb push-share-nfs push-ssh-host
 
 # ── End-to-end test ───────────────────────────────────────────────────────────
 
