@@ -26,7 +26,9 @@ package main
 // line that arrives again is then one of two things. A copy of a try that
 // arrived before is a **repeat**: the subject delivered the same line twice.
 // A try that had not arrived before is a **resend**: the client sent the line
-// again, because it got no answer, and the subject took both posts. Without
+// again, because the subject did not confirm the first post, and the subject
+// took both. The subject may not have answered, or may have answered with an
+// error such as 503 while it kept the records. Without
 // marks, a duplicate is neither, and only the total counts.
 //
 // /timeline counts arrivals in 100 ms buckets, which shows when delivery

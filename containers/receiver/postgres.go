@@ -69,20 +69,34 @@ func receivePostgres(cfg config, cnt *counters, _ *validator) error {
 }
 
 // readPostgres runs the query and answers its rows, each as a part of its own
-// with the time its text was first seen.
+// with the time its text was first seen (postgresParts).
 func readPostgres(ctx context.Context, conn *pgx.Conn, query string, seen map[uint64]int64) ([]snapshotPart, error) {
 	rows, err := conn.Query(ctx, query)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	now := time.Now().UnixNano()
-	var parts []snapshotPart
+	var texts []*string
 	for rows.Next() {
 		var text *string
 		if err := rows.Scan(&text); err != nil {
 			return nil, err
 		}
+		texts = append(texts, text)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return postgresParts(texts, seen, time.Now().UnixNano()), nil
+}
+
+// postgresParts makes a part of each row's text, with its lines, and leaves out
+// a NULL. A row keeps the time its text was first seen, by a hash of the text,
+// in seen: now for a text that no poll saw before. So a row that the table holds
+// twice is two parts with the time of the first.
+func postgresParts(texts []*string, seen map[uint64]int64, now int64) []snapshotPart {
+	var parts []snapshotPart
+	for _, text := range texts {
 		if text == nil {
 			continue
 		}
@@ -96,5 +110,5 @@ func readPostgres(ctx context.Context, conn *pgx.Conn, query string, seen map[ui
 		}
 		parts = append(parts, snapshotPart{seen: at, lines: valueLines([][]byte{[]byte(*text)}, true)})
 	}
-	return parts, rows.Err()
+	return parts
 }

@@ -728,3 +728,60 @@ func TestWaitRoundAfterCountsOnlyALaterRound(t *testing.T) {
 		t.Fatalf("waitRoundAfter refused a round that began after the time it waits from (ok %v, err %v)", ok, err)
 	}
 }
+
+// TestDrainSeqCheckCountsLateRepeats checks that a drain of lines with try marks
+// goes on once nothing is missing, until the duplicates stop changing: a repeat
+// that arrives after the last acknowledged line still counts. A drain of
+// unmarked lines stops at once, as before.
+func TestDrainSeqCheckCountsLateRepeats(t *testing.T) {
+	start := time.Now()
+	read := func() (seqCheckResult, error) {
+		c := seqCheckResult{Missing: 0, ReceivedAcked: 100, TriesMarked: true}
+		switch since := time.Since(start); {
+		case since >= 100*time.Millisecond:
+			c.Duplicates, c.Repeats = 30, 30
+		case since >= 50*time.Millisecond:
+			c.Duplicates, c.Repeats = 10, 10
+		}
+		return c, nil
+	}
+	c, checked, err := drainSeqCheck(context.Background(), read, time.Now().Add(time.Minute), 150*time.Millisecond, 5*time.Millisecond)
+	if !checked || err != nil || c.Repeats != 30 {
+		t.Fatalf("drain = %+v %v %v, want the 30 repeats that came after the last acknowledged line", c, checked, err)
+	}
+
+	unmarked, calls := seqCheckResult{Missing: 0, ReceivedAcked: 100}, 0
+	c, _, _ = drainSeqCheck(context.Background(), func() (seqCheckResult, error) { calls++; return unmarked, nil },
+		time.Now().Add(time.Minute), time.Minute, time.Millisecond)
+	if calls != 1 || c.Duplicates != 0 {
+		t.Fatalf("a drain of unmarked lines read %d times, want 1", calls)
+	}
+}
+
+// TestTheCaseReportsTheRepeatsOfTheReceiverThatRepeatedMost checks the summary:
+// the case's repeats come from the receiver that repeated the most, not from the
+// one that missed the most.
+func TestTheCaseReportsTheRepeatsOfTheReceiverThatRepeatedMost(t *testing.T) {
+	rep := scenarioReport{
+		SeqCheck: &seqCheckResult{Missing: 2, Repeats: 560, TriesMarked: true},
+		Receivers: []receiverResult{
+			{ID: "tcp", Missing: 2, Repeats: 560, Resends: 0, TriesMarked: true},
+			{ID: "http", Missing: 0, Repeats: 900, Resends: 7, TriesMarked: true},
+		},
+	}
+	out := rep.summary()
+	if out["repeats"] != int64(900) || out["resends"] != int64(7) {
+		t.Errorf("repeats %v, resends %v; want 900 and 7, the receiver that repeated the most", out["repeats"], out["resends"])
+	}
+	if out["repeats_tcp"] != int64(560) || out["repeats_http"] != int64(900) {
+		t.Errorf("per receiver: %v %v", out["repeats_tcp"], out["repeats_http"])
+	}
+	single := scenarioReport{SeqCheck: &seqCheckResult{Repeats: 4, Resends: 1, TriesMarked: true}}
+	if out := single.summary(); out["repeats"] != int64(4) {
+		t.Errorf("one receiver: %v", out["repeats"])
+	}
+	none := scenarioReport{SeqCheck: &seqCheckResult{Repeats: 0}}
+	if _, ok := none.summary()["repeats"]; ok {
+		t.Error("lines without marks report no repeats")
+	}
+}

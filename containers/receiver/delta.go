@@ -136,6 +136,8 @@ func newDeltaTable(store deltaStore, column string) *deltaTable {
 type deltaAction struct {
 	Add *struct {
 		Path string `json:"path"`
+		// DeletionVector marks rows of the file that the table no longer holds
+		DeletionVector json.RawMessage `json:"deletionVector"`
 	} `json:"add"`
 	Remove *struct {
 		Path string `json:"path"`
@@ -192,6 +194,11 @@ func (d *deltaTable) apply(commit []byte) error {
 			return fmt.Errorf("a line of the log is not JSON: %w", err)
 		}
 		if a.Add != nil {
+			// The receiver reads every row of a file, so the rows that a deletion
+			// vector removed would count as repeats: it refuses such a table
+			if dv := bytes.TrimSpace(a.Add.DeletionVector); len(dv) > 0 && !bytes.Equal(dv, []byte("null")) {
+				return fmt.Errorf("the file %s has a deletion vector, which this receiver does not read: turn the table's deletion vectors off", a.Add.Path)
+			}
 			d.active[a.Add.Path] = true
 		}
 		if a.Remove != nil {

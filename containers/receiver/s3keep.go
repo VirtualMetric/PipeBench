@@ -23,72 +23,126 @@ import (
 // second object.
 //
 // Each poll lists the bucket, and reads an object that is new or whose ETag
-// changed since the last poll.
+// changed since the last poll (keptObjects.poll).
 func receiveS3Kept(client *s3.Client, bucket, prefix string, cfg config, cnt *counters) error {
 	snap := newSnapshotTracker(seqTrack, cfg.LatencySampleEvery, cnt.newShard())
 	bytesPerLine := int64(getEnvInt("RECEIVER_S3_BYTES_PER_LINE", 256))
-	type kept struct {
-		etag string
-		part snapshotPart
-	}
-	objects := map[string]*kept{}
+	kept := newKeptObjects(s3Objects{client: client, bucket: bucket, prefix: prefix})
 	fmt.Fprintf(os.Stderr, "receiver: s3: keeping the objects of bucket=%q prefix=%q, and counting what the bucket holds\n", bucket, prefix)
 	return pollLoop("s3", cloudPollInterval(), func(ctx context.Context) error {
-		now := time.Now().UnixNano()
-		listed := map[string]bool{}
-		var continuation *string
-		for {
-			out, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-				Bucket:            aws.String(bucket),
-				Prefix:            aws.String(prefix),
-				ContinuationToken: continuation,
-			})
-			if err != nil {
-				return fmt.Errorf("list objects: %w", err)
-			}
-			for _, obj := range out.Contents {
-				key, etag := aws.ToString(obj.Key), aws.ToString(obj.ETag)
-				listed[key] = true
-				if k, ok := objects[key]; ok && k.etag == etag {
-					continue
-				}
-				get, err := client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: obj.Key})
-				if err != nil {
-					return fmt.Errorf("get object %s: %w", key, err)
-				}
-				body, err := io.ReadAll(get.Body)
-				get.Body.Close()
-				if err != nil {
-					return fmt.Errorf("read object %s: %w", key, err)
-				}
-				lines, err := bodyLines(body)
-				if err != nil {
-					return fmt.Errorf("decode object %s: %w", key, err)
-				}
-				// A record of several lines written as JSON holds them escaped
-				lines = valueLines(lines, true)
-				seen := now
-				if k, ok := objects[key]; ok {
-					seen = k.part.seen
-				}
-				objects[key] = &kept{etag: etag, part: snapshotPart{name: key, seen: seen, lines: lines}}
-			}
-			if out.IsTruncated == nil || !*out.IsTruncated {
-				break
-			}
-			continuation = out.NextContinuationToken
-		}
-		parts := make([]snapshotPart, 0, len(objects))
-		for key, k := range objects {
-			if !listed[key] {
-				delete(objects, key)
-				continue
-			}
-			parts = append(parts, k.part)
+		parts, err := kept.poll(ctx, time.Now().UnixNano())
+		if err != nil {
+			return err
 		}
 		snap.rebuild(parts, bytesPerLine)
 		return nil
 	})
+}
+
+// objectInfo is a listed object: its key and its ETag.
+type objectInfo struct {
+	key, etag string
+}
+
+// objectStore lists a bucket's objects and reads one.
+type objectStore interface {
+	list(ctx context.Context) ([]objectInfo, error)
+	get(ctx context.Context, key string) ([]byte, error)
+}
+
+// s3Objects is an objectStore of an S3 bucket, below a prefix.
+type s3Objects struct {
+	client         *s3.Client
+	bucket, prefix string
+}
+
+func (o s3Objects) list(ctx context.Context) ([]objectInfo, error) {
+	var out []objectInfo
+	var continuation *string
+	for {
+		page, err := o.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(o.bucket),
+			Prefix:            aws.String(o.prefix),
+			ContinuationToken: continuation,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("list objects: %w", err)
+		}
+		for _, obj := range page.Contents {
+			out = append(out, objectInfo{key: aws.ToString(obj.Key), etag: aws.ToString(obj.ETag)})
+		}
+		if page.IsTruncated == nil || !*page.IsTruncated {
+			return out, nil
+		}
+		continuation = page.NextContinuationToken
+	}
+}
+
+func (o s3Objects) get(ctx context.Context, key string) ([]byte, error) {
+	get, err := o.client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(o.bucket), Key: aws.String(key)})
+	if err != nil {
+		return nil, fmt.Errorf("get object %s: %w", key, err)
+	}
+	defer get.Body.Close()
+	return io.ReadAll(get.Body)
+}
+
+// keptObjects keeps the lines of each object that a bucket holds, by its key.
+type keptObjects struct {
+	store   objectStore
+	objects map[string]*keptObject
+}
+
+// keptObject is an object's ETag, and its lines with the time it was first seen.
+type keptObject struct {
+	etag string
+	part snapshotPart
+}
+
+func newKeptObjects(store objectStore) *keptObjects {
+	return &keptObjects{store: store, objects: map[string]*keptObject{}}
+}
+
+// poll lists the bucket, reads each object that is new or whose ETag changed,
+// forgets the objects that are gone, and answers the lines of every object the
+// bucket holds. An object written again keeps the time it was first seen, and
+// its new lines replace its old ones.
+func (k *keptObjects) poll(ctx context.Context, now int64) ([]snapshotPart, error) {
+	listed, err := k.store.list(ctx)
+	if err != nil {
+		return nil, err
+	}
+	there := make(map[string]bool, len(listed))
+	for _, obj := range listed {
+		there[obj.key] = true
+		if old, ok := k.objects[obj.key]; ok && old.etag == obj.etag {
+			continue
+		}
+		body, err := k.store.get(ctx, obj.key)
+		if err != nil {
+			return nil, err
+		}
+		lines, err := bodyLines(body)
+		if err != nil {
+			return nil, fmt.Errorf("decode object %s: %w", obj.key, err)
+		}
+		// A record of several lines written as JSON holds them escaped
+		lines = valueLines(lines, true)
+		seen := now
+		if old, ok := k.objects[obj.key]; ok {
+			seen = old.part.seen
+		}
+		k.objects[obj.key] = &keptObject{etag: obj.etag, part: snapshotPart{name: obj.key, seen: seen, lines: lines}}
+	}
+	parts := make([]snapshotPart, 0, len(k.objects))
+	for key, obj := range k.objects {
+		if !there[key] {
+			delete(k.objects, key)
+			continue
+		}
+		parts = append(parts, obj.part)
+	}
+	return parts, nil
 }
 
 // bodyLines splits an object's body into its lines, as countBody does: gzip

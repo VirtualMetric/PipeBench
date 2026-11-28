@@ -20,14 +20,7 @@ import (
 func receiveKafka(cfg config, cnt *counters, val *validator) error {
 	brokers := strings.Split(getEnv("RECEIVER_KAFKA_BROKERS", "kafka:9092"), ",")
 	topic := getEnv("RECEIVER_KAFKA_TOPIC", "events")
-	client, err := kgo.NewClient(
-		kgo.SeedBrokers(brokers...),
-		kgo.ConsumeTopics(topic),
-		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
-		// The subject may make the topic itself, after the receiver starts
-		kgo.AllowAutoTopicCreation(),
-		kgo.MetadataMinAge(time.Second),
-	)
+	client, err := kgo.NewClient(kafkaOptions(brokers, topic)...)
 	if err != nil {
 		return err
 	}
@@ -39,12 +32,33 @@ func receiveKafka(cfg config, cnt *counters, val *validator) error {
 		fetches.EachError(func(t string, p int32, err error) {
 			fmt.Fprintf(os.Stderr, "receiver: kafka: %s/%d: %v\n", t, p, err)
 		})
-		fetches.EachRecord(func(r *kgo.Record) {
-			for line := range bytes.SplitSeq(r.Value, []byte{'\n'}) {
-				if len(bytes.TrimSpace(line)) > 0 {
-					onLine(line)
-				}
-			}
-		})
+		fetches.EachRecord(func(r *kgo.Record) { kafkaRecordLines(r, onLine) })
+	}
+}
+
+// kafkaOptions are the client options of the kafka mode. It reads committed
+// records only: a producer with transactions sends a batch again after it
+// aborted the first try, and the records of an aborted transaction are not the
+// topic's. Read uncommitted, they would count as arrived, and the batch sent
+// again as a repeat.
+func kafkaOptions(brokers []string, topic string) []kgo.Opt {
+	return []kgo.Opt{
+		kgo.SeedBrokers(brokers...),
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.FetchIsolationLevel(kgo.ReadCommitted()),
+		// The subject may make the topic itself, after the receiver starts
+		kgo.AllowAutoTopicCreation(),
+		kgo.MetadataMinAge(time.Second),
+	}
+}
+
+// kafkaRecordLines hands onLine each line of a record's value, and leaves out
+// blank lines. A record can hold several lines, as one record of a post does.
+func kafkaRecordLines(r *kgo.Record, onLine func([]byte)) {
+	for line := range bytes.SplitSeq(r.Value, []byte{'\n'}) {
+		if len(bytes.TrimSpace(line)) > 0 {
+			onLine(line)
+		}
 	}
 }

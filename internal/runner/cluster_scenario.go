@@ -2147,9 +2147,12 @@ func (rep scenarioReport) summary() map[string]any {
 			out["resends_"+rr.ID] = rr.Resends
 		}
 	}
-	if rep.SeqCheck != nil && rep.SeqCheck.TriesMarked {
-		out["repeats"] = rep.SeqCheck.Repeats
-		out["resends"] = rep.SeqCheck.Resends
+	// The case's repeats and resends are those of the receiver that repeated the
+	// most: rep.SeqCheck is the receiver that missed the most, which may have
+	// repeated fewer
+	if repeats, resends, marked := mostRepeats(rep); marked {
+		out["repeats"] = repeats
+		out["resends"] = resends
 	}
 	for k, v := range rep.Measures {
 		out["ms_"+k] = v
@@ -2708,6 +2711,28 @@ func receiverVerdict(rs []receiverResult, ex config.ScenarioExpect) []string {
 	return reasons
 }
 
+// mostRepeats answers the repeats and the resends of the receiver whose lines
+// the subject repeated the most, and whether any receiver's lines carried try
+// marks. A case with one receiver answers that receiver's.
+func mostRepeats(rep scenarioReport) (repeats, resends int64, marked bool) {
+	if len(rep.Receivers) == 0 {
+		if rep.SeqCheck == nil || !rep.SeqCheck.TriesMarked {
+			return 0, 0, false
+		}
+		return rep.SeqCheck.Repeats, rep.SeqCheck.Resends, true
+	}
+	for _, r := range rep.Receivers {
+		if !r.TriesMarked {
+			continue
+		}
+		if !marked || r.Repeats > repeats {
+			repeats, resends = r.Repeats, r.Resends
+		}
+		marked = true
+	}
+	return repeats, resends, marked
+}
+
 // repeatVerdict judges max_repeats at one receiver. Without marked tries the
 // receiver can not tell a repeat from a resend, so the limit fails rather than
 // pass on a count of 0 that nobody took. So does a duplicate whose copy lost its
@@ -2953,15 +2978,32 @@ func withoutLoadVerdict(rep scenarioReport, ex config.ScenarioExpect, dedup bool
 // quiet, or until deadline. It returns the last check that succeeded.
 // checked is false when no read succeeded at all, and err is then the last
 // error. The loss of such a run is unknown, not zero.
+//
+// When the lines carry try marks, the case counts the subject's repeats, and a
+// repeat can arrive after the last acknowledged line has: a retry stream that
+// waits, or a receiver that reads its destination once a poll. So then the
+// drain goes on once nothing is missing, until the count of duplicates has not
+// changed for quiet either.
 func drainSeqCheck(ctx context.Context, read func() (seqCheckResult, error), deadline time.Time, quiet, poll time.Duration) (check seqCheckResult, checked bool, err error) {
 	var lastReceived int64 = -1
 	quietSince := time.Now()
+	var lastDuplicates int64 = -1
+	var duplicatesSince time.Time
 	for {
 		c, readErr := read()
 		if readErr == nil {
 			check, checked = c, true
 			if c.Missing == 0 {
-				return check, true, nil
+				if !c.TriesMarked {
+					return check, true, nil
+				}
+				if c.Duplicates != lastDuplicates {
+					lastDuplicates, duplicatesSince = c.Duplicates, time.Now()
+				} else if time.Since(duplicatesSince) > quiet {
+					return check, true, nil
+				}
+			} else {
+				lastDuplicates = -1
 			}
 			if c.ReceivedAcked != lastReceived {
 				lastReceived = c.ReceivedAcked

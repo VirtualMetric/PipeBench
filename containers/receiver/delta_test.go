@@ -187,3 +187,23 @@ func TestAValueOfSeveralLinesCountsEachLine(t *testing.T) {
 		t.Errorf("plain: %q", got)
 	}
 }
+
+// A table whose files carry deletion vectors is refused: the receiver reads every
+// row of a file, so the rows a vector removed would count as repeats.
+func TestTheDeltaReceiverRefusesDeletionVectors(t *testing.T) {
+	table := t.TempDir()
+	writeDataFile(t, table, "a.parquet", "CONN=0 SEQ=0 TS=1 x")
+	writeCommit(t, table, 0, `{"add":{"path":"a.parquet","size":1,"dataChange":true,"deletionVector":{"storageType":"i","pathOrInlineDv":"wi5b=000010000siXQKl0rr91000f$1d6mu","offset":1,"sizeInBytes":36,"cardinality":1}}}`)
+	err := newDeltaTable(dirStore(table), "message").poll()
+	if err == nil || !strings.Contains(err.Error(), "deletion vector") {
+		t.Fatalf("poll: %v", err)
+	}
+
+	// An add whose vector is null is an add of every row
+	other := t.TempDir()
+	writeDataFile(t, other, "a.parquet", "CONN=0 SEQ=0 TS=1 x")
+	writeCommit(t, other, 0, `{"add":{"path":"a.parquet","size":1,"dataChange":true,"deletionVector":null}}`)
+	if err := newDeltaTable(dirStore(other), "message").poll(); err != nil {
+		t.Fatalf("poll of a null vector: %v", err)
+	}
+}
