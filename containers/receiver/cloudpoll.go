@@ -33,6 +33,8 @@ func newCloudOnLine(cnt *counters, val *validator, cfg config) func([]byte) {
 		if needsValidation {
 			val.recordLine(line, cfg)
 		}
+		// The sequence tracker hears of the line too, when RECEIVER_TRACK_SEQ is on
+		trackSeq(line)
 	}
 }
 

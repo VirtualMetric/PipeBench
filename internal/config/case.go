@@ -3035,7 +3035,7 @@ type ReceiverConfig struct {
 	// `receivers:`; ignored for the singular `receiver:` form (the
 	// container is always `bench-receiver` there).
 	ID     string `yaml:"id"`
-	Mode   string `yaml:"mode"`   // "tcp" | "file" | "http" | "otlp" | "s3" | "azure_blob" | "sqs" | "kinesis" | "cloudwatch"
+	Mode   string `yaml:"mode"`   // "tcp" | "file" | "http" | "otlp" | "s3" | "azure_blob" | "sqs" | "kinesis" | "cloudwatch" | "delta" | "postgres" | "kafka"
 	Listen string `yaml:"listen"` // ":9001" or file path
 	// Env is mode-specific extra env passed straight through to the
 	// receiver container (e.g. RECEIVER_S3_BUCKET=bench-out), mirroring

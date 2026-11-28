@@ -191,6 +191,9 @@ type seqCheckResult struct {
 	Extra          int64    `json:"extra"`
 	Unique         int64    `json:"unique"`
 	Duplicates     int64    `json:"duplicates"`
+	Repeats        int64    `json:"repeats"`
+	Resends        int64    `json:"resends"`
+	TriesMarked    bool     `json:"tries_marked"`
 	Unparsed       int64    `json:"unparsed"`
 	Cut            int64    `json:"cut"`
 	UnexpectedConn []string `json:"unexpected_conns,omitempty"`
@@ -2139,6 +2142,14 @@ func (rep scenarioReport) summary() map[string]any {
 	for _, rr := range rep.Receivers {
 		out["missing_"+rr.ID] = rr.Missing
 		out["duplicates_"+rr.ID] = rr.Duplicates
+		if rr.TriesMarked {
+			out["repeats_"+rr.ID] = rr.Repeats
+			out["resends_"+rr.ID] = rr.Resends
+		}
+	}
+	if rep.SeqCheck != nil && rep.SeqCheck.TriesMarked {
+		out["repeats"] = rep.SeqCheck.Repeats
+		out["resends"] = rep.SeqCheck.Resends
 	}
 	for k, v := range rep.Measures {
 		out["ms_"+k] = v
@@ -2499,6 +2510,9 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 		if ex.MaxDuplicates != nil && rep.Duplicates > *ex.MaxDuplicates {
 			v.reasons = append(v.reasons, fmt.Sprintf("%d lines arrived more than once (max_duplicates %d)", rep.Duplicates, *ex.MaxDuplicates))
 		}
+		if len(recvResults) == 1 {
+			v.reasons = append(v.reasons, repeatVerdict(recvResults[0], ex.MaxRepeats)...)
+		}
 	}
 	if ex.MaxSplitBrainMs != nil && rep.Leadership.SplitBrainMs > *ex.MaxSplitBrainMs {
 		v.reasons = append(v.reasons, fmt.Sprintf("two nodes named themselves the leader for %s (max_split_brain_ms %d)",
@@ -2582,14 +2596,20 @@ type receiverResult struct {
 	ID string `json:"id"`
 	// Checked is false when the receiver never answered the sequence check,
 	// so that its loss is unknown.
-	Checked    bool            `json:"checked"`
-	Received   int64           `json:"received"`
-	CutLines   int64           `json:"cut_lines"`
-	Unique     int64           `json:"unique"`
-	Missing    int64           `json:"missing"`
-	Duplicates int64           `json:"duplicates"`
-	Extra      int64           `json:"extra"`
-	SeqCheck   *seqCheckResult `json:"seqcheck,omitempty"`
+	Checked    bool  `json:"checked"`
+	Received   int64 `json:"received"`
+	CutLines   int64 `json:"cut_lines"`
+	Unique     int64 `json:"unique"`
+	Missing    int64 `json:"missing"`
+	Duplicates int64 `json:"duplicates"`
+	Extra      int64 `json:"extra"`
+	// Repeats are the duplicates that the subject delivered twice, and
+	// Resends those that the client sent again, when the generator marks its
+	// tries (TriesMarked). Without marks, both are 0.
+	Repeats     int64           `json:"repeats"`
+	Resends     int64           `json:"resends"`
+	TriesMarked bool            `json:"tries_marked"`
+	SeqCheck    *seqCheckResult `json:"seqcheck,omitempty"`
 	// DuplicateRanges groups the lines that arrived at this receiver twice.
 	DuplicateRanges []duplicateRange `json:"duplicate_ranges,omitempty"`
 }
@@ -2613,7 +2633,8 @@ func (sr *scenarioRun) checkReceiver(rc scenarioReceiver, acked map[string]int64
 		return receiverResult{}, fmt.Errorf("interrupted: %w", sr.ctx.Err())
 	}
 	res := receiverResult{ID: rc.ID, Checked: checked, SeqCheck: &check,
-		Unique: check.Unique, Missing: check.Missing, Duplicates: check.Duplicates, Extra: check.Extra, CutLines: check.Cut}
+		Unique: check.Unique, Missing: check.Missing, Duplicates: check.Duplicates, Extra: check.Extra, CutLines: check.Cut,
+		Repeats: check.Repeats, Resends: check.Resends, TriesMarked: check.TriesMarked}
 	if !checked {
 		sr.failures = append(sr.failures, fmt.Sprintf("%s never answered the sequence check, so loss is unknown: %v", rc.describe(), err))
 	}
@@ -2626,6 +2647,9 @@ func (sr *scenarioRun) checkReceiver(rc scenarioReceiver, acked map[string]int64
 	}
 	fmt.Printf("  delivery%s: %d acknowledged, %d of them arrived, %d missing, %d duplicates, %d extra, %d cut lines\n",
 		at, check.Acked, check.ReceivedAcked, check.Missing, check.Duplicates, check.Extra, check.Cut)
+	if check.TriesMarked {
+		fmt.Printf("    of the duplicates%s, %d are the subject's repeats and %d the client's resends\n", at, check.Repeats, check.Resends)
+	}
 	for conn, cc := range check.Conns {
 		if cc.Missing > 0 {
 			fmt.Printf("    conn %s: missing %d, first ranges %v\n", conn, cc.Missing, cc.MissingRanges)
@@ -2679,8 +2703,31 @@ func receiverVerdict(rs []receiverResult, ex config.ScenarioExpect) []string {
 		if maxDuplicates != nil && r.Duplicates > *maxDuplicates {
 			reasons = append(reasons, fmt.Sprintf("%d lines arrived at receiver %s more than once (max_duplicates %d)", r.Duplicates, r.ID, *maxDuplicates))
 		}
+		reasons = append(reasons, repeatVerdict(r, ex.ReceiverRepeatLimit(r.ID))...)
 	}
 	return reasons
+}
+
+// repeatVerdict judges max_repeats at one receiver. Without marked tries the
+// receiver can not tell a repeat from a resend, so the limit fails rather than
+// pass on a count of 0 that nobody took.
+func repeatVerdict(r receiverResult, maxRepeats *int64) []string {
+	if maxRepeats == nil {
+		return nil
+	}
+	name := "the receiver"
+	if r.ID != "" {
+		name = "receiver " + r.ID
+	}
+	switch {
+	case !r.Checked:
+		return []string{fmt.Sprintf("%s never answered the sequence check, so max_repeats was not checked", name)}
+	case !r.TriesMarked:
+		return []string{fmt.Sprintf("no line at %s carried a try mark, so max_repeats was not checked: the generator needs GENERATOR_MARK_TRIES", name)}
+	case r.Repeats > *maxRepeats:
+		return []string{fmt.Sprintf("the subject delivered %d lines to %s more than once (max_repeats %d)", r.Repeats, name, *maxRepeats)}
+	}
+	return nil
 }
 
 // nodeLogText returns a node container's whole log. A variable, so that tests can

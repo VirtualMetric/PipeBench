@@ -633,6 +633,12 @@ func main() {
 		err = receiveKinesis(cfg, cnt, val)
 	case "cloudwatch":
 		err = receiveCloudWatch(cfg, cnt, val)
+	case "delta":
+		err = receiveDelta(cfg, cnt, val)
+	case "postgres":
+		err = receivePostgres(cfg, cnt, val)
+	case "kafka":
+		err = receiveKafka(cfg, cnt, val)
 	default:
 		fmt.Fprintf(os.Stderr, "receiver: unknown mode %q\n", cfg.Mode)
 		os.Exit(1)

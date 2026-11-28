@@ -103,7 +103,7 @@ func writeAWSInit(path string, aws *config.AWSConfig, now time.Time) error {
 // whichever is set wins.
 func cloudEnvForMode(mode string, awsEnv, minioEnv, azureEnv map[string]string) map[string]string {
 	switch mode {
-	case "s3":
+	case "s3", "delta":
 		if awsEnv != nil {
 			return awsEnv
 		}

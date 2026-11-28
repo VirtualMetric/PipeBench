@@ -12,6 +12,13 @@ package main
 // 2xx) is sent again, byte for byte, to the next target. The receiver can
 // then tell a re-sent line from a new one, and count it as a duplicate.
 //
+// With GENERATOR_MARK_TRIES, each line also carries " TRY=<k>" after TS: 1 in
+// the first post of its batch, 2 in the next one, and so on, up to 63. A post
+// sent again is then not byte for byte the same. The receiver can tell a line
+// that the client sent again from a line that the subject delivered twice: a
+// copy of the same try is the subject's repeat, another try is the client's
+// resend. A try past 63 keeps the mark 63.
+//
 // TS is the time the batch was first posted. A retried batch keeps it, so the
 // latency the receiver measures includes the time the client spent retrying,
 // as a real client would see it.
@@ -76,6 +83,8 @@ type ackConfig struct {
 	drain       time.Duration
 	contentType string
 	progress    time.Duration
+	// markTries writes each post's try into its lines (GENERATOR_MARK_TRIES).
+	markTries bool
 	// steps are GENERATOR_STEPS, and stepWarmup the part of each step that its numbers leave out
 	// (steps.go). stepsErr says why GENERATOR_STEPS could not be read.
 	steps      []stepSpec
@@ -101,6 +110,7 @@ func loadAckConfig(cfg config) ackConfig {
 		maxCooldown: envDuration("GENERATOR_TARGET_COOLDOWN_MAX", 10*time.Second),
 		drain:       envDuration("GENERATOR_DRAIN_TIMEOUT", 60*time.Second),
 		contentType: getEnv("GENERATOR_HTTP_CONTENT_TYPE", "text/plain"),
+		markTries:   strings.EqualFold(getEnv("GENERATOR_MARK_TRIES", "false"), "true"),
 		progress:    envDuration("GENERATOR_PROGRESS_INTERVAL", time.Second),
 		stepWarmup:  envDuration("GENERATOR_STEP_WARMUP", 20*time.Second),
 		receiver:    strings.TrimRight(os.Getenv("GENERATOR_RECEIVER_METRICS"), "/"),
@@ -289,8 +299,10 @@ func (s *ackStats) noteAck(conn int, target string, lines int, bytesN int, now i
 	s.mu.Unlock()
 }
 
-// buildAckLine writes one line: "CONN=<id> SEQ=<n> TS=<ns> <padding>".
-func buildAckLine(buf *bytes.Buffer, conn int, seq, tsNs int64, size int, pad string) {
+// buildAckLine writes one line: "CONN=<id> SEQ=<n> TS=<ns> <padding>", or
+// "CONN=<id> SEQ=<n> TS=<ns> TRY=<k> <padding>" when try is 1 or more. The
+// line keeps its size either way: the mark takes the place of padding.
+func buildAckLine(buf *bytes.Buffer, conn int, seq, tsNs int64, size int, pad string, try int) {
 	start := buf.Len()
 	buf.WriteString("CONN=")
 	buf.WriteString(strconv.Itoa(conn))
@@ -298,6 +310,10 @@ func buildAckLine(buf *bytes.Buffer, conn int, seq, tsNs int64, size int, pad st
 	buf.WriteString(strconv.FormatInt(seq, 10))
 	buf.WriteString(" TS=")
 	buf.WriteString(strconv.FormatInt(tsNs, 10))
+	if try > 0 {
+		buf.WriteString(" TRY=")
+		buf.WriteString(strconv.Itoa(min(try, 63)))
+	}
 	buf.WriteByte(' ')
 	if rest := size - (buf.Len() - start); rest > 0 {
 		if rest > len(pad) {
@@ -461,20 +477,31 @@ func newAckSlot(conn int, ac ackConfig) *ackSlot {
 func (sl *ackSlot) send(cfg config, ac ackConfig, stats *ackStats, picker *targetPicker,
 	clock *sendClock, pads []string, ts int64, hardStop time.Time,
 ) (time.Time, bool) {
-	sl.buf.Reset()
-	for i := range ac.batch {
-		if i > 0 {
-			sl.buf.WriteByte('\n')
+	build := func(try int) []byte {
+		sl.buf.Reset()
+		for i := range ac.batch {
+			if i > 0 {
+				sl.buf.WriteByte('\n')
+			}
+			seq := sl.seq + int64(i)
+			buildAckLine(&sl.buf, sl.conn, seq, ts, cfg.LineSize, pads[seq%int64(len(pads))], try)
 		}
-		seq := sl.seq + int64(i)
-		buildAckLine(&sl.buf, sl.conn, seq, ts, cfg.LineSize, pads[seq%int64(len(pads))])
+		return append([]byte(nil), sl.buf.Bytes()...)
 	}
-	body := append([]byte(nil), sl.buf.Bytes()...)
+	try := 0
+	if ac.markTries {
+		try = 1
+	}
+	body := build(try)
 	stats.pending.Add(int64(ac.batch))
 	defer stats.pending.Add(-int64(ac.batch))
 
 	fresh := true
-	for {
+	for attempt := 0; ; attempt++ {
+		if ac.markTries && attempt > 0 {
+			try++
+			body = build(try)
+		}
 		now := time.Now()
 		if now.After(hardStop) {
 			stats.unacked.Add(int64(ac.batch))

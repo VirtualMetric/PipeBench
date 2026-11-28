@@ -248,3 +248,63 @@ func TestAckProgressLineCountsEachTarget(t *testing.T) {
 		t.Fatalf("progress line\n got %q\nwant %q", line, want)
 	}
 }
+
+// TestAMarkedTryNamesEachPostOfABatch checks GENERATOR_MARK_TRIES: each post of
+// a batch carries its try, 1 for the first and one more for each post after it,
+// and a line keeps its size. Without the mark, a post sent again is the same
+// bytes (TestHTTPAckFailsOverAndResendsSameBytes).
+func TestAMarkedTryNamesEachPostOfABatch(t *testing.T) {
+	tryRE := regexp.MustCompile(`^CONN=(\d+) SEQ=(\d+) TS=(\d+) TRY=(\d+) `)
+	var mu sync.Mutex
+	tries := map[string][]string{} // "conn/seq" -> the try of each post that carried it, in order
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		n := calls.Add(1)
+		mu.Lock()
+		for _, l := range bytes.Split(body, []byte("\n")) {
+			m := tryRE.FindSubmatch(l)
+			if m == nil || len(l) != 72 {
+				t.Errorf("a line without its try mark, or of another size: %q", l)
+				continue
+			}
+			k := string(m[1]) + "/" + string(m[2])
+			tries[k] = append(tries[k], string(m[4]))
+		}
+		mu.Unlock()
+		// Refuse two posts of every three, so that each batch takes three tries
+		if n%3 != 0 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+	}))
+	defer srv.Close()
+
+	t.Setenv("GENERATOR_HTTP_BATCH", "3")
+	t.Setenv("GENERATOR_RETRY_BACKOFF", "1ms")
+	t.Setenv("GENERATOR_TARGET_COOLDOWN", "0s")
+	t.Setenv("GENERATOR_PROGRESS_INTERVAL", "1h")
+	t.Setenv("GENERATOR_MARK_TRIES", "true")
+	cfg := config{Mode: "http_ack", Target: srv.URL, Rate: 600, Duration: 200 * time.Millisecond, LineSize: 72, Connections: 1}
+	acked, _, err := runHTTPAck(cfg, &sendClock{})
+	if err != nil || acked == 0 {
+		t.Fatalf("runHTTPAck: %d acked, %v", acked, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for seq := int64(0); seq < acked; seq++ {
+		got := strings.Join(tries["0/"+strconv.FormatInt(seq, 10)], ",")
+		if got != "1,2,3" {
+			t.Fatalf("SEQ %d went with tries %q, want 1,2,3", seq, got)
+		}
+	}
+}
+
+// TestATryPast63KeepsTheMark63 checks that the mark never outgrows what the
+// receiver reads.
+func TestATryPast63KeepsTheMark63(t *testing.T) {
+	var buf bytes.Buffer
+	buildAckLine(&buf, 7, 12, 99, 60, strings.Repeat("x", 60), 200)
+	if got := buf.String(); !strings.HasPrefix(got, "CONN=7 SEQ=12 TS=99 TRY=63 ") || len(got) != 60 {
+		t.Errorf("line %q", got)
+	}
+}
