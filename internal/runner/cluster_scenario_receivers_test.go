@@ -326,6 +326,11 @@ func TestReceiverVerdictJudgesRepeats(t *testing.T) {
 	if got := receiverVerdict(rs, config.ScenarioExpect{}); len(got) != 0 {
 		t.Fatalf("without max_repeats nothing is judged: %q", got)
 	}
+	// A duplicate that is neither a repeat nor a resend lost its mark, and fails the limit
+	unmarked := receiverResult{ID: "e", Checked: true, Duplicates: 5, Repeats: 0, Resends: 3, TriesMarked: true}
+	if got := repeatVerdict(unmarked, &five); len(got) != 1 || !strings.Contains(got[0], "2 of the lines that arrived at receiver e more than once carried no try mark") {
+		t.Fatalf("unmarked duplicates: %q", got)
+	}
 	if got := repeatVerdict(receiverResult{ID: "d"}, &zero); len(got) != 1 || !strings.Contains(got[0], "never answered") {
 		t.Fatalf("an unchecked receiver: %q", got)
 	}

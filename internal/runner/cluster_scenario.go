@@ -2710,7 +2710,8 @@ func receiverVerdict(rs []receiverResult, ex config.ScenarioExpect) []string {
 
 // repeatVerdict judges max_repeats at one receiver. Without marked tries the
 // receiver can not tell a repeat from a resend, so the limit fails rather than
-// pass on a count of 0 that nobody took.
+// pass on a count of 0 that nobody took. So does a duplicate whose copy lost its
+// mark on the way, which is neither kind and would escape the limit.
 func repeatVerdict(r receiverResult, maxRepeats *int64) []string {
 	if maxRepeats == nil {
 		return nil
@@ -2724,6 +2725,8 @@ func repeatVerdict(r receiverResult, maxRepeats *int64) []string {
 		return []string{fmt.Sprintf("%s never answered the sequence check, so max_repeats was not checked", name)}
 	case !r.TriesMarked:
 		return []string{fmt.Sprintf("no line at %s carried a try mark, so max_repeats was not checked: the generator needs GENERATOR_MARK_TRIES", name)}
+	case r.Duplicates > r.Repeats+r.Resends:
+		return []string{fmt.Sprintf("%d of the lines that arrived at %s more than once carried no try mark, so max_repeats can not tell whether the subject repeated them", r.Duplicates-r.Repeats-r.Resends, name)}
 	case r.Repeats > *maxRepeats:
 		return []string{fmt.Sprintf("the subject delivered %d lines to %s more than once (max_repeats %d)", r.Repeats, name, *maxRepeats)}
 	}
