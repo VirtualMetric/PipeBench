@@ -94,7 +94,7 @@ func readPostgres(ctx context.Context, conn *pgx.Conn, query string, seen map[ui
 			at = now
 			seen[k] = at
 		}
-		parts = append(parts, snapshotPart{seen: at, lines: [][]byte{[]byte(*text)}})
+		parts = append(parts, snapshotPart{seen: at, lines: valueLines([][]byte{[]byte(*text)}, true)})
 	}
 	return parts, rows.Err()
 }

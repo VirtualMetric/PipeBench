@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"sort"
 	"time"
 )
@@ -66,6 +67,31 @@ func (s *snapshotTracker) rebuild(parts []snapshotPart, bytesPerLine int64) {
 		}
 	}
 	s.track.adopt(fresh)
+}
+
+// valueLines splits each value that a destination holds into its lines. One
+// value can hold several lines: a subject that takes a post of many lines as
+// one record writes them as one row, separated by newlines. A subject that
+// writes the record as JSON writes each newline as the two characters \n, which
+// escaped also splits on. Blank lines are left out.
+func valueLines(values [][]byte, escaped bool) [][]byte {
+	out := make([][]byte, 0, len(values))
+	for _, v := range values {
+		parts := bytes.Split(v, []byte{'\n'})
+		if escaped {
+			var more [][]byte
+			for _, p := range parts {
+				more = append(more, bytes.Split(p, []byte{'\\', 'n'})...)
+			}
+			parts = more
+		}
+		for _, p := range parts {
+			if p = bytes.TrimRight(p, "\r"); len(bytes.TrimSpace(p)) > 0 {
+				out = append(out, p)
+			}
+		}
+	}
+	return out
 }
 
 // adopt replaces what the tracker holds with what fresh holds, at once, so

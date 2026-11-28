@@ -1,7 +1,9 @@
 package main
 
 import (
+	"compress/gzip"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,11 +15,12 @@ import (
 // deltaRow is a row of the test tables: a line in a "message" column, as the
 // director's lake target writes a plain-text record.
 type deltaRow struct {
-	Epoch   int64  `parquet:"epoch"`
-	Message string `parquet:"message,optional"`
+	Epoch   int64   `parquet:"epoch"`
+	Message *string `parquet:"message,optional"`
 }
 
 // writeDataFile writes rows as a Parquet file of the table, at a path below it.
+// A line of "<null>" is a row whose message is NULL.
 func writeDataFile(t *testing.T, table, rel string, lines ...string) {
 	t.Helper()
 	path := filepath.Join(table, filepath.FromSlash(rel))
@@ -26,7 +29,10 @@ func writeDataFile(t *testing.T, table, rel string, lines ...string) {
 	}
 	rows := make([]deltaRow, len(lines))
 	for i, l := range lines {
-		rows[i] = deltaRow{Epoch: int64(i), Message: l}
+		rows[i] = deltaRow{Epoch: int64(i)}
+		if l != "<null>" {
+			rows[i].Message = &l
+		}
 	}
 	if err := parquet.WriteFile(path, rows); err != nil {
 		t.Fatal(err)
@@ -73,12 +79,12 @@ func TestTheDeltaReceiverCountsWhatTheTableHoldsNow(t *testing.T) {
 
 	// Two commits of two rows each. A path with a partition folder and an
 	// escaped character is read too.
-	writeDataFile(t, table, "part-0.parquet", line(0, 1), line(1, 1))
+	writeDataFile(t, table, "part-0.parquet", line(0, 1), "<null>", line(1, 1))
 	writeDataFile(t, table, "day=2026-11-28/part 1.parquet", line(2, 1), line(3, 1))
 	writeCommit(t, table, 0, `{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}`, add("part-0.parquet"))
 	writeCommit(t, table, 1, add("day=2026-11-28/part%201.parquet"))
-	if got := pollAndCheck(t, d, snap, tr, 4); got.Missing != 0 || got.Unique != 4 || got.Duplicates != 0 {
-		t.Fatalf("after two commits: %+v", got)
+	if got := pollAndCheck(t, d, snap, tr, 4); got.Missing != 0 || got.Unique != 4 || got.Duplicates != 0 || got.Unparsed != 0 {
+		t.Fatalf("after two commits, with a NULL row left out: %+v", got)
 	}
 
 	// A compaction rewrites both files into one: each row still counts once
@@ -95,14 +101,22 @@ func TestTheDeltaReceiverCountsWhatTheTableHoldsNow(t *testing.T) {
 		t.Fatalf("after a commit that adds rows again: %+v", got)
 	}
 
+	// A row that holds a post of three lines, as the director writes a post it
+	// takes as one record, counts each line
+	writeDataFile(t, table, "part-4.parquet", line(4, 1)+"\n"+line(5, 1)+"\r\n"+line(6, 1)+"\n")
+	writeCommit(t, table, 4, add("part-4.parquet"))
+	if got := pollAndCheck(t, d, snap, tr, 7); got.Missing != 0 || got.Unique != 7 || got.Unparsed != 0 {
+		t.Fatalf("after a row of three lines: %+v", got)
+	}
+
 	// A commit that is not there yet ends the reading, and the next poll
 	// goes on from it
-	writeCommit(t, table, 5, remove("part-3.parquet"))
-	if got := pollAndCheck(t, d, snap, tr, 4); got.Duplicates != 2 {
+	writeCommit(t, table, 6, remove("part-3.parquet"))
+	if got := pollAndCheck(t, d, snap, tr, 7); got.Duplicates != 2 {
 		t.Fatalf("a commit after a gap was read: %+v", got)
 	}
-	writeCommit(t, table, 4, `{"commitInfo":{"operation":"WRITE"}}`)
-	if got := pollAndCheck(t, d, snap, tr, 4); got.Duplicates != 0 || got.Unique != 4 {
+	writeCommit(t, table, 5, `{"commitInfo":{"operation":"WRITE"}}`)
+	if got := pollAndCheck(t, d, snap, tr, 7); got.Duplicates != 0 || got.Unique != 7 {
 		t.Fatalf("after the gap closed: %+v", got)
 	}
 }
@@ -137,5 +151,39 @@ func TestASnapshotCountsNewLinesOnceAndKeepsArrivalOrder(t *testing.T) {
 	}
 	if got := tr.check(map[int64]int64{0: 2}, 5); got.Unique != 2 || got.Duplicates != 0 {
 		t.Errorf("%+v", got)
+	}
+	// The part seen first starts the timeline, whatever order the parts came in
+	if start := tr.timeline().StartNs; start != 1_500_000_000 {
+		t.Errorf("the timeline starts at %d, want the first part seen, 1500000000", start)
+	}
+}
+
+// TestAnObjectsLinesAreReadAsCountBodyReadsThem checks bodyLines, which the
+// kept s3 mode reads an object with: gzip by its magic bytes, no blank lines.
+func TestAnObjectsLinesAreReadAsCountBodyReadsThem(t *testing.T) {
+	var gz strings.Builder
+	w := gzipWriter(&gz)
+	_, _ = w.Write([]byte("CONN=0 SEQ=0 TS=1 a\n\nCONN=0 SEQ=1 TS=1 b\n"))
+	_ = w.Close()
+	for _, body := range [][]byte{[]byte("CONN=0 SEQ=0 TS=1 a\n\nCONN=0 SEQ=1 TS=1 b\n"), []byte(gz.String())} {
+		lines, err := bodyLines(body)
+		if err != nil || len(lines) != 2 || string(lines[1]) != "CONN=0 SEQ=1 TS=1 b" {
+			t.Fatalf("lines %q, %v", lines, err)
+		}
+	}
+}
+
+func gzipWriter(w io.Writer) *gzip.Writer { return gzip.NewWriter(w) }
+
+// TestAValueOfSeveralLinesCountsEachLine checks valueLines: a value splits on
+// newlines, and, for a destination that holds the record as JSON, on an escaped
+// newline too.
+func TestAValueOfSeveralLinesCountsEachLine(t *testing.T) {
+	value := []byte(`{"message":"CONN=0 SEQ=0 TS=1 a\nCONN=0 SEQ=1 TS=1 b"}` + "\nCONN=0 SEQ=2 TS=1 c\r\n\n")
+	if got := valueLines([][]byte{value}, true); len(got) != 3 || !strings.HasSuffix(string(got[1]), `b"}`) || string(got[2]) != "CONN=0 SEQ=2 TS=1 c" {
+		t.Errorf("escaped: %q", got)
+	}
+	if got := valueLines([][]byte{value}, false); len(got) != 2 {
+		t.Errorf("plain: %q", got)
 	}
 }

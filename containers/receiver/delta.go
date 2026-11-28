@@ -212,7 +212,11 @@ func (d *deltaTable) readFile(p string) ([][]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return parquetColumn(bytes.NewReader(data), int64(len(data)), d.column)
+	values, err := parquetColumn(bytes.NewReader(data), int64(len(data)), d.column)
+	if err != nil {
+		return nil, err
+	}
+	return valueLines(values, false), nil
 }
 
 // parquetColumn reads every value of one top-level column of a Parquet file,

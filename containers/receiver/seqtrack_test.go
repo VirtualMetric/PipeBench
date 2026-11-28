@@ -365,6 +365,17 @@ func TestADuplicateIsARepeatOrAResendByItsTry(t *testing.T) {
 	for _, d := range tr.duplicates().Samples {
 		kinds[d.Kind]++
 	}
+	// The line whose first copy was its third try: try 1 came late, from the
+	// client, and try 3 came again, from the subject
+	var seq1 []string
+	for _, d := range tr.duplicates().Samples {
+		if d.Conn == 0 && d.Seq == 1 {
+			seq1 = append(seq1, d.Kind)
+		}
+	}
+	if strings.Join(seq1, ",") != "resend,repeat" {
+		t.Errorf("SEQ 1 arrived again as %v, want a resend and then a repeat", seq1)
+	}
 	if kinds["repeat"] != 3 || kinds["resend"] != 2 || kinds[""] != 1 {
 		t.Errorf("the duplicates list says %v", kinds)
 	}
