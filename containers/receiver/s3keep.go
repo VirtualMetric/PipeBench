@@ -65,6 +65,8 @@ func receiveS3Kept(client *s3.Client, bucket, prefix string, cfg config, cnt *co
 				if err != nil {
 					return fmt.Errorf("decode object %s: %w", key, err)
 				}
+				// A record of several lines written as JSON holds them escaped
+				lines = valueLines(lines, true)
 				seen := now
 				if k, ok := objects[key]; ok {
 					seen = k.part.seen
