@@ -191,6 +191,9 @@ type seqCheckResult struct {
 	Extra          int64    `json:"extra"`
 	Unique         int64    `json:"unique"`
 	Duplicates     int64    `json:"duplicates"`
+	Repeats        int64    `json:"repeats"`
+	Resends        int64    `json:"resends"`
+	TriesMarked    bool     `json:"tries_marked"`
 	Unparsed       int64    `json:"unparsed"`
 	Cut            int64    `json:"cut"`
 	UnexpectedConn []string `json:"unexpected_conns,omitempty"`
@@ -2139,6 +2142,17 @@ func (rep scenarioReport) summary() map[string]any {
 	for _, rr := range rep.Receivers {
 		out["missing_"+rr.ID] = rr.Missing
 		out["duplicates_"+rr.ID] = rr.Duplicates
+		if rr.TriesMarked {
+			out["repeats_"+rr.ID] = rr.Repeats
+			out["resends_"+rr.ID] = rr.Resends
+		}
+	}
+	// The case's repeats and resends are those of the receiver that repeated the
+	// most: rep.SeqCheck is the receiver that missed the most, which may have
+	// repeated fewer
+	if repeats, resends, marked := mostRepeats(rep); marked {
+		out["repeats"] = repeats
+		out["resends"] = resends
 	}
 	for k, v := range rep.Measures {
 		out["ms_"+k] = v
@@ -2499,6 +2513,9 @@ func (sr *scenarioRun) finish() (scenarioReport, scenarioVerdict, error) {
 		if ex.MaxDuplicates != nil && rep.Duplicates > *ex.MaxDuplicates {
 			v.reasons = append(v.reasons, fmt.Sprintf("%d lines arrived more than once (max_duplicates %d)", rep.Duplicates, *ex.MaxDuplicates))
 		}
+		if len(recvResults) == 1 {
+			v.reasons = append(v.reasons, repeatVerdict(recvResults[0], ex.MaxRepeats)...)
+		}
 	}
 	if ex.MaxSplitBrainMs != nil && rep.Leadership.SplitBrainMs > *ex.MaxSplitBrainMs {
 		v.reasons = append(v.reasons, fmt.Sprintf("two nodes named themselves the leader for %s (max_split_brain_ms %d)",
@@ -2582,14 +2599,20 @@ type receiverResult struct {
 	ID string `json:"id"`
 	// Checked is false when the receiver never answered the sequence check,
 	// so that its loss is unknown.
-	Checked    bool            `json:"checked"`
-	Received   int64           `json:"received"`
-	CutLines   int64           `json:"cut_lines"`
-	Unique     int64           `json:"unique"`
-	Missing    int64           `json:"missing"`
-	Duplicates int64           `json:"duplicates"`
-	Extra      int64           `json:"extra"`
-	SeqCheck   *seqCheckResult `json:"seqcheck,omitempty"`
+	Checked    bool  `json:"checked"`
+	Received   int64 `json:"received"`
+	CutLines   int64 `json:"cut_lines"`
+	Unique     int64 `json:"unique"`
+	Missing    int64 `json:"missing"`
+	Duplicates int64 `json:"duplicates"`
+	Extra      int64 `json:"extra"`
+	// Repeats are the duplicates that the subject delivered twice, and
+	// Resends those that the client sent again, when the generator marks its
+	// tries (TriesMarked). Without marks, both are 0.
+	Repeats     int64           `json:"repeats"`
+	Resends     int64           `json:"resends"`
+	TriesMarked bool            `json:"tries_marked"`
+	SeqCheck    *seqCheckResult `json:"seqcheck,omitempty"`
 	// DuplicateRanges groups the lines that arrived at this receiver twice.
 	DuplicateRanges []duplicateRange `json:"duplicate_ranges,omitempty"`
 }
@@ -2613,7 +2636,8 @@ func (sr *scenarioRun) checkReceiver(rc scenarioReceiver, acked map[string]int64
 		return receiverResult{}, fmt.Errorf("interrupted: %w", sr.ctx.Err())
 	}
 	res := receiverResult{ID: rc.ID, Checked: checked, SeqCheck: &check,
-		Unique: check.Unique, Missing: check.Missing, Duplicates: check.Duplicates, Extra: check.Extra, CutLines: check.Cut}
+		Unique: check.Unique, Missing: check.Missing, Duplicates: check.Duplicates, Extra: check.Extra, CutLines: check.Cut,
+		Repeats: check.Repeats, Resends: check.Resends, TriesMarked: check.TriesMarked}
 	if !checked {
 		sr.failures = append(sr.failures, fmt.Sprintf("%s never answered the sequence check, so loss is unknown: %v", rc.describe(), err))
 	}
@@ -2626,6 +2650,9 @@ func (sr *scenarioRun) checkReceiver(rc scenarioReceiver, acked map[string]int64
 	}
 	fmt.Printf("  delivery%s: %d acknowledged, %d of them arrived, %d missing, %d duplicates, %d extra, %d cut lines\n",
 		at, check.Acked, check.ReceivedAcked, check.Missing, check.Duplicates, check.Extra, check.Cut)
+	if check.TriesMarked {
+		fmt.Printf("    of the duplicates%s, %d are the subject's repeats and %d the client's resends\n", at, check.Repeats, check.Resends)
+	}
 	for conn, cc := range check.Conns {
 		if cc.Missing > 0 {
 			fmt.Printf("    conn %s: missing %d, first ranges %v\n", conn, cc.Missing, cc.MissingRanges)
@@ -2679,8 +2706,56 @@ func receiverVerdict(rs []receiverResult, ex config.ScenarioExpect) []string {
 		if maxDuplicates != nil && r.Duplicates > *maxDuplicates {
 			reasons = append(reasons, fmt.Sprintf("%d lines arrived at receiver %s more than once (max_duplicates %d)", r.Duplicates, r.ID, *maxDuplicates))
 		}
+		reasons = append(reasons, repeatVerdict(r, ex.ReceiverRepeatLimit(r.ID))...)
 	}
 	return reasons
+}
+
+// mostRepeats answers the repeats and the resends of the receiver whose lines
+// the subject repeated the most, and whether any receiver's lines carried try
+// marks. A case with one receiver answers that receiver's.
+func mostRepeats(rep scenarioReport) (repeats, resends int64, marked bool) {
+	if len(rep.Receivers) == 0 {
+		if rep.SeqCheck == nil || !rep.SeqCheck.TriesMarked {
+			return 0, 0, false
+		}
+		return rep.SeqCheck.Repeats, rep.SeqCheck.Resends, true
+	}
+	for _, r := range rep.Receivers {
+		if !r.TriesMarked {
+			continue
+		}
+		if !marked || r.Repeats > repeats {
+			repeats, resends = r.Repeats, r.Resends
+		}
+		marked = true
+	}
+	return repeats, resends, marked
+}
+
+// repeatVerdict judges max_repeats at one receiver. Without marked tries the
+// receiver can not tell a repeat from a resend, so the limit fails rather than
+// pass on a count of 0 that nobody took. So does a duplicate whose copy lost its
+// mark on the way, which is neither kind and would escape the limit.
+func repeatVerdict(r receiverResult, maxRepeats *int64) []string {
+	if maxRepeats == nil {
+		return nil
+	}
+	name := "the receiver"
+	if r.ID != "" {
+		name = "receiver " + r.ID
+	}
+	switch {
+	case !r.Checked:
+		return []string{fmt.Sprintf("%s never answered the sequence check, so max_repeats was not checked", name)}
+	case !r.TriesMarked:
+		return []string{fmt.Sprintf("no line at %s carried a try mark, so max_repeats was not checked: the generator needs GENERATOR_MARK_TRIES", name)}
+	case r.Duplicates > r.Repeats+r.Resends:
+		return []string{fmt.Sprintf("%d of the lines that arrived at %s more than once carried no try mark, so max_repeats can not tell whether the subject repeated them", r.Duplicates-r.Repeats-r.Resends, name)}
+	case r.Repeats > *maxRepeats:
+		return []string{fmt.Sprintf("the subject delivered %d lines to %s more than once (max_repeats %d)", r.Repeats, name, *maxRepeats)}
+	}
+	return nil
 }
 
 // nodeLogText returns a node container's whole log. A variable, so that tests can
@@ -2903,15 +2978,32 @@ func withoutLoadVerdict(rep scenarioReport, ex config.ScenarioExpect, dedup bool
 // quiet, or until deadline. It returns the last check that succeeded.
 // checked is false when no read succeeded at all, and err is then the last
 // error. The loss of such a run is unknown, not zero.
+//
+// When the lines carry try marks, the case counts the subject's repeats, and a
+// repeat can arrive after the last acknowledged line has: a retry stream that
+// waits, or a receiver that reads its destination once a poll. So then the
+// drain goes on once nothing is missing, until the count of duplicates has not
+// changed for quiet either.
 func drainSeqCheck(ctx context.Context, read func() (seqCheckResult, error), deadline time.Time, quiet, poll time.Duration) (check seqCheckResult, checked bool, err error) {
 	var lastReceived int64 = -1
 	quietSince := time.Now()
+	var lastDuplicates int64 = -1
+	var duplicatesSince time.Time
 	for {
 		c, readErr := read()
 		if readErr == nil {
 			check, checked = c, true
 			if c.Missing == 0 {
-				return check, true, nil
+				if !c.TriesMarked {
+					return check, true, nil
+				}
+				if c.Duplicates != lastDuplicates {
+					lastDuplicates, duplicatesSince = c.Duplicates, time.Now()
+				} else if time.Since(duplicatesSince) > quiet {
+					return check, true, nil
+				}
+			} else {
+				lastDuplicates = -1
 			}
 			if c.ReceivedAcked != lastReceived {
 				lastReceived = c.ReceivedAcked

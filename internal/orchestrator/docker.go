@@ -3108,7 +3108,7 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 				Env:      mergeEnv(cloudEnvForMode(rc.Mode, awsEnv, minioEnv, azureEnv), rc.Env),
 				AWSDep:   tc.UsesAWS() && config.IsCloudPollingReceiverMode(rc.Mode) && rc.Mode != "azure_blob",
 				AzureDep: tc.UsesAzure() && rc.Mode == "azure_blob",
-				MinioDep: tc.UsesMinio() && rc.Mode == "s3",
+				MinioDep: tc.UsesMinio() && (rc.Mode == "s3" || rc.Mode == "delta"),
 			})
 		}
 	} else {
@@ -3117,7 +3117,7 @@ func writeComposeAt(path string, cfg RunConfig, t0 time.Time) error {
 		vars.RecvEnv = mergeEnv(cloudEnvForMode(tc.Receiver.Mode, awsEnv, minioEnv, azureEnv), tc.Receiver.Env)
 		vars.RecvAWSDep = tc.UsesAWS() && config.IsCloudPollingReceiverMode(tc.Receiver.Mode) && tc.Receiver.Mode != "azure_blob"
 		vars.RecvAzureDep = tc.UsesAzure() && tc.Receiver.Mode == "azure_blob"
-		vars.RecvMinioDep = tc.UsesMinio() && tc.Receiver.Mode == "s3"
+		vars.RecvMinioDep = tc.UsesMinio() && (tc.Receiver.Mode == "s3" || tc.Receiver.Mode == "delta")
 	}
 
 	// Cloud emulator services. The AWS init script is rendered from the

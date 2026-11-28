@@ -335,3 +335,59 @@ func TestSeqTrackerKeepsOneLatencySampleInN(t *testing.T) {
 		t.Fatalf("latency without sampling: %d samples, sample_every %d, want 100 and 0", ls.Count, ls.SampleEvery)
 	}
 }
+
+// TestADuplicateIsARepeatOrAResendByItsTry checks how the tracker splits the
+// lines that arrived again: a copy of a try that arrived is the subject's
+// repeat, and a try that had not arrived is the client's resend.
+func TestADuplicateIsARepeatOrAResendByItsTry(t *testing.T) {
+	tr := newSeqTracker(1)
+	at := int64(1_000)
+	feed := func(line string) {
+		at++
+		tr.record([]byte(line), at)
+	}
+	feed("CONN=0 SEQ=0 TS=5 TRY=1 a") // first arrival
+	feed("CONN=0 SEQ=0 TS=5 TRY=2 a") // the client sent it again: a resend
+	feed("CONN=0 SEQ=0 TS=5 TRY=1 a") // the subject delivered try 1 again: a repeat
+	feed("CONN=0 SEQ=0 TS=5 TRY=2 a") // and try 2 again: a repeat
+	feed("CONN=0 SEQ=1 TS=6 TRY=3 b") // first arrival, of the third try
+	feed("CONN=0 SEQ=1 TS=6 TRY=1 b") // the first try arrives late: a resend
+	feed("CONN=0 SEQ=1 TS=6 TRY=3 b") // a repeat of try 3
+	feed("CONN=1 SEQ=0 TS=7 c")       // a line without a mark
+	feed("CONN=1 SEQ=0 TS=7 c")       // a duplicate that is neither
+
+	got := tr.check(map[int64]int64{0: 2, 1: 1}, 5)
+	if got.Duplicates != 6 || got.Repeats != 3 || got.Resends != 2 || !got.TriesMarked || got.Missing != 0 {
+		t.Fatalf("duplicates %d, repeats %d, resends %d, marked %v, missing %d; want 6, 3, 2, true, 0",
+			got.Duplicates, got.Repeats, got.Resends, got.TriesMarked, got.Missing)
+	}
+	kinds := map[string]int{}
+	for _, d := range tr.duplicates().Samples {
+		kinds[d.Kind]++
+	}
+	// The line whose first copy was its third try: try 1 came late, from the
+	// client, and try 3 came again, from the subject
+	var seq1 []string
+	for _, d := range tr.duplicates().Samples {
+		if d.Conn == 0 && d.Seq == 1 {
+			seq1 = append(seq1, d.Kind)
+		}
+	}
+	if strings.Join(seq1, ",") != "resend,repeat" {
+		t.Errorf("SEQ 1 arrived again as %v, want a resend and then a repeat", seq1)
+	}
+	if kinds["repeat"] != 3 || kinds["resend"] != 2 || kinds[""] != 1 {
+		t.Errorf("the duplicates list says %v", kinds)
+	}
+}
+
+// TestLinesWithoutMarksSayNothingOfTries checks that an old generator's lines
+// leave the split empty.
+func TestLinesWithoutMarksSayNothingOfTries(t *testing.T) {
+	tr := newSeqTracker(1)
+	tr.record([]byte("CONN=0 SEQ=0 TS=5 x"), 10)
+	tr.record([]byte("CONN=0 SEQ=0 TS=5 x"), 11)
+	if got := tr.check(map[int64]int64{0: 1}, 5); got.Duplicates != 1 || got.Repeats != 0 || got.Resends != 0 || got.TriesMarked {
+		t.Errorf("%+v", got)
+	}
+}

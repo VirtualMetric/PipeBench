@@ -230,6 +230,12 @@ type ScenarioExpect struct {
 	// MaxDuplicates is how many lines may arrive more than once, at each
 	// receiver when there are several.
 	MaxDuplicates *int64 `yaml:"max_duplicates"`
+	// MaxRepeats is how many lines the subject may deliver more than once, at
+	// each receiver when there are several. It counts only the copies of a
+	// post that arrived before, not the posts that the client sent again
+	// because it got no answer, so it needs a generator that marks its tries
+	// (http_ack with GENERATOR_MARK_TRIES).
+	MaxRepeats *int64 `yaml:"max_repeats"`
 	// MaxSplitBrainMs is how long two nodes may both name themselves the
 	// cluster's leader in the same round of /health reads.
 	MaxSplitBrainMs *int64 `yaml:"max_split_brain_ms"`
@@ -288,9 +294,11 @@ type ScenarioThroughputExpect struct {
 // ScenarioReceiverExpect is how one receiver is judged
 // (cluster.scenario.expect.receivers.<id>).
 type ScenarioReceiverExpect struct {
-	// MaxLoss and MaxDuplicates replace the case's own for this receiver.
+	// MaxLoss, MaxDuplicates and MaxRepeats replace the case's own for this
+	// receiver.
 	MaxLoss       *int64 `yaml:"max_loss"`
 	MaxDuplicates *int64 `yaml:"max_duplicates"`
+	MaxRepeats    *int64 `yaml:"max_repeats"`
 	// MinLoss is the fewest acknowledged lines that must be missing at this
 	// receiver. A case that tests a loss the subject makes on purpose fails
 	// when nothing was lost, because it then tested nothing.
@@ -341,6 +349,15 @@ func (ex ScenarioExpect) ReceiverLimits(id string) (maxLoss, maxDuplicates, minL
 		maxDuplicates = own.MaxDuplicates
 	}
 	return maxLoss, maxDuplicates, own.MinLoss
+}
+
+// ReceiverRepeatLimit returns the max_repeats that receiver id is judged by:
+// the case's, or the receiver's own where expect.receivers sets one.
+func (ex ScenarioExpect) ReceiverRepeatLimit(id string) *int64 {
+	if own, ok := ex.Receivers[id]; ok && own.MaxRepeats != nil {
+		return own.MaxRepeats
+	}
+	return ex.MaxRepeats
 }
 
 // ScenarioStep is one step. Do names the action; the other fields are its
@@ -903,6 +920,9 @@ func (tc *TestCase) validateClusterScenario() error {
 	if err := tc.validateReceiverExpect(sc.Expect); err != nil {
 		return fmt.Errorf("case %q: %w", tc.Name, err)
 	}
+	if err := tc.validateMaxRepeats(sc.Expect); err != nil {
+		return fmt.Errorf("case %q: %w", tc.Name, err)
+	}
 	if sc.Expect.MaxStreamLeaderlessMs != nil && *sc.Expect.MaxStreamLeaderlessMs < 0 {
 		return fmt.Errorf("case %q: expect.max_stream_leaderless_ms must not be negative, got %d", tc.Name, *sc.Expect.MaxStreamLeaderlessMs)
 	}
@@ -1247,6 +1267,25 @@ func validateThroughputExpect(sc *ScenarioConfig) error {
 
 // validateReceiverExpect checks cluster.scenario.expect.receivers: each
 // entry names one of the case's several receivers, and its limits make sense.
+// validateMaxRepeats checks that a case that judges max_repeats can tell a
+// repeat from a resend: its generator must mark its tries.
+func (tc *TestCase) validateMaxRepeats(ex ScenarioExpect) error {
+	set := ex.MaxRepeats != nil
+	for _, own := range ex.Receivers {
+		set = set || own.MaxRepeats != nil
+	}
+	if !set {
+		return nil
+	}
+	if ex.MaxRepeats != nil && *ex.MaxRepeats < 0 {
+		return fmt.Errorf("expect.max_repeats must be 0 or more, got %d", *ex.MaxRepeats)
+	}
+	if tc.Generator.Mode != "http_ack" || !strings.EqualFold(tc.Generator.Env["GENERATOR_MARK_TRIES"], "true") {
+		return fmt.Errorf("max_repeats tells the subject's repeats from the client's resends by the tries that the generator marks, so it needs the http_ack generator with GENERATOR_MARK_TRIES: \"true\"")
+	}
+	return nil
+}
+
 func (tc *TestCase) validateReceiverExpect(ex ScenarioExpect) error {
 	if ex.Receivers == nil {
 		return nil
@@ -1264,7 +1303,7 @@ func (tc *TestCase) validateReceiverExpect(ex ScenarioExpect) error {
 		if err := tc.validateScenarioReceiver(id); err != nil {
 			return fmt.Errorf("expect.receivers: %w", err)
 		}
-		for field, v := range map[string]*int64{"max_loss": own.MaxLoss, "max_duplicates": own.MaxDuplicates, "min_loss": own.MinLoss} {
+		for field, v := range map[string]*int64{"max_loss": own.MaxLoss, "max_duplicates": own.MaxDuplicates, "max_repeats": own.MaxRepeats, "min_loss": own.MinLoss} {
 			if v != nil && *v < 0 {
 				return fmt.Errorf("expect.receivers.%s.%s must be 0 or more, got %d", id, field, *v)
 			}
@@ -1273,7 +1312,7 @@ func (tc *TestCase) validateReceiverExpect(ex ScenarioExpect) error {
 		if minLoss != nil && maxLoss != nil && *minLoss > *maxLoss {
 			return fmt.Errorf("expect.receivers.%s: min_loss %d is more than max_loss %d", id, *minLoss, *maxLoss)
 		}
-		if own.MaxLoss == nil && own.MaxDuplicates == nil && own.MinLoss == nil && own.CountedLoss == nil {
+		if own.MaxLoss == nil && own.MaxDuplicates == nil && own.MaxRepeats == nil && own.MinLoss == nil && own.CountedLoss == nil {
 			return fmt.Errorf("expect.receivers.%s sets no limit", id)
 		}
 		if c := own.CountedLoss; c != nil {

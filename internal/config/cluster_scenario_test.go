@@ -636,3 +636,38 @@ func TestValidateClusterScenarioRefuseAndRandomSleep(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateMaxRepeatsNeedsMarkedTries(t *testing.T) {
+	marked := func(maxRepeats *int64, mark string) *TestCase {
+		tc := validScenarioCase()
+		tc.Cluster.Scenario.Expect.MaxRepeats = maxRepeats
+		if mark != "" {
+			if tc.Generator.Env == nil {
+				tc.Generator.Env = map[string]string{}
+			}
+			tc.Generator.Env["GENERATOR_MARK_TRIES"] = mark
+		}
+		return tc
+	}
+	if err := marked(int64p(0), "true").Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if err := marked(nil, "").Validate(); err != nil {
+		t.Fatalf("a case without max_repeats needs no marks: %v", err)
+	}
+	cases := map[string]struct {
+		tc   *TestCase
+		want string
+	}{
+		"max_repeats without marks":  {marked(int64p(0), ""), "needs the http_ack generator with GENERATOR_MARK_TRIES"},
+		"max_repeats with marks off": {marked(int64p(0), "false"), "needs the http_ack generator with GENERATOR_MARK_TRIES"},
+		"a max_repeats less than 0":  {marked(int64p(-1), "true"), "max_repeats must be 0 or more"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := c.tc.Validate(); err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("Validate() = %v, want an error containing %q", err, c.want)
+			}
+		})
+	}
+}

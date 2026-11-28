@@ -51,3 +51,25 @@ func TestCountBody(t *testing.T) {
 		})
 	}
 }
+
+// TestACloudModeTracksEachEscapedLineOfARecord checks that the tracker hears of
+// each line of a record that a subject wrote as JSON, with its newlines escaped,
+// while the counters count the record as one line, as the destination holds it.
+func TestACloudModeTracksEachEscapedLineOfARecord(t *testing.T) {
+	saved := seqTrack
+	t.Cleanup(func() { seqTrack = saved })
+	seqTrack = newSeqTracker(1)
+	cnt := &counters{}
+	onLine := newCloudOnLine(cnt, &validator{}, config{})
+	onLine([]byte(`{"message":"CONN=0 SEQ=0 TS=1 a\nCONN=0 SEQ=1 TS=1 b"}`))
+	if got := seqTrack.check(map[int64]int64{0: 2}, 5); got.Unique != 2 || got.Missing != 0 {
+		t.Errorf("the tracker heard %+v", got)
+	}
+	var lines int64
+	for _, s := range cnt.shards {
+		lines += s.lines.Load()
+	}
+	if lines != 1 {
+		t.Errorf("the counters hold %d lines, want 1", lines)
+	}
+}

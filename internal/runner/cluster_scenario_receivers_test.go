@@ -303,3 +303,35 @@ func TestCountedLossVerdictJudgesEachSide(t *testing.T) {
 		})
 	}
 }
+
+// TestReceiverVerdictJudgesRepeats checks max_repeats: it counts the subject's
+// repeats only, a receiver's own limit replaces the case's, and a receiver
+// whose lines carried no try mark fails the limit instead of passing on 0.
+func TestReceiverVerdictJudgesRepeats(t *testing.T) {
+	zero, five := int64(0), int64(5)
+	rs := []receiverResult{
+		{ID: "a", Checked: true, Duplicates: 40, Repeats: 3, Resends: 37, TriesMarked: true},
+		{ID: "b", Checked: true, Duplicates: 40, Repeats: 0, Resends: 40, TriesMarked: true},
+		{ID: "c", Checked: true, TriesMarked: false},
+	}
+	got := receiverVerdict(rs, config.ScenarioExpect{MaxRepeats: &zero})
+	if len(got) != 2 || !strings.Contains(got[0], "delivered 3 lines to receiver a more than once (max_repeats 0)") ||
+		!strings.Contains(got[1], "no line at receiver c carried a try mark") {
+		t.Fatalf("verdict %q", got)
+	}
+	ex := config.ScenarioExpect{MaxRepeats: &zero, Receivers: map[string]config.ScenarioReceiverExpect{"a": {MaxRepeats: &five}}}
+	if got := receiverVerdict(rs[:2], ex); len(got) != 0 {
+		t.Fatalf("receiver a may repeat 5, and receiver b repeated none: %q", got)
+	}
+	if got := receiverVerdict(rs, config.ScenarioExpect{}); len(got) != 0 {
+		t.Fatalf("without max_repeats nothing is judged: %q", got)
+	}
+	// A duplicate that is neither a repeat nor a resend lost its mark, and fails the limit
+	unmarked := receiverResult{ID: "e", Checked: true, Duplicates: 5, Repeats: 0, Resends: 3, TriesMarked: true}
+	if got := repeatVerdict(unmarked, &five); len(got) != 1 || !strings.Contains(got[0], "2 of the lines that arrived at receiver e more than once carried no try mark") {
+		t.Fatalf("unmarked duplicates: %q", got)
+	}
+	if got := repeatVerdict(receiverResult{ID: "d"}, &zero); len(got) != 1 || !strings.Contains(got[0], "never answered") {
+		t.Fatalf("an unchecked receiver: %q", got)
+	}
+}

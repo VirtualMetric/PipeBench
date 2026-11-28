@@ -21,6 +21,16 @@ package main
 // Every line still counts as arrived, so the loss check and the timeline stay
 // exact.
 //
+// A generator that marks its tries (GENERATOR_MARK_TRIES) writes " TRY=<k>"
+// after TS: 1 for the first post of a batch, 2 for the next, and so on. A
+// line that arrives again is then one of two things. A copy of a try that
+// arrived before is a **repeat**: the subject delivered the same line twice.
+// A try that had not arrived before is a **resend**: the client sent the line
+// again, because the subject did not confirm the first post, and the subject
+// took both. The subject may not have answered, or may have answered with an
+// error such as 503 while it kept the records. Without
+// marks, a duplicate is neither, and only the total counts.
+//
 // /timeline counts arrivals in 100 ms buckets, which shows when delivery
 // stalled and when it came back. /duplicates lists the lines that arrived
 // more than once, with the time of each copy.
@@ -54,11 +64,13 @@ type latSample struct {
 
 // dupSample is one arrival of a line that had arrived before.
 type dupSample struct {
-	Conn    int64 `json:"conn"`
-	Seq     int64 `json:"seq"`
-	SentNs  int64 `json:"sent_ns,omitempty"`
-	FirstNs int64 `json:"first_ns,omitempty"` // first arrival, when it is known
-	AtNs    int64 `json:"at_ns"`
+	Conn    int64  `json:"conn"`
+	Seq     int64  `json:"seq"`
+	Try     int64  `json:"try,omitempty"`
+	Kind    string `json:"kind,omitempty"` // "repeat" or "resend", with marked tries
+	SentNs  int64  `json:"sent_ns,omitempty"`
+	FirstNs int64  `json:"first_ns,omitempty"` // first arrival, when it is known
+	AtNs    int64  `json:"at_ns"`
 }
 
 // maxDupSamples bounds the duplicates the tracker remembers one by one. It
@@ -71,11 +83,20 @@ type tlBucket struct {
 }
 
 type seqTracker struct {
-	mu       sync.Mutex
-	start    int64 // arrival of the first line, unix nanos
-	conns    map[int64]*seqConn
-	unique   int64
-	dups     int64
+	mu     sync.Mutex
+	start  int64 // arrival of the first line, unix nanos
+	conns  map[int64]*seqConn
+	unique int64
+	dups   int64
+	// repeats and resends split dups by the line's TRY mark (see above).
+	repeats int64
+	resends int64
+	marked  bool
+	// firstTry holds the try of a line's first arrival when it was not 1, and
+	// tries the tries that arrived of each line that arrived more than once,
+	// one bit for each try from 1 to 63.
+	firstTry map[seqKey]int64
+	tries    map[seqKey]uint64
 	unparsed int64
 	cut      int64
 	samples  []latSample
@@ -86,36 +107,52 @@ type seqTracker struct {
 	sampleEvery int64
 }
 
+// seqKey names one line: its CONN and its SEQ.
+type seqKey struct{ conn, seq int64 }
+
 // newSeqTracker returns a tracker that keeps the latency of one line in
 // sampleEvery. A sampleEvery of 1 or less keeps every line's.
 func newSeqTracker(sampleEvery int64) *seqTracker {
-	return &seqTracker{conns: map[int64]*seqConn{}, sampleEvery: max(sampleEvery, 1)}
+	return &seqTracker{conns: map[int64]*seqConn{}, sampleEvery: max(sampleEvery, 1),
+		firstTry: map[seqKey]int64{}, tries: map[seqKey]uint64{}}
 }
 
 // parseSeqLine finds "CONN=<id> SEQ=<n>" and an optional " TS=<ns>" after it.
 // The prefix is searched anywhere in the line, so a subject that wraps the
 // record (a syslog header, for example) is still tracked.
 func parseSeqLine(line []byte) (conn, seq, ts int64, ok bool) {
+	conn, seq, ts, _, ok = parseSeqLineTry(line)
+	return conn, seq, ts, ok
+}
+
+// parseSeqLineTry is parseSeqLine, and also answers the line's try: the
+// " TRY=<k>" after TS, or 0 when the line has no mark.
+func parseSeqLineTry(line []byte) (conn, seq, ts, try int64, ok bool) {
 	s := string(line)
 	i := strings.Index(s, "CONN=")
 	if i < 0 {
-		return 0, 0, 0, false
+		return 0, 0, 0, 0, false
 	}
 	rest := s[i+len("CONN="):]
 	conn, rest, ok = leadingInt(rest)
 	if !ok || !strings.HasPrefix(rest, " SEQ=") {
-		return 0, 0, 0, false
+		return 0, 0, 0, 0, false
 	}
 	seq, rest, ok = leadingInt(rest[len(" SEQ="):])
 	if !ok {
-		return 0, 0, 0, false
+		return 0, 0, 0, 0, false
 	}
 	if strings.HasPrefix(rest, " TS=") {
-		if v, _, tok := leadingInt(rest[len(" TS="):]); tok {
+		if v, after, tok := leadingInt(rest[len(" TS="):]); tok {
 			ts = v
+			if strings.HasPrefix(after, " TRY=") {
+				if k, _, kok := leadingInt(after[len(" TRY="):]); kok && k >= 1 && k <= 63 {
+					try = k
+				}
+			}
 		}
 	}
-	return conn, seq, ts, true
+	return conn, seq, ts, try, true
 }
 
 func leadingInt(s string) (int64, string, bool) {
@@ -150,7 +187,7 @@ func (t *seqTracker) recordCut(now int64) {
 
 // record notes one received line that arrived at now (unix nanos).
 func (t *seqTracker) record(line []byte, now int64) {
-	conn, seq, ts, ok := parseSeqLine(line)
+	conn, seq, ts, try, ok := parseSeqLineTry(line)
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -174,12 +211,19 @@ func (t *seqTracker) record(line []byte, now int64) {
 		copy(grown, c.bits)
 		c.bits = grown
 	}
+	if try > 0 {
+		t.marked = true
+	}
 	if c.bits[word]&(1<<bit) != 0 {
 		t.dups++
+		kind := t.classify(seqKey{conn, seq}, try)
 		if len(t.dupList) < maxDupSamples {
-			t.dupList = append(t.dupList, dupSample{Conn: conn, Seq: seq, SentNs: ts, AtNs: now})
+			t.dupList = append(t.dupList, dupSample{Conn: conn, Seq: seq, Try: try, Kind: kind, SentNs: ts, AtNs: now})
 		}
 		return
+	}
+	if try > 1 {
+		t.firstTry[seqKey{conn, seq}] = try
 	}
 	c.bits[word] |= 1 << bit
 	c.count++
@@ -191,6 +235,31 @@ func (t *seqTracker) record(line []byte, now int64) {
 	if ts > 0 && now > ts && seq%t.sampleEvery == 0 {
 		t.samples = append(t.samples, latSample{sent: ts, lat: now - ts, seq: seq, conn: conn})
 	}
+}
+
+// classify counts one more arrival of a line that arrived before, by its try,
+// and answers "repeat", "resend", or "" for a line without a mark. Callers
+// hold t.mu.
+func (t *seqTracker) classify(k seqKey, try int64) string {
+	if try <= 0 {
+		return ""
+	}
+	seen, ok := t.tries[k]
+	if !ok {
+		first := int64(1)
+		if f, fok := t.firstTry[k]; fok {
+			first = f
+		}
+		seen = 1 << uint(first)
+	}
+	bit := uint64(1) << uint(try)
+	t.tries[k] = seen | bit
+	if seen&bit != 0 {
+		t.repeats++
+		return "repeat"
+	}
+	t.resends++
+	return "resend"
 }
 
 // bucket returns the timeline bucket for now. Callers hold t.mu.
@@ -228,6 +297,9 @@ type seqCheck struct {
 	Extra          int64                `json:"extra"`
 	Unique         int64                `json:"unique"`
 	Duplicates     int64                `json:"duplicates"`
+	Repeats        int64                `json:"repeats"`
+	Resends        int64                `json:"resends"`
+	TriesMarked    bool                 `json:"tries_marked"`
 	Unparsed       int64                `json:"unparsed"`
 	Cut            int64                `json:"cut"`
 	Conns          map[string]connCheck `json:"conns"`
@@ -240,7 +312,8 @@ type seqCheck struct {
 func (t *seqTracker) check(acked map[int64]int64, maxRanges int) seqCheck {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	out := seqCheck{Conns: map[string]connCheck{}, Unique: t.unique, Duplicates: t.dups, Unparsed: t.unparsed, Cut: t.cut}
+	out := seqCheck{Conns: map[string]connCheck{}, Unique: t.unique, Duplicates: t.dups, Unparsed: t.unparsed, Cut: t.cut,
+		Repeats: t.repeats, Resends: t.resends, TriesMarked: t.marked}
 	for conn, n := range acked {
 		cc := connCheck{Acked: n}
 		c := t.conns[conn]

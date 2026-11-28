@@ -35,6 +35,9 @@ func receiveS3(cfg config, cnt *counters, val *validator) error {
 		o.UsePathStyle = true
 	})
 
+	if getEnv("RECEIVER_S3_KEEP", "false") == "true" {
+		return receiveS3Kept(client, bucket, prefix, cfg, cnt)
+	}
 	onLine := newCloudOnLine(cnt, val, cfg)
 	fmt.Fprintf(os.Stderr, "receiver: polling s3 bucket=%q prefix=%q endpoint=%s\n", bucket, prefix, endpoint)
 

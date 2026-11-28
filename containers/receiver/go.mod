@@ -11,6 +11,9 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/kinesis v1.46.3
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.106.4
 	github.com/aws/aws-sdk-go-v2/service/sqs v1.46.3
+	github.com/jackc/pgx/v5 v5.10.0
+	github.com/parquet-go/parquet-go v0.32.0
+	github.com/twmb/franz-go v1.21.5
 	github.com/valyala/fasthttp v1.73.0
 	go.opentelemetry.io/proto/otlp v1.11.0
 	google.golang.org/grpc v1.83.1
@@ -36,8 +39,16 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.38.3 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.45.3 // indirect
 	github.com/aws/smithy-go v1.27.6 // indirect
+	github.com/google/uuid v1.6.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.30.0 // indirect
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/klauspost/compress v1.19.1 // indirect
+	github.com/parquet-go/bitpack v1.0.0 // indirect
+	github.com/parquet-go/jsonlite v1.0.0 // indirect
+	github.com/pierrec/lz4/v4 v4.1.26 // indirect
+	github.com/twmb/franz-go/pkg/kmsg v1.13.1 // indirect
+	github.com/twpayne/go-geom v1.6.1 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect

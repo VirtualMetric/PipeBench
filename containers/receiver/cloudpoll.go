@@ -33,6 +33,15 @@ func newCloudOnLine(cnt *counters, val *validator, cfg config) func([]byte) {
 		if needsValidation {
 			val.recordLine(line, cfg)
 		}
+		// The sequence tracker hears of the line too, when RECEIVER_TRACK_SEQ is on.
+		// A subject that writes a record of several lines as JSON escapes its
+		// newlines, so the tracker hears of each of them (valueLines). The
+		// counters above count the line as the destination holds it.
+		if seqTrack != nil || keyTrack != nil {
+			for _, l := range valueLines([][]byte{line}, true) {
+				trackSeq(l)
+			}
+		}
 	}
 }
 
